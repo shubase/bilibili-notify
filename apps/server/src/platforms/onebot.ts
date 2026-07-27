@@ -23,7 +23,7 @@ import type { PlatformAdapter, ProbeResult } from "./types.js";
  * - `ws-reverse`:独立端按 adapter 各自的 `port` 监听,bot 主动连入(端口即身份)。
  *
  * WS 两种方式都用 OneBot v11 的 action 帧 `{action,params,echo}` 发消息,按 `echo`
- * 收响应。本插件 push-only:入站的 message/notice/heartbeat 事件帧一律忽略。
+ * 收响应。入站事件帧会交给 standalone 命令处理器；未匹配命令的事件仍然忽略。
  *
  * 有状态:`ws`/`ws-reverse` 连接由 `reconcile()` 按当前 adapter 集合 start/stop/rebind,
  * `dispose()` 在 shutdown 时全部关闭。
@@ -42,7 +42,18 @@ export interface OnebotPlatformAdapterOptions {
 	 * 推送历史不再谎报失败。取 `max(cfg.timeoutMs, 此值)`。测试注入用。
 	 */
 	forwardMinTimeoutMs?: number;
+	/** Optional standalone inbound event hook. Used by group chat commands. */
+	onInboundEvent?: OnebotInboundEventHandler;
 }
+
+export interface OnebotInboundEventContext {
+	adapterId: string;
+	frame: unknown;
+	sendGroupText(groupId: string, text: string): Promise<DeliveryResult>;
+	sendGroupForwardText(groupId: string, nodes: string[]): Promise<DeliveryResult>;
+}
+
+export type OnebotInboundEventHandler = (ctx: OnebotInboundEventContext) => void | Promise<void>;
 
 const DEFAULT_TIMEOUT_MS = 15_000;
 const DEFAULT_RETRY_INTERVAL_MS = 1_000;
@@ -365,6 +376,7 @@ class WsChannel {
 		private readonly ws: WebSocket,
 		private readonly idPrefix: string,
 		private readonly serviceCtx: ServiceContext,
+		private readonly onEvent?: (frame: unknown, channel: WsChannel) => void,
 	) {
 		ws.on("message", (raw: RawData) => this.onMessage(raw));
 	}
@@ -401,8 +413,11 @@ class WsChannel {
 			return; // 非 JSON,丢弃
 		}
 		const echo = typeof frame.echo === "string" ? frame.echo : undefined;
-		// 无 echo = 入站事件 / heartbeat;echo 不在表里 = 未知响应。push-only,一律忽略。
-		if (!echo) return;
+		// 无 echo = 入站事件 / heartbeat。交给上层命令处理器；未匹配命令时自然 no-op。
+		if (!echo) {
+			this.onEvent?.(frame, this);
+			return;
+		}
 		const p = this.pending.get(echo);
 		if (!p) return;
 		this.pending.delete(echo);
@@ -442,6 +457,9 @@ class ForwardConn {
 		private readonly headers: Record<string, string>,
 		private readonly serviceCtx: ServiceContext,
 		private readonly log: Logger,
+		private readonly eventTimeoutMs: number,
+		private readonly forwardTimeoutMs: number,
+		private readonly onInboundEvent?: OnebotInboundEventHandler,
 	) {
 		this.connect();
 	}
@@ -461,7 +479,9 @@ class ForwardConn {
 		ws.on("open", () => {
 			this.attempt = 0;
 			this.lastError = null;
-			this.channel = new WsChannel(ws, `fwd:${this.adapterId}`, this.serviceCtx);
+			this.channel = new WsChannel(ws, `fwd:${this.adapterId}`, this.serviceCtx, (frame, channel) =>
+				this.handleEvent(frame, channel),
+			);
 			this.log.info(`[onebot] 正向 WS 已连接 adapter=${this.adapterId} url=${this.url}`);
 		});
 		ws.on("error", (err: Error) => {
@@ -501,6 +521,20 @@ class ForwardConn {
 		}
 		this.ws = null;
 	}
+
+	private handleEvent(frame: unknown, channel: WsChannel): void {
+		if (!this.onInboundEvent) return;
+		const ctx = makeInboundContext(
+			this.adapterId,
+			frame,
+			channel,
+			this.eventTimeoutMs,
+			this.forwardTimeoutMs,
+		);
+		void Promise.resolve(this.onInboundEvent(ctx)).catch((err) => {
+			this.log.warn(`[onebot] 入站事件处理失败 adapter=${this.adapterId}: ${String(err)}`);
+		});
+	}
 }
 
 /** 反向 WS:独立端按 `port` 监听,bot 主动连入。端口即身份。 */
@@ -516,6 +550,9 @@ class ReverseListener {
 		private readonly accessToken: string | undefined,
 		private readonly serviceCtx: ServiceContext,
 		private readonly log: Logger,
+		private readonly eventTimeoutMs: number,
+		private readonly forwardTimeoutMs: number,
+		private readonly onInboundEvent?: OnebotInboundEventHandler,
 	) {
 		this.start();
 	}
@@ -549,7 +586,9 @@ class ReverseListener {
 			ws.close(1008, "unauthorized");
 			return;
 		}
-		const channel = new WsChannel(ws, `rev:${this.adapterId}`, this.serviceCtx);
+		const channel = new WsChannel(ws, `rev:${this.adapterId}`, this.serviceCtx, (frame, ch) =>
+			this.handleEvent(frame, ch),
+		);
 		const entry = { ws, channel };
 		this.bots.add(entry);
 		this.log.info(`[onebot] 反向 WS bot 已连入 adapter=${this.adapterId}(在线 ${this.bots.size})`);
@@ -611,6 +650,20 @@ class ReverseListener {
 		}
 		this.wss = null;
 	}
+
+	private handleEvent(frame: unknown, channel: WsChannel): void {
+		if (!this.onInboundEvent) return;
+		const ctx = makeInboundContext(
+			this.adapterId,
+			frame,
+			channel,
+			this.eventTimeoutMs,
+			this.forwardTimeoutMs,
+		);
+		void Promise.resolve(this.onInboundEvent(ctx)).catch((err) => {
+			this.log.warn(`[onebot] 入站事件处理失败 adapter=${this.adapterId}: ${String(err)}`);
+		});
+	}
 }
 
 /** 正向 WS 握手头:合并自定义 headers + `Authorization: Bearer <token>`。 */
@@ -618,6 +671,67 @@ function forwardHeaders(cfg: OnebotWsConfig): Record<string, string> {
 	const headers: Record<string, string> = { ...cfg.headers };
 	if (cfg.accessToken) headers.Authorization = `Bearer ${cfg.accessToken}`;
 	return headers;
+}
+
+function makeInboundContext(
+	adapterId: string,
+	frame: unknown,
+	channel: WsChannel,
+	timeoutMs: number,
+	forwardTimeoutMs: number,
+): OnebotInboundEventContext {
+	const sendAction = async (
+		action: string,
+		params: Record<string, unknown>,
+		timeout: number,
+	): Promise<DeliveryResult> => {
+		const t0 = Date.now();
+		try {
+			const response = await channel.call(action, params, timeout);
+			const verdict = interpretResponse(response);
+			return verdict.ok
+				? { ok: true, latencyMs: Date.now() - t0 }
+				: { ok: false, latencyMs: Date.now() - t0, err: verdict.err };
+		} catch (e) {
+			const err =
+				e instanceof IndeterminateActionError
+					? e.message + INDETERMINATE_NOTE
+					: e instanceof Error
+						? e.message
+						: String(e);
+			return { ok: false, latencyMs: Date.now() - t0, err };
+		}
+	};
+
+	return {
+		adapterId,
+		frame,
+		async sendGroupText(groupId, text) {
+			const gid = Number(groupId);
+			if (!Number.isFinite(gid)) return { ok: false, latencyMs: 0, err: "groupId 非数字" };
+			return sendAction(
+				"send_group_msg",
+				{
+					group_id: gid,
+					message: [{ type: "text", data: { text } }],
+				},
+				timeoutMs,
+			);
+		},
+		async sendGroupForwardText(groupId, nodes) {
+			const gid = Number(groupId);
+			if (!Number.isFinite(gid)) return { ok: false, latencyMs: 0, err: "groupId 非数字" };
+			const messages = nodes.map((text) => ({
+				type: "node",
+				data: {
+					name: FALLBACK_BOT_IDENTITY.name,
+					uin: FALLBACK_BOT_IDENTITY.uin,
+					content: [{ type: "text", data: { text } }],
+				},
+			}));
+			return sendAction("send_group_forward_msg", { group_id: gid, messages }, forwardTimeoutMs);
+		},
+	};
 }
 
 /** 正向连接配置指纹 —— 仅取影响连接的字段,变了才重连。 */
@@ -634,6 +748,7 @@ export function createOnebotAdapter(opts: OnebotPlatformAdapterOptions): Platfor
 	const serviceCtx = opts.serviceCtx;
 	const fallbackTimeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 	const forwardMinTimeoutMs = opts.forwardMinTimeoutMs ?? DEFAULT_FORWARD_MIN_TIMEOUT_MS;
+	const onInboundEvent = opts.onInboundEvent;
 
 	const forwardConns = new Map<string, ForwardConn>();
 	const reverseListeners = new Map<string, ReverseListener>();
@@ -826,7 +941,17 @@ export function createOnebotAdapter(opts: OnebotPlatformAdapterOptions): Platfor
 				existing?.close();
 				forwardConns.set(
 					id,
-					new ForwardConn(id, fp, cfg.url, forwardHeaders(cfg), serviceCtx, log),
+					new ForwardConn(
+						id,
+						fp,
+						cfg.url,
+						forwardHeaders(cfg),
+						serviceCtx,
+						log,
+						cfg.timeoutMs ?? fallbackTimeoutMs,
+						Math.max(cfg.timeoutMs ?? fallbackTimeoutMs, forwardMinTimeoutMs),
+						onInboundEvent,
+					),
 				);
 			}
 
@@ -849,7 +974,16 @@ export function createOnebotAdapter(opts: OnebotPlatformAdapterOptions): Platfor
 				// error 事件落到 bindError,经 probe 暴露给 dashboard。
 				reverseListeners.set(
 					id,
-					new ReverseListener(id, cfg.port, cfg.accessToken, serviceCtx, log),
+					new ReverseListener(
+						id,
+						cfg.port,
+						cfg.accessToken,
+						serviceCtx,
+						log,
+						cfg.timeoutMs ?? fallbackTimeoutMs,
+						Math.max(cfg.timeoutMs ?? fallbackTimeoutMs, forwardMinTimeoutMs),
+						onInboundEvent,
+					),
 				);
 			}
 		},

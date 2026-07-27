@@ -9,6 +9,7 @@ import { type AuthSystem, createAuthSystem } from "./auth/index.js";
 import { createSessionCodec } from "./auth/session.js";
 import { createWsTicketStore } from "./auth/ws-ticket.js";
 import { createBackupService } from "./backup/service.js";
+import { createBiliOnebotCommandHandler } from "./commands/bili-onebot.js";
 import { loadBootstrapConfig, resolveConfigPath } from "./config/loader.js";
 import { type ChromeSource, persistChromeSource } from "./config/persist.js";
 import { startHistoryRetention } from "./history/retention.js";
@@ -195,7 +196,11 @@ export async function startStandaloneServer(
 		// subscription-changed listener handles deletions made while running.
 		await runtime.subRuntimeStore.prune(subBinding.store.list().map((s) => s.id));
 		const adapters = [
-			createOnebotAdapter({ logger: log, serviceCtx: runtime.serviceCtx }),
+			createOnebotAdapter({
+				logger: log,
+				serviceCtx: runtime.serviceCtx,
+				onInboundEvent: createBiliOnebotCommandHandler(runtime),
+			}),
 			createQQOfficialAdapter({
 				logger: log,
 				serviceCtx: runtime.serviceCtx,

@@ -223,6 +223,8 @@ export const OnebotSessionSchema = z
 	.object({
 		groupId: z.string().optional(),
 		userId: z.string().optional(),
+		/** 群聊指令权限：普通群成员是否也可以管理本群 B 站订阅；缺省为关闭。 */
+		allowMemberManage: z.boolean().optional(),
 	})
 	.strict();
 export type OnebotSession = z.infer<typeof OnebotSessionSchema>;

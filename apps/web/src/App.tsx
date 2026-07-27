@@ -16,6 +16,7 @@ import { useStateChannel } from "./hooks/useStateChannel";
 import About from "./pages/About";
 import Ai from "./pages/Ai";
 import Cards from "./pages/Cards";
+import Commands from "./pages/Commands";
 import Dashboard from "./pages/Dashboard";
 import History from "./pages/History";
 import Logs from "./pages/Logs";
@@ -96,6 +97,7 @@ function AuthedApp() {
 						<Route path="/cards" element={<Cards />} />
 						<Route path="/ai" element={<Ai />} />
 						<Route path="/system" element={<System />} />
+						<Route path="/commands" element={<Commands />} />
 						<Route path="/logs" element={<Logs />} />
 						<Route path="/about" element={<About />} />
 					</Routes>

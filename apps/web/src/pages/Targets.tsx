@@ -107,7 +107,8 @@ function targetSessionSummary(target: PushTarget): string {
 	if (target.platform === "onebot") {
 		const s = target.session;
 		if (target.scope === "private") return s.userId ? `→ 用户 ${s.userId}` : "→ 未指定用户";
-		return s.groupId ? `→ 群 ${s.groupId}` : "→ 未指定群号";
+		const suffix = s.allowMemberManage ? " · 普通成员可管理" : "";
+		return s.groupId ? `→ 群 ${s.groupId}${suffix}` : `→ 未指定群号${suffix}`;
 	}
 	if (target.platform === "qq-official") {
 		const s = target.session;
@@ -806,7 +807,12 @@ function TargetEditorModal({
 												// OneBot group/private are mutually exclusive — drop the other field
 												const old = value.session as OnebotSession;
 												const session: OnebotSession =
-													s.value === "group" ? { groupId: old.groupId } : { userId: old.userId };
+													s.value === "group"
+														? {
+																groupId: old.groupId,
+																allowMemberManage: old.allowMemberManage,
+															}
+														: { userId: old.userId };
 												onChange({ ...value, scope: s.value, session });
 											} else {
 												onChange({ ...value, scope: s.value });
@@ -882,6 +888,8 @@ function TargetSessionFields({
 }) {
 	if (target.platform === "onebot") {
 		const s = target.session as OnebotSession;
+		const setSession = (patch: Partial<OnebotSession>) =>
+			onChange({ ...target, session: { ...s, ...patch } });
 		if (target.scope === "private") {
 			return (
 				<Field label="QQ 号 (userId)" code="session.userId" required>
@@ -895,14 +903,22 @@ function TargetSessionFields({
 			);
 		}
 		return (
-			<Field label="群号 (groupId)" code="session.groupId" required>
-				<TInput
-					value={s.groupId ?? ""}
-					onChange={(v) => onChange({ ...target, session: { groupId: v || undefined } })}
-					placeholder="如:123456789"
-					mono
-				/>
-			</Field>
+			<>
+				<Field label="群号 (groupId)" code="session.groupId" required>
+					<TInput
+						value={s.groupId ?? ""}
+						onChange={(v) => setSession({ groupId: v || undefined })}
+						placeholder="如:123456789"
+						mono
+					/>
+				</Field>
+				<Field code="session.allowMemberManage">
+					<Toggle
+						value={s.allowMemberManage === true}
+						onChange={(v) => setSession({ allowMemberManage: v || undefined })}
+					/>
+				</Field>
+			</>
 		);
 	}
 	if (target.platform === "qq-official") {

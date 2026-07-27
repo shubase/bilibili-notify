@@ -36,6 +36,7 @@ const NAV: ReadonlyArray<{
 	{ to: "/system", label: "系统" },
 	{ to: "/logs", label: "日志" },
 	{ to: "/about", label: "关于" },
+	{ to: "/commands", label: "指令功能" },
 ];
 
 function AccountChip() {

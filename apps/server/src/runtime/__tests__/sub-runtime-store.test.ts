@@ -130,6 +130,25 @@ describe("SubRuntimeStore.patch — 逐键替换语义", () => {
 		});
 		await expect(readFileJson()).resolves.toMatchObject({ s1: { roomId: "930987" } });
 	});
+
+	it("followed/followError 落盘；followError: undefined 表示清除失败原因", async () => {
+		const store = make();
+		await store.patch("s1", { cachedProfile: PROFILE_A, followed: false, followError: "拉黑" });
+		expect(store.get("s1")).toEqual({
+			cachedProfile: PROFILE_A,
+			followed: false,
+			followError: "拉黑",
+		});
+
+		await store.patch("s1", { followed: true, followError: undefined });
+		expect(store.get("s1")).toEqual({
+			cachedProfile: PROFILE_A,
+			followed: true,
+		});
+		await expect(readFileJson()).resolves.toEqual({
+			s1: { cachedProfile: PROFILE_A, followed: true },
+		});
+	});
 });
 
 describe("SubRuntimeStore.get / getAll — 防御性克隆", () => {

@@ -13,6 +13,8 @@ export type {
 	CardKind,
 	CardStyle,
 	CardStyleByKind,
+	CommandAliases,
+	CommandConfig,
 	ContentFilters,
 	GlobalConfig,
 	GlobalDefaults,

@@ -20,6 +20,7 @@
 export type FieldSection =
 	| "general"
 	| "master"
+	| "commands"
 	| "ai"
 	| "persona"
 	| "cardStyle"
@@ -124,9 +125,70 @@ export const FIELD_LABELS = {
 	},
 
 	// ── Master ────────────────────────────────────────────────────────────
+	"master.ownerQq": {
+		label: "主人 QQ",
+		hint: "用于群聊 bili 全局管理命令；默认 1319870047",
+		section: "master",
+	},
 	"master.targetId": {
 		label: "Master 推送目标",
 		section: "master",
+	},
+
+	// ── 群聊指令 ──────────────────────────────────────────────────────────
+	"commands.enabled": {
+		label: "启用群聊指令",
+		hint: "关闭后不再响应 OneBot 群聊里的 bili 命令。",
+		section: "commands",
+	},
+	"commands.prefix": {
+		label: "命令前缀",
+		hint: "默认 bili；不支持空格。示例：bili add 123456",
+		section: "commands",
+	},
+	"commands.ownerQq": {
+		label: "主人 QQ",
+		hint: "可执行全局订阅命令；默认 1319870047。",
+		section: "commands",
+	},
+	"commands.aliases.help": {
+		label: "帮助",
+		hint: "显示群聊命令说明。",
+		section: "commands",
+	},
+	"commands.aliases.add": {
+		label: "订阅本群",
+		hint: "把指定 UID 的 UP 主订阅到当前群。",
+		section: "commands",
+	},
+	"commands.aliases.del": {
+		label: "取消本群订阅",
+		hint: "取消当前群对指定 UID 的订阅。",
+		section: "commands",
+	},
+	"commands.aliases.list": {
+		label: "查看本群订阅",
+		section: "commands",
+	},
+	"commands.aliases.listall": {
+		label: "查看全部订阅",
+		hint: "仅主人可用。",
+		section: "commands",
+	},
+	"commands.aliases.delall": {
+		label: "清空本群订阅",
+		hint: "仅主人可用。",
+		section: "commands",
+	},
+	"commands.aliases.delallall": {
+		label: "删除全部订阅",
+		hint: "仅主人可用。",
+		section: "commands",
+	},
+	"commands.aliases.member": {
+		label: "普通成员管理权限",
+		hint: "群主、管理员、主人可用；默认用法 bili member on/off/status。",
+		section: "commands",
 	},
 
 	// ── AI 连接 ───────────────────────────────────────────────────────────
@@ -465,6 +527,11 @@ export const FIELD_LABELS = {
 	"target.enabled": { label: "启用", section: "target" },
 	"session.userId": { label: "QQ 号 (userId)", section: "session" },
 	"session.groupId": { label: "群号 (groupId)", section: "session" },
+	"session.allowMemberManage": {
+		label: "普通成员可管理本群订阅",
+		hint: "关闭时只有群主、管理员和主人能执行 bili add / del；bili delall 仅主人可用。",
+		section: "session",
+	},
 	// QQ 官方机器人会话寻址(按 scope)
 	"session.guildId": { label: "频道服务器 ID (guildId)", section: "session" },
 	"session.channelId": { label: "子频道 ID (channelId)", section: "session" },

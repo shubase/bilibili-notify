@@ -97,8 +97,68 @@ export type AppConfig = z.infer<typeof AppConfigSchema>;
 export const MasterConfigSchema = z.object({
 	/** 用于错误私聊的 PushTarget.id；undefined 时不发私聊。 */
 	targetId: z.uuid().optional(),
+	/** @deprecated 群聊命令主人 QQ 已迁移到 commands.ownerQq；保留兼容旧存档。 */
+	ownerQq: z.string().regex(/^\d+$/, "ownerQq must be a numeric QQ string").default("1319870047"),
 });
 export type MasterConfig = z.infer<typeof MasterConfigSchema>;
+
+export const DEFAULT_COMMAND_PREFIX = "bili";
+export const DEFAULT_COMMAND_OWNER_QQ = "1319870047";
+export const DEFAULT_COMMAND_ALIASES = {
+	help: "help",
+	add: "add",
+	del: "del",
+	list: "list",
+	listall: "listall",
+	delall: "delall",
+	delallall: "delallall",
+	member: "member",
+} as const;
+
+const CommandTokenSchema = z
+	.string()
+	.trim()
+	.min(1, "command token cannot be empty")
+	.max(24, "command token is too long")
+	.regex(/^\S+$/, "command token must not contain whitespace");
+
+export const CommandAliasesSchema = z.object({
+	help: CommandTokenSchema.default(DEFAULT_COMMAND_ALIASES.help),
+	add: CommandTokenSchema.default(DEFAULT_COMMAND_ALIASES.add),
+	del: CommandTokenSchema.default(DEFAULT_COMMAND_ALIASES.del),
+	list: CommandTokenSchema.default(DEFAULT_COMMAND_ALIASES.list),
+	listall: CommandTokenSchema.default(DEFAULT_COMMAND_ALIASES.listall),
+	delall: CommandTokenSchema.default(DEFAULT_COMMAND_ALIASES.delall),
+	delallall: CommandTokenSchema.default(DEFAULT_COMMAND_ALIASES.delallall),
+	member: CommandTokenSchema.default(DEFAULT_COMMAND_ALIASES.member),
+});
+export type CommandAliases = z.infer<typeof CommandAliasesSchema>;
+
+export const CommandConfigSchema = z
+	.object({
+		enabled: z.boolean().default(true),
+		prefix: CommandTokenSchema.default(DEFAULT_COMMAND_PREFIX),
+		/** 群聊命令的主人 QQ；用于执行全局管理命令。未填时回退到默认主人。 */
+		ownerQq: z.string().regex(/^\d+$/, "ownerQq must be a numeric QQ string").optional(),
+		aliases: CommandAliasesSchema.default(DEFAULT_COMMAND_ALIASES),
+	})
+	.superRefine((cfg, ctx) => {
+		const seen = new Map<string, keyof CommandAliases>();
+		for (const [key, value] of Object.entries(cfg.aliases) as Array<
+			[keyof CommandAliases, string]
+		>) {
+			const prev = seen.get(value);
+			if (prev) {
+				ctx.addIssue({
+					code: "custom",
+					path: ["aliases", key],
+					message: `command alias duplicates ${String(prev)}`,
+				});
+			}
+			seen.set(value, key);
+		}
+	});
+export type CommandConfig = z.infer<typeof CommandConfigSchema>;
 
 /** 全局默认值；resolve(sub, globals) 在 per-UP overrides 缺字段时回退到这里。 */
 export const GlobalDefaultsSchema = z.object({
@@ -127,6 +187,7 @@ export type GlobalDefaults = z.infer<typeof GlobalDefaultsSchema>;
 export const GlobalConfigSchema = z.object({
 	app: AppConfigSchema,
 	master: MasterConfigSchema,
+	commands: CommandConfigSchema.default({}),
 	defaults: GlobalDefaultsSchema,
 	bootstrap: BootstrapConfigSchema.optional(),
 });
@@ -289,6 +350,7 @@ export function makeDefaultGlobalConfig(): GlobalConfig {
 	return GlobalConfigSchema.parse({
 		app: {},
 		master: {},
+		commands: {},
 		defaults: {
 			features: DEFAULT_FEATURE_FLAGS,
 			filters: DEFAULT_CONTENT_FILTERS,

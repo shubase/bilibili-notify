@@ -133,11 +133,17 @@ export function createSubRuntimeStore(opts: CreateSubRuntimeStoreOptions): SubRu
 				const prev = records[id] ?? {};
 				// Per-key replace: callers pass complete cachedProfile / fansBaseline
 				// objects. `undefined` keys in `partial` are skipped so a fans-only
-				// tick doesn't clobber an existing fansBaseline.
+				// tick doesn't clobber an existing fansBaseline. followed/followError
+				// use presence checks because `followError: undefined` means clear it.
 				const next: SubRuntime = { ...prev };
 				if (partial.cachedProfile !== undefined) next.cachedProfile = partial.cachedProfile;
 				if (partial.fansBaseline !== undefined) next.fansBaseline = partial.fansBaseline;
 				if (partial.roomId !== undefined) next.roomId = partial.roomId;
+				if ("followed" in partial) next.followed = partial.followed;
+				if ("followError" in partial) {
+					if (partial.followError === undefined) delete next.followError;
+					else next.followError = partial.followError;
+				}
 				records = { ...records, [id]: next };
 				await persist();
 			});

@@ -160,7 +160,7 @@ function SystemSettingsSection({
 	return (
 		<GlassBox
 			title="Core · 应用"
-			subtitle="后端运行参数 + Master 主人账号 · globals.app / globals.master"
+			subtitle="后端运行参数 + Master 通知目标 · globals.app / globals.master"
 			accent="#FB7299"
 			icon={<Icon.sliders size={14} />}
 			badge="app + master"
@@ -234,10 +234,8 @@ function SystemSettingsSection({
 
 			<div className="mt-3 rounded-lg border border-bn-pink/20 bg-linear-to-br from-bn-pink/8 to-transparent p-3">
 				<div className="mb-1.5 flex items-center justify-between">
-					<span className="text-[12.5px] font-bold text-bn-text-primary">主人账号 · master</span>
-					<span className="text-[10.5px] text-bn-text-tertiary">
-						插件遇错误会私聊报告给这个目标
-					</span>
+					<span className="text-[12.5px] font-bold text-bn-text-primary">Master 通知目标</span>
+					<span className="text-[10.5px] text-bn-text-tertiary">插件遇错误时会向这个目标报告</span>
 				</div>
 				<Field code="master.targetId">
 					<TSelect

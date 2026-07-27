@@ -55,3 +55,4 @@ astrbot/core/__pycache__/
 # 从头到尾不看它。
 astrbot/core/pages/dashboard/
 /data/
+/.local-data/

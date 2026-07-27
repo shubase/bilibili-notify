@@ -22,6 +22,7 @@ export interface DiffSection {
 const SECTION_LABELS: Record<GroupSectionKey, string> = {
 	general: "通用",
 	master: "Master",
+	commands: "指令功能",
 	ai: "AI 模型",
 	persona: "AI 人格",
 	cardStyle: "卡片样式",
@@ -47,6 +48,7 @@ const SECTION_LABELS: Record<GroupSectionKey, string> = {
 const SECTION_ORDER: GroupSectionKey[] = [
 	"general",
 	"master",
+	"commands",
 	"ai",
 	"persona",
 	"cardStyle",
