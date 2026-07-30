@@ -23,9 +23,11 @@ import {
 	parseBiliCommand,
 	parseOnebotGroupMessage,
 } from "../bili-onebot.js";
+import { clearBiliVideoParseCacheForTest, parseBiliVideoTarget } from "../bili-video-parser.js";
 
 beforeEach(() => {
 	H.ensureFollowed.mockReset();
+	clearBiliVideoParseCacheForTest();
 });
 
 describe("bili OneBot group command parser", () => {
@@ -36,7 +38,11 @@ describe("bili OneBot group command parser", () => {
 	});
 
 	it("解析订阅管理命令", () => {
-		expect(parseBiliCommand("bili add 123456")).toEqual({ kind: "add", uid: "123456" });
+		expect(parseBiliCommand("bili add 123456")).toEqual({ kind: "add", query: "123456" });
+		expect(parseBiliCommand("bili add 火 播 君")).toEqual({
+			kind: "add",
+			query: "火 播 君",
+		});
 		expect(parseBiliCommand("bili del 123456")).toEqual({ kind: "del", uid: "123456" });
 		expect(parseBiliCommand("bili list")).toEqual({ kind: "list" });
 		expect(parseBiliCommand("bili listall")).toEqual({ kind: "listall" });
@@ -45,6 +51,19 @@ describe("bili OneBot group command parser", () => {
 		expect(parseBiliCommand("bili member on")).toEqual({ kind: "member", action: "on" });
 		expect(parseBiliCommand("bili member off")).toEqual({ kind: "member", action: "off" });
 		expect(parseBiliCommand("bili member status")).toEqual({ kind: "member", action: "status" });
+	});
+
+	it("解析 Bilibili 视频 BV 与 av 标识", async () => {
+		await expect(
+			parseBiliVideoTarget("https://www.bilibili.com/video/BV1QY4y1p7Jd"),
+		).resolves.toEqual({
+			bvid: "BV1QY4y1p7Jd",
+			cacheKey: "BV1QY4y1p7Jd",
+		});
+		await expect(parseBiliVideoTarget("av170001")).resolves.toEqual({
+			aid: 170001,
+			cacheKey: "av170001",
+		});
 	});
 
 	it("支持配置命令前缀和关键字", () => {
@@ -63,7 +82,7 @@ describe("bili OneBot group command parser", () => {
 				member: "权限",
 			},
 		};
-		expect(parseBiliCommand("bn 添加 123456", config)).toEqual({ kind: "add", uid: "123456" });
+		expect(parseBiliCommand("bn 添加 123456", config)).toEqual({ kind: "add", query: "123456" });
 		expect(parseBiliCommand("bn 权限 开", config)).toEqual({ kind: "member", action: "on" });
 		expect(parseBiliCommand("bili add 123456", config)).toBeNull();
 		expect(parseBiliCommand("bn 删除 abc", config)).toEqual({
@@ -72,11 +91,8 @@ describe("bili OneBot group command parser", () => {
 		});
 	});
 
-	it("UID 必须是纯数字", () => {
-		expect(parseBiliCommand("bili add abc")).toEqual({
-			kind: "unknown",
-			reason: "用法错误，应为：bili add <uid>",
-		});
+	it("add 支持名字，del 仍然要求 UID 是纯数字", () => {
+		expect(parseBiliCommand("bili add abc")).toEqual({ kind: "add", query: "abc" });
 		expect(parseBiliCommand("bili del")).toEqual({
 			kind: "unknown",
 			reason: "用法错误，应为：bili del <uid>",
@@ -174,7 +190,7 @@ describe("bili OneBot group command handler", () => {
 			message: "已被对方拉黑，无法关注",
 		});
 
-		await sendCommand(h.runtime, "bili add 123456");
+		await sendCommand(h.runtime, "bili add 123456", { groupName: "女仆值班室" });
 
 		expect(h.replies[0]).toContain("订阅失败：无法关注 测试UP");
 		expect(h.subscriptions).toHaveLength(0);
@@ -186,12 +202,12 @@ describe("bili OneBot group command handler", () => {
 		const h = makeRuntime();
 		H.ensureFollowed.mockResolvedValueOnce({ ok: true, code: 0 });
 
-		await sendCommand(h.runtime, "bili add 123456");
+		await sendCommand(h.runtime, "bili add 123456", { groupName: "女仆值班室" });
 
 		expect(h.replies[0]).toBe("✅ 订阅成功!\n📺 测试UP\n🔗 UID: 123456");
 		expect(h.targets).toHaveLength(1);
 		expect(h.targets[0]).toMatchObject({
-			name: "QQ群 987",
+			name: "女仆值班室",
 			adapterId: "onebot-main",
 			platform: "onebot",
 			scope: "group",
@@ -213,6 +229,104 @@ describe("bili OneBot group command handler", () => {
 			id: h.subscriptions[0]?.id,
 			partial: { followed: true, followError: undefined },
 		});
+	});
+
+	it("bili add 支持通过 UP 名字精确命中后订阅", async () => {
+		const h = makeRuntime();
+		H.ensureFollowed.mockResolvedValueOnce({ ok: true, code: 0 });
+		h.runtime.engines.api.searchByType.mockResolvedValueOnce({
+			code: 0,
+			data: {
+				result: [
+					{
+						mid: "268536810",
+						uname: '<em class="keyword">火</em>播君',
+						fans: 672345,
+					},
+				],
+			},
+		});
+		h.runtime.engines.api.getUserCardInfo.mockResolvedValueOnce({
+			code: 0,
+			data: {
+				card: {
+					mid: "268536810",
+					name: "火播君",
+					face: "https://example.invalid/huobojun.png",
+					sign: "",
+					fans: 672345,
+				},
+			},
+		});
+
+		await sendCommand(h.runtime, "bili add 火播君", { groupName: "女仆值班室" });
+
+		expect(h.runtime.engines.api.searchByType).toHaveBeenCalledWith("bili_user", "火播君", {
+			page: 1,
+			pageSize: 5,
+		});
+		expect(H.ensureFollowed).toHaveBeenCalledWith(h.runtime.engines.api, "268536810");
+		expect(h.replies[0]).toBe("✅ 订阅成功!\n📺 火播君\n🔗 UID: 268536810");
+		expect(h.subscriptions[0]?.uid).toBe("268536810");
+	});
+
+	it("bili add 名字命中多个候选时只返回前 5 个 UID，不自动订阅", async () => {
+		const h = makeRuntime();
+		h.runtime.engines.api.searchByType.mockResolvedValueOnce({
+			code: 0,
+			data: {
+				result: [
+					{ mid: "10001", uname: "火播君", fans: 672345 },
+					{ mid: "10002", uname: "火播姬", fans: 12345 },
+					{ mid: "10003", uname: "火播频道", fans: 2345 },
+					{ mid: "10004", uname: "火播直播间", fans: 345 },
+					{ mid: "10005", uname: "火播Official", fans: 45 },
+					{ mid: "10006", uname: "不应显示", fans: 1 },
+				],
+			},
+		});
+
+		await sendCommand(h.runtime, "bili add 火播");
+
+		expect(H.ensureFollowed).not.toHaveBeenCalled();
+		expect(h.subscriptions).toHaveLength(0);
+		expect(h.replies[0]).toContain("🔎 找到多个可能的 UP「火播」，请使用 UID 添加：");
+		expect(h.replies[0]).toContain("1. 火播君 · 67.2万粉丝\n   UID: 10001");
+		expect(h.replies[0]).toContain("5. 火播Official · 45 粉丝\n   UID: 10005");
+		expect(h.replies[0]).not.toContain("10006");
+	});
+
+	it("bili add 名字无搜索结果时返回未找到", async () => {
+		const h = makeRuntime();
+		h.runtime.engines.api.searchByType.mockResolvedValueOnce({
+			code: 0,
+			data: { result: [] },
+		});
+
+		await sendCommand(h.runtime, "bili add 不存在的UP");
+
+		expect(H.ensureFollowed).not.toHaveBeenCalled();
+		expect(h.replies[0]).toBe(
+			"订阅失败：未找到名为「不存在的UP」的 UP。请换更准确的名字，或使用 UID。",
+		);
+	});
+
+	it("bili del 时同步已有本群推送目标名称", async () => {
+		const h = makeRuntime();
+		h.targets.push({
+			id: "target-987",
+			name: "QQ群 987",
+			adapterId: "onebot-main",
+			platform: "onebot",
+			scope: "group",
+			enabled: true,
+			session: { groupId: "987" },
+		});
+		h.subscriptions.push(makeRoutedSubscription("123456", "测试UP", "target-987"));
+
+		await sendCommand(h.runtime, "bili del 123456", { groupName: "新的群名" });
+
+		expect(h.targets[0]?.name).toBe("新的群名");
 	});
 
 	it("bili add 为已有 UP 新增本群订阅时保持开播开启，但关闭本群开播 @全体", async () => {
@@ -344,11 +458,11 @@ describe("bili OneBot group command handler", () => {
 
 		expect(h.replies[0]).toBe(
 			[
-				"📺 B 站订阅助手",
+				"📺 B站订阅助手",
 				"",
 				"🧩 管理员可用",
-				"• bili add <uid>：订阅 UP 到本群",
-				"• bili del <uid>：取消本群订阅",
+				"• bili add <uid>|<名字>：订阅 UP",
+				"• bili del <uid>：取消订阅",
 				"• bili member on|off：设置普通成员管理权限",
 				"• bili member status：查看普通成员管理权限",
 				"",
@@ -411,6 +525,41 @@ describe("bili OneBot group command handler", () => {
 			allowMemberManage: true,
 		});
 	});
+
+	it("自动解析 Bilibili 视频链接并回复封面和视频详情", async () => {
+		const h = makeRuntime();
+
+		await sendCommand(h.runtime, "看看 https://www.bilibili.com/video/BV1QY4y1p7Jd");
+
+		expect(h.replies).toHaveLength(0);
+		expect(h.segmentReplies).toHaveLength(1);
+		expect(h.runtime.engines.api.getVideoInfo).toHaveBeenCalledWith({
+			bvid: "BV1QY4y1p7Jd",
+			aid: undefined,
+		});
+		const message = h.segmentReplies[0]?.message ?? [];
+		expect(message[0]).toEqual({
+			type: "image",
+			data: { file: "https://i0.hdslb.com/bfs/archive/test-cover.jpg" },
+		});
+		expect(message[1]?.type).toBe("text");
+		const text = message[1]?.data.text ?? "";
+		expect(text).toContain("📺 标题：测试视频");
+		expect(text).toContain("👤 UP主：测试UP");
+		expect(text).toContain("📝 简介：测试简介");
+		expect(text).toContain("🔗 https://www.bilibili.com/video/BV1QY4y1p7Jd");
+		expect(text).not.toContain("🎬 Bilibili 视频解析");
+	});
+
+	it("视频解析全局关闭后不处理群聊视频链接", async () => {
+		const h = makeRuntime();
+		h.globals.commands.videoParse.enabled = false;
+
+		await sendCommand(h.runtime, "https://www.bilibili.com/video/BV1QY4y1p7Jd");
+
+		expect(h.segmentReplies).toHaveLength(0);
+		expect(h.runtime.engines.api.getVideoInfo).not.toHaveBeenCalled();
+	});
 });
 
 function makeRuntime() {
@@ -421,6 +570,10 @@ function makeRuntime() {
 	const patches: Array<{ id: string; partial: Record<string, unknown> }> = [];
 	const replies: string[] = [];
 	const forwardReplies: Array<{ groupId: string; nodes: string[] }> = [];
+	const segmentReplies: Array<{
+		groupId: string;
+		message: Array<{ type: string; data: Record<string, string> }>;
+	}> = [];
 
 	const runtime = {
 		engines: {
@@ -436,6 +589,14 @@ function makeRuntime() {
 							fans: 42,
 						},
 					},
+				})),
+				getVideoInfo: vi.fn(async () => ({
+					code: 0,
+					data: makeVideoInfo(),
+				})),
+				searchByType: vi.fn(async () => ({
+					code: 0,
+					data: { result: [] },
 				})),
 			},
 		},
@@ -477,9 +638,19 @@ function makeRuntime() {
 		},
 		__testReplies: replies,
 		__testForwardReplies: forwardReplies,
+		__testSegmentReplies: segmentReplies,
 	} as any;
 
-	return { runtime, targets, subscriptions, patches, replies, forwardReplies };
+	return {
+		runtime,
+		globals,
+		targets,
+		subscriptions,
+		patches,
+		replies,
+		forwardReplies,
+		segmentReplies,
+	};
 }
 
 function makeRoutedSubscription(uid: string, name: string, targetId: string): Subscription {
@@ -489,6 +660,38 @@ function makeRoutedSubscription(uid: string, name: string, targetId: string): Su
 	return sub;
 }
 
+function makeVideoInfo() {
+	return {
+		bvid: "BV1QY4y1p7Jd",
+		aid: 170001,
+		videos: 1,
+		tid: 17,
+		tname: "单机游戏",
+		copyright: 1,
+		pic: "//i0.hdslb.com/bfs/archive/test-cover.jpg",
+		title: "测试视频",
+		pubdate: 0,
+		ctime: 0,
+		desc: "测试简介",
+		duration: 125,
+		owner: {
+			mid: 123456,
+			name: "测试UP",
+			face: "https://example.invalid/face.jpg",
+		},
+		stat: {
+			aid: 170001,
+			view: 12345,
+			danmaku: 678,
+			reply: 9,
+			favorite: 10,
+			coin: 11,
+			share: 12,
+			like: 13,
+		},
+	};
+}
+
 async function sendCommand(
 	runtime: any,
 	text: string,
@@ -496,6 +699,7 @@ async function sendCommand(
 		userId?: string;
 		role?: "owner" | "admin" | "member";
 		forwardOk?: boolean;
+		groupName?: string | null;
 		selfId?: string | number;
 		message?: unknown;
 	} = {},
@@ -512,8 +716,13 @@ async function sendCommand(
 			sender: { role: options.role ?? "member" },
 			message: options.message ?? [{ type: "text", data: { text } }],
 		},
+		getGroupName: async () => options.groupName ?? null,
 		sendGroupText: async (_groupId, message) => {
 			runtime.__testReplies?.push(message);
+			return { ok: true, latencyMs: 1 };
+		},
+		sendGroupMessage: async (groupId, message) => {
+			runtime.__testSegmentReplies?.push({ groupId, message });
 			return { ok: true, latencyMs: 1 };
 		},
 		sendGroupForwardText: async (groupId, nodes) => {

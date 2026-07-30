@@ -12,6 +12,7 @@ export const GET_LOGIN_STATUS = "https://passport.bilibili.com/x/passport-login/
 export const GET_LIVE_ROOM_INFO = "https://api.live.bilibili.com/room/v1/Room/get_info";
 export const GET_MASTER_INFO = "https://api.live.bilibili.com/live_user/v1/Master/info";
 export const GET_USER_CARD_INFO = "https://api.bilibili.com/x/web-interface/card";
+export const GET_VIDEO_INFO = "https://api.bilibili.com/x/web-interface/view";
 /** 关系状态数(粉丝/关注)。轻量,专用于粉丝计数轮询(比 card 载荷小得多)。 */
 export const GET_RELATION_STAT = "https://api.bilibili.com/x/relation/stat";
 /** 多用户详细信息(name/face/vip),uids 逗号分隔、单次最多 50 个。 */

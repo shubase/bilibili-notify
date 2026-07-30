@@ -14,6 +14,7 @@ import {
 } from "@bilibili-notify/internal";
 import type { OnebotInboundEventHandler } from "../platforms/onebot.js";
 import type { AppRuntime } from "../runtime/bootstrap.js";
+import { handleBiliVideoParse } from "./bili-video-parser.js";
 
 type SenderRole = "owner" | "admin" | "member" | "unknown";
 type BiliCommandKind = Exclude<BiliCommand["kind"], "unknown">;
@@ -29,6 +30,8 @@ const COMMAND_KINDS: readonly BiliCommandKind[] = [
 	"member",
 ];
 const LIST_FORWARD_PAGE_SIZE = 30;
+const USER_SEARCH_PAGE_SIZE = 5;
+const USER_SEARCH_KEYWORD_MAX_LENGTH = 50;
 const MENU_TRIGGER = "菜单";
 const COMMAND_SUBSCRIPTION_DEFAULT_FEATURES = {
 	liveGuardBuy: true,
@@ -51,7 +54,7 @@ const DEFAULT_COMMAND_CONFIG: ResolvedCommandConfig = {
 
 export type BiliCommand =
 	| { kind: "help" }
-	| { kind: "add"; uid: string }
+	| { kind: "add"; query: string }
 	| { kind: "del"; uid: string }
 	| { kind: "list" }
 	| { kind: "listall" }
@@ -77,6 +80,12 @@ interface UpProfile {
 	fans: number;
 }
 
+interface UpSearchCandidate {
+	uid: string;
+	name: string;
+	fans?: number;
+}
+
 type OnebotGroupTarget = Extract<PushTarget, { platform: "onebot" }> & { scope: "group" };
 
 interface GroupSubscriptionListResult {
@@ -91,45 +100,53 @@ export function parseBiliCommand(
 	if (!config.enabled) return null;
 	const text = input.trim();
 	if (!text) return null;
-	const tokens = text.split(/\s+/);
-	if (tokens[0] !== config.prefix) return null;
-	const action = tokens[1]?.toLowerCase() ?? config.aliases.help.toLowerCase();
+	const afterPrefix = parseAfterPrefix(text, config.prefix);
+	if (afterPrefix === null) return null;
+	const actionToken = firstToken(afterPrefix);
+	const action = actionToken?.toLowerCase() ?? config.aliases.help.toLowerCase();
+	const argsText = actionToken ? afterPrefix.slice(actionToken.length).trim() : "";
+	const tokens = argsText ? argsText.split(/\s+/) : [];
 	const matched = commandKindByAlias(config.aliases, action);
 
 	if (matched === "help") {
-		return tokens.length === 2 ? { kind: "help" } : badUsage(commandUsage(config, "help"));
+		return tokens.length === 0 ? { kind: "help" } : badUsage(commandUsage(config, "help"));
 	}
 	if (matched === "list") {
-		return tokens.length === 2 ? { kind: "list" } : badUsage(commandUsage(config, "list"));
+		return tokens.length === 0 ? { kind: "list" } : badUsage(commandUsage(config, "list"));
 	}
 	if (matched === "listall") {
-		return tokens.length === 2 ? { kind: "listall" } : badUsage(commandUsage(config, "listall"));
+		return tokens.length === 0 ? { kind: "listall" } : badUsage(commandUsage(config, "listall"));
 	}
 	if (matched === "delall") {
-		return tokens.length === 2 ? { kind: "delall" } : badUsage(commandUsage(config, "delall"));
+		return tokens.length === 0 ? { kind: "delall" } : badUsage(commandUsage(config, "delall"));
 	}
 	if (matched === "delallall") {
-		return tokens.length === 2
+		return tokens.length === 0
 			? { kind: "delallall" }
 			: badUsage(commandUsage(config, "delallall"));
 	}
 	if (matched === "member") {
-		const action = parseMemberPermissionAction(tokens[2]);
-		if (tokens.length !== 3 || !action) {
+		const action = parseMemberPermissionAction(tokens[0]);
+		if (tokens.length !== 1 || !action) {
 			return badUsage(commandUsage(config, "member", "on|off|status"));
 		}
 		return { kind: "member", action };
 	}
 
-	if (matched === "add" || matched === "del") {
-		const uid = tokens[2];
-		if (tokens.length !== 3 || !uid || !/^\d+$/.test(uid)) {
-			return badUsage(commandUsage(config, matched, "<uid>"));
-		}
-		return { kind: matched, uid };
+	if (matched === "add") {
+		if (!argsText) return badUsage(commandUsage(config, "add", "<uid>|<名字>"));
+		return { kind: "add", query: argsText };
 	}
 
-	return { kind: "unknown", reason: `未知命令：${tokens[1] ?? ""}` };
+	if (matched === "del") {
+		const uid = tokens[0];
+		if (tokens.length !== 1 || !uid || !/^\d+$/.test(uid)) {
+			return badUsage(commandUsage(config, "del", "<uid>"));
+		}
+		return { kind: "del", uid };
+	}
+
+	return { kind: "unknown", reason: `未知命令：${actionToken ?? ""}` };
 }
 
 export function extractOnebotMessageText(message: unknown, rawMessage: unknown): string {
@@ -190,7 +207,14 @@ export function isOnebotMenuRequest(frame: unknown): boolean {
 export function createBiliOnebotCommandHandler(runtime: AppRuntime): OnebotInboundEventHandler {
 	const log = runtime.serviceCtx.logger;
 
-	return async ({ adapterId, frame, sendGroupText, sendGroupForwardText }) => {
+	return async ({
+		adapterId,
+		frame,
+		getGroupName,
+		sendGroupText,
+		sendGroupMessage,
+		sendGroupForwardText,
+	}) => {
 		const event = parseOnebotGroupMessage(frame);
 		if (!event) return;
 		const reply = async (text: string): Promise<void> => {
@@ -207,7 +231,10 @@ export function createBiliOnebotCommandHandler(runtime: AppRuntime): OnebotInbou
 		}
 
 		const command = parseBiliCommand(event.text, commandConfig);
-		if (!command) return;
+		if (!command) {
+			await handleBiliVideoParse(runtime, { frame, sendGroupMessage });
+			return;
+		}
 
 		const groupTarget = findGroupTarget(runtime, adapterId, event.groupId);
 		const isOwner = event.userId === commandConfig.ownerQq;
@@ -244,9 +271,12 @@ export function createBiliOnebotCommandHandler(runtime: AppRuntime): OnebotInbou
 				return;
 			}
 
+			const groupName =
+				command.kind === "add" || command.kind === "del" ? await getGroupName(event.groupId) : null;
 			const message = await handleBiliCommand(runtime, adapterId, event, command, {
 				isOwner,
 				config: commandConfig,
+				groupName,
 			});
 			if (message) await reply(message);
 		} catch (err) {
@@ -261,7 +291,7 @@ async function handleBiliCommand(
 	adapterId: string,
 	event: GroupMessageEvent,
 	command: BiliCommand,
-	perm: { isOwner: boolean; config: ResolvedCommandConfig },
+	perm: { isOwner: boolean; config: ResolvedCommandConfig; groupName?: string | null },
 ): Promise<string | null> {
 	switch (command.kind) {
 		case "help":
@@ -269,9 +299,15 @@ async function handleBiliCommand(
 		case "unknown":
 			return `${command.reason}\n\n发送 ${commandUsage(perm.config, "help")} 查看可用命令。`;
 		case "add":
-			return addSubscription(runtime, adapterId, event.groupId, command.uid);
+			return addSubscription(runtime, adapterId, event.groupId, command.query, perm.groupName);
 		case "del":
-			return deleteGroupSubscription(runtime, adapterId, event.groupId, command.uid);
+			return deleteGroupSubscription(
+				runtime,
+				adapterId,
+				event.groupId,
+				command.uid,
+				perm.groupName,
+			);
 		case "list":
 			return listGroupSubscriptions(runtime, adapterId, event.groupId);
 		case "listall":
@@ -295,18 +331,25 @@ async function addSubscription(
 	runtime: AppRuntime,
 	adapterId: string,
 	groupId: string,
-	uid: string,
+	query: string,
+	groupName?: string | null,
 ): Promise<string> {
 	const engines = runtime.engines;
 	if (!engines) return "B 站 API 尚未就绪，稍后再试。";
 
-	const existingTarget = findGroupTarget(runtime, adapterId, groupId);
+	const existingTarget = await syncGroupTargetName(
+		runtime,
+		findGroupTarget(runtime, adapterId, groupId),
+		groupName,
+	);
 	if (existingTarget && !existingTarget.enabled) {
 		return `订阅失败：当前群推送目标「${existingTarget.name}」已禁用，请先在 Dashboard 启用。`;
 	}
 
-	const profileResult = await lookupUpProfile(runtime, uid);
+	const profileResult = await resolveAddProfile(runtime, query);
 	if (!profileResult.ok) return profileResult.message;
+	const { profile } = profileResult;
+	const uid = profile.uid;
 
 	const follow = await ensureFollowed(engines.api, uid);
 	if (!follow.ok) {
@@ -317,12 +360,13 @@ async function addSubscription(
 				followError: follow.message || `code=${follow.code}`,
 			});
 		}
-		return `订阅失败：无法关注 ${profileResult.profile.name}（UID ${uid}）。原因：${
+		return `订阅失败：无法关注 ${profile.name}（UID ${uid}）。原因：${
 			follow.message || `code=${follow.code}`
 		}`;
 	}
 
-	const target = existingTarget ?? (await ensureGroupTarget(runtime, adapterId, groupId));
+	const target =
+		existingTarget ?? (await ensureGroupTarget(runtime, adapterId, groupId, groupName));
 	const existing = runtime.configStore.getSubscriptions().find((s) => s.uid === uid);
 	const base = existing ?? makeEmptySubscription({ id: randomUUID(), uid });
 	const alreadyInGroup = existing ? isTargetRouted(existing, target.id) : false;
@@ -332,16 +376,16 @@ async function addSubscription(
 		isNewGroupRoute: !alreadyInGroup,
 	});
 	next.enabled = true;
-	next.name = profileResult.profile.name || next.name;
+	next.name = profile.name || next.name;
 
 	await runtime.configStore.upsertSubscription(next);
 	await runtime.subRuntimeStore.patch(next.id, {
-		cachedProfile: toCachedProfile(profileResult.profile),
+		cachedProfile: toCachedProfile(profile),
 		followed: true,
 		followError: undefined,
 	});
 
-	return formatSubscriptionAddResult(profileResult.profile.name, uid, alreadyInGroup);
+	return formatSubscriptionAddResult(profile.name, uid, alreadyInGroup);
 }
 
 function formatSubscriptionAddResult(name: string, uid: string, alreadyInGroup: boolean): string {
@@ -355,8 +399,13 @@ async function deleteGroupSubscription(
 	adapterId: string,
 	groupId: string,
 	uid: string,
+	groupName?: string | null,
 ): Promise<string> {
-	const target = findGroupTarget(runtime, adapterId, groupId);
+	const target = await syncGroupTargetName(
+		runtime,
+		findGroupTarget(runtime, adapterId, groupId),
+		groupName,
+	);
 	if (!target) return "本群还没有绑定过 B 站推送目标。";
 
 	const sub = runtime.configStore.getSubscriptions().find((s) => s.uid === uid);
@@ -475,11 +524,11 @@ function listAllSubscriptions(runtime: AppRuntime): string {
 
 function helpText(_isOwner: boolean, config: ResolvedCommandConfig): string {
 	return [
-		"📺 B 站订阅助手",
+		"📺 B站订阅助手",
 		"",
 		"🧩 管理员可用",
-		`• ${commandUsage(config, "add", "<uid>")}：订阅 UP 到本群`,
-		`• ${commandUsage(config, "del", "<uid>")}：取消本群订阅`,
+		`• ${commandUsage(config, "add", "<uid>|<名字>")}：订阅 UP`,
+		`• ${commandUsage(config, "del", "<uid>")}：取消订阅`,
 		`• ${commandUsage(config, "member", "on|off")}：设置普通成员管理权限`,
 		`• ${commandUsage(config, "member", "status")}：查看普通成员管理权限`,
 		"",
@@ -505,7 +554,7 @@ function formatMemberManageUpdate(enabled: boolean, config: ResolvedCommandConfi
 	return [
 		`✅ 普通成员管理权限已${enabled ? "开启" : "关闭"}`,
 		enabled
-			? `普通成员现在可以执行 ${commandUsage(config, "add", "<uid>")} / ${commandUsage(config, "del", "<uid>")} 管理本群订阅。`
+			? `普通成员现在可以执行 ${commandUsage(config, "add", "<uid>|<名字>")} / ${commandUsage(config, "del", "<uid>")} 管理本群订阅。`
 			: "普通成员现在只能查看本群订阅，不能新增或取消订阅。",
 	].join("\n");
 }
@@ -515,9 +564,70 @@ function formatMemberManageStatus(enabled: boolean, config: ResolvedCommandConfi
 		"👥 普通成员管理权限",
 		`状态：${enabled ? "已开启" : "已关闭"}`,
 		enabled
-			? `普通成员可执行 ${commandUsage(config, "add", "<uid>")} / ${commandUsage(config, "del", "<uid>")}。`
+			? `普通成员可执行 ${commandUsage(config, "add", "<uid>|<名字>")} / ${commandUsage(config, "del", "<uid>")}。`
 			: "普通成员只能查看本群订阅。",
 	].join("\n");
+}
+
+async function resolveAddProfile(
+	runtime: AppRuntime,
+	query: string,
+): Promise<{ ok: true; profile: UpProfile } | { ok: false; message: string }> {
+	const normalized = normalizeAddQuery(query);
+	if (!normalized) return { ok: false, message: "订阅失败：请输入 UID 或 UP 主名字。" };
+	if (/^\d+$/.test(normalized)) return lookupUpProfile(runtime, normalized);
+	if (normalized.length > USER_SEARCH_KEYWORD_MAX_LENGTH) {
+		return {
+			ok: false,
+			message: "订阅失败：UP 主名字太长，请换更精确的关键词，或直接使用 UID。",
+		};
+	}
+	return lookupUpProfileByName(runtime, normalized);
+}
+
+async function lookupUpProfileByName(
+	runtime: AppRuntime,
+	keyword: string,
+): Promise<{ ok: true; profile: UpProfile } | { ok: false; message: string }> {
+	const engines = runtime.engines;
+	if (!engines) return { ok: false, message: "B 站 API 尚未就绪，稍后再试。" };
+	try {
+		const res = await engines.api.searchByType("bili_user", keyword, {
+			page: 1,
+			pageSize: USER_SEARCH_PAGE_SIZE,
+		});
+		const code = readNumberField(res, "code");
+		if (code !== null && code !== 0) {
+			const message = readStringField(res, "message") ?? readStringField(res, "msg");
+			return {
+				ok: false,
+				message: `订阅失败：搜索 UP「${keyword}」失败。${message ? `原因：${message}` : ""}`,
+			};
+		}
+
+		const candidates = extractUserSearchCandidates(res);
+		if (candidates.length === 0) {
+			return {
+				ok: false,
+				message: `订阅失败：未找到名为「${keyword}」的 UP。请换更准确的名字，或使用 UID。`,
+			};
+		}
+
+		const exactMatches = candidates.filter(
+			(candidate) => normalizeNameForCompare(candidate.name) === normalizeNameForCompare(keyword),
+		);
+		const candidate =
+			exactMatches.length === 1 ? exactMatches[0] : candidates.length === 1 ? candidates[0] : null;
+		if (!candidate) return { ok: false, message: formatUserSearchCandidates(keyword, candidates) };
+		return lookupUpProfile(runtime, candidate.uid);
+	} catch (err) {
+		return {
+			ok: false,
+			message: `订阅失败：搜索 UP「${keyword}」时出错。${
+				err instanceof Error ? err.message : String(err)
+			}`,
+		};
+	}
 }
 
 async function lookupUpProfile(
@@ -554,10 +664,124 @@ async function lookupUpProfile(
 	}
 }
 
+function normalizeAddQuery(query: string): string {
+	return query.trim().replace(/\s+/g, " ");
+}
+
+function extractUserSearchCandidates(res: unknown): UpSearchCandidate[] {
+	const root = asRecord(res);
+	const data = asRecord(root?.data);
+	const result = data?.result;
+	if (!Array.isArray(result)) return [];
+
+	const seen = new Set<string>();
+	const candidates: UpSearchCandidate[] = [];
+	for (const item of result) {
+		const candidate = parseUserSearchCandidate(item);
+		if (!candidate || seen.has(candidate.uid)) continue;
+		seen.add(candidate.uid);
+		candidates.push(candidate);
+		if (candidates.length >= USER_SEARCH_PAGE_SIZE) break;
+	}
+	return candidates;
+}
+
+function parseUserSearchCandidate(item: unknown): UpSearchCandidate | null {
+	const obj = asRecord(item);
+	if (!obj) return null;
+	const uid = normalizeNumericId(obj.mid ?? obj.uid);
+	const rawName = readStringField(obj, "uname") ?? readStringField(obj, "name");
+	const name = rawName ? stripSearchHighlight(rawName).trim() : "";
+	if (!uid || !name) return null;
+	const fans = readNumberField(obj, "fans");
+	return fans !== null ? { uid, name, fans } : { uid, name };
+}
+
+function formatUserSearchCandidates(keyword: string, candidates: UpSearchCandidate[]): string {
+	return [
+		`🔎 找到多个可能的 UP「${keyword}」，请使用 UID 添加：`,
+		"",
+		...candidates.map((candidate, index) => {
+			const fans = candidate.fans === undefined ? "" : ` · ${formatFans(candidate.fans)}`;
+			return `${index + 1}. ${candidate.name}${fans}\n   UID: ${candidate.uid}`;
+		}),
+		"",
+		`仅显示前 ${USER_SEARCH_PAGE_SIZE} 个结果，请发送：bili add <uid>`,
+	].join("\n");
+}
+
+function formatFans(fans: number): string {
+	if (fans >= 10000) return `${trimDecimal(fans / 10000)}万粉丝`;
+	return `${fans} 粉丝`;
+}
+
+function trimDecimal(value: number): string {
+	return value.toFixed(1).replace(/\.0$/, "");
+}
+
+function normalizeNameForCompare(name: string): string {
+	return normalizeAddQuery(stripSearchHighlight(name)).toLowerCase();
+}
+
+function stripSearchHighlight(value: string): string {
+	return decodeHtmlEntities(value.replace(/<[^>]*>/g, ""));
+}
+
+function decodeHtmlEntities(value: string): string {
+	return value
+		.replace(/&amp;/g, "&")
+		.replace(/&lt;/g, "<")
+		.replace(/&gt;/g, ">")
+		.replace(/&quot;/g, '"')
+		.replace(/&#39;/g, "'");
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+	return value && typeof value === "object" ? (value as Record<string, unknown>) : null;
+}
+
+function readStringField(value: unknown, key: string): string | null {
+	const record = asRecord(value);
+	const field = record?.[key];
+	return typeof field === "string" ? field : null;
+}
+
+function readNumberField(value: unknown, key: string): number | null {
+	const record = asRecord(value);
+	const field = record?.[key];
+	if (typeof field === "number" && Number.isFinite(field)) return field;
+	if (typeof field === "string" && /^-?\d+(?:\.\d+)?$/.test(field.trim())) {
+		return Number(field);
+	}
+	return null;
+}
+
+function normalizeGroupName(groupName?: string | null): string | null {
+	const trimmed = groupName?.trim();
+	return trimmed ? trimmed : null;
+}
+
+function groupTargetNameForCreate(groupId: string, groupName?: string | null): string {
+	return normalizeGroupName(groupName) ?? `QQ群 ${groupId}`;
+}
+
+async function syncGroupTargetName(
+	runtime: AppRuntime,
+	target: OnebotGroupTarget | null,
+	groupName?: string | null,
+): Promise<OnebotGroupTarget | null> {
+	const name = normalizeGroupName(groupName);
+	if (!target || !name || target.name === name) return target;
+	const next: OnebotGroupTarget = { ...target, name };
+	await runtime.configStore.upsertTarget(next);
+	return next;
+}
+
 async function ensureGroupTarget(
 	runtime: AppRuntime,
 	adapterId: string,
 	groupId: string,
+	groupName?: string | null,
 ): Promise<OnebotGroupTarget> {
 	const existing = findGroupTarget(runtime, adapterId, groupId);
 	if (existing) return existing;
@@ -569,7 +793,7 @@ async function ensureGroupTarget(
 
 	const target: OnebotGroupTarget = {
 		id: randomUUID(),
-		name: `QQ群 ${groupId}`,
+		name: groupTargetNameForCreate(groupId, groupName),
 		adapterId: adapter.id,
 		platform: "onebot",
 		scope: "group",
@@ -722,6 +946,18 @@ function normalizeToken(value: string | undefined, fallback: string): string {
 function commandKindByAlias(aliases: CommandAliases, action: string): BiliCommandKind | undefined {
 	const normalized = action.toLowerCase();
 	return COMMAND_KINDS.find((kind) => aliases[kind].toLowerCase() === normalized);
+}
+
+function parseAfterPrefix(text: string, prefix: string): string | null {
+	if (text === prefix) return "";
+	if (!text.startsWith(prefix)) return null;
+	const next = text[prefix.length];
+	if (!next || !/\s/.test(next)) return null;
+	return text.slice(prefix.length).trimStart();
+}
+
+function firstToken(text: string): string | null {
+	return text.match(/^\S+/)?.[0] ?? null;
 }
 
 function commandUsage(config: ResolvedCommandConfig, kind: BiliCommandKind, arg?: string): string {

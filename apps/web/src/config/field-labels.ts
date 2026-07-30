@@ -151,6 +151,11 @@ export const FIELD_LABELS = {
 		hint: "可执行全局订阅命令；默认 1319870047。",
 		section: "commands",
 	},
+	"commands.videoParse.enabled": {
+		label: "自动解析视频链接",
+		hint: "开启后，群聊中出现 Bilibili 视频链接时自动回复封面和视频信息。",
+		section: "commands",
+	},
 	"commands.aliases.help": {
 		label: "帮助",
 		hint: "显示群聊命令说明。",
@@ -158,11 +163,11 @@ export const FIELD_LABELS = {
 	},
 	"commands.aliases.add": {
 		label: "订阅本群",
-		hint: "把指定 UID 的 UP 主订阅到当前群。",
+		hint: "把指定 UID 或名字的 UP 主订阅到当前群。",
 		section: "commands",
 	},
 	"commands.aliases.del": {
-		label: "取消本群订阅",
+		label: "取消订阅",
 		hint: "取消当前群对指定 UID 的订阅。",
 		section: "commands",
 	},

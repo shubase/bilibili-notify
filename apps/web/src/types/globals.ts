@@ -25,6 +25,7 @@ export type {
 	ModuleLogLevels,
 	ScheduleConfig,
 	TemplateBundle,
+	VideoParseConfig,
 } from "@bilibili-notify/internal";
 
 /**

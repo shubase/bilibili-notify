@@ -114,6 +114,15 @@ export const DEFAULT_COMMAND_ALIASES = {
 	delallall: "delallall",
 	member: "member",
 } as const;
+export const DEFAULT_VIDEO_PARSE_CONFIG = {
+	enabled: true,
+} as const;
+export const DEFAULT_COMMAND_CONFIG = {
+	enabled: true,
+	prefix: DEFAULT_COMMAND_PREFIX,
+	aliases: DEFAULT_COMMAND_ALIASES,
+	videoParse: DEFAULT_VIDEO_PARSE_CONFIG,
+} as const;
 
 const CommandTokenSchema = z
 	.string()
@@ -134,6 +143,11 @@ export const CommandAliasesSchema = z.object({
 });
 export type CommandAliases = z.infer<typeof CommandAliasesSchema>;
 
+export const VideoParseConfigSchema = z.object({
+	enabled: z.boolean().default(true),
+});
+export type VideoParseConfig = z.infer<typeof VideoParseConfigSchema>;
+
 export const CommandConfigSchema = z
 	.object({
 		enabled: z.boolean().default(true),
@@ -141,6 +155,7 @@ export const CommandConfigSchema = z
 		/** 群聊命令的主人 QQ；用于执行全局管理命令。未填时回退到默认主人。 */
 		ownerQq: z.string().regex(/^\d+$/, "ownerQq must be a numeric QQ string").optional(),
 		aliases: CommandAliasesSchema.default(DEFAULT_COMMAND_ALIASES),
+		videoParse: VideoParseConfigSchema.default(DEFAULT_VIDEO_PARSE_CONFIG),
 	})
 	.superRefine((cfg, ctx) => {
 		const seen = new Map<string, keyof CommandAliases>();
@@ -187,7 +202,7 @@ export type GlobalDefaults = z.infer<typeof GlobalDefaultsSchema>;
 export const GlobalConfigSchema = z.object({
 	app: AppConfigSchema,
 	master: MasterConfigSchema,
-	commands: CommandConfigSchema.default({}),
+	commands: CommandConfigSchema.default(DEFAULT_COMMAND_CONFIG),
 	defaults: GlobalDefaultsSchema,
 	bootstrap: BootstrapConfigSchema.optional(),
 });

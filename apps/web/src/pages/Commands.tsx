@@ -16,6 +16,7 @@ import type {
 
 const DEFAULT_PREFIX = "bili";
 const DEFAULT_OWNER_QQ = "1319870047";
+const DEFAULT_VIDEO_PARSE = { enabled: true };
 const DEFAULT_ALIASES: CommandAliases = {
 	help: "help",
 	add: "add",
@@ -36,8 +37,8 @@ const COMMAND_ROWS: ReadonlyArray<{
 	badge?: string;
 }> = [
 	{ key: "help", meaning: "显示帮助" },
-	{ key: "add", arg: "<uid>", meaning: "订阅 UP 到本群" },
-	{ key: "del", arg: "<uid>", meaning: "取消本群订阅" },
+	{ key: "add", arg: "<uid>|<名字>", meaning: "订阅 UP" },
+	{ key: "del", arg: "<uid>", meaning: "取消订阅" },
 	{ key: "list", meaning: "查看本群订阅" },
 	{ key: "listall", meaning: "查看全部订阅", badge: "主人" },
 	{ key: "delall", meaning: "清空本群订阅", badge: "主人" },
@@ -77,6 +78,10 @@ function editableCommands(draft: GlobalConfig): CommandConfig {
 		enabled: commands.enabled ?? true,
 		prefix: commands.prefix ?? DEFAULT_PREFIX,
 		ownerQq: commands.ownerQq ?? draft.master.ownerQq ?? DEFAULT_OWNER_QQ,
+		videoParse: {
+			...DEFAULT_VIDEO_PARSE,
+			...(commands.videoParse ?? {}),
+		},
 		aliases: {
 			...DEFAULT_ALIASES,
 			...(commands.aliases ?? {}),
@@ -215,6 +220,21 @@ export default function Commands() {
 				{ownerInvalid ? (
 					<div className="-mt-1 mb-1 text-[11px] text-bn-danger-text">主人 QQ 只能填写数字。</div>
 				) : null}
+			</GlassBox>
+
+			<GlassBox
+				title="Bilibili 视频解析"
+				subtitle="自动解析群聊中的 B 站视频链接 · 全局开关"
+				accent="#00AEEC"
+				icon={<Icon.eye size={14} />}
+				badge={commands.videoParse.enabled ? "已启用" : "已停用"}
+			>
+				<Field code="commands.videoParse.enabled">
+					<Toggle
+						value={commands.videoParse.enabled}
+						onChange={(v) => patchCommands({ videoParse: { enabled: v } })}
+					/>
+				</Field>
 			</GlassBox>
 
 			<GlassBox

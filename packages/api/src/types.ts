@@ -119,6 +119,57 @@ export interface UserCardInfoData {
 	data: UserCardInfo;
 }
 
+// ---- Video Info ----
+
+export interface VideoInfoOwner {
+	mid: number;
+	name: string;
+	face: string;
+}
+
+export interface VideoInfoStat {
+	aid: number;
+	view: number;
+	danmaku: number;
+	reply: number;
+	favorite: number;
+	coin: number;
+	share: number;
+	like: number;
+}
+
+export interface VideoInfoPage {
+	cid: number;
+	page: number;
+	part: string;
+	duration: number;
+}
+
+export interface VideoInfo {
+	bvid: string;
+	aid: number;
+	videos: number;
+	tid: number;
+	tname: string;
+	copyright: number;
+	pic: string;
+	title: string;
+	pubdate: number;
+	ctime: number;
+	desc: string;
+	duration: number;
+	owner: VideoInfoOwner;
+	stat: VideoInfoStat;
+	pages?: VideoInfoPage[];
+}
+
+export interface VideoInfoData {
+	code: number;
+	message?: string;
+	msg?: string;
+	data: VideoInfo | null;
+}
+
 /**
  * `x/relation/stat` —— 关系状态数。粉丝计数轮询的轻量数据源(只回数字,不含
  * name/face/sign 等主页卡字段)。`data` 可能为 null(风控/错误码)。

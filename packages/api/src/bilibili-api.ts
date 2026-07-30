@@ -24,6 +24,7 @@ import type {
 	UserCardsBatchData,
 	V_VoucherCaptchaData,
 	ValidateCaptchaData,
+	VideoInfoData,
 } from "./types";
 import { buildTicketParams, encWbi, type WbiKeys } from "./wbi";
 
@@ -732,6 +733,14 @@ export class BilibiliAPI {
 			`${EP.GET_USER_CARD_INFO}?mid=${encodeURIComponent(mid)}${withPhoto ? "&photo=true" : ""}`,
 			"getUserCardInfo",
 		);
+	}
+
+	async getVideoInfo(options: { bvid?: string; aid?: number }): Promise<VideoInfoData> {
+		const params = new URLSearchParams();
+		if (options.bvid) params.set("bvid", options.bvid);
+		else if (options.aid !== undefined) params.set("aid", String(options.aid));
+		else throw new Error("getVideoInfo requires bvid or aid");
+		return this.getJson(`${EP.GET_VIDEO_INFO}?${params.toString()}`, "getVideoInfo");
 	}
 
 	/**

@@ -49,7 +49,9 @@ export interface OnebotPlatformAdapterOptions {
 export interface OnebotInboundEventContext {
 	adapterId: string;
 	frame: unknown;
+	getGroupName(groupId: string): Promise<string | null>;
 	sendGroupText(groupId: string, text: string): Promise<DeliveryResult>;
+	sendGroupMessage(groupId: string, message: OnebotMessageSegment[]): Promise<DeliveryResult>;
 	sendGroupForwardText(groupId: string, nodes: string[]): Promise<DeliveryResult>;
 }
 
@@ -85,7 +87,7 @@ type OnebotHttpConfig = Extract<OnebotAdapterConfig, { transport: "http" }>;
 type OnebotWsConfig = Extract<OnebotAdapterConfig, { transport: "ws" }>;
 type OnebotWsReverseConfig = Extract<OnebotAdapterConfig, { transport: "ws-reverse" }>;
 
-interface OneBotMessageSegment {
+export interface OnebotMessageSegment {
 	type: "text" | "image" | "at";
 	data: Record<string, string>;
 }
@@ -111,7 +113,7 @@ function bufferToBase64Uri(buffer: Buffer): string {
 	return `base64://${buffer.toString("base64")}`;
 }
 
-function segmentToOnebot(seg: PayloadSegment): OneBotMessageSegment {
+function segmentToOnebot(seg: PayloadSegment): OnebotMessageSegment {
 	switch (seg.type) {
 		case "text":
 			return { type: "text", data: { text: seg.text } };
@@ -124,12 +126,12 @@ function segmentToOnebot(seg: PayloadSegment): OneBotMessageSegment {
 	}
 }
 
-function buildSegments(payload: NotificationPayload): OneBotMessageSegment[] {
+function buildSegments(payload: NotificationPayload): OnebotMessageSegment[] {
 	switch (payload.kind) {
 		case "text":
 			return [{ type: "text", data: { text: payload.text } }];
 		case "image": {
-			const out: OneBotMessageSegment[] = [
+			const out: OnebotMessageSegment[] = [
 				{ type: "image", data: { file: bufferToBase64Uri(payload.image.buffer) } },
 			];
 			if (payload.caption) out.push({ type: "text", data: { text: payload.caption } });
@@ -673,6 +675,14 @@ function forwardHeaders(cfg: OnebotWsConfig): Record<string, string> {
 	return headers;
 }
 
+function parseGroupName(raw: unknown): string | null {
+	if (!raw || typeof raw !== "object") return null;
+	const name = (raw as { group_name?: unknown }).group_name;
+	if (typeof name !== "string") return null;
+	const trimmed = name.trim();
+	return trimmed.length > 0 ? trimmed : null;
+}
+
 function makeInboundContext(
 	adapterId: string,
 	frame: unknown,
@@ -706,6 +716,22 @@ function makeInboundContext(
 	return {
 		adapterId,
 		frame,
+		async getGroupName(groupId) {
+			const gid = Number(groupId);
+			if (!Number.isFinite(gid)) return null;
+			try {
+				const response = await channel.call(
+					"get_group_info",
+					{ group_id: gid, no_cache: true },
+					timeoutMs,
+				);
+				const verdict = interpretResponse(response);
+				if (!verdict.ok) return null;
+				return parseGroupName(response.data);
+			} catch {
+				return null;
+			}
+		},
 		async sendGroupText(groupId, text) {
 			const gid = Number(groupId);
 			if (!Number.isFinite(gid)) return { ok: false, latencyMs: 0, err: "groupId 非数字" };
@@ -717,6 +743,12 @@ function makeInboundContext(
 				},
 				timeoutMs,
 			);
+		},
+		async sendGroupMessage(groupId, message) {
+			const gid = Number(groupId);
+			if (!Number.isFinite(gid)) return { ok: false, latencyMs: 0, err: "groupId 非数字" };
+			if (message.length === 0) return { ok: false, latencyMs: 0, err: "empty message" };
+			return sendAction("send_group_msg", { group_id: gid, message }, timeoutMs);
 		},
 		async sendGroupForwardText(groupId, nodes) {
 			const gid = Number(groupId);
