@@ -7,6 +7,8 @@
 
 import { type ReactNode, useEffect, useState } from "react";
 import { type FieldLabel, getFieldLabel } from "../config/field-labels.js";
+import { Btn } from "./atoms";
+import { type FieldUpdate, useFieldReset, useFieldUpdate } from "./field-updates";
 import { Icon } from "./icons";
 
 // ── Field ────────────────────────────────────────────────────────────────────
@@ -33,6 +35,8 @@ export function Field({ code, label, hint, required, full, children }: FieldProp
 	const entry: FieldLabel | null = getFieldLabel(code);
 	const effectiveLabel: ReactNode = label ?? entry?.label ?? code;
 	const effectiveHint: ReactNode = hint ?? entry?.hint;
+	const update = useFieldUpdate(code);
+	const reset = useFieldReset(code);
 	return (
 		<div
 			data-code={code}
@@ -47,17 +51,62 @@ export function Field({ code, label, hint, required, full, children }: FieldProp
 					<code className="rounded bg-bn-code-bg px-1.5 py-px font-mono text-[10.5px] text-bn-text-tertiary">
 						{code}
 					</code>
+					{reset ? (
+						<span data-field-reset>
+							<Btn variant="ghost" size="sm" onClick={reset} title="把这条文案还原成当前默认">
+								恢复默认
+							</Btn>
+						</span>
+					) : null}
 				</div>
 				{effectiveHint ? (
 					<div className="text-[11px] leading-snug text-bn-text-secondary">{effectiveHint}</div>
 				) : null}
 			</div>
-			<div className="flex min-w-0 flex-1 items-start">{children}</div>
+			<div className="flex min-w-0 flex-1 flex-col items-stretch gap-1.5">
+				{children}
+				{update ? <DefaultUpdateNotice update={update} /> : null}
+			</div>
+		</div>
+	);
+}
+
+/**
+ * 「这条文案的默认值变了」的提示条,贴在字段下方。
+ *
+ * 摆出新默认让主人自己比,再给两条出路 —— 换成新的,或者留着自己的。两个动作都会
+ * 把这一版记进账本,所以**点完就不再打扰**(留着自己的那条尤其要紧:不记的话他每次
+ * 打开这页都被问一遍同一件事)。
+ */
+function DefaultUpdateNotice({ update }: { update: FieldUpdate }) {
+	return (
+		<div
+			data-template-update
+			className="rounded-bn-card border border-bn-warning-border bg-bn-warning-soft px-2.5 py-2"
+		>
+			<div className="mb-1.5 flex items-center gap-1.5 text-[11px] font-bold text-bn-warning-text">
+				<Icon.sparkle className="h-3 w-3" />
+				默认文案有更新
+			</div>
+			<pre className="mb-2 max-h-24 overflow-auto whitespace-pre-wrap break-all rounded-md bg-bn-code-bg px-2 py-1.5 font-mono text-[10.5px] leading-relaxed text-bn-text-secondary">
+				{update.preview}
+			</pre>
+			<div className="flex flex-wrap gap-2">
+				<Btn variant="primary" size="sm" onClick={update.accept}>
+					用新默认
+				</Btn>
+				<Btn variant="outline" size="sm" onClick={update.keep}>
+					保持我的
+				</Btn>
+			</div>
 		</div>
 	);
 }
 
 // ── Inputs ───────────────────────────────────────────────────────────────────
+
+/** 只读态的观感:压暗 + 禁用光标。与 Toggle 的 disabled 同一套语汇。 */
+const DISABLED_FIELD = "disabled:cursor-not-allowed disabled:opacity-60";
 
 const INPUT_BASE =
 	"h-[30px] rounded-md border border-bn-border bg-bn-field px-2.5 text-[12.5px] text-bn-text-primary outline-none focus:border-bn-pink focus:ring-1 focus:ring-bn-pink/30";
@@ -70,6 +119,8 @@ export interface TInputProps {
 	secret?: boolean;
 	full?: boolean;
 	type?: string;
+	/** 只读态(内置人格那几份)。禁用而不是隐藏 —— 内容本身仍是主人要看的。 */
+	disabled?: boolean;
 }
 
 export function TInput({
@@ -80,6 +131,7 @@ export function TInput({
 	secret,
 	full = true,
 	type = "text",
+	disabled,
 }: TInputProps) {
 	// secret=true 时使用 <input type="password">,DOM value 不在 devtools 树展示明文,
 	// 也阻止屏幕共享/截图泄漏。
@@ -91,7 +143,8 @@ export function TInput({
 			onChange={(e) => onChange(e.target.value)}
 			placeholder={placeholder}
 			autoComplete={secret ? "new-password" : undefined}
-			className={`${INPUT_BASE} ${mono || secret ? "font-mono" : ""} ${full ? "min-w-0 w-full" : "w-auto"}`}
+			disabled={disabled}
+			className={`${INPUT_BASE} ${mono || secret ? "font-mono" : ""} ${full ? "min-w-0 w-full" : "w-auto"} ${DISABLED_FIELD}`}
 		/>
 	);
 }
@@ -102,16 +155,19 @@ export interface TAreaProps {
 	placeholder?: string;
 	rows?: number;
 	mono?: boolean;
+	/** 只读态,同 {@link TInputProps.disabled}。 */
+	disabled?: boolean;
 }
 
-export function TArea({ value, onChange, placeholder, rows = 3, mono }: TAreaProps) {
+export function TArea({ value, onChange, placeholder, rows = 3, mono, disabled }: TAreaProps) {
 	return (
 		<textarea
 			value={value}
 			onChange={(e) => onChange(e.target.value)}
 			placeholder={placeholder}
 			rows={rows}
-			className={`min-w-0 w-full resize-y rounded-md border border-bn-border bg-bn-field px-2.5 py-2 text-[12.5px] leading-relaxed text-bn-text-primary outline-none focus:border-bn-pink focus:ring-1 focus:ring-bn-pink/30 ${mono ? "font-mono" : ""}`}
+			disabled={disabled}
+			className={`min-w-0 w-full resize-y rounded-md border border-bn-border bg-bn-field px-2.5 py-2 text-[12.5px] leading-relaxed text-bn-text-primary outline-none focus:border-bn-pink focus:ring-1 focus:ring-bn-pink/30 ${mono ? "font-mono" : ""} ${DISABLED_FIELD}`}
 		/>
 	);
 }
@@ -256,6 +312,9 @@ export function Picker<T extends string | number | boolean>({
 						type="button"
 						key={String(o.value)}
 						onClick={() => onChange(o.value)}
+						// 选中态此前只体现在 class 上 —— 读屏软件读不出来,测试也只能去比对
+						// 样式字符串。aria-pressed 让「选的是哪个」成为可查询的事实。
+						aria-pressed={active}
 						className={`rounded px-3 py-1 text-[11.5px] font-semibold transition ${
 							active ? "bg-bn-surface-strong text-bn-pink shadow-sm" : "text-bn-text-tertiary"
 						}`}

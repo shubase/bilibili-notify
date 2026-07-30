@@ -261,6 +261,98 @@ export interface AiTestPushResponse {
 	err?: string;
 }
 
+// ---- /api/ai/conversations(女仆 AI 聊天)------------------------------------
+
+/**
+ * 女仆为了答这一句而调过的一个工具。
+ *
+ * 会跟着回复一起落盘,而不是只活在那次流里 —— 只在流里显示的话,`done` 一到、
+ * 真身把在途副本换下来的那一刻,这几条就凭空消失了,刷新之后也再看不到她当时
+ * 查过什么。
+ */
+export interface AiToolTraceDTO {
+	/** 工具名(`list_subscriptions` 之类),界面上翻成中文再显示。 */
+	name: string;
+	/** 归一成字符串的入参,与真正交给工具的那份一致。 */
+	args: Record<string, string>;
+	/** 执行成没成。失败的那次也留着 —— 「查了但没查到」和「压根没查」不一样。 */
+	ok: boolean;
+}
+
+/** 一条聊天消息。`id` 供前端当列表 key,`ts` 是服务端落盘时刻(ISO)。 */
+export interface AiChatMessageDTO {
+	id: string;
+	role: "user" | "assistant";
+	content: string;
+	ts: string;
+	/** 助手消息专有:答这一句时调过的工具。没调过就整个字段缺席。 */
+	tools?: AiToolTraceDTO[];
+	/**
+	 * 用户消息专有:这一问带的图片资产 id。前端拿它拼
+	 * `/api/ai/assets/<id>` 显示缩略图。没带图就整个字段缺席。
+	 */
+	images?: string[];
+}
+
+/**
+ * 侧栏「最近」的一项 —— 只有元信息,**不驮消息体**。
+ *
+ * 列表与详情分开是刻意的:侧栏一次要列几十个会话,把每个会话的整段对话都带上,
+ * 光为了显示一行标题就要传几百 KB。点进某个会话时再 `GET /:id` 取全文。
+ */
+export interface AiConversationMetaDTO {
+	id: string;
+	title: string;
+	createdAt: string;
+	updatedAt: string;
+	messageCount: number;
+	/**
+	 * 标题是否已由 AI 起过。缺失(旧会话)按 false 算 —— 前端据此决定要不要去要
+	 * 一个标题,所以「不知道」必须落在「还没起过」这一边,否则老会话一个都轮不上。
+	 */
+	autoTitled?: boolean;
+}
+
+/** 一整个会话(含消息)。`GET /api/ai/conversations/:id` 的载荷。 */
+export interface AiConversationDTO extends AiConversationMetaDTO {
+	messages: AiChatMessageDTO[];
+}
+
+/** `GET /api/ai/conversations` 响应,按最近聊过的排在前。 */
+export interface AiConversationListResponse {
+	conversations: AiConversationMetaDTO[];
+}
+
+/** `POST /api/ai/conversations` / `GET /api/ai/conversations/:id` 响应。 */
+export interface AiConversationResponse {
+	conversation: AiConversationDTO;
+}
+
+/**
+ * `POST /api/ai/conversations/:id/title` 响应 —— 起完标题后的会话元信息。
+ *
+ * 起名失败也回 200 + **当前**标题(等于没变)。标题是装饰,不值得为它弹红字;
+ * 前端照常拿它更新侧栏那一行就行。
+ */
+export interface AiConversationMetaResponse {
+	conversation: AiConversationMetaDTO;
+}
+
+/**
+ * `POST /api/ai/conversations/:id/chat` 响应。
+ *
+ * 回的是**两条**消息而不只是回复:用户那条的 id / ts 由服务端生成,前端乐观
+ * 渲染的那条只是占位,拿回真身才能把 key 对上,刷新后也不会出现两条一样的话。
+ */
+export interface AiChatReplyResponse {
+	/** 落盘后的用户消息(id / ts 已定)。 */
+	user: AiChatMessageDTO;
+	/** 女仆的回复。 */
+	reply: AiChatMessageDTO;
+	/** 更新后的会话元信息 —— 标题可能刚由这条首问定下来,侧栏要跟着改。 */
+	conversation: AiConversationMetaDTO;
+}
+
 /** `POST /api/cards/preview` 响应。 */
 export interface PreviewResponse {
 	ok: boolean;

@@ -8,7 +8,7 @@
  *     时的降级重试
  *   - chat():多轮会话历史携带 / enableConversation 关闭即丢弃 / 满载压缩 /
  *     tool-calling 循环 + MAX_ROUNDS 上限
- *   - session 生命周期:TTL 过期计数、stop() 清空、flushPendingSubActions 吞错
+ *   - session 生命周期:TTL 过期计数、stop() 清空
  *
  * 策略:`openai` 是 `await import("openai")` 动态导入 → `vi.mock` 注入 FakeOpenAI;
  * `./tools` 整体 mock 以隔离 tool 循环(不牵连真实 executeTool / api / 订阅);
@@ -63,8 +63,9 @@ function makeConfig(over: Partial<CommentaryGeneratorConfig> = {}): CommentaryGe
 		liveSummaryPrompt: "LIVE_SCENE_PROMPT",
 		enableConversation: true,
 		maxHistory: 5,
+		provider: "custom",
 		enableThinking: false,
-		enableSearch: false,
+		thinkingLevel: "high",
 		enableVision: false,
 		...over,
 	};
@@ -113,7 +114,20 @@ function createParams(n: number): {
 	messages: ChatMsg[];
 	temperature?: number;
 	tools?: unknown;
+	stream?: boolean;
+	/**
+	 * Python SDK 独有的写法,Node 侧发出去谁也不认。留在这里只为断言它**不再出现**
+	 * —— 曾经思考参数就是被塞进这个字段里,于是从来没有真正生效过。
+	 */
 	extra_body?: Record<string, unknown>;
+	// provider 方言参数一律落在请求体顶层。
+	enable_thinking?: boolean;
+	thinking_budget?: number;
+	thinking?: unknown;
+	reasoning?: unknown;
+	reasoning_effort?: string;
+	top_k?: number;
+	enable_search?: boolean;
 } {
 	const call = oai.create.mock.calls[n];
 	if (!call) throw new Error(`create 未被调用第 ${n} 次`);
@@ -208,16 +222,16 @@ describe("CommentaryGenerator.comment", () => {
 		expect(typeof userMsg?.content).toBe("string");
 	});
 
-	it("enableThinking=true 且首请求抛错 → 降级重试(第二次无 extra_body)", async () => {
-		const { gen } = makeGen({ enableThinking: true });
+	it("enableThinking=true 且首请求抛错 → 降级重试(第二次不带思考参数)", async () => {
+		const { gen } = makeGen({ provider: "siliconflow", enableThinking: true });
 		oai.create
 			.mockRejectedValueOnce(new Error("thinking unsupported"))
 			.mockResolvedValueOnce(msgResp("降级成功"));
 		const out = await gen.comment("x");
 		expect(out).toBe("降级成功");
 		expect(oai.create).toHaveBeenCalledTimes(2);
-		expect(createParams(0).extra_body).toMatchObject({ enable_thinking: true });
-		expect(createParams(1).extra_body).toBeUndefined();
+		expect(createParams(0).enable_thinking).toBe(true);
+		expect(createParams(1).enable_thinking).toBeUndefined();
 	});
 
 	it("enableThinking=false 且请求抛错 → 直接抛出,不重试", async () => {
@@ -225,6 +239,98 @@ describe("CommentaryGenerator.comment", () => {
 		oai.create.mockRejectedValueOnce(new Error("boom"));
 		await expect(gen.comment("x")).rejects.toThrow("boom");
 		expect(oai.create).toHaveBeenCalledTimes(1);
+	});
+
+	describe("provider 方言参数上线", () => {
+		it("落在请求体顶层,而不是 extra_body", async () => {
+			// extra_body 是 Python SDK 的糖(它会摊平);Node 的 openai 包不认识它,
+			// 会原样序列化成一个嵌套字段发出去 —— 没有任何服务商读得懂。
+			const { gen } = makeGen({
+				provider: "siliconflow",
+				enableThinking: true,
+				thinkingLevel: "medium",
+			});
+			oai.create.mockResolvedValueOnce(msgResp("ok"));
+			await gen.comment("x");
+			expect(createParams(0)).toMatchObject({ enable_thinking: true, thinking_budget: 16384 });
+			expect(createParams(0).extra_body).toBeUndefined();
+		});
+
+		it("换一家就换一套写法", async () => {
+			const { gen } = makeGen({
+				provider: "deepseek",
+				enableThinking: true,
+				thinkingLevel: "high",
+			});
+			oai.create.mockResolvedValueOnce(msgResp("ok"));
+			await gen.comment("x");
+			expect(createParams(0)).toMatchObject({
+				thinking: { type: "enabled" },
+				reasoning_effort: "max",
+			});
+			expect(createParams(0).enable_thinking).toBeUndefined();
+		});
+
+		it("兜底档一个方言字段都不发", async () => {
+			const { gen } = makeGen({ provider: "custom", enableThinking: true });
+			oai.create.mockResolvedValueOnce(msgResp("ok"));
+			await gen.comment("x");
+			const p = createParams(0);
+			expect(p.enable_thinking).toBeUndefined();
+			expect(p.thinking).toBeUndefined();
+			expect(p.reasoning).toBeUndefined();
+		});
+	});
+
+	describe("额外请求参数", () => {
+		it("摊进请求体顶层", async () => {
+			const { gen } = makeGen({ provider: "custom", extraParams: '{"top_k": 40}' });
+			oai.create.mockResolvedValueOnce(msgResp("ok"));
+			await gen.comment("x");
+			expect(createParams(0).top_k).toBe(40);
+		});
+
+		it("与内建参数冲突时主人写的赢", async () => {
+			const { gen } = makeGen({
+				provider: "siliconflow",
+				enableThinking: true,
+				thinkingLevel: "low",
+				extraParams: '{"thinking_budget": 999}',
+			});
+			oai.create.mockResolvedValueOnce(msgResp("ok"));
+			await gen.comment("x");
+			expect(createParams(0).thinking_budget).toBe(999);
+			// 没被覆盖的那半仍然生效。
+			expect(createParams(0).enable_thinking).toBe(true);
+		});
+
+		it("覆盖不了 messages —— 覆盖了就是整段对话凭空消失", async () => {
+			const { gen } = makeGen({ provider: "custom", extraParams: '{"messages": []}' });
+			oai.create.mockResolvedValueOnce(msgResp("ok"));
+			await gen.comment("正文在此");
+			expect(createParams(0).messages.length).toBeGreaterThan(0);
+		});
+
+		it("写错 JSON 照常发请求,只是不带额外参数 —— 不让一个填错的框拖垮整条链路", async () => {
+			const { gen } = makeGen({ provider: "custom", extraParams: "{不是 JSON}" });
+			oai.create.mockResolvedValueOnce(msgResp("ok"));
+			await expect(gen.comment("x")).resolves.toBe("ok");
+			expect(oai.create).toHaveBeenCalledTimes(1);
+		});
+
+		it("降级重试时额外参数原样带着 —— 摘掉的只该是女仆自己加的思考参数", async () => {
+			const { gen } = makeGen({
+				provider: "siliconflow",
+				enableThinking: true,
+				extraParams: '{"top_k": 40}',
+			});
+			oai.create
+				.mockRejectedValueOnce(new Error("thinking unsupported"))
+				.mockResolvedValueOnce(msgResp("降级成功"));
+			await gen.comment("x");
+			expect(createParams(1).enable_thinking).toBeUndefined();
+			expect(createParams(1).top_k).toBe(40);
+		});
 	});
 
 	it("AI1:网关返回空 choices → 抛明确错误(非不可读的 TypeError)", async () => {
@@ -282,7 +388,7 @@ describe("CommentaryGenerator.chat — 会话历史", () => {
 		oai.create
 			.mockResolvedValueOnce(toolCallResp("fake_tool", { q: "abc" }))
 			.mockResolvedValueOnce(msgResp("最终回答"));
-		const { result } = await gen.chat("帮我查", "s1");
+		const result = await gen.chat("帮我查", "s1");
 
 		expect(result).toBe("最终回答");
 		expect(toolsMock.executeTool).toHaveBeenCalledTimes(1);
@@ -293,7 +399,7 @@ describe("CommentaryGenerator.chat — 会话历史", () => {
 	it("tool-calling 持续返回工具调用 → MAX_ROUNDS(8)后返回上限提示", async () => {
 		const { gen } = makeGen();
 		oai.create.mockResolvedValue(toolCallResp("fake_tool", {}));
-		const { result } = await gen.chat("死循环工具", "s1");
+		const result = await gen.chat("死循环工具", "s1");
 		expect(result).toBe("（工具调用轮次已达上限）");
 		expect(oai.create).toHaveBeenCalledTimes(8);
 	});
@@ -318,10 +424,615 @@ describe("CommentaryGenerator.chat — 会话历史", () => {
 			],
 		};
 		oai.create.mockResolvedValueOnce(badArgs).mockResolvedValueOnce(msgResp("收尾"));
-		const { result } = await gen.chat("x", "s1");
+		const result = await gen.chat("x", "s1");
 		expect(result).toBe("收尾");
 		// 解析失败时 executeTool 不会被调用(在 JSON.parse 阶段就 catch)
 		expect(toolsMock.executeTool).not.toHaveBeenCalled();
+	});
+});
+
+// ---------------------------------------------------------------------------
+// chatStateless()
+// ---------------------------------------------------------------------------
+
+/**
+ * `chat()` 把历史存在**进程内存**的 session map 里,重启即失忆;独立端 dashboard
+ * 的聊天记录却落在磁盘上,重开还在。两者搭在一起就会出现「界面上明明摆着上文,
+ * 女仆却完全不记得」——`chatStateless` 就是为此存在:历史由调用方交出来,引擎
+ * 一次性用完,不读也不写 session map。
+ */
+describe("CommentaryGenerator.chatStateless — 调用方自带历史", () => {
+	it("整段历史原样送进模型,顺序不变", async () => {
+		const { gen } = makeGen({ maxHistory: 5 });
+		oai.create.mockResolvedValueOnce(msgResp("答2"));
+		const result = await gen.chatStateless([
+			{ role: "user", content: "问1" },
+			{ role: "assistant", content: "答1" },
+			{ role: "user", content: "问2" },
+		]);
+
+		expect(result).toBe("答2");
+		// [0] 是 system prompt,其后是调用方给的三条。只断言这段前缀:callAPI 的
+		// 工具循环会**就地**往同一个数组里 push 助手回复,而 mock 记的是引用,
+		// 读到的是调用结束后的样子 —— 整段相等会被那条追加的记账消息带偏。
+		const msgs = createParams(0).messages;
+		expect(msgs[0]?.role).toBe("system");
+		expect(msgs.slice(1, 4).map((m) => m.content)).toEqual(["问1", "答1", "问2"]);
+	});
+
+	it("不改调用方交出来的数组 —— callAPI 的就地追加不许漏回去", async () => {
+		// 上一条测试暴露的:callAPI 拿到 messages 会往里 push。调用方(会话存储)
+		// 把持久化的消息数组直接递进来,漏回去就是往磁盘记录里掺记账消息。
+		const { gen } = makeGen();
+		const history = [{ role: "user" as const, content: "问" }];
+		oai.create.mockResolvedValueOnce(msgResp("答"));
+		await gen.chatStateless(history);
+		expect(history).toEqual([{ role: "user", content: "问" }]);
+	});
+
+	it("不碰 session map —— 调用前后会话数都是 0", async () => {
+		// enableConversation=true 时 chat() 会存一条;chatStateless 无论如何都不该存。
+		const { gen } = makeGen({ enableConversation: true });
+		oai.create.mockResolvedValueOnce(msgResp("答"));
+		await gen.chatStateless([{ role: "user", content: "问" }]);
+		expect(gen.sessionCount).toBe(0);
+	});
+
+	it("历史超过 maxHistory*2 条 → 只送最近的那些", async () => {
+		const { gen } = makeGen({ maxHistory: 1 }); // 上限 2 条
+		oai.create.mockResolvedValueOnce(msgResp("答"));
+		await gen.chatStateless([
+			{ role: "user", content: "很久以前" },
+			{ role: "assistant", content: "旧答" },
+			{ role: "user", content: "最新问题" },
+		]);
+
+		const texts = createParams(0).messages.map((m) => m.content);
+		expect(texts).not.toContain("很久以前");
+		expect(texts).toContain("旧答");
+		expect(texts).toContain("最新问题");
+	});
+
+	it("截断不会触发压缩 —— 只发一次请求,不额外调模型写摘要", async () => {
+		// chat() 满载时会多打一次 create 去压缩历史存回 session;无状态路径没有
+		// 「存回」这一步,再去压缩就是白白多花一次 token。
+		const { gen } = makeGen({ maxHistory: 1 });
+		oai.create.mockResolvedValueOnce(msgResp("答"));
+		await gen.chatStateless([
+			{ role: "user", content: "问1" },
+			{ role: "assistant", content: "答1" },
+			{ role: "user", content: "问2" },
+		]);
+		expect(oai.create).toHaveBeenCalledTimes(1);
+	});
+
+	it("带工具能力:首响应 tool_calls → 执行工具 → 二响应返回内容", async () => {
+		const { gen } = makeGen();
+		oai.create
+			.mockResolvedValueOnce(toolCallResp("fake_tool", { q: "abc" }))
+			.mockResolvedValueOnce(msgResp("最终回答"));
+		const result = await gen.chatStateless([{ role: "user", content: "帮我查" }]);
+
+		expect(result).toBe("最终回答");
+		expect(toolsMock.executeTool).toHaveBeenCalledTimes(1);
+		expect(toolsMock.executeTool.mock.calls[0]?.[0]).toBe("fake_tool");
+	});
+
+	it("空历史 → 直接抛,不拿一句只有 system prompt 的请求去撞模型", async () => {
+		const { gen } = makeGen();
+		await expect(gen.chatStateless([])).rejects.toThrow("对话历史为空");
+		expect(oai.create).not.toHaveBeenCalled();
+	});
+});
+
+// ---------------------------------------------------------------------------
+// chatStatelessStream()
+// ---------------------------------------------------------------------------
+
+/** 造一个 SDK 风格的流:async iterable of chunks。 */
+function streamOf(chunks: unknown[]): AsyncIterable<unknown> {
+	return {
+		async *[Symbol.asyncIterator]() {
+			for (const c of chunks) yield c;
+		},
+	};
+}
+const textChunk = (text: string) => ({ choices: [{ delta: { content: text } }] });
+/** tool_call 的分片:name / arguments 都是一段段来的,靠 index 归位。 */
+const toolChunk = (index: number, part: Record<string, unknown>) => ({
+	choices: [{ delta: { tool_calls: [{ index, ...part }] } }],
+});
+
+describe("CommentaryGenerator.summarizeTitle", () => {
+	/**
+	 * 侧栏那一行标题原本取首问的前 24 字。主人每次都以「你好」开场,于是每个会话
+	 * 都叫「你好」,一行看下来全是同一个词,等于没有标题。改成让模型看完首轮问答
+	 * 起一个短标题。
+	 */
+	const ROUND = [
+		{ role: "user" as const, content: "本周谁最勤奋" },
+		{ role: "assistant" as const, content: "小绫看了一下,是 A 君。" },
+	];
+
+	it("拿首轮问答换一句短标题", async () => {
+		const { gen } = makeGen();
+		oai.create.mockResolvedValueOnce(msgResp("本周勤奋榜"));
+		expect(await gen.summarizeTitle(ROUND)).toBe("本周勤奋榜");
+	});
+
+	it("不带工具 —— 起个标题不该顺手去查订阅", async () => {
+		// 带上 tools 的话模型可能真去调一轮,白花一次往返还可能改动什么。
+		const { gen } = makeGen();
+		oai.create.mockResolvedValueOnce(msgResp("标题"));
+		await gen.summarizeTitle(ROUND);
+		expect(createParams(0).tools).toBeUndefined();
+	});
+
+	it("不流式 —— 一个短标题没什么可逐字看的", async () => {
+		const { gen } = makeGen();
+		oai.create.mockResolvedValueOnce(msgResp("标题"));
+		await gen.summarizeTitle(ROUND);
+		expect(createParams(0).stream).toBeUndefined();
+	});
+
+	it("模型爱加的引号 / 前缀 / 句号都洗掉", async () => {
+		// 「标题:」这类前缀和成对引号是最常见的两种,不洗就直接进了侧栏。
+		for (const [raw, want] of [
+			['"本周勤奋榜"', "本周勤奋榜"],
+			["「本周勤奋榜」", "本周勤奋榜"],
+			["标题：本周勤奋榜", "本周勤奋榜"],
+			["本周勤奋榜。", "本周勤奋榜"],
+			// 多行一律取最后一行(见「模型先想后答」那条),不是拼起来。
+			["  思考中…\n本周勤奋榜  ", "本周勤奋榜"],
+		] as const) {
+			const { gen } = makeGen();
+			oai.create.mockReset();
+			oai.create.mockResolvedValueOnce(msgResp(raw));
+			expect(await gen.summarizeTitle(ROUND)).toBe(want);
+		}
+	});
+
+	it("模型先想后答 → 取最后一行,别把思考过程当标题", async () => {
+		// 推理模型常常先写一段思考再给结论,而结论在**最后**。整段压成一行再截断
+		// 的话,侧栏那行会是「让我想想,这段对话在讲…」这种半截思考。
+		const { gen } = makeGen();
+		oai.create.mockResolvedValueOnce(msgResp("让我想想,这段对话主要在讲订阅管理。\n\n订阅管理"));
+		expect(await gen.summarizeTitle(ROUND)).toBe("订阅管理");
+	});
+
+	it("给的 token 预算够模型想一会儿 —— 太抠会让它把额度花在思考上、正文空手而归", async () => {
+		// 32 个 token 对推理模型是不够的:思考吃光预算,content 回来是空的,于是
+		// 起名永远失败,而主人只看到标题一直是自己那句提问。
+		const { gen } = makeGen();
+		oai.create.mockResolvedValueOnce(msgResp("标题"));
+		await gen.summarizeTitle(ROUND);
+		const budget = (createParams(0) as unknown as { max_tokens?: number }).max_tokens;
+		expect(budget).toBeGreaterThanOrEqual(100);
+	});
+
+	it("模型话痨就截断 —— 侧栏一行放不下", async () => {
+		const { gen } = makeGen();
+		oai.create.mockResolvedValueOnce(
+			msgResp("这是一个非常非常长的标题长到侧栏根本放不下还要继续说"),
+		);
+		const title = await gen.summarizeTitle(ROUND);
+		expect(title.length).toBeLessThanOrEqual(17);
+		expect(title.endsWith("…")).toBe(true);
+	});
+
+	it("模型回了空 → 抛,让调用方保留原来的标题", async () => {
+		// 静默返回空串的话,侧栏那一行会变成一片空白,比「你好」更糟。
+		const { gen } = makeGen();
+		oai.create.mockResolvedValueOnce(msgResp("   "));
+		await expect(gen.summarizeTitle(ROUND)).rejects.toThrow();
+	});
+
+	it("空对话 → 直接抛,不拿一句只有 system prompt 的请求去撞模型", async () => {
+		const { gen } = makeGen();
+		await expect(gen.summarizeTitle([])).rejects.toThrow();
+		expect(oai.create).not.toHaveBeenCalled();
+	});
+});
+
+describe("CommentaryGenerator.chatStatelessStream — 真流式", () => {
+	it("逐块回调 onDelta,拼起来等于最终结果", async () => {
+		const { gen } = makeGen();
+		oai.create.mockResolvedValueOnce(
+			streamOf([textChunk("主人"), textChunk("晚上好"), textChunk("~")]),
+		);
+
+		const seen: string[] = [];
+		const result = await gen.chatStatelessStream([{ role: "user", content: "在吗" }], {
+			onDelta: (t) => seen.push(t),
+		});
+
+		expect(seen).toEqual(["主人", "晚上好", "~"]);
+		expect(result).toBe("主人晚上好~");
+	});
+
+	it("确实开了 stream —— 不是拿完整响应再假装逐字吐", async () => {
+		const { gen } = makeGen();
+		oai.create.mockResolvedValueOnce(streamOf([textChunk("好")]));
+		await gen.chatStatelessStream([{ role: "user", content: "在吗" }], { onDelta: () => {} });
+		expect(createParams(0)).toMatchObject({ stream: true });
+	});
+
+	it("空 delta 块被跳过,不回调空串", async () => {
+		// 首块常常只带 role、没有 content;真回调一个空串,前端那边会白闪一下。
+		const { gen } = makeGen();
+		oai.create.mockResolvedValueOnce(
+			streamOf([{ choices: [{ delta: { role: "assistant" } }] }, textChunk("好")]),
+		);
+		const seen: string[] = [];
+		await gen.chatStatelessStream([{ role: "user", content: "x" }], {
+			onDelta: (t) => seen.push(t),
+		});
+		expect(seen).toEqual(["好"]);
+	});
+
+	it("工具轮:分片拼出完整的 name/arguments,执行后继续流式吐正文", async () => {
+		// 流式下 tool_call 的函数名和参数是**一小段一小段**来的,不按 index 累加
+		// 就会拿到半个函数名,工具永远调不起来。
+		const { gen } = makeGen();
+		oai.create
+			.mockResolvedValueOnce(
+				streamOf([
+					toolChunk(0, { id: "c1", function: { name: "fake_", arguments: '{"q":' } }),
+					toolChunk(0, { function: { name: "tool", arguments: '"abc"}' } }),
+				]),
+			)
+			.mockResolvedValueOnce(streamOf([textChunk("查到了")]));
+
+		const result = await gen.chatStatelessStream([{ role: "user", content: "帮我查" }], {
+			onDelta: () => {},
+		});
+
+		expect(result).toBe("查到了");
+		expect(toolsMock.executeTool.mock.calls[0]?.[0]).toBe("fake_tool");
+		expect(toolsMock.executeTool.mock.calls[0]?.[1]).toEqual({ q: "abc" });
+	});
+
+	it("工具轮本身不吐正文 —— 那一轮没有给人看的内容", async () => {
+		const { gen } = makeGen();
+		oai.create
+			.mockResolvedValueOnce(
+				streamOf([toolChunk(0, { id: "c1", function: { name: "fake_tool", arguments: "{}" } })]),
+			)
+			.mockResolvedValueOnce(streamOf([textChunk("答案")]));
+		const seen: string[] = [];
+		await gen.chatStatelessStream([{ role: "user", content: "x" }], {
+			onDelta: (t) => seen.push(t),
+		});
+		expect(seen).toEqual(["答案"]);
+	});
+
+	it("网关不支持流式 → 回落非流式,一次性把整段交出去", async () => {
+		// 一个不支持 stream 的兼容网关不该让聊天整个用不了。此时还没吐过任何字,
+		// 悄悄重来一次对主人是无感的。
+		const { gen } = makeGen();
+		oai.create
+			.mockRejectedValueOnce(new Error("stream is not supported"))
+			.mockResolvedValueOnce(msgResp("整段回复"));
+
+		const seen: string[] = [];
+		const result = await gen.chatStatelessStream([{ role: "user", content: "x" }], {
+			onDelta: (t) => seen.push(t),
+		});
+		expect(result).toBe("整段回复");
+		expect(seen).toEqual(["整段回复"]);
+		expect(createParams(1)).not.toMatchObject({ stream: true });
+	});
+
+	/**
+	 * 账户层面的拒绝(余额 / 鉴权 / 限流)不该被当成「网关不支持流式」。
+	 *
+	 * 硅基流动余额用完时回的就是 `402 status code (no body)`。回落非流式一样会被
+	 * 拒 —— 拒绝发生在账单那一层,跟请求体里有没有 stream 毫无关系。硬回落只是把
+	 * 同一个错误再撞一次,还把真正的原因藏在「流式不可用」这句话后面:主人看着
+	 * 日志会以为是流式坏了,去翻代码而不是去充值。
+	 */
+	const httpErr = (status: number, msg: string) => Object.assign(new Error(msg), { status });
+
+	it("402 余额不足 → 直接说是余额,不回落再撞一次", async () => {
+		const { gen } = makeGen();
+		oai.create.mockRejectedValueOnce(httpErr(402, "402 status code (no body)"));
+
+		await expect(
+			gen.chatStatelessStream([{ role: "user", content: "x" }], { onDelta: () => {} }),
+		).rejects.toThrow(/余额|配额/);
+		// 只发了一次 —— 没有白撞第二次。
+		expect(oai.create).toHaveBeenCalledTimes(1);
+	});
+
+	it("401 key 无效 → 同样不回落,而且说的是 key 不是流式", async () => {
+		const { gen } = makeGen();
+		oai.create.mockRejectedValueOnce(httpErr(401, "401 Unauthorized"));
+		await expect(
+			gen.chatStatelessStream([{ role: "user", content: "x" }], { onDelta: () => {} }),
+		).rejects.toThrow(/API Key/);
+		expect(oai.create).toHaveBeenCalledTimes(1);
+	});
+
+	it("429 限流 → 不回落,立刻重来只会加剧", async () => {
+		const { gen } = makeGen();
+		oai.create.mockRejectedValueOnce(httpErr(429, "429 Too Many Requests"));
+		await expect(
+			gen.chatStatelessStream([{ role: "user", content: "x" }], { onDelta: () => {} }),
+		).rejects.toThrow(/频繁|限流/);
+		expect(oai.create).toHaveBeenCalledTimes(1);
+	});
+
+	it("开着 thinking 时 402 也不再降级重试一次", async () => {
+		// thinking 降级那条路同样是「换个参数重来」,对账单问题一样白搭。
+		const { gen } = makeGen({ enableThinking: true });
+		oai.create.mockRejectedValue(httpErr(402, "402 status code (no body)"));
+		await expect(
+			gen.chatStatelessStream([{ role: "user", content: "x" }], { onDelta: () => {} }),
+		).rejects.toThrow(/余额|配额/);
+		expect(oai.create).toHaveBeenCalledTimes(1);
+	});
+
+	it("500 之类的上游抖动仍然回落 —— 那确实可能换条路就好了", async () => {
+		const { gen } = makeGen();
+		oai.create
+			.mockRejectedValueOnce(httpErr(500, "500 Internal Server Error"))
+			.mockResolvedValueOnce(msgResp("整段回复"));
+		const result = await gen.chatStatelessStream([{ role: "user", content: "x" }], {
+			onDelta: () => {},
+		});
+		expect(result).toBe("整段回复");
+	});
+
+	it("已经吐出字之后再断 → 抛错,不静默吞掉半截回复", async () => {
+		// 这时候页面上已经有半句话了,悄悄重来会让那半句凭空变成另一段。
+		const { gen } = makeGen();
+		oai.create.mockResolvedValueOnce({
+			async *[Symbol.asyncIterator]() {
+				yield textChunk("前半句");
+				throw new Error("connection reset");
+			},
+		});
+		await expect(
+			gen.chatStatelessStream([{ role: "user", content: "x" }], { onDelta: () => {} }),
+		).rejects.toThrow("connection reset");
+	});
+
+	it("空历史 → 直接抛,与 chatStateless 同约定", async () => {
+		const { gen } = makeGen();
+		await expect(gen.chatStatelessStream([], { onDelta: () => {} })).rejects.toThrow(
+			"对话历史为空",
+		);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// chatStatelessStream — 工具调用痕迹
+// ---------------------------------------------------------------------------
+
+/**
+ * 工具轮**不产生正文**,所以在主人那边表现为打字点原地多停几秒 —— 她在查东西,
+ * 界面上却和「模型卡住了」长得一模一样。`onToolEvent` 就是把这几秒讲出来。
+ *
+ * 分 start / end 两拍而不是查完一次性报:查订阅要走一趟 B 站,慢的时候好几秒,
+ * 而那正是最需要反馈的一刻 —— 等查完再说,等于什么都没说。
+ */
+describe("CommentaryGenerator.chatStatelessStream — 工具调用痕迹", () => {
+	interface Ev {
+		phase: string;
+		id: string;
+		name?: string;
+		args?: Record<string, string>;
+		ok?: boolean;
+	}
+
+	/** 第一轮调一个工具,第二轮出正文。 */
+	function toolThenText(name: string, args: object, text = "查到了") {
+		oai.create
+			.mockResolvedValueOnce(
+				streamOf([toolChunk(0, { id: "c1", function: { name, arguments: JSON.stringify(args) } })]),
+			)
+			.mockResolvedValueOnce(streamOf([textChunk(text)]));
+	}
+
+	it("每个工具调用发一对 start / end", async () => {
+		const { gen } = makeGen();
+		toolThenText("fake_tool", { uid: "123" });
+
+		const seen: Ev[] = [];
+		await gen.chatStatelessStream([{ role: "user", content: "帮我查" }], {
+			onDelta: () => {},
+			onToolEvent: (e) => seen.push(e as Ev),
+		});
+
+		expect(seen.map((e) => e.phase)).toEqual(["start", "end"]);
+		expect(seen[0]).toMatchObject({ name: "fake_tool", args: { uid: "123" } });
+		expect(seen[1]).toMatchObject({ ok: true });
+	});
+
+	it("start 在工具执行**之前**发出 —— 等查完再说等于没说", async () => {
+		const { gen } = makeGen();
+		toolThenText("fake_tool", {});
+		const order: string[] = [];
+		toolsMock.executeTool.mockImplementationOnce(async () => {
+			order.push("执行");
+			return "r";
+		});
+
+		await gen.chatStatelessStream([{ role: "user", content: "x" }], {
+			onDelta: () => {},
+			onToolEvent: (e) => order.push(e.phase),
+		});
+
+		expect(order).toEqual(["start", "执行", "end"]);
+	});
+
+	it("end 用同一个 id 认回它的 start —— 一轮里两个工具不能串台", async () => {
+		const { gen } = makeGen();
+		oai.create
+			.mockResolvedValueOnce(
+				streamOf([
+					toolChunk(0, { id: "c1", function: { name: "fake_tool", arguments: "{}" } }),
+					toolChunk(1, { id: "c2", function: { name: "other_tool", arguments: "{}" } }),
+				]),
+			)
+			.mockResolvedValueOnce(streamOf([textChunk("好了")]));
+
+		const seen: Ev[] = [];
+		await gen.chatStatelessStream([{ role: "user", content: "x" }], {
+			onDelta: () => {},
+			onToolEvent: (e) => seen.push(e as Ev),
+		});
+
+		const starts = seen.filter((e) => e.phase === "start");
+		expect(starts.map((e) => e.name)).toEqual(["fake_tool", "other_tool"]);
+		expect(new Set(starts.map((e) => e.id)).size).toBe(2);
+		// 每个 start 都配得上一个同 id 的 end。
+		for (const s of starts) {
+			expect(seen.some((e) => e.phase === "end" && e.id === s.id)).toBe(true);
+		}
+	});
+
+	it("跨轮的 id 也不重复 —— 否则第二轮的痕迹会盖掉第一轮的", async () => {
+		const { gen } = makeGen();
+		oai.create
+			.mockResolvedValueOnce(
+				streamOf([toolChunk(0, { id: "c1", function: { name: "fake_tool", arguments: "{}" } })]),
+			)
+			.mockResolvedValueOnce(
+				streamOf([toolChunk(0, { id: "c2", function: { name: "fake_tool", arguments: "{}" } })]),
+			)
+			.mockResolvedValueOnce(streamOf([textChunk("好了")]));
+
+		const seen: Ev[] = [];
+		await gen.chatStatelessStream([{ role: "user", content: "x" }], {
+			onDelta: () => {},
+			onToolEvent: (e) => seen.push(e as Ev),
+		});
+
+		const ids = seen.filter((e) => e.phase === "start").map((e) => e.id);
+		expect(ids).toHaveLength(2);
+		expect(new Set(ids).size).toBe(2);
+	});
+
+	it("工具执行失败 → end 的 ok 是假,对话照常继续", async () => {
+		const { gen } = makeGen();
+		toolThenText("fake_tool", {}, "虽然没查到,但…");
+		toolsMock.executeTool.mockRejectedValueOnce(new Error("B 站超时"));
+
+		const seen: Ev[] = [];
+		const result = await gen.chatStatelessStream([{ role: "user", content: "x" }], {
+			onDelta: () => {},
+			onToolEvent: (e) => seen.push(e as Ev),
+		});
+
+		expect(result).toBe("虽然没查到,但…");
+		expect(seen.find((e) => e.phase === "end")).toMatchObject({ ok: false });
+	});
+
+	it("参数没解析出来也要发 start —— 她确实伸手够过这个工具", async () => {
+		// 这条路上 executeTool 压根不会被调用(在 JSON.parse 就 catch 了)。若只在
+		// 执行前发 start,主人看到的就是一段无缘无故的空白等待。
+		const { gen } = makeGen();
+		oai.create
+			.mockResolvedValueOnce(
+				streamOf([
+					toolChunk(0, { id: "c1", function: { name: "fake_tool", arguments: "{不是json" } }),
+				]),
+			)
+			.mockResolvedValueOnce(streamOf([textChunk("收尾")]));
+
+		const seen: Ev[] = [];
+		await gen.chatStatelessStream([{ role: "user", content: "x" }], {
+			onDelta: () => {},
+			onToolEvent: (e) => seen.push(e as Ev),
+		});
+
+		expect(seen.map((e) => e.phase)).toEqual(["start", "end"]);
+		expect(seen[0]).toMatchObject({ name: "fake_tool", args: {} });
+		expect(seen[1]).toMatchObject({ ok: false });
+		expect(toolsMock.executeTool).not.toHaveBeenCalled();
+	});
+
+	it("入参里的数字归一成字符串 —— 与交给工具的那份完全一致", async () => {
+		// 模型常把 uid 输出成数字。界面上和工具里拿到的必须是同一个值,否则
+		// 「查了 UID 12345」和实际查的对不上号。
+		const { gen } = makeGen();
+		toolThenText("fake_tool", { uid: 12345 });
+
+		const seen: Ev[] = [];
+		await gen.chatStatelessStream([{ role: "user", content: "x" }], {
+			onDelta: () => {},
+			onToolEvent: (e) => seen.push(e as Ev),
+		});
+
+		expect(seen[0]?.args).toEqual({ uid: "12345" });
+		expect(toolsMock.executeTool.mock.calls[0]?.[1]).toEqual({ uid: "12345" });
+	});
+
+	it("不传 onToolEvent 照常跑 —— 它是可选的旁听席", async () => {
+		const { gen } = makeGen();
+		toolThenText("fake_tool", {});
+		const result = await gen.chatStatelessStream([{ role: "user", content: "x" }], {
+			onDelta: () => {},
+		});
+		expect(result).toBe("查到了");
+	});
+});
+
+// ---------------------------------------------------------------------------
+// 「只用纯文本」按调用方分叉
+// ---------------------------------------------------------------------------
+
+/**
+ * dashboard 的聊天要渲染 Markdown,推送渠道不渲染。所以那条约束只对**对话**这一路
+ * 摘掉,其余全部原样保留。
+ *
+ * 这一组的重心在推送侧:那才是一旦搞错就会把字面 `**加粗**` 送进主人群里的一侧。
+ */
+describe("CommentaryGenerator — Markdown 约束的作用域", () => {
+	const PLAIN_TEXT_RULE = "只用纯文本";
+	/** 取第 n 次调用实际发出去的 system prompt。 */
+	const sysPrompt = (n: number) => createParams(n).messages[0]?.content as string;
+
+	it("dashboard 流式聊天:摘掉那条约束", async () => {
+		const { gen } = makeGen();
+		oai.create.mockResolvedValueOnce(streamOf([textChunk("好")]));
+		await gen.chatStatelessStream([{ role: "user", content: "在吗" }], { onDelta: () => {} });
+		expect(sysPrompt(0)).not.toContain(PLAIN_TEXT_RULE);
+	});
+
+	it("动态点评:约束照旧 —— 这一路直奔 QQ / Telegram", async () => {
+		const { gen } = makeGen();
+		oai.create.mockResolvedValueOnce(msgResp("点评"));
+		await gen.comment("某 UP 发了动态", "dynamic");
+		expect(sysPrompt(0)).toContain(PLAIN_TEXT_RULE);
+	});
+
+	it("koishi 侧的 chat():约束照旧 —— 那边是群消息,不渲染 Markdown", async () => {
+		const { gen } = makeGen();
+		oai.create.mockResolvedValueOnce(msgResp("答"));
+		await gen.chat("问", "s1");
+		expect(sysPrompt(0)).toContain(PLAIN_TEXT_RULE);
+	});
+
+	it("非流式 chatStateless:同样摘掉 —— 它与流式是同一个 dashboard 入口", async () => {
+		const { gen } = makeGen();
+		oai.create.mockResolvedValueOnce(msgResp("答"));
+		await gen.chatStateless([{ role: "user", content: "在吗" }]);
+		expect(sysPrompt(0)).not.toContain(PLAIN_TEXT_RULE);
+	});
+
+	it("起标题那一跳不吃人格提示词,与这条约束无关", async () => {
+		// summarizeTitle 用的是自己的提示词(TITLE_PROMPT),这里只是钉住它没被顺手
+		// 接上人格那一段 —— 侧栏标题不该带口头禅。
+		const { gen } = makeGen();
+		oai.create.mockResolvedValueOnce(msgResp("本周勤奋榜"));
+		await gen.summarizeTitle([
+			{ role: "user", content: "本周谁最勤奋" },
+			{ role: "assistant", content: "让我看看" },
+		]);
+		expect(sysPrompt(0)).not.toContain(PLAIN_TEXT_RULE);
+		expect(sysPrompt(0)).toContain("标题");
 	});
 });
 
@@ -363,19 +1074,6 @@ describe("CommentaryGenerator — session 生命周期", () => {
 		expect(gen.sessionCount).toBe(2);
 		gen.clearSession("sa");
 		expect(gen.sessionCount).toBe(1);
-	});
-
-	it("flushPendingSubActions 顺序执行并吞掉单个失败", async () => {
-		const { gen } = makeGen();
-		const ok1 = vi.fn(async () => {});
-		const bad = vi.fn(async () => {
-			throw new Error("boom");
-		});
-		const ok2 = vi.fn(async () => {});
-		await expect(gen.flushPendingSubActions([ok1, bad, ok2])).resolves.toBeUndefined();
-		expect(ok1).toHaveBeenCalled();
-		expect(bad).toHaveBeenCalled();
-		expect(ok2).toHaveBeenCalled();
 	});
 });
 

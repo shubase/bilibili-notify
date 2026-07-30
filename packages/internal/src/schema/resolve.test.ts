@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vite-plus/test";
+import { resolveAIProfile } from "../constants";
 import { DEFAULT_CARD_LAYOUT } from "./card-layout";
 import { makeDefaultGlobalConfig } from "./globals";
 import { DEFAULT_MESSAGE_LAYOUT } from "./message-layout";
@@ -19,7 +20,7 @@ describe("resolve()", () => {
 		expect(eff.filters).toEqual(globals.defaults.filters);
 		expect(eff.schedule).toEqual(globals.defaults.schedule);
 		expect(eff.cardStyle).toEqual(globals.defaults.cardStyle);
-		expect(eff.ai.model).toBe(globals.defaults.ai.model);
+		expect(eff.ai.model).toBe(resolveAIProfile(globals.defaults.ai).model);
 		expect(eff.ai.persona).toEqual(globals.defaults.ai.persona);
 	});
 
@@ -89,7 +90,11 @@ describe("resolve()", () => {
 		expect(eff.ai.dynamicPrompt).toBe(globals.defaults.ai.dynamicPrompt);
 	});
 
-	it("AI override 'custom' uses provided persona but inherits missing fields", () => {
+	it("老的 'custom' 人格就地失效 —— per-UP 只能挑一份已有人格,写不了自己的", () => {
+		// 设置页曾经给过一档「完全自定义」,能就地写一套只属于这个 UP 的人设。
+		// 那一档撤掉了(人格一律在「智能女仆」页里写,per-UP 只负责挑一份),盘上
+		// 却还留着当年写下的字段。**它们不再参与解析** —— 留着继续生效的话就成了
+		// 界面上看不见、实际仍在起作用的鬼配置,日后排查起来最费劲。
 		const globals = makeDefaultGlobalConfig();
 		const customPersona = {
 			name: "助手",
@@ -106,16 +111,19 @@ describe("resolve()", () => {
 				ai: {
 					preset: "custom",
 					persona: customPersona,
+					dynamicPrompt: "老的动态模板",
+					liveSummaryPrompt: "老的总结模板",
 					temperature: 1.5,
 				},
 			},
 		};
 		const eff = resolve(sub, globals.defaults);
 
-		expect(eff.ai.persona).toEqual(customPersona);
-		expect(eff.ai.temperature).toBe(1.5);
-		// dynamicPrompt 没显式覆盖 → 继承全局
+		expect(eff.ai.persona).toEqual(globals.defaults.ai.persona);
 		expect(eff.ai.dynamicPrompt).toBe(globals.defaults.ai.dynamicPrompt);
+		expect(eff.ai.liveSummaryPrompt).toBe(globals.defaults.ai.liveSummaryPrompt);
+		// temperature 不在撤掉之列 —— 它本来就是独立一格,与人格无关。
+		expect(eff.ai.temperature).toBe(1.5);
 	});
 
 	it("AI override personaId 直通(与 preset 无关,inherit 时也生效;AstrBot 端用,其它端忽略)", () => {
@@ -177,7 +185,7 @@ describe("resolve()", () => {
 		expect(eff2.ai.dynamicPrompt).toBe(globals.defaults.ai.dynamicPrompt);
 	});
 
-	it("R1: 显式 override.persona 优先于具名 preset.persona(与 prompt 字段同序)", () => {
+	it("挑了具名人格时,盘上残留的 persona / prompt 一概不参与 —— 挑哪份就是哪份", () => {
 		const globals = makeDefaultGlobalConfig();
 		const presetPersona = {
 			name: "preset名",
@@ -202,12 +210,14 @@ describe("resolve()", () => {
 		};
 		const sub: Subscription = {
 			...SUB_BASE,
-			overrides: { ai: { preset: "tsundere", persona: overridePersona } },
+			overrides: {
+				ai: { preset: "tsundere", persona: overridePersona, dynamicPrompt: "残留模板" },
+			},
 		};
 		const eff = resolve(sub, globals.defaults);
-		// 显式 per-UP persona 必须胜过 preset 的 persona(此前被静默丢弃)。
-		expect(eff.ai.persona).toEqual(overridePersona);
-		// 未被 override 覆盖的 dynamicPrompt 仍取 preset —— 既有语义不回归。
+		// 选中的那份人格说了算。残留的 persona 曾经压过它 —— 那时「完全自定义」还在,
+		// 两者能同时存在;现在挑一份就是挑一份,不该被看不见的旧字段改写。
+		expect(eff.ai.persona).toEqual(presetPersona);
 		expect(eff.ai.dynamicPrompt).toBe("P 模板");
 	});
 
@@ -288,5 +298,102 @@ describe("resolve()", () => {
 			eff.routing.dynamic.push("550e8400-e29b-41d4-a716-446655440000");
 			expect(SUB_BASE.routing.dynamic).toHaveLength(0);
 		});
+	});
+});
+
+/**
+ * 全局启用哪一份人格 —— `ai.activePreset` 指针。
+ *
+ * 加这个字段是为了让设置页的「全局人格选择」成为**真正的选择器**:不填 = 用
+ * `ai.persona`(老行为,不需要迁移),填了就用那份预设。关键在于它**不改写**
+ * `ai.persona` —— 切回「默认」时主人手写的那份原封不动地回来。
+ *
+ * 旧界面是靠「把预设复制进 ai.persona」来表达选中的,那一下就把主人手写的覆盖了、
+ * 且换不回来;想显示「现在选的是哪份」还得拿 persona 去逐字段比对猜。两个毛病
+ * 都由这个指针一并解决。
+ */
+describe("ai.activePreset —— 全局用哪一份人格", () => {
+	const TSUNDERE = {
+		name: "傲娇",
+		addressUser: "笨蛋",
+		addressSelf: "本喵",
+		traits: "毒舌",
+		catchphrase: "哼",
+		baseRole: "",
+		extraSystemPrompt: "",
+	};
+
+	it("不填 → 回落 ai.persona。这是**安全网**,不是常态", () => {
+		// schema 保证 parse 出来的配置恒带指针(见 ai-persona-pointer.test.ts),所以这条
+		// 路只在指针被就地抹掉时走到 —— 它存在的意义是「无论如何都得有份人格」,
+		// 而不是让人靠改 ai.persona 来换全局人格(那条路已经没有界面入口了)。
+		const globals = makeDefaultGlobalConfig();
+		globals.defaults.ai.activePreset = undefined;
+		globals.defaults.ai.persona.name = "梦梦";
+		expect(resolve(SUB_BASE, globals.defaults).ai.persona.name).toBe("梦梦");
+	});
+
+	it("默认配置指向第一份「温柔女仆」", () => {
+		const globals = makeDefaultGlobalConfig();
+		expect(globals.defaults.ai.activePreset).toBe("gentle-maid");
+		expect(resolve(SUB_BASE, globals.defaults).ai.persona.name).toBe("小绫");
+	});
+
+	it("填了 → 全局改用那份预设的人格与它写了的 prompt", () => {
+		const globals = makeDefaultGlobalConfig();
+		globals.defaults.ai.persona.name = "梦梦";
+		globals.defaults.ai.presets = [
+			{ id: "tsundere", label: "傲娇", persona: TSUNDERE, dynamicPrompt: "傲娇动态" },
+		];
+		globals.defaults.ai.activePreset = "tsundere";
+		const eff = resolve(SUB_BASE, globals.defaults);
+		expect(eff.ai.persona).toEqual(TSUNDERE);
+		expect(eff.ai.dynamicPrompt).toBe("傲娇动态");
+	});
+
+	it("预设没写的那段 prompt 仍回落全局 —— undefined 的意思本就是「跟全局一样」", () => {
+		const globals = makeDefaultGlobalConfig();
+		globals.defaults.ai.liveSummaryPrompt = "全局总结";
+		globals.defaults.ai.presets = [{ id: "tsundere", label: "傲娇", persona: TSUNDERE }];
+		globals.defaults.ai.activePreset = "tsundere";
+		expect(resolve(SUB_BASE, globals.defaults).ai.liveSummaryPrompt).toBe("全局总结");
+	});
+
+	it("**不改写 ai.persona** —— 切回「默认」时主人手写的那份还在", () => {
+		const globals = makeDefaultGlobalConfig();
+		globals.defaults.ai.persona.name = "梦梦";
+		globals.defaults.ai.presets = [{ id: "tsundere", label: "傲娇", persona: TSUNDERE }];
+		globals.defaults.ai.activePreset = "tsundere";
+		resolve(SUB_BASE, globals.defaults);
+		expect(globals.defaults.ai.persona.name).toBe("梦梦");
+	});
+
+	it("指向一份已不存在的预设 → 回落 ai.persona,不炸也不留空人格", () => {
+		// 主人可能刚把那份删掉,或者备份导入换了一批预设。
+		const globals = makeDefaultGlobalConfig();
+		globals.defaults.ai.persona.name = "梦梦";
+		globals.defaults.ai.activePreset = "gone";
+		expect(resolve(SUB_BASE, globals.defaults).ai.persona.name).toBe("梦梦");
+	});
+
+	it("per-UP 覆盖仍然压过全局指针 —— per-UP 的语义一点没变", () => {
+		const globals = makeDefaultGlobalConfig();
+		globals.defaults.ai.presets = [
+			{ id: "tsundere", label: "傲娇", persona: TSUNDERE },
+			{ id: "critic", label: "评论家", persona: { ...TSUNDERE, name: "评论家" } },
+		];
+		globals.defaults.ai.activePreset = "tsundere";
+		const sub: Subscription = { ...SUB_BASE, overrides: { ai: { preset: "critic" } } };
+		expect(resolve(sub, globals.defaults).ai.persona.name).toBe("评论家");
+	});
+
+	it("per-UP 显式 inherit → 继承的是**全局指针指的那份**,不是 ai.persona", () => {
+		// inherit 的意思是「跟全局一样」,而全局此刻用的正是那份预设。
+		const globals = makeDefaultGlobalConfig();
+		globals.defaults.ai.persona.name = "梦梦";
+		globals.defaults.ai.presets = [{ id: "tsundere", label: "傲娇", persona: TSUNDERE }];
+		globals.defaults.ai.activePreset = "tsundere";
+		const sub: Subscription = { ...SUB_BASE, overrides: { ai: { preset: "inherit" } } };
+		expect(resolve(sub, globals.defaults).ai.persona.name).toBe("傲娇");
 	});
 });

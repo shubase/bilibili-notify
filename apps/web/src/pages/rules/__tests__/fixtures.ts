@@ -53,11 +53,12 @@ export function makeDefaults(): GlobalDefaults {
 		},
 		ai: {
 			enabled: false,
-			model: "",
-			temperature: 0.7,
 			persona,
 			dynamicPrompt: "",
 			liveSummaryPrompt: "",
+			// 一家都没添加 = 全新配置。连接与生成参数都住在服务商桶里。
+			provider: "custom",
+			providers: {},
 			presets: [],
 		},
 		cardStyle: {
@@ -102,5 +103,8 @@ export function makeDefaults(): GlobalDefaults {
 				separator: "\n",
 			},
 		},
+		// 空账本 = 刚从老版本升上来的形态(该字段引入前写的 globals.json)。
+		// 要测「默认文案有更新」的提示,拿它当基线正合适。
+		templateDefaultsSeen: {},
 	};
 }

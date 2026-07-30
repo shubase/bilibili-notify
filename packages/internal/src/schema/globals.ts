@@ -1,4 +1,11 @@
 import { z } from "zod";
+import { BUILTIN_AI_PRESETS, DEFAULT_TEMPLATES } from "../constants";
+import { allTemplateFingerprints } from "../template-defaults";
+
+// 模板默认值住在零依赖的 `constants.ts` —— 前端要拿它跟盘上的值比对(「默认文案有
+// 更新」那套),从这里(带 zod)拿会把 zod 拽进浏览器 bundle。同 BUILTIN_AI_PRESETS。
+export { DEFAULT_TEMPLATES } from "../constants";
+
 import { CardLayoutSchema, DEFAULT_CARD_LAYOUT } from "./card-layout";
 import {
 	AISettingsSchema,
@@ -196,6 +203,19 @@ export const GlobalDefaultsSchema = z.object({
 	// 之前持久化的)load 时被 zod 自动补全 —— 否则 ConfigValidationError 让独立端
 	// 启动直接挂。新字段加 GlobalDefaults 时都该带 default,保留迁移友好性。
 	imageGroup: ImageGroupSettingsSchema.default(DEFAULT_IMAGE_GROUP),
+	/**
+	 * 「这一版默认文案我已经知道了」的账本:点路径 → 当时那版默认的指纹。
+	 *
+	 * 主人改了某条模板的默认,已装好的用户拿不到 —— 他们盘上写的是当初那一版。
+	 * 判定「要不要提示他更新」靠的就是这本账:**指纹对不上 = 这版默认他没见过**。
+	 * 于是不必再去猜「他到底改没改过」,那条路要维护一张历代默认表,而那张表
+	 * 没人守得住(`liveSummary` 已经漏过一次)。判定见 `../template-defaults.ts`。
+	 *
+	 * `.default({})` 是老配置兜底(同 imageGroup);全新安装由
+	 * `makeDefaultGlobalConfig` 一次填满 —— 理由见
+	 * `./template-defaults-seen.test.ts` 里那条「改了自己的文案不该立刻被提示」。
+	 */
+	templateDefaultsSeen: z.record(z.string(), z.string()).default({}),
 });
 export type GlobalDefaults = z.infer<typeof GlobalDefaultsSchema>;
 
@@ -208,143 +228,17 @@ export const GlobalConfigSchema = z.object({
 });
 export type GlobalConfig = z.infer<typeof GlobalConfigSchema>;
 
-/**
- * 模板默认值（占位，可由 UI 编辑）。
- *
- * 占位符统一 `{key}` 语法,由 `LiveTemplateRenderer.applyTemplate` / `interpolate`
- * 替换(`applyTemplate` 同时兼容 koishi 旧存档的 legacy `-key`)。变量集严格对齐
- * 渲染器实际提供的字段:
- * - 直播:`{name}` `{time}` `{follower}` `{follower_change}` `{watched}`
- * - 上舰:`{uname}` `{mname}` `{guard}`
- * - 特别关注:`{mastername}` `{uname}` `{msg}`
- * - 弹幕总结:`{dmc}` `{mdn}` `{dca}` `{un1..5}` `{dc1..5}`
- * - 动态:`{name}`
- *
- * 链接不再是模板变量:动态 / 视频 / 开播的链接是消息版式的独立「链接」部件
- * (显隐 / 位置由版式或 koishi 端的开关决定)。旧存档模板里残留的 `{url}` /
- * `{link}` 在版式路径渲染时连同前导分隔符一起剥离,不会双链接。
- *
- * liveStart/liveOngoing/liveEnd 与 packages/live 的 `DEFAULT_LIVE_TEMPLATES`
- * 保持字面量一致 —— 这样「自定义关闭时实际推送的内建默认」== 「自定义打开时
- * UI 载入的默认文本」,不再出现 `{name}` 原样吐出的错配。
- */
-export const DEFAULT_TEMPLATES = {
-	liveStart: "{name} 开播啦，当前粉丝数：{follower}",
-	liveOngoing: "{name} 正在直播，已播 {time}，累计观看：{watched}",
-	liveEnd: "{name} 下播啦，本次直播了 {time}，粉丝变化 {follower_change}",
-	liveSummary: `🔍【弹幕情报站】本场直播数据如下：
-🧍‍♂️ 总共 {dmc} 位{mdn}上线
-💬 共计 {dca} 条弹幕飞驰而过
-📊 热词云图已生成，快来看看你有没有上榜！
-👑 本场顶级输出选手：
-🥇 {un1} - 弹幕输出 {dc1} 条
-🥈 {un2} - 弹幕 {dc2} 条，萌力惊人
-🥉 {un3} - {dc3} 条精准狙击
-🎖️ 特别嘉奖：{un4} & {un5}
-你们的弹幕，我们都记录在案！🕵️‍♀️`,
-	dynamic: "{name}发布了一条动态",
-	dynamicVideo: "{name}发布了新视频",
-	wordcloudStopWords: "",
-	specialDanmaku: "{mastername} 的关注用户 {uname} 发送弹幕：{msg}",
-	specialUserEnter: "{uname} 进入了 {mastername} 的直播间",
-	guardBuy: {
-		// false = 默认上舰图 + 内置文案；true = 启用三档自定义文案/图片
-		enable: false,
-		captain: { imageUrl: "", template: "{uname} 成为了 {mname} 的舰长！" },
-		commander: {
-			imageUrl: "",
-			template: "{uname} 成为了 {mname} 的提督！",
-		},
-		governor: {
-			imageUrl: "",
-			template: "{uname} 成为了 {mname} 的总督！",
-		},
-	},
-} as const;
-
-// 第一个 AI 人格预设「温柔女仆」。同时作为 DEFAULT_AI 的默认 persona / prompt 来源,
-// 保证「默认配置 = 首个预设」单一真相,不靠手抄两份。
-const PRESET_GENTLE_MAID = {
-	id: "gentle-maid",
-	label: "温柔女仆",
-	persona: {
-		name: "小绫",
-		addressUser: "主人",
-		addressSelf: "小绫",
-		traits: "温柔、体贴、说话轻声细语",
-		catchphrase: "请主人慢用~",
-		baseRole: "你是主人贴身的小女仆,语气温柔、耐心、关心主人,把每一次汇报都当成对主人的服务。",
-		extraSystemPrompt: "回复保持礼貌,可以用 (*´ω`*) 之类的颜文字点缀,不要过分卖萌。",
-	},
-	dynamicPrompt:
-		"主人订阅的 UP 主刚刚更新了动态,请用温柔的语气向主人转述核心内容,并补一两句你的看法。",
-	liveSummaryPrompt:
-		"用温柔的语气向主人讲讲直播主要发生了什么(150-200 字),从弹幕和氛围中提炼亮点。",
-} as const;
-
 export const DEFAULT_AI = {
 	enabled: false,
-	model: "gpt-4o-mini",
-	temperature: 0.7,
 	// 默认 AI 配置 = 首个预设「温柔女仆」:persona 与两个 prompt 都取自 PRESET_GENTLE_MAID。
-	persona: PRESET_GENTLE_MAID.persona,
-	dynamicPrompt: PRESET_GENTLE_MAID.dynamicPrompt,
-	liveSummaryPrompt: PRESET_GENTLE_MAID.liveSummaryPrompt,
-	presets: [
-		PRESET_GENTLE_MAID,
-		{
-			id: "tsundere",
-			label: "傲娇毒舌",
-			persona: {
-				name: "凛子",
-				addressUser: "笨蛋",
-				addressSelf: "本小姐",
-				traits: "嘴硬心软、毒舌、爱用反问",
-				catchphrase: "哼,才不是为了你才看的呢!",
-				baseRole: "你是一个嘴硬心软的傲娇 AI,虽然嘴上不饶人,但实际上还是认真在帮主人盯 UP 主动态。",
-				extraSystemPrompt: "可以毒舌但避免人身攻击,关键信息一定要说清楚。不要把每句话都加'哼'。",
-			},
-			dynamicPrompt:
-				"主人让你看的 UP 主又更新动态了,用傲娇的语气吐槽一下,但内容核心要讲清楚,不要光吐槽不汇报。",
-			liveSummaryPrompt:
-				"主人非要让你帮他看一整场直播,用傲娇的语气把这场直播总结一下,允许适当吐槽,但关键点要交代到。",
-		},
-		{
-			id: "analyst",
-			label: "理性分析",
-			persona: {
-				name: "分析师",
-				addressUser: "用户",
-				addressSelf: "我",
-				traits: "客观、专业、信息密度高",
-				catchphrase: "",
-				baseRole: "你是一名专业的内容分析师,用中立、客观、信息密度高的语气总结 UP 主动态与直播。",
-				extraSystemPrompt:
-					"避免感情色彩与颜文字。结构化输出:亮点 / 关键信息 / 简评 三段式,简评不超过两句。",
-			},
-			dynamicPrompt:
-				"按「亮点 / 关键信息 / 简评」三段式输出,语言客观简洁,简评不超过两句,避免主观情感词。",
-			liveSummaryPrompt:
-				"客观总结直播:涉及话题、互动热点、整体氛围。控制在 200 字内,避免颜文字与感叹号堆叠。",
-		},
-		{
-			id: "genki",
-			label: "元气少女",
-			persona: {
-				name: "小阳",
-				addressUser: "你",
-				addressSelf: "我",
-				traits: "活泼、热情、爱用感叹号",
-				catchphrase: "诶嘿~",
-				baseRole: "你是一个超级元气的助手,充满活力、热情地分享 UP 主的最新动态和直播!",
-				extraSystemPrompt:
-					"语气活泼但不要刷感叹号刷到刺眼,一两个就够。可以用「!!」、「~」、「诶嘿」之类。",
-			},
-			dynamicPrompt: "用元气满满的语气把 UP 主新动态讲给用户听,内容核心要说出来,语气活泼但别过头。",
-			liveSummaryPrompt:
-				"用元气满满的语气帮用户回顾这场直播的重点(200 字内),保持热情但抓住关键点。",
-		},
-	],
+	persona: BUILTIN_AI_PRESETS[0].persona,
+	dynamicPrompt: BUILTIN_AI_PRESETS[0].dynamicPrompt,
+	liveSummaryPrompt: BUILTIN_AI_PRESETS[0].liveSummaryPrompt,
+	// 全新安装一家服务商都没添加 —— 设置页左栏是空的,引擎按「还没配齐」停用。
+	// provider 指针先停在兜底档,主人添加第一家时会跟着切过去。
+	provider: "custom",
+	providers: {},
+	presets: BUILTIN_AI_PRESETS,
 } as const;
 
 export const DEFAULT_CARD_STYLE = {
@@ -374,6 +268,9 @@ export function makeDefaultGlobalConfig(): GlobalConfig {
 			ai: DEFAULT_AI,
 			cardStyle: DEFAULT_CARD_STYLE,
 			imageGroup: DEFAULT_IMAGE_GROUP,
+			// 全新安装把账本一次填满:他拿到的就是当前默认,没什么可更新的。
+			// 空着的话,他一动手改文案就会被提示「默认文案有更新」—— 更新到哪去?
+			templateDefaultsSeen: allTemplateFingerprints(DEFAULT_TEMPLATES),
 		},
 	});
 }

@@ -80,4 +80,52 @@ describe("formatDiffValue", () => {
 		expect(formatDiffValue("__unknown__", true)).toEqual({ display: "开启" });
 		expect(formatDiffValue("__unknown__", "x")).toEqual({ display: "x" });
 	});
+
+	describe("默认更新提示的账本", () => {
+		// 账本存的是内容指纹(`1hxy5zb` 这种),对用户零信息量。它在灵动岛里要回答的
+		// 只有一句话:「这条提示我确认过了没有」。所以渲染成人话,不吐原串。
+		it("有指纹 → 「已确认」,不暴露那串指纹", () => {
+			expect(formatDiffValue("templateDefaultsSeen.liveSummary", "1hxy5zb")).toEqual({
+				display: "已确认",
+			});
+		});
+
+		it("嵌套路径的账本条目一样处理", () => {
+			expect(formatDiffValue("templateDefaultsSeen.guardBuy.captain.template", "abc123")).toEqual({
+				display: "已确认",
+			});
+		});
+
+		it("还没记过 → 「未确认」,而不是「(未设置)」那种系统腔", () => {
+			expect(formatDiffValue("templateDefaultsSeen.liveSummary", undefined)).toEqual({
+				display: "未确认",
+			});
+		});
+
+		it("别误伤名字里带 templateDefaultsSeen 之外的 code", () => {
+			expect(formatDiffValue("templates.liveSummary", "开播啦")).toEqual({ display: "开播啦" });
+		});
+	});
+
+	describe("逐家服务商的桶", () => {
+		// 密钥住在 `ai.providers.<家>.apiKey`,字典里没有这条逐家的 entry ——
+		// 直接读字典就查不到 secret 位,于是**明文密钥会摊在灵动岛面板上**。
+		it("逐家路径下的 apiKey 照样脱敏", () => {
+			expect(formatDiffValue("ai.providers.deepseek.apiKey", "sk-real-key")).toEqual({
+				display: "••• 已改",
+			});
+		});
+
+		it("视觉副模型的密钥同理", () => {
+			expect(formatDiffValue("ai.providers.openrouter.vision.apiKey", "sk-vision")).toEqual({
+				display: "••• 已改",
+			});
+		});
+
+		it("不是密钥的那些照常显示", () => {
+			expect(formatDiffValue("ai.providers.deepseek.model", "deepseek-chat")).toEqual({
+				display: "deepseek-chat",
+			});
+		});
+	});
 });

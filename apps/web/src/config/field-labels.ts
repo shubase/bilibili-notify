@@ -16,6 +16,12 @@
  * 由各调用处兜底。
  */
 
+import {
+	AI_PROVIDER_IDS,
+	type AIProviderId,
+	providerMeta,
+} from "@bilibili-notify/internal/constants";
+
 /** 字段分组,灵动岛 expand panel 按 section 分组渲染。 */
 export type FieldSection =
 	| "general"
@@ -199,11 +205,65 @@ export const FIELD_LABELS = {
 	// ── AI 连接 ───────────────────────────────────────────────────────────
 	"ai.apiKey": { label: "API Key", section: "ai", secret: true },
 	"ai.baseUrl": { label: "Base URL", section: "ai" },
+	"ai.provider": {
+		label: "服务商",
+		hint: "「开思考」这件事各家写法完全不一样，女仆得知道是哪家才翻译得对。选「自定义」则不发任何服务商专属参数，需要什么请写到下面的额外请求参数里",
+		section: "ai",
+	},
+	// 合成字段,不是 schema 里的东西 —— 灵动岛只认得「摊平后的当前那一家」,
+	// 添加/删除别家在它眼里毫无变化,于是保存条不亮、主人一走就丢。这一行把
+	// 「已添加哪几家」显式喂给它。见 Ai.tsx#packIsland。
+	"ai.providerList": {
+		label: "已添加的服务商",
+		hint: "左栏列着的那几家。删掉一家会连同它存着的密钥一起抹掉",
+		section: "ai",
+	},
+	"ai.enableThinking": {
+		label: "深度思考",
+		hint: "让模型先想一轮再回答。更慢、更贵，但复杂内容的点评质量会好一截。要是那家网关不认，女仆会自动摘掉参数重试一次，不会报错",
+		section: "ai",
+	},
+	"ai.thinkingLevel": {
+		label: "思考深度",
+		hint: "统一三档，女仆按服务商换算：OpenRouter 是 low/medium/high，DeepSeek 只有 high/max，火山与硅基是 token 预算。换服务商时这个设置不作废",
+		section: "ai",
+	},
+	"ai.extraParams": {
+		label: "额外请求参数",
+		hint: '一段 JSON，原样摊进请求体。适配之外的服务商、或联网搜索这类各家写法不同的能力都写这里，比如 OpenRouter 的 {"plugins":[{"id":"web"}]}。跟女仆自己发的参数撞了以你为准；写错了那一次就当没填。model / messages / tools 是请求骨架，会被挡掉',
+		section: "ai",
+	},
 	"ai.model": { label: "模型 ID", section: "ai" },
 	"ai.temperature": {
 		label: "temperature",
 		hint: "0–2,越高越发散",
 		section: "ai",
+	},
+
+	// ── 图片理解 ──────────────────────────────────────────────────────────
+	// 这个开关是在**声明主模型的能力**，不是在选「把图发给谁」。写成后者的话
+	// （旧文案「主模型直接看图」）会让人以为打开就等于图归主模型看 —— 而下面
+	// 配了视觉模型时它其实完全不生效。
+	"ai.enableVision": {
+		label: "主模型支持看图",
+		hint: "你的主模型自己看得见图吗（gpt-4o、qwen-vl 这类）？看得见就打开，图直接交给它，省一次往返也不掉细节；看不见就别开，改填下面的视觉模型。注意：一旦填了视觉模型，就一律以视觉模型为准，这个开关不再起作用",
+		section: "ai",
+	},
+	"ai.vision.model": {
+		label: "视觉模型 ID",
+		hint: "主模型看不见图时（比如 DeepSeek）填这里，图会先由它转成文字描述再交给主模型。填了它就优先于上面那个开关。留空则不启用",
+		section: "ai",
+	},
+	"ai.vision.baseUrl": {
+		label: "视觉 Base URL",
+		hint: "留空则跟随主模型。只有视觉模型在另一家服务商时才需要单独填",
+		section: "ai",
+	},
+	"ai.vision.apiKey": {
+		label: "视觉 API Key",
+		hint: "留空则跟随主模型",
+		section: "ai",
+		secret: true,
 	},
 	"ai.test.target": {
 		label: "推到哪里",
@@ -215,7 +275,16 @@ export const FIELD_LABELS = {
 		hint: "一句话或一个问题 · 最多 500 字",
 		section: "ai",
 	},
-	"ai.preset": { label: "预设", section: "ai" },
+	"ai.preset": {
+		label: "人格",
+		hint: "从「智能女仆」页备着的那几份里挑一份给这个 UP。想改内容或另起一份都到那边去",
+		section: "ai",
+	},
+	"ai.activePreset": {
+		label: "全局人格",
+		hint: "女仆平时用哪一份性格。它只是个指向，换来换去都不会动到「默认」那份的内容",
+		section: "ai",
+	},
 	// AI / Cards hero strip 的「启用」总开关 Toggle 没包 <Field>(Picker 直挂在
 	// GlassBox right 槽),walkTreeDiff 输出 `enabled` 顶层路径。label 取通用
 	// 「启用」,灵动岛上下文已经标 pageLabel("智能女仆" / "卡片样式"),用户
@@ -550,9 +619,56 @@ export const FIELD_LABELS = {
  * 在字典里 lookup;命中则返回 entry,否则返回 `null` 并在开发环境 warn。Field
  * 组件需要 lookup 失败时回退到 prop label,确保 schema 漂移不直接白屏。
  */
+/**
+ * 「默认文案有更新」的账本前缀。
+ *
+ * 它的 code 是**动态**的 —— `templateDefaultsSeen.<任意模板路径>`,模板加一条这里
+ * 就多一条,逐个登记进 FIELD_LABELS 等于把同一份清单抄两遍(而且必然有人忘)。
+ * 所以走前缀 fallback,label 直接**借对应模板字段自己的名字**:模板哪天改名,
+ * 账本这条跟着改,不会两边对不上。
+ */
+const SEEN_PREFIX = "templateDefaultsSeen.";
+
+/**
+ * 逐家服务商的桶前缀 —— `ai.providers.<家>.<字段>`。
+ *
+ * 连接与生成参数一家存一套,code 因此是**家数 × 十来个字段**的笛卡尔积,逐条登记
+ * 就是把 `ai.*` 那批 entry 抄五遍。所以走前缀 fallback:hint / section / **secret**
+ * 全部继承 `ai.<字段>` 那条,label 前面缀上是哪一家。
+ *
+ * 继承 `secret` 尤其要紧:漏了这一步,灵动岛的 diff 面板查不到密钥位,会把主人刚
+ * 敲进去的 **API Key 明文**摊在面板上。
+ */
+const PROVIDER_PREFIX = "ai.providers.";
+const PROVIDER_IDS: ReadonlySet<string> = new Set(AI_PROVIDER_IDS);
+
 export function getFieldLabel(code: string): FieldLabel | null {
 	const hit = (FIELD_LABELS as Record<string, FieldLabel | undefined>)[code];
 	if (hit) return hit;
+	if (code.startsWith(SEEN_PREFIX)) {
+		const path = code.slice(SEEN_PREFIX.length);
+		const owner = (FIELD_LABELS as Record<string, FieldLabel | undefined>)[`templates.${path}`];
+		return {
+			label: `${owner?.label ?? path} · 默认更新提示`,
+			hint: "主人对「默认文案有更新」那条提示的处理结果;记下来是为了不再重复问。",
+			section: "templates",
+		};
+	}
+	if (code.startsWith(PROVIDER_PREFIX)) {
+		const rest = code.slice(PROVIDER_PREFIX.length);
+		const cut = rest.indexOf(".");
+		const id = cut < 0 ? "" : rest.slice(0, cut);
+		// 认不出的家、或者认不出的字段,一律**老实说不认识** —— 兜一个半截标签
+		// (「undefined · 某字段」)比缺一行更难查。
+		if (PROVIDER_IDS.has(id)) {
+			const base = (FIELD_LABELS as Record<string, FieldLabel | undefined>)[
+				`ai.${rest.slice(cut + 1)}`
+			];
+			if (base) {
+				return { ...base, label: `${providerMeta(id as AIProviderId).label} · ${base.label}` };
+			}
+		}
+	}
 	if (import.meta.env.DEV) {
 		console.warn(`[field-labels] missing entry for code="${code}"`);
 	}
