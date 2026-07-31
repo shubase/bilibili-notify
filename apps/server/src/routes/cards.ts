@@ -46,6 +46,7 @@ import {
 } from "@bilibili-notify/internal";
 import { Hono } from "hono";
 import { z } from "zod";
+import { commandHelpHintFromGlobals } from "../commands/bili-onebot.js";
 import type { ChromeSource } from "../config/persist.js";
 import {
 	deleteCardBg,
@@ -581,6 +582,7 @@ export function createCardsRoute(opts: CardsRouteOptions): Hono {
 					content.offset ?? 1,
 					style,
 					layout?.dynamic,
+					commandHelpHintFromGlobals(opts.deps.store.getGlobals()),
 				);
 				return { buffer, mime: "image/jpeg" };
 			} catch (err) {
@@ -609,6 +611,7 @@ export function createCardsRoute(opts: CardsRouteOptions): Hono {
 			layout,
 			bgDataUrl,
 			coverDataUrl,
+			commandHelpHintFromGlobals(opts.deps.store.getGlobals()),
 		);
 		const html = await renderCard(component, props, {
 			title,
@@ -802,6 +805,7 @@ async function renderRealDynamic(
 	offset: number,
 	style: PreviewStyle,
 	layout?: CardBlock[],
+	helpHint?: string,
 ): Promise<Buffer> {
 	if (!/^\d+$/.test(uid)) throw new Error("UID 必须是纯数字");
 
@@ -821,13 +825,20 @@ async function renderRealDynamic(
 	const item = items[idx];
 	if (!item) throw new Error(`第 ${offset} 条动态为空`);
 
-	return renderer.generateDynamicCard(
+	const generateDynamicCard = renderer.generateDynamicCard.bind(renderer) as (
+		data: Parameters<ImageRenderer["generateDynamicCard"]>[0],
+		colorOptions?: Parameters<ImageRenderer["generateDynamicCard"]>[1],
+		layout?: Parameters<ImageRenderer["generateDynamicCard"]>[2],
+		options?: { helpHint?: string },
+	) => Promise<Buffer>;
+	return generateDynamicCard(
 		item,
 		{
 			cardColorStart: style.cardColorStart,
 			cardColorEnd: style.cardColorEnd,
 		},
 		layout,
+		{ helpHint },
 	);
 }
 
@@ -848,6 +859,7 @@ function buildPreviewSpec(
 	bgDataUrl?: string,
 	/** 已解析的直播封面 data URL(仅 live 卡消费,语义同上)。 */
 	coverDataUrl?: string,
+	helpHint?: string,
 ): PreviewSpec {
 	const backgroundImage = bgDataUrl || undefined;
 	if (kind === "live") {
@@ -865,7 +877,12 @@ function buildPreviewSpec(
 	}
 	return {
 		component: DynamicCard,
-		props: { ...buildDynamicPreviewProps(style), layout: layout?.dynamic, backgroundImage },
+		props: {
+			...buildDynamicPreviewProps(style),
+			layout: layout?.dynamic,
+			backgroundImage,
+			helpHint,
+		},
 		title: "卡片预览 · 动态",
 		htmlWidth: 600,
 	};

@@ -95,6 +95,14 @@ describe("DynamicCard layout", () => {
 		expect(order.filter((b) => b === "content").length).toBe(2);
 	});
 
+	it("renders the help hint only on the outer header", async () => {
+		const node = makeNode({
+			forward: makeNode({ upName: "原作者", stats: undefined }),
+		});
+		const html = await renderDyn({ node, helpHint: "发送 bili帮助 获取菜单" });
+		expect(html.match(/发送 bili帮助 获取菜单/g)).toHaveLength(1);
+	});
+
 	it("applies layout visibility to the forwarded inner dynamic", async () => {
 		const layout: CardBlock[] = DEFAULT_CARD_LAYOUT.dynamic.map((b) =>
 			b.type === "additional" ? { ...b, visible: false } : b,

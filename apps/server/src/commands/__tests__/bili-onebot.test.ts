@@ -32,24 +32,32 @@ beforeEach(() => {
 
 describe("bili OneBot group command parser", () => {
 	it("只接收无斜杠的 bili 前缀", () => {
+		expect(parseBiliCommand("bili帮助")).toEqual({ kind: "help" });
 		expect(parseBiliCommand("bili help")).toEqual({ kind: "help" });
-		expect(parseBiliCommand("/bili help")).toBeNull();
+		expect(parseBiliCommand("/bili帮助")).toBeNull();
 		expect(parseBiliCommand(" 菜单 ")).toBeNull();
 	});
 
-	it("解析订阅管理命令", () => {
-		expect(parseBiliCommand("bili add 123456")).toEqual({ kind: "add", query: "123456" });
-		expect(parseBiliCommand("bili add 火 播 君")).toEqual({
+	it("解析中文无空格订阅管理命令", () => {
+		expect(parseBiliCommand("bili订阅123456")).toEqual({ kind: "add", query: "123456" });
+		expect(parseBiliCommand("bili订阅火播君")).toEqual({
 			kind: "add",
-			query: "火 播 君",
+			query: "火播君",
 		});
+		expect(parseBiliCommand("bili取消123456")).toEqual({ kind: "del", uid: "123456" });
+		expect(parseBiliCommand("bili列表")).toEqual({ kind: "list" });
+		expect(parseBiliCommand("bili全部列表")).toEqual({ kind: "listall" });
+		expect(parseBiliCommand("bili清空")).toEqual({ kind: "delall" });
+		expect(parseBiliCommand("bili清空全部")).toEqual({ kind: "delallall" });
+		expect(parseBiliCommand("bili权限开启")).toEqual({ kind: "member", action: "on" });
+		expect(parseBiliCommand("bili权限关闭")).toEqual({ kind: "member", action: "off" });
+		expect(parseBiliCommand("bili权限状态")).toEqual({ kind: "member", action: "status" });
+	});
+
+	it("兼容旧英文命令", () => {
+		expect(parseBiliCommand("bili add 123456")).toEqual({ kind: "add", query: "123456" });
 		expect(parseBiliCommand("bili del 123456")).toEqual({ kind: "del", uid: "123456" });
 		expect(parseBiliCommand("bili list")).toEqual({ kind: "list" });
-		expect(parseBiliCommand("bili listall")).toEqual({ kind: "listall" });
-		expect(parseBiliCommand("bili delall")).toEqual({ kind: "delall" });
-		expect(parseBiliCommand("bili delallall")).toEqual({ kind: "delallall" });
-		expect(parseBiliCommand("bili member on")).toEqual({ kind: "member", action: "on" });
-		expect(parseBiliCommand("bili member off")).toEqual({ kind: "member", action: "off" });
 		expect(parseBiliCommand("bili member status")).toEqual({ kind: "member", action: "status" });
 	});
 
@@ -82,20 +90,21 @@ describe("bili OneBot group command parser", () => {
 				member: "权限",
 			},
 		};
-		expect(parseBiliCommand("bn 添加 123456", config)).toEqual({ kind: "add", query: "123456" });
+		expect(parseBiliCommand("bn添加123456", config)).toEqual({ kind: "add", query: "123456" });
 		expect(parseBiliCommand("bn 权限 开", config)).toEqual({ kind: "member", action: "on" });
+		expect(parseBiliCommand("bn权限开", config)).toEqual({ kind: "member", action: "on" });
 		expect(parseBiliCommand("bili add 123456", config)).toBeNull();
 		expect(parseBiliCommand("bn 删除 abc", config)).toEqual({
 			kind: "unknown",
-			reason: "用法错误，应为：bn 删除 <uid>",
+			reason: "用法错误，应为：bn删除<uid>",
 		});
 	});
 
 	it("add 支持名字，del 仍然要求 UID 是纯数字", () => {
-		expect(parseBiliCommand("bili add abc")).toEqual({ kind: "add", query: "abc" });
-		expect(parseBiliCommand("bili del")).toEqual({
+		expect(parseBiliCommand("bili订阅abc")).toEqual({ kind: "add", query: "abc" });
+		expect(parseBiliCommand("bili取消")).toEqual({
 			kind: "unknown",
-			reason: "用法错误，应为：bili del <uid>",
+			reason: "用法错误，应为：bili取消<uid>",
 		});
 	});
 
@@ -103,15 +112,15 @@ describe("bili OneBot group command parser", () => {
 		const text = extractOnebotMessageText(
 			[
 				{ type: "at", data: { qq: "10000" } },
-				{ type: "text", data: { text: " bili list " } },
+				{ type: "text", data: { text: " bili列表 " } },
 			],
 			"",
 		);
-		expect(text).toBe("bili list");
+		expect(text).toBe("bili列表");
 	});
 
 	it("从 CQ 字符串中去掉 CQ 码", () => {
-		expect(extractOnebotMessageText("[CQ:at,qq=10000] bili list", "")).toBe("bili list");
+		expect(extractOnebotMessageText("[CQ:at,qq=10000] bili列表", "")).toBe("bili列表");
 	});
 
 	it("只解析群聊 message 事件", () => {
@@ -122,16 +131,16 @@ describe("bili OneBot group command parser", () => {
 				group_id: 987,
 				user_id: 123,
 				sender: { role: "admin" },
-				message: [{ type: "text", data: { text: "bili list" } }],
+				message: [{ type: "text", data: { text: "bili列表" } }],
 			}),
-		).toMatchObject({ groupId: "987", userId: "123", role: "admin", text: "bili list" });
+		).toMatchObject({ groupId: "987", userId: "123", role: "admin", text: "bili列表" });
 
 		expect(
 			parseOnebotGroupMessage({
 				post_type: "message",
 				message_type: "private",
 				user_id: 123,
-				message: "bili list",
+				message: "bili列表",
 			}),
 		).toBeNull();
 	});
@@ -182,7 +191,7 @@ describe("bili OneBot group command parser", () => {
 });
 
 describe("bili OneBot group command handler", () => {
-	it("bili add 关注失败时返回失败，并且不创建订阅和群目标", async () => {
+	it("bili订阅 关注失败时返回失败，并且不创建订阅和群目标", async () => {
 		const h = makeRuntime();
 		H.ensureFollowed.mockResolvedValueOnce({
 			ok: false,
@@ -190,7 +199,7 @@ describe("bili OneBot group command handler", () => {
 			message: "已被对方拉黑，无法关注",
 		});
 
-		await sendCommand(h.runtime, "bili add 123456", { groupName: "女仆值班室" });
+		await sendCommand(h.runtime, "bili订阅123456", { groupName: "女仆值班室" });
 
 		expect(h.replies[0]).toContain("订阅失败：无法关注 测试UP");
 		expect(h.subscriptions).toHaveLength(0);
@@ -198,11 +207,11 @@ describe("bili OneBot group command handler", () => {
 		expect(h.patches).toHaveLength(0);
 	});
 
-	it("bili add 成功时自动创建本群推送目标并写入订阅路由", async () => {
+	it("bili订阅 成功时自动创建本群推送目标并写入订阅路由", async () => {
 		const h = makeRuntime();
 		H.ensureFollowed.mockResolvedValueOnce({ ok: true, code: 0 });
 
-		await sendCommand(h.runtime, "bili add 123456", { groupName: "女仆值班室" });
+		await sendCommand(h.runtime, "bili订阅123456", { groupName: "女仆值班室" });
 
 		expect(h.replies[0]).toBe("✅ 订阅成功!\n📺 测试UP\n🔗 UID: 123456");
 		expect(h.targets).toHaveLength(1);
@@ -231,7 +240,7 @@ describe("bili OneBot group command handler", () => {
 		});
 	});
 
-	it("bili add 支持通过 UP 名字精确命中后订阅", async () => {
+	it("bili订阅 支持通过 UP 名字精确命中后订阅", async () => {
 		const h = makeRuntime();
 		H.ensureFollowed.mockResolvedValueOnce({ ok: true, code: 0 });
 		h.runtime.engines.api.searchByType.mockResolvedValueOnce({
@@ -259,7 +268,7 @@ describe("bili OneBot group command handler", () => {
 			},
 		});
 
-		await sendCommand(h.runtime, "bili add 火播君", { groupName: "女仆值班室" });
+		await sendCommand(h.runtime, "bili订阅火播君", { groupName: "女仆值班室" });
 
 		expect(h.runtime.engines.api.searchByType).toHaveBeenCalledWith("bili_user", "火播君", {
 			page: 1,
@@ -270,7 +279,7 @@ describe("bili OneBot group command handler", () => {
 		expect(h.subscriptions[0]?.uid).toBe("268536810");
 	});
 
-	it("bili add 名字命中多个候选时只返回前 5 个 UID，不自动订阅", async () => {
+	it("bili订阅 名字命中多个候选时只返回前 5 个 UID，不自动订阅", async () => {
 		const h = makeRuntime();
 		h.runtime.engines.api.searchByType.mockResolvedValueOnce({
 			code: 0,
@@ -286,24 +295,25 @@ describe("bili OneBot group command handler", () => {
 			},
 		});
 
-		await sendCommand(h.runtime, "bili add 火播");
+		await sendCommand(h.runtime, "bili订阅火播");
 
 		expect(H.ensureFollowed).not.toHaveBeenCalled();
 		expect(h.subscriptions).toHaveLength(0);
 		expect(h.replies[0]).toContain("🔎 找到多个可能的 UP「火播」，请使用 UID 添加：");
 		expect(h.replies[0]).toContain("1. 火播君 · 67.2万粉丝\n   UID: 10001");
 		expect(h.replies[0]).toContain("5. 火播Official · 45 粉丝\n   UID: 10005");
+		expect(h.replies[0]).toContain("请发送：bili订阅<uid>");
 		expect(h.replies[0]).not.toContain("10006");
 	});
 
-	it("bili add 名字无搜索结果时返回未找到", async () => {
+	it("bili订阅 名字无搜索结果时返回未找到", async () => {
 		const h = makeRuntime();
 		h.runtime.engines.api.searchByType.mockResolvedValueOnce({
 			code: 0,
 			data: { result: [] },
 		});
 
-		await sendCommand(h.runtime, "bili add 不存在的UP");
+		await sendCommand(h.runtime, "bili订阅不存在的UP");
 
 		expect(H.ensureFollowed).not.toHaveBeenCalled();
 		expect(h.replies[0]).toBe(
@@ -311,7 +321,7 @@ describe("bili OneBot group command handler", () => {
 		);
 	});
 
-	it("bili del 时同步已有本群推送目标名称", async () => {
+	it("bili取消 时同步已有本群推送目标名称", async () => {
 		const h = makeRuntime();
 		h.targets.push({
 			id: "target-987",
@@ -324,12 +334,12 @@ describe("bili OneBot group command handler", () => {
 		});
 		h.subscriptions.push(makeRoutedSubscription("123456", "测试UP", "target-987"));
 
-		await sendCommand(h.runtime, "bili del 123456", { groupName: "新的群名" });
+		await sendCommand(h.runtime, "bili取消123456", { groupName: "新的群名" });
 
 		expect(h.targets[0]?.name).toBe("新的群名");
 	});
 
-	it("bili add 为已有 UP 新增本群订阅时保持开播开启，但关闭本群开播 @全体", async () => {
+	it("bili订阅 为已有 UP 新增本群订阅时保持开播开启，但关闭本群开播 @全体", async () => {
 		const h = makeRuntime();
 		H.ensureFollowed.mockResolvedValueOnce({ ok: true, code: 0 });
 		h.targets.push({
@@ -345,11 +355,22 @@ describe("bili OneBot group command handler", () => {
 		sub.atAllDefaults.live = true;
 		h.subscriptions.push(sub);
 
-		await sendCommand(h.runtime, "bili add 123456");
+		await sendCommand(h.runtime, "bili订阅123456");
 
 		expect(h.subscriptions[0]?.routing.live).toContain("target-987");
 		expect(h.subscriptions[0]?.atAllDefaults.live).toBe(true);
 		expect(h.subscriptions[0]?.atAll.live).toMatchObject({ "target-987": false });
+	});
+
+	it("普通成员未开启管理权限时，使用管理员命令会回复权限状态", async () => {
+		const h = makeRuntime();
+
+		await sendCommand(h.runtime, "bili订阅123456", { userId: "20000", role: "member" });
+
+		expect(h.replies[0]).toBe(
+			["👥 普通成员管理权限", "状态：已关闭", "普通成员只能查看本群订阅。"].join("\n"),
+		);
+		expect(h.subscriptions).toHaveLength(0);
 	});
 
 	it("群目标开启普通成员管理后，普通成员可以管理本群订阅", async () => {
@@ -364,7 +385,7 @@ describe("bili OneBot group command handler", () => {
 			session: { groupId: "987", allowMemberManage: true },
 		});
 
-		await sendCommand(h.runtime, "bili del 123456", { userId: "20000", role: "member" });
+		await sendCommand(h.runtime, "bili取消123456", { userId: "20000", role: "member" });
 
 		expect(h.replies[0]).toBe("本群未订阅 UID 123456。");
 	});
@@ -381,10 +402,28 @@ describe("bili OneBot group command handler", () => {
 				"🐾 pet",
 				"   表情包命令。",
 				"",
-				"📺 bili help",
+				"📺 bili帮助",
 				"   B站订阅功能。",
 			].join("\n"),
 		);
+	});
+
+	it("旧英文默认 aliases 会自动迁移为中文展示", async () => {
+		const h = makeRuntime();
+		h.globals.commands.aliases = {
+			help: "help",
+			add: "add",
+			del: "del",
+			list: "list",
+			listall: "listall",
+			delall: "delall",
+			delallall: "delallall",
+			member: "member",
+		};
+
+		await sendCommand(h.runtime, "菜单");
+
+		expect(h.replies[0]).toContain("📺 bili帮助");
 	});
 
 	it("@机器人说菜单时回复功能菜单，@其他人不触发", async () => {
@@ -420,14 +459,60 @@ describe("bili OneBot group command handler", () => {
 		});
 		h.subscriptions.push(makeRoutedSubscription("123456", "测试UP", "target-987"));
 
-		await sendCommand(h.runtime, "bili list");
+		await sendCommand(h.runtime, "bili列表");
 
 		expect(h.replies).toHaveLength(0);
 		expect(h.forwardReplies).toHaveLength(1);
 		expect(h.forwardReplies[0]).toMatchObject({ groupId: "987" });
 		expect(h.forwardReplies[0]?.nodes).toEqual([
 			["📺 本群 B 站订阅（1 个）", "第 1/1 页", "", "1. 测试UP（UID 123456）"].join("\n"),
+			["🧩 管理员可用", "• bili订阅<uid>|<名字>：订阅 UP", "• bili取消<uid>：取消订阅"].join("\n"),
 		]);
+	});
+
+	it("bili list 每页 10 个订阅，并在最后追加管理员命令节点", async () => {
+		const h = makeRuntime();
+		h.targets.push({
+			id: "target-987",
+			name: "测试群",
+			adapterId: "onebot-main",
+			platform: "onebot",
+			scope: "group",
+			enabled: true,
+			session: { groupId: "987" },
+		});
+		for (let i = 1; i <= 11; i += 1) {
+			h.subscriptions.push(makeRoutedSubscription(String(100000 + i), `测试UP${i}`, "target-987"));
+		}
+
+		await sendCommand(h.runtime, "bili列表");
+
+		expect(h.replies).toHaveLength(0);
+		expect(h.forwardReplies).toHaveLength(1);
+		expect(h.forwardReplies[0]?.nodes).toHaveLength(3);
+		expect(h.forwardReplies[0]?.nodes[0]).toBe(
+			[
+				"📺 本群 B 站订阅（11 个）",
+				"第 1/2 页",
+				"",
+				"1. 测试UP1（UID 100001）",
+				"2. 测试UP2（UID 100002）",
+				"3. 测试UP3（UID 100003）",
+				"4. 测试UP4（UID 100004）",
+				"5. 测试UP5（UID 100005）",
+				"6. 测试UP6（UID 100006）",
+				"7. 测试UP7（UID 100007）",
+				"8. 测试UP8（UID 100008）",
+				"9. 测试UP9（UID 100009）",
+				"10. 测试UP10（UID 100010）",
+			].join("\n"),
+		);
+		expect(h.forwardReplies[0]?.nodes[1]).toBe(
+			["📺 本群 B 站订阅（11 个）", "第 2/2 页", "", "11. 测试UP11（UID 100011）"].join("\n"),
+		);
+		expect(h.forwardReplies[0]?.nodes[2]).toBe(
+			["🧩 管理员可用", "• bili订阅<uid>|<名字>：订阅 UP", "• bili取消<uid>：取消订阅"].join("\n"),
+		);
 	});
 
 	it("bili list 合并转发失败时回退普通文本", async () => {
@@ -443,7 +528,7 @@ describe("bili OneBot group command handler", () => {
 		});
 		h.subscriptions.push(makeRoutedSubscription("123456", "测试UP", "target-987"));
 
-		await sendCommand(h.runtime, "bili list", { forwardOk: false });
+		await sendCommand(h.runtime, "bili列表", { forwardOk: false });
 
 		expect(h.forwardReplies).toHaveLength(1);
 		expect(h.replies[0]).toBe(
@@ -454,29 +539,55 @@ describe("bili OneBot group command handler", () => {
 	it("bili help 按权限分组展示命令，并隐藏主人命令", async () => {
 		const h = makeRuntime();
 
-		await sendCommand(h.runtime, "bili help");
+		await sendCommand(h.runtime, "bili帮助");
 
-		expect(h.replies[0]).toBe(
-			[
-				"📺 B站订阅助手",
-				"",
-				"🧩 管理员可用",
-				"• bili add <uid>|<名字>：订阅 UP",
-				"• bili del <uid>：取消订阅",
-				"• bili member on|off：设置普通成员管理权限",
-				"• bili member status：查看普通成员管理权限",
-				"",
-				"🔎 普通成员可用",
-				"• bili list：查看本群订阅",
-				"• bili help：显示本说明",
-			].join("\n"),
-		);
+		const expected = [
+			"B站订阅up主 推送动态和直播",
+			"",
+			"🧩 管理员可用",
+			"• bili订阅<uid>|<名字>：订阅 UP",
+			"• bili取消<uid>：取消订阅",
+			"• bili权限开启|关闭：设置普通成员管理权限",
+			"• bili权限状态：查看普通成员管理权限",
+			"",
+			"🔎 普通成员可用",
+			"• bili列表：查看本群订阅",
+			"• bili帮助：显示本说明",
+		].join("\n");
+
+		expect(h.replies).toHaveLength(0);
+		expect(h.forwardReplies).toHaveLength(1);
+		expect(h.forwardReplies[0]).toMatchObject({ groupId: "987" });
+		expect(h.forwardReplies[0]?.nodes).toEqual([expected]);
+	});
+
+	it("bili help 合并转发失败时回退普通文本", async () => {
+		const h = makeRuntime();
+
+		await sendCommand(h.runtime, "bili帮助", { forwardOk: false });
+
+		const expected = [
+			"B站订阅up主 推送动态和直播",
+			"",
+			"🧩 管理员可用",
+			"• bili订阅<uid>|<名字>：订阅 UP",
+			"• bili取消<uid>：取消订阅",
+			"• bili权限开启|关闭：设置普通成员管理权限",
+			"• bili权限状态：查看普通成员管理权限",
+			"",
+			"🔎 普通成员可用",
+			"• bili列表：查看本群订阅",
+			"• bili帮助：显示本说明",
+		].join("\n");
+
+		expect(h.forwardReplies).toHaveLength(1);
+		expect(h.replies[0]).toBe(expected);
 	});
 
 	it("delall 仅主人可用，群管理员也不能清空本群订阅", async () => {
 		const h = makeRuntime();
 
-		await sendCommand(h.runtime, "bili delall", { userId: "20000", role: "admin" });
+		await sendCommand(h.runtime, "bili清空", { userId: "20000", role: "admin" });
 
 		expect(h.replies[0]).toBe("只有主人可以执行这个命令。");
 	});
@@ -484,7 +595,7 @@ describe("bili OneBot group command handler", () => {
 	it("群管理员可以通过指令开启和关闭普通成员管理本群订阅权限", async () => {
 		const h = makeRuntime();
 
-		await sendCommand(h.runtime, "bili member on", { userId: "20000", role: "admin" });
+		await sendCommand(h.runtime, "bili权限开启", { userId: "20000", role: "admin" });
 
 		expect(h.replies[0]).toContain("普通成员管理权限已开启");
 		expect(h.targets).toHaveLength(1);
@@ -495,7 +606,7 @@ describe("bili OneBot group command handler", () => {
 			session: { groupId: "987", allowMemberManage: true },
 		});
 
-		await sendCommand(h.runtime, "bili member off", { userId: "20000", role: "admin" });
+		await sendCommand(h.runtime, "bili权限关闭", { userId: "20000", role: "admin" });
 
 		expect(h.replies[1]).toContain("普通成员管理权限已关闭");
 		expect(h.targets[0]).toMatchObject({
@@ -518,7 +629,7 @@ describe("bili OneBot group command handler", () => {
 			session: { groupId: "987", allowMemberManage: true },
 		});
 
-		await sendCommand(h.runtime, "bili member off", { userId: "20000", role: "member" });
+		await sendCommand(h.runtime, "bili权限关闭", { userId: "20000", role: "member" });
 
 		expect(h.replies[0]).toBe("只有群主、管理员或主人可以修改普通成员管理权限。");
 		expect((h.targets[0] as Extract<PushTarget, { platform: "onebot" }>).session).toMatchObject({

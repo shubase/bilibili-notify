@@ -149,7 +149,7 @@ export const FIELD_LABELS = {
 	},
 	"commands.prefix": {
 		label: "命令前缀",
-		hint: "默认 bili；不支持空格。示例：bili add 123456",
+		hint: "默认 bili；不支持空格。示例：bili订阅123456",
 		section: "commands",
 	},
 	"commands.ownerQq": {
@@ -198,7 +198,7 @@ export const FIELD_LABELS = {
 	},
 	"commands.aliases.member": {
 		label: "普通成员管理权限",
-		hint: "群主、管理员、主人可用；默认用法 bili member on/off/status。",
+		hint: "群主、管理员、主人可用；默认用法 bili权限开启 / bili权限关闭 / bili权限状态。",
 		section: "commands",
 	},
 
@@ -603,7 +603,7 @@ export const FIELD_LABELS = {
 	"session.groupId": { label: "群号 (groupId)", section: "session" },
 	"session.allowMemberManage": {
 		label: "普通成员可管理本群订阅",
-		hint: "关闭时只有群主、管理员和主人能执行 bili add / del；bili delall 仅主人可用。",
+		hint: "关闭时只有群主、管理员和主人能执行 bili订阅 / bili取消；bili清空 仅主人可用。",
 		section: "session",
 	},
 	// QQ 官方机器人会话寻址(按 scope)

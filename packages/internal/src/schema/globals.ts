@@ -112,14 +112,14 @@ export type MasterConfig = z.infer<typeof MasterConfigSchema>;
 export const DEFAULT_COMMAND_PREFIX = "bili";
 export const DEFAULT_COMMAND_OWNER_QQ = "1319870047";
 export const DEFAULT_COMMAND_ALIASES = {
-	help: "help",
-	add: "add",
-	del: "del",
-	list: "list",
-	listall: "listall",
-	delall: "delall",
-	delallall: "delallall",
-	member: "member",
+	help: "帮助",
+	add: "订阅",
+	del: "取消",
+	list: "列表",
+	listall: "全部列表",
+	delall: "清空",
+	delallall: "清空全部",
+	member: "权限",
 } as const;
 export const DEFAULT_VIDEO_PARSE_CONFIG = {
 	enabled: true,

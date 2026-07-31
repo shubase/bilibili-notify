@@ -60,6 +60,7 @@ import {
 import { BilibiliPush } from "@bilibili-notify/push";
 import type { SubscriptionStore } from "@bilibili-notify/subscription";
 import { attachReadOnlyTools } from "../ai/read-only-tools.js";
+import { commandHelpHintFromGlobals } from "../commands/bili-onebot.js";
 import type { ConfigStore } from "../config/store.js";
 import type { HistoryStore } from "../history/store.js";
 import type { PlatformAdapter, ProbeResult } from "../platforms/types.js";
@@ -431,7 +432,8 @@ export function createEngines(opts: CreateEnginesOptions): EnginesRuntime {
 	};
 
 	const dynamicConfig = (): DynamicEngineConfig => {
-		const f = globals().defaults.filters;
+		const g = globals();
+		const f = g.defaults.filters;
 		// New schema uses array-of-regex while the engine takes a single combined
 		// regex string; join with `|` (capturing-group safe since users supply
 		// alt patterns themselves).
@@ -443,14 +445,14 @@ export function createEngines(opts: CreateEnginesOptions): EnginesRuntime {
 			f.blockDraw ||
 			f.blockAv;
 		const whitelistHasRules = f.whitelistKeywords.length > 0 || f.whitelistRegex.length > 0;
-		return {
-			dynamicCron: globals().app.dynamicCron,
+		const config = {
+			dynamicCron: g.app.dynamicCron,
 			dynamicVideoUrlToBV: false,
-			imageGroup: globals().defaults.imageGroup,
-			imageEnabled: globals().defaults.cardStyle.enabled,
-			aiEnabled: globals().defaults.ai.enabled,
-			dynamicTemplate: globals().defaults.templates.dynamic,
-			videoTemplate: globals().defaults.templates.dynamicVideo,
+			imageGroup: g.defaults.imageGroup,
+			imageEnabled: g.defaults.cardStyle.enabled,
+			aiEnabled: g.defaults.ai.enabled,
+			dynamicTemplate: g.defaults.templates.dynamic,
+			videoTemplate: g.defaults.templates.dynamicVideo,
 			filter: {
 				enable: blockHasRules,
 				notify: false,
@@ -465,8 +467,10 @@ export function createEngines(opts: CreateEnginesOptions): EnginesRuntime {
 				whitelistKeywords: f.whitelistKeywords,
 			},
 			// 无 per-UP 背景覆盖的 UP 靠它轮换全局默认图廊(见 pickDynamicColorOptions)。
-			defaultBackgroundImages: globals().defaults.cardStyle.backgroundImages,
+			defaultBackgroundImages: g.defaults.cardStyle.backgroundImages,
+			helpHint: commandHelpHintFromGlobals(g),
 		};
+		return config;
 	};
 
 	const dynamic = new DynamicEngine({
@@ -723,6 +727,7 @@ export function createEngines(opts: CreateEnginesOptions): EnginesRuntime {
 				const featuresChanged = !eq(prev.defaults.features, g.defaults.features);
 				const layoutChanged = !eq(prev.defaults.cardLayout, g.defaults.cardLayout);
 				const messageLayoutChanged = !eq(prev.defaults.messageLayout, g.defaults.messageLayout);
+				const commandsChanged = !eq(prev.commands, g.commands);
 
 				// `app` 是一个 section,但里面装着三件互不相干的事(日志等级 / User-Agent /
 				// 健康检查间隔)。以整个 section 为门会让它们互相牵连 —— 改个 dynamicCron
@@ -769,7 +774,8 @@ export function createEngines(opts: CreateEnginesOptions): EnginesRuntime {
 					imageGroupChanged ||
 					cardStyleChanged ||
 					aiChanged ||
-					templatesChanged
+					templatesChanged ||
+					commandsChanged
 				) {
 					dynamic.updateConfig(dynamicConfig());
 				}

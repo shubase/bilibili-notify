@@ -507,6 +507,7 @@ export class ImageRenderer {
 		colorOptions: CardColorOptions = {},
 		/** dynamic 版式描述符;缺省 = 默认版式(复刻现状)。 */
 		layout?: CardBlock[],
+		options: { helpHint?: string } = {},
 	): Promise<Buffer> {
 		const t0 = Date.now();
 		const { cardColorStart = this.config.cardColorStart, cardColorEnd = this.config.cardColorEnd } =
@@ -533,6 +534,7 @@ export class ImageRenderer {
 				glassOpacity,
 				glassClear,
 				backgroundImage,
+				helpHint: options.helpHint,
 				node,
 				layout,
 			},

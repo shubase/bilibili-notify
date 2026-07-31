@@ -24,13 +24,19 @@ export type DynamicCardProps = {
 	glassClear?: boolean;
 	/** 自定义背景图(已解析的 data URL / http URL);非空时替换外框渐变。 */
 	backgroundImage?: string;
+	/** 顶部右侧提示语，仅渲染在最外层动态卡片 header。 */
+	helpHint?: string;
 };
 
 /**
  * 由一个 DynamicNode + 版式生成各块构建器(按 type)。content 块内嵌转发原动态时,用
  * 同一份 layout 递归调用 renderBlocks —— 内部动态因此完全跟随用户的块顺序 / 显隐 / 边距。
  */
-function nodeBuilders(node: DynamicNode, layout: CardBlock[]): Record<string, () => VNode | null> {
+function nodeBuilders(
+	node: DynamicNode,
+	layout: CardBlock[],
+	helpHint?: string,
+): Record<string, () => VNode | null> {
 	return {
 		[DIVIDER_TYPE]: () => (
 			<div style="height: 1px; background: rgba(0,0,0,0.06); margin: 0 16px;" />
@@ -43,7 +49,7 @@ function nodeBuilders(node: DynamicNode, layout: CardBlock[]): Record<string, ()
 					src={node.avatarUrl}
 					alt="头像"
 				/>
-				<div class="flex flex-col gap-[3px]">
+				<div class="flex min-w-0 flex-1 flex-col gap-[3px]">
 					<span
 						class="text-[17px] font-bold leading-none"
 						style={{ color: node.upIsVip ? "#FB7299" : "#18191C" }}
@@ -55,6 +61,14 @@ function nodeBuilders(node: DynamicNode, layout: CardBlock[]): Record<string, ()
 						{node.pubTime}
 					</span>
 				</div>
+				{helpHint ? (
+					<div
+						class="ml-auto shrink-0 text-right text-[12px] font-medium leading-[1.35]"
+						style="color: #999; max-width: 160px; overflow-wrap: anywhere;"
+					>
+						{helpHint}
+					</div>
+				) : null}
 			</div>
 		),
 
@@ -121,7 +135,7 @@ export function DynamicCard(p: DynamicCardProps) {
 				class="w-full overflow-hidden rounded-[12px]"
 				style={`background: rgba(255,255,255,${glass}); backdrop-filter: blur(${blur}px); box-shadow: 0 4px 16px rgba(0,0,0,0.12); padding-top: 14px; padding-bottom: 12px;`}
 			>
-				{renderBlocks(layout, nodeBuilders(p.node, layout))}
+				{renderBlocks(layout, nodeBuilders(p.node, layout, p.helpHint))}
 			</div>
 		</div>
 	);

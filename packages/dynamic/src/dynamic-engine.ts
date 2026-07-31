@@ -188,6 +188,8 @@ export interface DynamicEngineConfig {
 	 * 否则这些 UP 会一直渲染渲染器内部缓存的静态首图,图廊配再多张也不轮换。
 	 */
 	defaultBackgroundImages?: string[];
+	/** 动态卡片 header 右侧提示语，例如“发送 bili帮助 获取菜单”。 */
+	helpHint?: string;
 }
 
 export interface DynamicEngineOptions {
@@ -832,10 +834,17 @@ export class DynamicEngine {
 						// dynamic-engine 与 image-engine 的 Dynamic 类型同源同构（皆为 Bilibili
 						// 动态接口的子集，仅声明字段不同），运行时是同一对象。这里用 unknown
 						// 中转的类型断言避开两份独立 .d.ts 的结构性差异。
-						buffer = await this.image.generateDynamicCard(
+						const generateDynamicCard = this.image.generateDynamicCard.bind(this.image) as (
+							data: Parameters<ImageRenderer["generateDynamicCard"]>[0],
+							colorOptions?: Parameters<ImageRenderer["generateDynamicCard"]>[1],
+							layout?: Parameters<ImageRenderer["generateDynamicCard"]>[2],
+							options?: { helpHint?: string },
+						) => Promise<Buffer>;
+						buffer = await generateDynamicCard(
 							item as unknown as Parameters<ImageRenderer["generateDynamicCard"]>[0],
 							this.pickDynamicColorOptions(uid, sub?.customCardStyle),
 							sub?.dynamicLayout,
+							{ helpHint: this.config.helpHint },
 						);
 					}
 				} catch (e) {

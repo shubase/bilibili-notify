@@ -8,6 +8,7 @@ import {
 	DEFAULT_COMMAND_OWNER_QQ,
 	DEFAULT_COMMAND_PREFIX,
 	FEATURE_KEYS,
+	type GlobalConfig,
 	makeEmptySubscription,
 	type PushTarget,
 	type Subscription,
@@ -29,7 +30,7 @@ const COMMAND_KINDS: readonly BiliCommandKind[] = [
 	"delallall",
 	"member",
 ];
-const LIST_FORWARD_PAGE_SIZE = 30;
+const LIST_FORWARD_PAGE_SIZE = 10;
 const USER_SEARCH_PAGE_SIZE = 5;
 const USER_SEARCH_KEYWORD_MAX_LENGTH = 50;
 const MENU_TRIGGER = "菜单";
@@ -51,6 +52,22 @@ const DEFAULT_COMMAND_CONFIG: ResolvedCommandConfig = {
 	ownerQq: DEFAULT_COMMAND_OWNER_QQ,
 	aliases: { ...DEFAULT_COMMAND_ALIASES },
 };
+const LEGACY_COMMAND_ALIASES: CommandAliases = {
+	help: "help",
+	add: "add",
+	del: "del",
+	list: "list",
+	listall: "listall",
+	delall: "delall",
+	delallall: "delallall",
+	member: "member",
+};
+
+export function commandHelpHintFromGlobals(globals: GlobalConfig): string | undefined {
+	const config = resolveCommandConfigFromGlobals(globals);
+	if (!config.enabled) return undefined;
+	return `发送 ${commandUsage(config, "help")} 获取菜单`;
+}
 
 export type BiliCommand =
 	| { kind: "help" }
@@ -100,13 +117,15 @@ export function parseBiliCommand(
 	if (!config.enabled) return null;
 	const text = input.trim();
 	if (!text) return null;
-	const afterPrefix = parseAfterPrefix(text, config.prefix);
-	if (afterPrefix === null) return null;
-	const actionToken = firstToken(afterPrefix);
-	const action = actionToken?.toLowerCase() ?? config.aliases.help.toLowerCase();
-	const argsText = actionToken ? afterPrefix.slice(actionToken.length).trim() : "";
+	const parsed = parseAfterPrefix(text, config.prefix);
+	if (!parsed) return null;
+	const action = parseCommandAction(parsed.afterPrefix, config.aliases);
+	if (!action)
+		return parsed.separated
+			? { kind: "unknown", reason: `未知命令：${firstToken(parsed.afterPrefix) ?? ""}` }
+			: null;
+	const { matched, argsText } = action;
 	const tokens = argsText ? argsText.split(/\s+/) : [];
-	const matched = commandKindByAlias(config.aliases, action);
 
 	if (matched === "help") {
 		return tokens.length === 0 ? { kind: "help" } : badUsage(commandUsage(config, "help"));
@@ -128,7 +147,7 @@ export function parseBiliCommand(
 	if (matched === "member") {
 		const action = parseMemberPermissionAction(tokens[0]);
 		if (tokens.length !== 1 || !action) {
-			return badUsage(commandUsage(config, "member", "on|off|status"));
+			return badUsage(commandUsage(config, "member", "开启|关闭|状态"));
 		}
 		return { kind: "member", action };
 	}
@@ -146,7 +165,7 @@ export function parseBiliCommand(
 		return { kind: "del", uid };
 	}
 
-	return { kind: "unknown", reason: `未知命令：${actionToken ?? ""}` };
+	return { kind: "unknown", reason: `未知命令：${firstToken(parsed.afterPrefix) ?? ""}` };
 }
 
 export function extractOnebotMessageText(message: unknown, rawMessage: unknown): string {
@@ -251,13 +270,26 @@ export function createBiliOnebotCommandHandler(runtime: AppRuntime): OnebotInbou
 			return;
 		}
 		if (requiresGroupAdmin(command) && !canManageGroup) {
-			await reply("只有群主、管理员、主人或已授权的普通成员可以管理本群订阅。");
+			await reply(formatMemberManageStatus(false, commandConfig));
 			return;
 		}
 
 		try {
+			if (command.kind === "help") {
+				const text = helpText(isOwner, commandConfig);
+				const result = await sendGroupForwardText(event.groupId, [text]);
+				if (result.ok) return;
+				log.warn(
+					`[bili-command] 转发群 ${event.groupId} 帮助失败: ${
+						result.err ?? "unknown"
+					}，回退普通文本`,
+				);
+				await reply(text);
+				return;
+			}
+
 			if (command.kind === "list") {
-				const list = buildGroupSubscriptionList(runtime, adapterId, event.groupId);
+				const list = buildGroupSubscriptionList(runtime, adapterId, event.groupId, commandConfig);
 				if (list.forwardNodes.length > 0) {
 					const result = await sendGroupForwardText(event.groupId, list.forwardNodes);
 					if (result.ok) return;
@@ -299,7 +331,14 @@ async function handleBiliCommand(
 		case "unknown":
 			return `${command.reason}\n\n发送 ${commandUsage(perm.config, "help")} 查看可用命令。`;
 		case "add":
-			return addSubscription(runtime, adapterId, event.groupId, command.query, perm.groupName);
+			return addSubscription(
+				runtime,
+				adapterId,
+				event.groupId,
+				command.query,
+				perm.groupName,
+				perm.config,
+			);
 		case "del":
 			return deleteGroupSubscription(
 				runtime,
@@ -309,7 +348,7 @@ async function handleBiliCommand(
 				perm.groupName,
 			);
 		case "list":
-			return listGroupSubscriptions(runtime, adapterId, event.groupId);
+			return listGroupSubscriptions(runtime, adapterId, event.groupId, perm.config);
 		case "listall":
 			return listAllSubscriptions(runtime);
 		case "delall":
@@ -333,6 +372,7 @@ async function addSubscription(
 	groupId: string,
 	query: string,
 	groupName?: string | null,
+	config?: ResolvedCommandConfig,
 ): Promise<string> {
 	const engines = runtime.engines;
 	if (!engines) return "B 站 API 尚未就绪，稍后再试。";
@@ -346,7 +386,7 @@ async function addSubscription(
 		return `订阅失败：当前群推送目标「${existingTarget.name}」已禁用，请先在 Dashboard 启用。`;
 	}
 
-	const profileResult = await resolveAddProfile(runtime, query);
+	const profileResult = await resolveAddProfile(runtime, query, config ?? DEFAULT_COMMAND_CONFIG);
 	if (!profileResult.ok) return profileResult.message;
 	const { profile } = profileResult;
 	const uid = profile.uid;
@@ -469,14 +509,20 @@ async function setMemberManagePermission(
 	return formatMemberManageUpdate(enabled, config);
 }
 
-function listGroupSubscriptions(runtime: AppRuntime, adapterId: string, groupId: string): string {
-	return buildGroupSubscriptionList(runtime, adapterId, groupId).text;
+function listGroupSubscriptions(
+	runtime: AppRuntime,
+	adapterId: string,
+	groupId: string,
+	config: ResolvedCommandConfig,
+): string {
+	return buildGroupSubscriptionList(runtime, adapterId, groupId, config).text;
 }
 
 function buildGroupSubscriptionList(
 	runtime: AppRuntime,
 	adapterId: string,
 	groupId: string,
+	config: ResolvedCommandConfig,
 ): GroupSubscriptionListResult {
 	const target = findGroupTarget(runtime, adapterId, groupId);
 	if (!target) return { text: "本群暂无 B 站订阅。", forwardNodes: [] };
@@ -495,8 +541,17 @@ function buildGroupSubscriptionList(
 		const items = itemLines.slice(start, start + LIST_FORWARD_PAGE_SIZE);
 		return [header, `第 ${pageIndex + 1}/${pageCount} 页`, "", ...items].join("\n");
 	});
+	forwardNodes.push(listAdminHelpText(config));
 
 	return { text, forwardNodes };
+}
+
+function listAdminHelpText(config: ResolvedCommandConfig): string {
+	return [
+		"🧩 管理员可用",
+		`• ${commandUsage(config, "add", "<uid>|<名字>")}：订阅 UP`,
+		`• ${commandUsage(config, "del", "<uid>")}：取消订阅`,
+	].join("\n");
 }
 
 function listAllSubscriptions(runtime: AppRuntime): string {
@@ -524,13 +579,13 @@ function listAllSubscriptions(runtime: AppRuntime): string {
 
 function helpText(_isOwner: boolean, config: ResolvedCommandConfig): string {
 	return [
-		"📺 B站订阅助手",
+		"B站订阅up主 推送动态和直播",
 		"",
 		"🧩 管理员可用",
 		`• ${commandUsage(config, "add", "<uid>|<名字>")}：订阅 UP`,
 		`• ${commandUsage(config, "del", "<uid>")}：取消订阅`,
-		`• ${commandUsage(config, "member", "on|off")}：设置普通成员管理权限`,
-		`• ${commandUsage(config, "member", "status")}：查看普通成员管理权限`,
+		`• ${commandUsage(config, "member", "开启|关闭")}：设置普通成员管理权限`,
+		`• ${commandUsage(config, "member", "状态")}：查看普通成员管理权限`,
 		"",
 		"🔎 普通成员可用",
 		`• ${commandUsage(config, "list")}：查看本群订阅`,
@@ -572,6 +627,7 @@ function formatMemberManageStatus(enabled: boolean, config: ResolvedCommandConfi
 async function resolveAddProfile(
 	runtime: AppRuntime,
 	query: string,
+	config: ResolvedCommandConfig,
 ): Promise<{ ok: true; profile: UpProfile } | { ok: false; message: string }> {
 	const normalized = normalizeAddQuery(query);
 	if (!normalized) return { ok: false, message: "订阅失败：请输入 UID 或 UP 主名字。" };
@@ -582,12 +638,13 @@ async function resolveAddProfile(
 			message: "订阅失败：UP 主名字太长，请换更精确的关键词，或直接使用 UID。",
 		};
 	}
-	return lookupUpProfileByName(runtime, normalized);
+	return lookupUpProfileByName(runtime, normalized, config);
 }
 
 async function lookupUpProfileByName(
 	runtime: AppRuntime,
 	keyword: string,
+	config: ResolvedCommandConfig,
 ): Promise<{ ok: true; profile: UpProfile } | { ok: false; message: string }> {
 	const engines = runtime.engines;
 	if (!engines) return { ok: false, message: "B 站 API 尚未就绪，稍后再试。" };
@@ -618,7 +675,8 @@ async function lookupUpProfileByName(
 		);
 		const candidate =
 			exactMatches.length === 1 ? exactMatches[0] : candidates.length === 1 ? candidates[0] : null;
-		if (!candidate) return { ok: false, message: formatUserSearchCandidates(keyword, candidates) };
+		if (!candidate)
+			return { ok: false, message: formatUserSearchCandidates(keyword, candidates, config) };
 		return lookupUpProfile(runtime, candidate.uid);
 	} catch (err) {
 		return {
@@ -697,7 +755,11 @@ function parseUserSearchCandidate(item: unknown): UpSearchCandidate | null {
 	return fans !== null ? { uid, name, fans } : { uid, name };
 }
 
-function formatUserSearchCandidates(keyword: string, candidates: UpSearchCandidate[]): string {
+function formatUserSearchCandidates(
+	keyword: string,
+	candidates: UpSearchCandidate[],
+	config: ResolvedCommandConfig,
+): string {
 	return [
 		`🔎 找到多个可能的 UP「${keyword}」，请使用 UID 添加：`,
 		"",
@@ -706,7 +768,7 @@ function formatUserSearchCandidates(keyword: string, candidates: UpSearchCandida
 			return `${index + 1}. ${candidate.name}${fans}\n   UID: ${candidate.uid}`;
 		}),
 		"",
-		`仅显示前 ${USER_SEARCH_PAGE_SIZE} 个结果，请发送：bili add <uid>`,
+		`仅显示前 ${USER_SEARCH_PAGE_SIZE} 个结果，请发送：${commandUsage(config, "add", "<uid>")}`,
 	].join("\n");
 }
 
@@ -913,16 +975,27 @@ function requiresGroupAdmin(command: BiliCommand): boolean {
 }
 
 function resolveCommandConfig(runtime: AppRuntime): ResolvedCommandConfig {
-	const globals = runtime.configStore.getGlobals();
+	return resolveCommandConfigFromGlobals(runtime.configStore.getGlobals());
+}
+
+function resolveCommandConfigFromGlobals(globals: GlobalConfig): ResolvedCommandConfig {
 	const commandConfig = globals.commands as CommandConfig | undefined;
+	const aliases = isLegacyDefaultAliases(commandConfig?.aliases)
+		? undefined
+		: commandConfig?.aliases;
 	const ownerQq =
 		commandConfig?.ownerQq?.trim() || globals.master.ownerQq?.trim() || DEFAULT_COMMAND_OWNER_QQ;
 	return {
 		enabled: commandConfig?.enabled ?? true,
 		prefix: normalizeToken(commandConfig?.prefix, DEFAULT_COMMAND_PREFIX),
 		ownerQq: /^\d+$/.test(ownerQq) ? ownerQq : DEFAULT_COMMAND_OWNER_QQ,
-		aliases: normalizeAliases(commandConfig?.aliases),
+		aliases: normalizeAliases(aliases),
 	};
+}
+
+function isLegacyDefaultAliases(aliases: Partial<CommandAliases> | undefined): boolean {
+	if (!aliases) return false;
+	return COMMAND_KINDS.every((kind) => aliases[kind] === LEGACY_COMMAND_ALIASES[kind]);
 }
 
 function normalizeAliases(aliases: Partial<CommandAliases> | undefined): CommandAliases {
@@ -943,17 +1016,40 @@ function normalizeToken(value: string | undefined, fallback: string): string {
 	return token && !/\s/.test(token) ? token : fallback;
 }
 
-function commandKindByAlias(aliases: CommandAliases, action: string): BiliCommandKind | undefined {
-	const normalized = action.toLowerCase();
-	return COMMAND_KINDS.find((kind) => aliases[kind].toLowerCase() === normalized);
+function parseCommandAction(
+	text: string,
+	aliases: CommandAliases,
+): { matched: BiliCommandKind; argsText: string } | null {
+	if (!text) return { matched: "help", argsText: "" };
+
+	const candidates = COMMAND_KINDS.flatMap((kind) => [
+		{ kind, alias: aliases[kind], priority: 0 },
+		{ kind, alias: LEGACY_COMMAND_ALIASES[kind], priority: 1 },
+	]).sort((a, b) => b.alias.length - a.alias.length || a.priority - b.priority);
+	const normalized = text.toLowerCase();
+	for (const { kind, alias } of candidates) {
+		const normalizedAlias = alias.toLowerCase();
+		if (normalized === normalizedAlias) return { matched: kind, argsText: "" };
+		if (!normalized.startsWith(normalizedAlias)) continue;
+
+		const rest = text.slice(alias.length);
+		if (!rest) return { matched: kind, argsText: "" };
+		return { matched: kind, argsText: rest.trim() };
+	}
+	return null;
 }
 
-function parseAfterPrefix(text: string, prefix: string): string | null {
-	if (text === prefix) return "";
+function parseAfterPrefix(
+	text: string,
+	prefix: string,
+): { afterPrefix: string; separated: boolean } | null {
+	if (text === prefix) return { afterPrefix: "", separated: true };
 	if (!text.startsWith(prefix)) return null;
 	const next = text[prefix.length];
-	if (!next || !/\s/.test(next)) return null;
-	return text.slice(prefix.length).trimStart();
+	if (!next) return { afterPrefix: "", separated: true };
+	if (/\s/.test(next))
+		return { afterPrefix: text.slice(prefix.length).trimStart(), separated: true };
+	return { afterPrefix: text.slice(prefix.length).trim(), separated: false };
 }
 
 function firstToken(text: string): string | null {
@@ -961,7 +1057,7 @@ function firstToken(text: string): string | null {
 }
 
 function commandUsage(config: ResolvedCommandConfig, kind: BiliCommandKind, arg?: string): string {
-	return [config.prefix, config.aliases[kind], arg].filter(Boolean).join(" ");
+	return `${config.prefix}${config.aliases[kind]}${arg ?? ""}`;
 }
 
 function badUsage(usage: string): BiliCommand {

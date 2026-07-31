@@ -18,6 +18,16 @@ const DEFAULT_PREFIX = "bili";
 const DEFAULT_OWNER_QQ = "1319870047";
 const DEFAULT_VIDEO_PARSE = { enabled: true };
 const DEFAULT_ALIASES: CommandAliases = {
+	help: "帮助",
+	add: "订阅",
+	del: "取消",
+	list: "列表",
+	listall: "全部列表",
+	delall: "清空",
+	delallall: "清空全部",
+	member: "权限",
+};
+const LEGACY_ALIASES: CommandAliases = {
 	help: "help",
 	add: "add",
 	del: "del",
@@ -43,7 +53,7 @@ const COMMAND_ROWS: ReadonlyArray<{
 	{ key: "listall", meaning: "查看全部订阅", badge: "主人" },
 	{ key: "delall", meaning: "清空本群订阅", badge: "主人" },
 	{ key: "delallall", meaning: "删除全部订阅", badge: "主人" },
-	{ key: "member", arg: "on|off|status", meaning: "普通成员管理权限", badge: "群管" },
+	{ key: "member", arg: "开启|关闭|状态", meaning: "普通成员管理权限", badge: "群管" },
 ];
 
 function deepMerge<T>(base: T, patch: GlobalConfigPatch): T {
@@ -74,6 +84,7 @@ function deepMerge<T>(base: T, patch: GlobalConfigPatch): T {
 
 function editableCommands(draft: GlobalConfig): CommandConfig {
 	const commands = draft.commands ?? ({} as CommandConfig);
+	const aliases = isLegacyDefaultAliases(commands.aliases) ? undefined : commands.aliases;
 	return {
 		enabled: commands.enabled ?? true,
 		prefix: commands.prefix ?? DEFAULT_PREFIX,
@@ -84,9 +95,16 @@ function editableCommands(draft: GlobalConfig): CommandConfig {
 		},
 		aliases: {
 			...DEFAULT_ALIASES,
-			...(commands.aliases ?? {}),
+			...(aliases ?? {}),
 		},
 	};
+}
+
+function isLegacyDefaultAliases(aliases: Partial<CommandAliases> | undefined): boolean {
+	if (!aliases) return false;
+	return (Object.keys(LEGACY_ALIASES) as Array<keyof CommandAliases>).every(
+		(key) => aliases[key] === LEGACY_ALIASES[key],
+	);
 }
 
 function previewToken(value: string | undefined, fallback: string): string {
@@ -95,13 +113,9 @@ function previewToken(value: string | undefined, fallback: string): string {
 }
 
 function commandPreview(commands: CommandConfig, key: AliasKey, arg?: string): string {
-	return [
-		previewToken(commands.prefix, DEFAULT_PREFIX),
-		previewToken(commands.aliases[key], DEFAULT_ALIASES[key]),
-		arg,
-	]
-		.filter(Boolean)
-		.join(" ");
+	const prefix = previewToken(commands.prefix, DEFAULT_PREFIX);
+	const alias = previewToken(commands.aliases[key], DEFAULT_ALIASES[key]);
+	return `${prefix}${alias}${arg ?? ""}`;
 }
 
 function duplicateAliases(aliases: CommandAliases): Set<AliasKey> {
