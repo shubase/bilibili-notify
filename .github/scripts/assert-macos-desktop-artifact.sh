@@ -14,26 +14,45 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# 布局**只声明一次**,在 apps/desktop/layout.json —— 生产端、外壳、两个闸都读它。
+# 这里不再手抄一份路径清单:手抄的那份一旦落后于外壳,macOS 这条闸只查文件存在,
+# 照样绿,而用户拿到的是一个起不来的包。
+layout_file="apps/desktop/layout.json"
+node_bin=$(jq -er '.nodeBinary.macos' "$layout_file")
+# 不用 mapfile:那是 bash 4 的内建,而 macOS 上的 /bin/bash 至今是 3.2。
+required_rel=()
+while IFS= read -r rel; do
+	required_rel+=("$rel")
+done < <(jq -er '.requiredUnderResources[]' "$layout_file")
+# 禁止出现的目录(运行时数据 / 日志 / node_modules)同样来自声明:生产端扫的就是这一份。
+forbidden_rel=()
+while IFS= read -r rel; do
+	forbidden_rel+=("$rel")
+done < <(jq -er '.forbiddenUnderResources[]' "$layout_file")
+
 assert_resources_dir() {
 	local resources_dir="$1"
 	local label="$2"
-	for rel in node/bin/node app/apps/server/lib/index.mjs BUILD_INFO.json; do
+	for rel in "$node_bin" "${required_rel[@]}"; do
 		if [ ! -e "$resources_dir/$rel" ]; then
 			echo "::error::$label missing resources/$rel"
 			exit 1
 		fi
 	done
-	if [ ! -x "$resources_dir/node/bin/node" ]; then
+	if [ ! -x "$resources_dir/$node_bin" ]; then
 		echo "::error::$label Node binary is not executable"
 		exit 1
 	fi
+	local forbidden_paths=()
+	local rel
+	for rel in "${forbidden_rel[@]}"; do
+		forbidden_paths+=(-o -path "*/$rel" -o -path "*/$rel/*")
+	done
 	local forbidden
 	forbidden=$(find "$resources_dir" \( \
 		-name 'bn.config.yaml' -o -name 'bn.config.yml' -o -name 'bn.config.json' -o \
-		-name 'master.key' -o -name '.env*' -o -name '*.pem' -o -name '*.key' -o -name '*.enc' -o \
-		-path '*/app/apps/server/data' -o -path '*/app/apps/server/data/*' -o \
-		-path '*/app/apps/server/logs' -o -path '*/app/apps/server/logs/*' -o \
-		-path '*/app/node_modules/.pnpm' -o -path '*/app/node_modules/.pnpm/*' \
+		-name 'master.key' -o -name '.env*' -o -name '*.pem' -o -name '*.key' -o -name '*.enc' \
+		"${forbidden_paths[@]}" \
 	\) -print -quit)
 	if [ -n "$forbidden" ]; then
 		echo "::error::$label contains forbidden runtime file: $forbidden"

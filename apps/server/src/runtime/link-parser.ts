@@ -1,0 +1,313 @@
+/**
+ * 链接解析 —— 群里有人贴 B 站视频链接,机器人自动回一张视频卡片。
+ *
+ * 与指令分发器并列挂在 OneBot 入站帧上,但它**不是指令**:没有前缀、不认主人、
+ * 群里谁贴都算。正因为谁都能触发,它默认关着、有冷却、失败不回话 —— 群里没人
+ * 要求解析,失败了还回一句只是噪音,而且等于把「机器人在这个群里」广播出去。
+ *
+ * 回到来源群不走推送目标表:用收到这一帧的那个 adapter 直接发,群不必配成推送目标。
+ *
+ * 两个平台两个入口:OneBot 的原始帧走 {@link LinkParser.handle},官机网关已经解析好的群消息
+ * 走 {@link LinkParser.handleMessage} —— 同一套闸门与流程,只有「怎么拿到文本」不同。
+ */
+
+import type { VideoInfo, VideoRef } from "@bilibili-notify/api";
+import type { CardColorOptions, Dynamic, RenderPriority } from "@bilibili-notify/image";
+import {
+	type AdapterCapabilities,
+	type CardBlock,
+	type DeliveryResult,
+	extractVideoLinks,
+	type INBOUND_CAPABLE_PLATFORMS,
+	LINK_LIMITS,
+	type LinkLimits,
+	type LinkParsingConfig,
+	type LinkParsingPolicy,
+	type Logger,
+	type NotificationPayload,
+	type VideoLinkRef,
+	videoLinkKey,
+} from "@bilibili-notify/internal";
+import type { InboundGroupMessage } from "../platforms/types.js";
+import { RecencyTable } from "../util/recency-table.js";
+import { linkScopeKey } from "./link-scope.js";
+import { videoToDynamic } from "./video-card.js";
+
+/** 一条消息里最多解析几个链接 —— 再多就是刷屏了,也没人真需要。 */
+const MAX_LINKS_PER_MESSAGE = 3;
+
+const BUDGET_WINDOW_MS = 60_000;
+
+/**
+ * 链接从哪个平台来 —— 就是「我们真的收得到入站消息」的那批平台,别另立一份名单:
+ * 加第三个平台时只改一处的话,它能审批却解析不了群链接,而且哪儿都不报错。
+ */
+export type LinkSourcePlatform = (typeof INBOUND_CAPABLE_PLATFORMS)[number];
+
+/** 回复往哪儿发:平台决定用哪个适配器,`groupId` 在 OneBot 是群号、在官机是群 openid。 */
+export interface LinkReplyDestination {
+	platform: LinkSourcePlatform;
+	adapterId: string;
+	groupId: string;
+}
+
+/** adapter 归一化好的一条群消息,再带上它从哪个平台、哪条连接来。 */
+export interface InboundLinkMessage extends InboundGroupMessage {
+	platform: LinkSourcePlatform;
+	adapterId: string;
+}
+
+/** 一张链接卡的呈现;缺省项交给渲染器的全局配置兜底。 */
+export interface LinkCardPresentation {
+	colors?: CardColorOptions;
+	layout?: CardBlock[];
+}
+
+export interface LinkParserOptions {
+	logger: Logger;
+	/** 面板上那份配置。**现读**,不快照 —— 主人关掉立刻生效。 */
+	config: () => LinkParsingConfig;
+	/**
+	 * 这个群的答案:解不解析、回什么,键见 {@link linkScopeKey}。默认行与逐群例外怎么对上
+	 * 入站帧里的群(引用目标、停用、悬空、陌生群)全在 `link-scope.ts`,这里只查表。
+	 * 与 `config` 一样每条消息现读 —— 主人改一格立刻生效。
+	 */
+	policyFor: (key: string) => LinkParsingPolicy;
+	api: {
+		getVideoInfo(ref: VideoRef): Promise<VideoInfo>;
+		resolveShortLink(url: string): Promise<string | null>;
+	};
+	/** 推送用的卡片渲染器;`null` = 没有 Chrome,整个功能静默不动。**每次现取**,别攥着。 */
+	renderer: () => {
+		generateDynamicCard(
+			data: Dynamic,
+			colors?: CardColorOptions,
+			layout?: CardBlock[],
+			options?: { priority?: RenderPriority },
+		): Promise<Buffer>;
+	} | null;
+	/**
+	 * 这张卡怎么画:配色(含图廊轮到的那张背景)+ 版式。**每张卡取一次**,由引擎按推送
+	 * 动态卡在没有 per-UP 覆盖时的同一条规则算出来 —— 链接解析没有 UP 可言,吃的就是
+	 * 全局那份。各算一份的话,主人在卡片页给「动态」调的样式只有推送卡认。
+	 */
+	presentation: () => LinkCardPresentation;
+	/** 往来源群发 —— 由接线层用收到这一帧的那个 adapter 实现。 */
+	send: (dest: LinkReplyDestination, payload: NotificationPayload) => Promise<DeliveryResult>;
+	/**
+	 * 目的地所在适配器的平台能力(探测结果的缓存);没有能力概念的平台(官机)回 undefined =
+	 * 什么都发不了。形式选了小程序卡时据它决定发小程序卡还是回落图片卡。
+	 */
+	capabilities: (dest: LinkReplyDestination) => AdapterCapabilities | undefined;
+	/** 还没探出来时主动探一次(零副作用);不实现就当探不了。 */
+	probeCapabilities?: (dest: LinkReplyDestination) => Promise<AdapterCapabilities | undefined>;
+	now?: () => number;
+	/** 硬上限,缺省 {@link LINK_LIMITS};测试用小数字把边界拉到眼前。 */
+	limits?: Partial<LinkLimits>;
+}
+
+export interface LinkParser {
+	/** 喂一条 adapter 归一化好的群消息。功能关着、没有链接、自己发的,都静默返回;**永不抛**。 */
+	handleMessage(msg: InboundLinkMessage): Promise<void>;
+}
+
+export function createLinkParser(opts: LinkParserOptions): LinkParser {
+	const now = opts.now ?? (() => Date.now());
+	const limits: LinkLimits = { ...LINK_LIMITS, ...opts.limits };
+	/** `平台:adapterId:群:视频` → 上次开始处理的时刻。冷却关着(0)时不碰它。 */
+	const lastSeen = new RecencyTable<number>(limits.tableCap);
+	/** `平台:adapterId:群` → 最近一分钟里开始处理的时刻。 */
+	const groupStarts = new RecencyTable<number[]>(limits.tableCap);
+	/** 全局正在处理(取信息 / 渲染 / 发送)的链接数。 */
+	let inflight = 0;
+
+	const coolingDown = (key: string, cooldownMs: number): boolean => {
+		if (cooldownMs <= 0) return false;
+		const prev = lastSeen.get(key);
+		return prev !== undefined && now() - prev < cooldownMs;
+	};
+	const markCooldown = (key: string, cooldownMs: number): void => {
+		if (cooldownMs > 0) lastSeen.set(key, now());
+	};
+	const groupExhausted = (scope: string): boolean => {
+		const t = now();
+		const recent = (groupStarts.get(scope) ?? []).filter((ts) => t - ts < BUDGET_WINDOW_MS);
+		groupStarts.set(scope, recent);
+		return recent.length >= limits.groupPerMinute;
+	};
+	const recordGroupStart = (scope: string): void => {
+		groupStarts.set(scope, [...(groupStarts.get(scope) ?? []), now()]);
+	};
+
+	/** 冷却键里的「视频」段:直链按视频号;短链先按短链本身,解出视频号后再按视频号补一道。 */
+	const videoKey = (ref: VideoRef): string => ("bvid" in ref ? ref.bvid : `av${ref.aid}`);
+
+	/** 已经带着视频号的那两种直接成形;短链还没解,给不出。 */
+	const directRef = (ref: VideoLinkRef): VideoRef | null =>
+		ref.kind === "bvid" ? { bvid: ref.bvid } : ref.kind === "aid" ? { aid: ref.aid } : null;
+
+	async function toVideoRef(ref: VideoLinkRef): Promise<VideoRef | null> {
+		if (ref.kind !== "short") return directRef(ref);
+		const target = await opts.api.resolveShortLink(ref.url);
+		if (!target) return null;
+		const [resolved] = extractVideoLinks(target);
+		return resolved ? directRef(resolved) : null;
+	}
+
+	/**
+	 * 小程序卡的字段都来自视频信息。简介太长腾讯那边显示不下,截前 80 字;空的用 UP 名
+	 * 顶上 —— 卡上那行小字空着很难看。
+	 *
+	 * 页面路径是 B 站小程序的视频页:拿 B 站 App 真分享出来的卡向腾讯问 `GetAppInfoByLink`
+	 * 解出来的是 `pages/video/video?bvid=…&share_source=qq_ugc&unique_k=…`,后两个是统计
+	 * 参数,只带 bvid 真机验过能开(2026-09-07)。
+	 */
+	function miniAppCardOf(info: VideoInfo): NotificationPayload {
+		const desc = info.desc.trim().slice(0, 80);
+		return {
+			kind: "miniapp-card",
+			title: info.title,
+			desc: desc || info.owner.name,
+			picUrl: info.pic,
+			path: `pages/video/video?bvid=${info.bvid}`,
+			jumpUrl: `https://www.bilibili.com/video/${info.bvid}`,
+		};
+	}
+
+	/**
+	 * 这个目的地现在能不能发小程序卡。还没探出来就先探一次(空参数探接口,零副作用);
+	 * 探完仍未知按不能算 —— 不拿一张注定发不出去的卡去试,那一趟是真向腾讯要卡。
+	 *
+	 * 「探不出来的适配器别被反复问」的节流在适配器那一层(缓存与失效规则都在那儿),
+	 * 这里放心问就是。
+	 */
+	async function canSendMiniAppCard(dest: LinkReplyDestination): Promise<boolean> {
+		let caps = opts.capabilities(dest);
+		if (caps?.miniAppCard.state === "unknown" && opts.probeCapabilities) {
+			caps = await opts.probeCapabilities(dest);
+		}
+		return caps?.miniAppCard.state === "supported";
+	}
+
+	/**
+	 * 发什么:小程序卡(形式 × 能力由调用方算好)发失败就回落图片卡,群里不会空着。
+	 * 缓存翻不翻由适配器自己定(只有再收到 1404 才翻),这里不猜。
+	 */
+	async function reply(dest: LinkReplyDestination, ref: VideoRef, useMiniApp: boolean) {
+		const info = await opts.api.getVideoInfo(ref);
+		if (useMiniApp) {
+			const result = await opts.send(dest, miniAppCardOf(info));
+			if (result.ok) {
+				opts.logger.info(
+					`[link] 已回复小程序卡 group=${dest.groupId} ${info.bvid}(${result.latencyMs}ms)`,
+				);
+				return;
+			}
+			opts.logger.warn(
+				`[link] 小程序卡发送失败 group=${dest.groupId} ${info.bvid}: ${result.err},回落图片卡`,
+			);
+		}
+		await replyWithImageCard(dest, info);
+	}
+
+	async function replyWithImageCard(dest: LinkReplyDestination, info: VideoInfo) {
+		const renderer = opts.renderer();
+		if (!renderer) return;
+		// 低优先级:谁都能触发的卡,不能排在开播 / 动态卡前面。让路由渲染队列按车道做
+		// (渲染器那级与浏览器闸那级都认),不靠这里数自己发了几张。
+		const { colors, layout } = opts.presentation();
+		const buffer = await renderer.generateDynamicCard(videoToDynamic(info), colors, layout, {
+			priority: "low",
+		});
+		const result = await opts.send(dest, { kind: "image", image: { buffer, mime: "image/jpeg" } });
+		if (!result.ok) {
+			opts.logger.warn(`[link] 视频卡片发送失败 group=${dest.groupId} ${info.bvid}: ${result.err}`);
+			return;
+		}
+		// 成功也留一行:群里没回话只有两种解释(没触发 / 发失败),日志得能分清。
+		opts.logger.info(
+			`[link] 已回复视频卡片 group=${dest.groupId} ${info.bvid}(${result.latencyMs}ms)`,
+		);
+	}
+
+	async function handleMessage(msg: InboundLinkMessage): Promise<void> {
+		try {
+			// 闸门按代价从低到高排:群里每一句话都进这儿(官机开着「全部消息」时尤其如此),
+			// 先用一个正则把没链接的放走,再读配置(整份深拷贝)、再看有没有渲染器;网络与
+			// 冷却留到每个链接自己那一轮。
+			// 自己发的消息不解析 —— 机器人自己发的东西里若有链接,那是它自己贴的。
+			if (msg.selfId !== undefined && msg.userId === msg.selfId) return;
+			// 正文里的与分享卡里的一起找;卡片链接排在正文之后,与消息里的先后一致。
+			const refs = extractVideoLinks([msg.text, ...msg.cardLinks].join(" ")).slice(
+				0,
+				MAX_LINKS_PER_MESSAGE,
+			);
+			if (refs.length === 0) return;
+			const config = opts.config();
+			if (!config.enabled) return;
+			// 逐群答案在渲染器之前、记账之前:不解析的群什么都不该留下 —— 冷却也不记,
+			// 主人随后把群打开,刚才那条链接再贴一次就该出卡。
+			const scope = linkScopeKey(msg.platform, msg.adapterId, msg.groupId);
+			const policy = opts.policyFor(scope);
+			if (!policy.parse) return;
+			const dest: LinkReplyDestination = {
+				platform: msg.platform,
+				adapterId: msg.adapterId,
+				groupId: msg.groupId,
+			};
+			// 这条消息里的链接真能发出什么:小程序卡要形式选了且这个适配器签得了,签不了就
+			// 回落图片卡 —— 而图片卡又没渲染器(没装 Chrome)的话,一张也发不出来,整条静默
+			// 走人。问在记账之前:什么都发不出去的链接不该白吃冷却与群额度,不然适配器一恢复,
+			// 同一条链接还得等冷却过去。形式是图片卡时短路,不会为它去问适配器。
+			const useMiniApp = policy.form === "miniapp" && (await canSendMiniAppCard(dest));
+			if (!useMiniApp && !opts.renderer()) return;
+			const cooldownMs = config.cooldownSeconds * 1000;
+			for (const linkRef of refs) {
+				try {
+					// 三道闸先看不动手,都过了才一起记账:在冷却里的链接不该吃群额度,因为忙而放弃的
+					// 链接也不该被记成「处理过」—— 那样它再贴一次就要等整个冷却。
+					const rawKey = `${scope}:${videoLinkKey(linkRef)}`;
+					if (coolingDown(rawKey, cooldownMs)) continue;
+					if (inflight >= limits.maxInflight) {
+						opts.logger.debug(
+							`[link] 同时在处理的链接卡已满(${limits.maxInflight}),放弃 group=${msg.groupId}`,
+						);
+						break;
+					}
+					if (groupExhausted(scope)) {
+						opts.logger.debug(
+							`[link] 群一分钟额度已用完(${limits.groupPerMinute}),放弃 group=${msg.groupId}`,
+						);
+						break;
+					}
+					// 冷却从**开始处理**起算,不是发出去才算:一条坏链接被反复贴,不该每次都去打
+					// 接口 —— 短链的那一跳也是接口,所以短链先按它自己吃一道,解出视频号后再按
+					// 视频号吃一道(短链与直链指着同一个视频时只出一张)。
+					markCooldown(rawKey, cooldownMs);
+					recordGroupStart(scope);
+					inflight++;
+					try {
+						const ref = await toVideoRef(linkRef);
+						if (!ref) continue;
+						if (linkRef.kind === "short") {
+							const vKey = `${scope}:${videoKey(ref)}`;
+							if (coolingDown(vKey, cooldownMs)) continue;
+							markCooldown(vKey, cooldownMs);
+						}
+						await reply(dest, ref, useMiniApp);
+					} finally {
+						inflight--;
+					}
+				} catch (e) {
+					// 单个链接失败不回话、不影响同一条消息里的下一个。
+					opts.logger.warn(`[link] 解析失败 group=${msg.groupId}: ${String(e)}`);
+				}
+			}
+		} catch (e) {
+			// 这是在入站回调里被调的,抛出去就是一个 unhandledRejection。
+			opts.logger.error(`[link] 处理入站消息失败: ${String(e)}`);
+		}
+	}
+
+	return { handleMessage };
+}

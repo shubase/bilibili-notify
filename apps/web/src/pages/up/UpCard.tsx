@@ -1,20 +1,23 @@
+import { Avatar, ErrorNote, Icon, Pill, Toggle } from "@bilibili-notify/ui";
 import { useState } from "react";
-import { Avatar, Pill, Toggle } from "../../components/atoms";
-import { Icon } from "../../components/icons";
+import { PUSH_TONE } from "../../config/push-kinds";
 import { useLongPress } from "../../hooks/useLongPress";
 import { FEATURE_LABELS, type Subscription } from "../../types/domain";
 import { colorFromUid, displayName, relativeTime, subscribedFeatures } from "./helpers";
 
+/**
+ * 订阅功能开关的胶囊色。键空间是 FeatureKey(与推送类型 PushKind 不完全对齐 ——
+ * 开播与周期复推共用 live),但用的是同一套家族色,所以借 PUSH_TONE 而不是再抄
+ * 一份十六进制。两档衍生能力(特别弹幕/特别进房)统一走 derived。
+ */
 const FEATURE_TONE: Record<string, string> = {
-	dynamic: "#00AEEC",
-	live: "#FB7299",
-	liveEnd: "#FB7299",
-	liveGuardBuy: "#f2a053",
-	superchat: "#fdcb6e",
-	wordcloud: "#a29bfe",
-	liveSummary: "#a29bfe",
-	specialDanmaku: "#a29bfe",
-	specialUserEnter: "#a29bfe",
+	dynamic: PUSH_TONE.dynamic,
+	live: PUSH_TONE.live,
+	liveEnd: PUSH_TONE.live,
+	liveGuardBuy: PUSH_TONE.guard,
+	superchat: PUSH_TONE.sc,
+	specialDanmaku: PUSH_TONE.derived,
+	specialUserEnter: PUSH_TONE.derived,
 };
 
 export interface UpCardProps {
@@ -27,6 +30,15 @@ export interface UpCardProps {
 	/** 右键 / 长按请求在给定坐标弹出快捷菜单。 */
 	onRequestMenu: (pos: { x: number; y: number }) => void;
 }
+
+/**
+ * UP 卡与末尾那张「添加 UP 主」卡**共用**的最小高度。
+ *
+ * grid 同一行的高度由最高的那张卡决定。这个值从前只写在添加卡上,UP 卡自己没有
+ * —— 于是一切到分组筛选(添加卡按设计不出现),整排 UP 卡当场矮一截。两处引同一个
+ * 常量,谁也别再替谁撑着。
+ */
+export const UP_CARD_MIN_H = "min-h-55";
 
 export function UpCard({
 	sub,
@@ -70,17 +82,18 @@ export function UpCard({
 			}}
 			onMouseEnter={() => setHover(true)}
 			onMouseLeave={() => setHover(false)}
-			className={`group relative cursor-pointer overflow-hidden rounded-xl text-left transition focus:outline-none focus-visible:ring-2 focus-visible:ring-bn-pink ${
-				selected ? "ring-2 ring-bn-pink" : "ring-1 ring-bn-border"
-			} ${hover ? "-translate-y-0.5 shadow-bn-elev" : "shadow-sm"} ${
+			// 玻璃底(皮肤壁纸可透出);玻璃卡无描边(卡片风),未选中态靠阴影分层,选中态叠粉色 ring
+			className={`bn-glass group relative cursor-pointer overflow-hidden rounded-xl text-left transition focus:outline-none focus-visible:ring-2 focus-visible:ring-bn-pink ${UP_CARD_MIN_H} ${
+				selected ? "ring-2 ring-bn-pink" : ""
+			} ${hover ? "-translate-y-0.5 shadow-bn-elev" : "shadow-bn-card"} ${
 				sub.enabled ? "" : "opacity-70"
-			} bg-bn-surface`}
+			}`}
 		>
 			{/* cover band */}
 			<div
 				className="relative h-14"
 				style={{
-					background: `linear-gradient(135deg, ${color}66, ${color}33)`,
+					background: `linear-gradient(135deg, color-mix(in srgb, ${color} 40%, transparent), color-mix(in srgb, ${color} 20%, transparent))`,
 				}}
 			>
 				<div
@@ -96,8 +109,8 @@ export function UpCard({
 							e.stopPropagation();
 							onToggleSelect();
 						}}
-						className={`flex h-5.5 w-5.5 cursor-pointer items-center justify-center rounded border-0 ${
-							selected ? "bg-bn-pink text-white" : "bg-bn-surface/90 text-bn-text-secondary"
+						className={`flex h-5.5 w-5.5 cursor-pointer items-center justify-center rounded-sm border-0 ${
+							selected ? "bg-bn-pink text-bn-on-solid" : "bg-bn-surface/90 text-bn-text-secondary"
 						}`}
 					>
 						{selected ? <Icon.check size={12} /> : <Icon.square size={12} />}
@@ -118,7 +131,7 @@ export function UpCard({
 				</div>
 				<div className="mb-1 flex items-center justify-between">
 					<span
-						className="max-w-40 truncate text-sm font-bold text-bn-text-primary"
+						className="max-w-40 truncate text-bn-base font-bold text-bn-text-primary"
 						title={displayName(sub)}
 					>
 						{displayName(sub)}
@@ -130,7 +143,7 @@ export function UpCard({
 						disabled={togglePending}
 					/>
 				</div>
-				<div className="mb-2.5 flex items-center gap-1.5 text-[11px] text-bn-text-secondary">
+				<div className="mb-2.5 flex items-center gap-1.5 text-bn-xs text-bn-text-secondary">
 					<span>UID {sub.uid}</span>
 					<span>·</span>
 					<span>{fansLabel}</span>
@@ -142,34 +155,28 @@ export function UpCard({
 				 * 那不等于「未关注」,别凭空吓人。
 				 */}
 				{sub.followed === false ? (
-					<div className="mb-2.5 flex items-start gap-1 rounded-md border border-bn-danger-border bg-bn-danger-soft px-2 py-1.5 text-[10.5px] leading-snug text-bn-danger-text">
-						<Icon.warning size={12} className="mt-px shrink-0" />
-						<span>
-							未关注该 UP —— 收不到动态
-							{sub.followError ? <span className="opacity-80">（{sub.followError}）</span> : null}
-						</span>
-					</div>
+					<ErrorNote size="sm" icon={<Icon.warning size={12} />} className="mb-2.5">
+						未关注该 UP —— 收不到动态
+						{sub.followError ? <span className="opacity-80">（{sub.followError}）</span> : null}
+					</ErrorNote>
 				) : null}
 				<div className="mb-2.5 flex flex-wrap gap-1">
 					{features.length === 0 ? (
-						<span className="text-[10px] text-bn-text-secondary">未配置任何推送特性</span>
+						<span className="text-bn-2xs text-bn-text-secondary">未配置任何推送特性</span>
 					) : (
 						features.map((f) => (
-							<Pill key={f} color={FEATURE_TONE[f] ?? "#999"} subtle size="sm">
+							<Pill key={f} color={FEATURE_TONE[f] ?? "var(--color-bn-inactive)"} subtle size="sm">
 								{FEATURE_LABELS[f]}
 							</Pill>
 						))
 					)}
 				</div>
 				{sub.notes ? (
-					<div
-						className="mb-2 truncate text-[11px] italic text-bn-text-secondary"
-						title={sub.notes}
-					>
+					<div className="mb-2 truncate text-bn-xs italic text-bn-text-secondary" title={sub.notes}>
 						{sub.notes}
 					</div>
 				) : null}
-				<div className="flex items-center justify-between text-[11px] text-bn-text-secondary">
+				<div className="flex items-center justify-between text-bn-xs text-bn-text-secondary">
 					<span>
 						分组：
 						<span className="text-bn-text-tertiary">{sub.groups[0] ?? "默认"}</span>

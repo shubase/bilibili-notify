@@ -1,8 +1,18 @@
-import { buildPatch } from "@bilibili-notify/internal/patch";
+import type { AdapterCapabilitiesMap } from "@bilibili-notify/contract";
+import {
+	Avatar,
+	Btn,
+	ErrorNote,
+	GlassBox,
+	Icon,
+	LoadingBlock,
+	ModalShell,
+	StatusDot,
+} from "@bilibili-notify/ui";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useState } from "react";
-import { Avatar, Btn } from "../components/atoms";
 import { BrowserSourceSettings } from "../components/browser-source-settings";
+import { CommandsSettings } from "../components/commands-settings";
 import {
 	Field,
 	LogLevelPicker,
@@ -11,15 +21,20 @@ import {
 	TNum,
 	TSelect,
 } from "../components/forms";
-import { GlassBox } from "../components/glass-box";
-import { Icon } from "../components/icons";
+import { LinkParsingSettings } from "../components/link-parsing-settings";
+import { OnboardingReopenSection } from "../components/onboarding/reopen-section";
+import { UpdateSection } from "../components/update/update-section";
+import { PUSH_TONE } from "../config/push-kinds";
+import { SECTION_ACCENT } from "../config/section-accents";
 import { useDirtyDraft } from "../hooks/useDirtyDraft";
 import { ApiError, api } from "../services/api";
 import { useAuthStore } from "../store/auth";
 import { BiliLoginStatus, type BiliLoginStatusValue } from "../types/auth";
-import type { PushTarget } from "../types/domain";
+import type { PushAdapter, PushTarget } from "../types/domain";
 import type { AppConfig, GlobalConfig, GlobalConfigPatch, LogLevel } from "../types/globals";
 import { BackupSection } from "./backup/BackupSection";
+import { SkinSection } from "./skins/SkinSection";
+import { buildSystemPatch } from "./system-save-patch";
 
 const STATUS_LABELS: Record<BiliLoginStatusValue, string> = {
 	[BiliLoginStatus.NOT_LOGIN]: "未登录",
@@ -39,31 +54,36 @@ const STATUS_LABELS: Record<BiliLoginStatusValue, string> = {
  * 才作小字注脚。
  */
 const STATUS_ACCENT: Record<BiliLoginStatusValue, string> = {
-	[BiliLoginStatus.NOT_LOGIN]: "#94a3b8",
-	[BiliLoginStatus.LOADING_LOGIN_INFO]: "#3b82f6",
-	[BiliLoginStatus.LOGIN_QR]: "#f59e0b",
-	[BiliLoginStatus.LOGGING_QR]: "#f59e0b",
-	[BiliLoginStatus.LOGGED_IN]: "#22c55e",
-	[BiliLoginStatus.LOGIN_FAILED]: "#ef4444",
+	[BiliLoginStatus.NOT_LOGIN]: "var(--color-bn-inactive)",
+	[BiliLoginStatus.LOADING_LOGIN_INFO]: "var(--color-bn-blue)",
+	[BiliLoginStatus.LOGIN_QR]: "var(--color-bn-warning)",
+	[BiliLoginStatus.LOGGING_QR]: "var(--color-bn-warning)",
+	[BiliLoginStatus.LOGGED_IN]: "var(--color-bn-success)",
+	[BiliLoginStatus.LOGIN_FAILED]: "var(--color-bn-danger)",
 };
 
 function QrCard({ data, msg }: { data: unknown; msg: string }) {
 	const src = typeof data === "string" && data.length > 0 ? data : null;
 	return (
-		<div className="flex flex-col items-center gap-3 rounded-lg border border-bn-border bg-bn-surface/55 p-6">
+		// data-tour:「带我做」导览的聚光灯锚点 —— 二维码一出现聚光灯就从登录按钮转移过来
+		<div
+			data-tour="bili-login-qr"
+			className="flex flex-col items-center gap-3 rounded-lg border border-bn-border bg-bn-surface/55 p-6"
+		>
 			{src ? (
 				<img
 					alt="登录二维码"
-					className="h-56 w-56 rounded bg-bn-surface p-2 shadow-bn-card"
+					className="h-56 w-56 rounded-sm bg-bn-surface p-2 shadow-bn-card"
 					src={src}
 				/>
 			) : (
-				<div className="flex h-56 w-56 items-center justify-center rounded bg-bn-surface text-sm text-bn-text-tertiary">
-					二维码加载中…
+				<div className="flex h-56 w-56 items-center justify-center rounded-sm bg-bn-surface">
+					<LoadingBlock variant="inset" label="二维码加载中" />
 				</div>
 			)}
-			<div className="text-[12.5px] text-bn-text-secondary">使用 Bilibili 手机客户端扫码登录</div>
-			{msg ? <div className="text-[11px] text-bn-text-tertiary">{msg}</div> : null}
+			<div className="text-bn-sm text-bn-text-secondary">使用 Bilibili 手机客户端扫码登录</div>
+			{/* 常驻一行:msg 从无到有(尚未扫码→已扫码…)不许把弹窗撑高 */}
+			<div className="text-bn-xs text-bn-text-tertiary">{msg || " "}</div>
 		</div>
 	);
 }
@@ -81,9 +101,12 @@ const SYSTEM_MODULES: ReadonlyArray<{
 	label: string;
 	tone: string;
 }> = [
-	{ id: "core", label: "core 核心", tone: "#FB7299" },
-	{ id: "dynamic", label: "dynamic 动态", tone: "#00AEEC" },
-	{ id: "live", label: "live 直播", tone: "#FF6699" },
+	// dynamic / live 两格**就是**推送里那两族,直接引家族色,不另抄一份。core 不属于
+	// 任何一族,给它 System 这一屏自己的角光色 —— 此前它借的是 live 粉,而 live 那格
+	// 用的是漂了一档的 `#FF6699`,两格并排放着肉眼分不出是两个色。
+	{ id: "core", label: "core 核心", tone: SECTION_ACCENT.system },
+	{ id: "dynamic", label: "dynamic 动态", tone: PUSH_TONE.dynamic },
+	{ id: "live", label: "live 直播", tone: PUSH_TONE.live },
 ];
 
 const LOG_LEVEL_NUM: Record<LogLevel, LogLevelValue> = { error: 1, warn: 2, info: 3, debug: 4 };
@@ -161,7 +184,7 @@ function SystemSettingsSection({
 		<GlassBox
 			title="Core · 应用"
 			subtitle="后端运行参数 + Master 通知目标 · globals.app / globals.master"
-			accent="#FB7299"
+			accent="var(--color-bn-pink)"
 			icon={<Icon.sliders size={14} />}
 			badge="app + master"
 		>
@@ -185,11 +208,8 @@ function SystemSettingsSection({
 								key={m.id}
 								className="flex items-center justify-between gap-2 rounded-md border border-bn-border-subtle bg-bn-surface/60 px-2.5 py-1.5"
 							>
-								<span className="flex items-center gap-1.5 text-[12px] font-bold text-bn-text-primary">
-									<span
-										className="inline-block h-1.5 w-1.5 rounded-full"
-										style={{ background: m.tone }}
-									/>
+								<span className="flex items-center gap-1.5 text-bn-sm font-bold text-bn-text-primary">
+									<StatusDot size="sm" color={m.tone} />
 									{m.label}
 								</span>
 								<LogLevelPicker
@@ -234,8 +254,8 @@ function SystemSettingsSection({
 
 			<div className="mt-3 rounded-lg border border-bn-pink/20 bg-linear-to-br from-bn-pink/8 to-transparent p-3">
 				<div className="mb-1.5 flex items-center justify-between">
-					<span className="text-[12.5px] font-bold text-bn-text-primary">Master 通知目标</span>
-					<span className="text-[10.5px] text-bn-text-tertiary">插件遇错误时会向这个目标报告</span>
+					<span className="text-bn-sm font-bold text-bn-text-primary">Master 通知目标</span>
+					<span className="text-bn-2xs text-bn-text-tertiary">插件遇错误会私聊报告给这个目标</span>
 				</div>
 				<Field code="master.targetId">
 					<TSelect
@@ -247,7 +267,7 @@ function SystemSettingsSection({
 						]}
 					/>
 				</Field>
-				<div className="mt-1.5 text-[11px] text-bn-text-secondary">{masterStatus}</div>
+				<div className="mt-1.5 text-bn-xs text-bn-text-secondary">{masterStatus}</div>
 			</div>
 		</GlassBox>
 	);
@@ -262,6 +282,12 @@ export default function System() {
 	const status: BiliLoginStatusValue = snapshot?.status ?? BiliLoginStatus.LOADING_LOGIN_INFO;
 	const msg = snapshot?.msg ?? "";
 	const isQrPhase = status === BiliLoginStatus.LOGIN_QR || status === BiliLoginStatus.LOGGING_QR;
+	// 二维码走弹窗展示(不撑开页面布局);手动关掉后按钮变「继续扫码」可再打开,
+	// 扫码阶段结束(成功/失效)时重置。
+	const [qrDismissed, setQrDismissed] = useState(false);
+	useEffect(() => {
+		if (!isQrPhase) setQrDismissed(false);
+	}, [isQrPhase]);
 	const loggedIn = status === BiliLoginStatus.LOGGED_IN;
 	// 与 header AccountChip 同一数据源:snapshot.data.card = { mid, name, face }。
 	const card = loggedIn
@@ -282,6 +308,16 @@ export default function System() {
 		queryKey: ["targets"],
 		queryFn: () => api.get<PushTarget[]>("/api/targets"),
 	});
+	const adaptersQuery = useQuery({
+		queryKey: ["adapters"],
+		queryFn: () => api.get<PushAdapter[]>("/api/adapters"),
+	});
+	// 能力是连上时探的,面板开着的时候半分钟刷一次,bot 后连上也能看到它变绿。
+	const capabilitiesQuery = useQuery({
+		queryKey: ["adapter-capabilities"],
+		queryFn: () => api.get<AdapterCapabilitiesMap>("/api/adapters/capabilities"),
+		refetchInterval: 30_000,
+	});
 
 	const [draft, setDraft] = useState<GlobalConfig | null>(null);
 
@@ -295,23 +331,11 @@ export default function System() {
 
 	const save = useMutation({
 		mutationFn: async (next: GlobalConfig) => {
-			// Only send the scopes this tab actually edits. Posting the whole
-			// draft would make the backend enable-check see `defaults.cardStyle`
-			// and `defaults.ai` in the patch body and run the puppeteer +
-			// chat.completions probes on every save — slow and pointless when
-			// the user never touched those fields here.
-			//
-			// 清空的可选字段(master.targetId / app.userAgent / 各模块 logLevels)由
-			// buildPatch 与基线一比自动变成显式 `null`。从前是逐个手写 `?? null`,
-			// 每加一个可选字段就得有人记得补一次 —— 漏掉的那个就是下一个「清不掉」。
+			// 改了哪块发哪块(挑块的规则与理由在 system-save-patch.ts)。草稿是从这份基线长出来
+			// 的,没有基线就不会有草稿;真走到这里是状态坏了,宁可报错也别静默发一份空补丁。
 			const base = globalsQuery.data;
-			await api.patch<GlobalConfig>(
-				"/api/globals",
-				buildPatch(
-					{ app: next.app, master: next.master },
-					{ app: base?.app, master: base?.master },
-				),
-			);
+			if (!base) throw new Error("配置基线尚未加载,无法保存");
+			await api.patch<GlobalConfig>("/api/globals", buildSystemPatch(next, base));
 		},
 		onSuccess: () => qc.invalidateQueries({ queryKey: ["globals"] }),
 	});
@@ -367,7 +391,7 @@ export default function System() {
 	});
 
 	return (
-		<div className="bn-anim-fade-in space-y-5">
+		<div className="bn-anim-page-in space-y-5">
 			<GlassBox
 				title="账号 · auth"
 				subtitle="B 站账号登录 + Cookie / 会话 · 扫码后实时生效"
@@ -384,49 +408,49 @@ export default function System() {
 							url={accountFace}
 						/>
 						<div className="min-w-0 flex-1">
-							<div className="truncate text-[14px] font-bold text-bn-text-primary">
+							<div className="truncate text-bn-md font-bold text-bn-text-primary">
 								{accountName ?? "已登录账号"}
 							</div>
-							<div className="mt-0.5 text-[11.5px] text-bn-text-secondary">
+							<div className="mt-0.5 text-bn-xs text-bn-text-secondary">
 								业务核心可正常拉取动态 / 直播 / WBI 签名
 							</div>
 							{cookiesRefreshedAt ? (
-								<div className="mt-0.5 text-[10.5px] text-bn-text-tertiary">
+								<div className="mt-0.5 text-bn-2xs text-bn-text-tertiary">
 									最近 Cookie 刷新：{new Date(cookiesRefreshedAt).toLocaleString()}
 								</div>
 							) : null}
 						</div>
 					</div>
-				) : isQrPhase ? (
-					<QrCard data={snapshot?.data} msg={msg} />
-				) : (
-					<div className="text-[12px] text-bn-text-secondary">
+				) : isQrPhase ? null : (
+					// 扫码阶段整块不渲染:状态与进度都在弹窗里(badge 也还挂着),这里再写
+					// 一遍纯属重复,还把卡片撑开一截。
+					<div className="text-bn-sm text-bn-text-secondary">
 						{status === BiliLoginStatus.NOT_LOGIN
 							? "尚未登录 B 站账号,点下方「发起扫码登录」开始。"
 							: STATUS_LABELS[status]}
 					</div>
 				)}
 
-				{extraMsg ? <div className="mt-2 text-[11px] text-amber-600">{extraMsg}</div> : null}
+				{extraMsg && !isQrPhase ? (
+					<div className="mt-2 text-bn-xs text-bn-warning">{extraMsg}</div>
+				) : null}
 
 				{status === BiliLoginStatus.LOGIN_FAILED ? (
-					<div className="mt-2.5 rounded border border-bn-danger-border bg-bn-danger-soft p-2.5 text-xs text-bn-danger-text">
-						{msg || "登录失败，可重试。"}
-					</div>
+					<ErrorNote className="mt-2.5">{msg || "登录失败，可重试。"}</ErrorNote>
 				) : null}
-				{actionError ? (
-					<div className="mt-2.5 rounded border border-bn-danger-border bg-bn-danger-soft p-2.5 text-xs text-bn-danger-text">
-						操作失败：{actionError}
-					</div>
-				) : null}
+				{actionError ? <ErrorNote className="mt-2.5">操作失败：{actionError}</ErrorNote> : null}
 
 				<div className="mt-3.5 flex flex-wrap gap-2 border-t border-bn-border-subtle pt-3">
 					<Btn
+						data-tour="bili-login"
 						variant="primary"
-						disabled={startQr.isPending || isQrPhase || loggedIn}
-						onClick={() => startQr.mutate()}
+						disabled={startQr.isPending || loggedIn}
+						onClick={() => {
+							if (isQrPhase) setQrDismissed(false);
+							else startQr.mutate();
+						}}
 					>
-						{startQr.isPending ? "处理中…" : "发起扫码登录"}
+						{startQr.isPending ? "处理中…" : isQrPhase ? "继续扫码" : "发起扫码登录"}
 					</Btn>
 					<Btn
 						variant="outline"
@@ -448,6 +472,13 @@ export default function System() {
 				</div>
 			</GlassBox>
 
+			{/* 二维码弹窗:不撑开页面布局;导览聚光灯经 bili-login-qr 锚点转移到这里 */}
+			{isQrPhase && !qrDismissed ? (
+				<ModalShell onCancel={() => setQrDismissed(true)} width={360} title="扫码登录 B 站">
+					<QrCard data={snapshot?.data} msg={msg} />
+				</ModalShell>
+			) : null}
+
 			{draft ? (
 				<SystemSettingsSection
 					draft={draft}
@@ -455,18 +486,36 @@ export default function System() {
 					onPatch={patchDraft}
 				/>
 			) : globalsQuery.isLoading ? (
-				<div className="text-xs text-bn-text-tertiary">加载系统配置中…</div>
+				<LoadingBlock label="正在读取系统配置" />
 			) : globalsQuery.error ? (
-				<div className="rounded border border-bn-danger-border bg-bn-danger-soft p-2 text-xs text-bn-danger-text">
+				<ErrorNote>
 					拉取 /api/globals 失败：{String((globalsQuery.error as Error).message)}
-				</div>
+				</ErrorNote>
+			) : null}
+
+			{draft ? <CommandsSettings draft={draft} onPatch={patchDraft} /> : null}
+
+			{draft ? (
+				<LinkParsingSettings
+					draft={draft}
+					onPatch={patchDraft}
+					targets={targetsQuery.data ?? []}
+					adapters={adaptersQuery.data ?? []}
+					capabilities={capabilitiesQuery.data ?? {}}
+				/>
 			) : null}
 
 			<BrowserSourceSettings />
 
+			<SkinSection />
+
 			<BackupSection />
 
-			<details className="rounded border border-bn-border bg-bn-surface-muted p-3 text-xs text-bn-text-secondary">
+			<UpdateSection />
+
+			<OnboardingReopenSection />
+
+			<details className="rounded-sm border border-bn-border bg-bn-surface-muted p-3 text-bn-sm text-bn-text-secondary">
 				<summary className="cursor-pointer font-medium text-bn-text-primary">原始登录快照</summary>
 				<pre className="mt-2 overflow-auto leading-relaxed">
 					{JSON.stringify(snapshot ?? { hint: "等待 /api/auth/status" }, null, 2)}

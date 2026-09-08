@@ -1,9 +1,8 @@
 import type { RenderSourceResponse } from "@bilibili-notify/contract";
+import { Btn, GlassBox } from "@bilibili-notify/ui";
 import { useEffect, useState } from "react";
 import { api } from "../services/api";
-import { Btn } from "./atoms";
 import { Field, TInput } from "./forms";
-import { GlassBox } from "./glass-box";
 
 type Busy = null | "detect" | "path" | "endpoint";
 
@@ -78,12 +77,14 @@ export function BrowserSourceSettings() {
 	) : status.enabled && source?.chromeEndpoint ? (
 		<span>
 			远程浏览器{" "}
-			<code className="rounded bg-bn-code-bg px-1.5 py-0.5 font-mono">{source.chromeEndpoint}</code>
+			<code className="rounded-sm bg-bn-code-bg px-1.5 py-0.5 font-mono">
+				{source.chromeEndpoint}
+			</code>
 		</span>
 	) : status.enabled && source?.chromePath ? (
 		<span>
 			本地浏览器{" "}
-			<code className="rounded bg-bn-code-bg px-1.5 py-0.5 font-mono">{source.chromePath}</code>
+			<code className="rounded-sm bg-bn-code-bg px-1.5 py-0.5 font-mono">{source.chromePath}</code>
 		</span>
 	) : (
 		<span className="text-bn-text-secondary">未启用 —— 卡片渲染当前退化为文字推送</span>
@@ -93,17 +94,14 @@ export function BrowserSourceSettings() {
 		<GlassBox
 			title="卡片渲染 · 浏览器"
 			subtitle="chromePath / chromeEndpoint · 应用即热切换,先探测连通再生效"
-			accent={status?.enabled ? "#22c55e" : "#94a3b8"}
+			accent={status?.enabled ? "var(--color-bn-success)" : "var(--color-bn-inactive)"}
 			badge={status ? (status.enabled ? "已启用" : "未启用") : undefined}
 		>
-			<div
-				data-testid="browser-source-current"
-				className="py-2.5 text-[12.5px] text-bn-text-primary"
-			>
+			<div data-testid="browser-source-current" className="py-2.5 text-bn-sm text-bn-text-primary">
 				{current}
 			</div>
 			{status && !status.persistable ? (
-				<div className="pb-2 text-[11px] text-bn-warning-text">
+				<div className="pb-2 text-bn-xs text-bn-warning-text">
 					当前部署没有可写的配置文件:切换即时生效,但重启后不保留(请改用环境变量 / yaml)。
 				</div>
 			) : null}
@@ -147,12 +145,12 @@ export function BrowserSourceSettings() {
 				</div>
 			</Field>
 			{detectMiss ? (
-				<div className="pt-1.5 text-[11px] text-bn-warning-text">
+				<div className="pt-1.5 text-bn-xs text-bn-warning-text">
 					未在常见位置找到 Chrome / Chromium,请手动填写路径。
 				</div>
 			) : null}
-			{okMsg ? <div className="pt-1.5 text-[11px] text-bn-success-text">✓ {okMsg}</div> : null}
-			{err ? <div className="pt-1.5 text-[11px] text-bn-danger-text">{err}</div> : null}
+			{okMsg ? <div className="pt-1.5 text-bn-xs text-bn-success-text">✓ {okMsg}</div> : null}
+			{err ? <div className="pt-1.5 text-bn-xs text-bn-danger-text">{err}</div> : null}
 		</GlassBox>
 	);
 }

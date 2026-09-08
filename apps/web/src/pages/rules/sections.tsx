@@ -4,20 +4,20 @@
  * delta for /api/globals.
  */
 
+import { CollapseBlock, GlassBox, Icon, Toggle } from "@bilibili-notify/ui";
 import { type ReactNode, useState } from "react";
-import { Toggle } from "../../components/atoms";
 import {
 	ArrayEditor,
 	Field,
-	type FieldProps,
 	Picker,
 	QuietHoursEditor,
 	TArea,
 	TInput,
 	TNum,
 } from "../../components/forms";
-import { CollapseBlock, GlassBox } from "../../components/glass-box";
-import { Icon } from "../../components/icons";
+import { InheritNote } from "../../components/inherit-note";
+import { GUARD_LEVELS } from "../../config/guard-levels";
+import { SECTION_ACCENT, sectionTitleColor } from "../../config/section-accents";
 import type { MessageKindLayoutFull } from "../../types/domain";
 import type {
 	ContentFilters,
@@ -176,8 +176,6 @@ export const PERUP_SECTIONS: SectionMeta[] = [
 	},
 ];
 
-const FieldRow = (props: FieldProps) => <Field {...props} />;
-
 // ── 1. Filter section ────────────────────────────────────────────────────────
 
 export function FilterSection({
@@ -207,61 +205,61 @@ export function FilterSection({
 		<GlassBox
 			title="动态过滤规则"
 			subtitle="filters · 屏蔽不想推送的动态"
-			accent="#FB7299"
+			accent="var(--color-bn-pink)"
 			icon={<Icon.filter size={14} />}
 			badge="filters"
 		>
-			<FieldRow code="blockKeywords" full>
+			<Field code="blockKeywords" full>
 				<ArrayEditor
 					value={value.blockKeywords}
 					onChange={(n) => set("blockKeywords", n)}
 					placeholder="关键词"
 				/>
-			</FieldRow>
-			<FieldRow code="blockRegex" full>
+			</Field>
+			<Field code="blockRegex" full>
 				<ArrayEditor
 					value={value.blockRegex}
 					onChange={(n) => set("blockRegex", n)}
 					placeholder="例如:^广告.*"
 				/>
-			</FieldRow>
+			</Field>
 			<div className="mt-1.5 grid grid-cols-1 gap-2 sm:grid-cols-2">
-				<FieldRow code="blockForward">
+				<Field code="blockForward">
 					<div className="flex h-7.5 items-center">
 						<Toggle value={value.blockForward} onChange={(v) => set("blockForward", v)} size="sm" />
 					</div>
-				</FieldRow>
-				<FieldRow code="blockArticle">
+				</Field>
+				<Field code="blockArticle">
 					<div className="flex h-7.5 items-center">
 						<Toggle value={value.blockArticle} onChange={(v) => set("blockArticle", v)} size="sm" />
 					</div>
-				</FieldRow>
-				<FieldRow code="blockDraw">
+				</Field>
+				<Field code="blockDraw">
 					<div className="flex h-7.5 items-center">
 						<Toggle value={value.blockDraw} onChange={(v) => set("blockDraw", v)} size="sm" />
 					</div>
-				</FieldRow>
-				<FieldRow code="blockAv">
+				</Field>
+				<Field code="blockAv">
 					<div className="flex h-7.5 items-center">
 						<Toggle value={value.blockAv} onChange={(v) => set("blockAv", v)} size="sm" />
 					</div>
-				</FieldRow>
+				</Field>
 			</div>
 			<CollapseBlock
 				label="启用白名单 · 仅推送命中条目"
 				enabled={whitelistEnabled}
 				onToggle={toggleWhitelist}
-				accent="#FB7299"
+				accent="var(--color-bn-pink)"
 			>
-				<FieldRow code="whitelistKeywords" full>
+				<Field code="whitelistKeywords" full>
 					<ArrayEditor
 						value={value.whitelistKeywords}
 						onChange={(n) => set("whitelistKeywords", n)}
 					/>
-				</FieldRow>
-				<FieldRow code="whitelistRegex" full>
+				</Field>
+				<Field code="whitelistRegex" full>
 					<ArrayEditor value={value.whitelistRegex} onChange={(n) => set("whitelistRegex", n)} />
-				</FieldRow>
+				</Field>
 			</CollapseBlock>
 		</GlassBox>
 	);
@@ -283,20 +281,20 @@ export function ImageGroupSection({
 		<GlassBox
 			title="动态图集"
 			subtitle="imageGroup · 图集类动态附图与推送形态"
-			accent="#FB7299"
+			accent="var(--color-bn-pink)"
 			icon={<Icon.dyn size={14} />}
 			badge="imageGroup"
 		>
-			<FieldRow code="enable">
+			<Field code="enable">
 				<Toggle value={value.enable} onChange={(v) => set("enable", v)} />
-			</FieldRow>
-			<FieldRow code="forward">
+			</Field>
+			<Field code="forward">
 				<Toggle
 					value={value.forward}
 					onChange={(v) => set("forward", v)}
 					disabled={!value.enable}
 				/>
-			</FieldRow>
+			</Field>
 		</GlassBox>
 	);
 }
@@ -320,12 +318,12 @@ export function LiveThresholdsSection({
 		<GlassBox
 			title="直播推送阈值"
 			subtitle="filters / schedule · 控制 SC 金额 / 上舰等级 / 推送频率"
-			accent="#00AEEC"
+			accent="var(--color-bn-blue)"
 			icon={<Icon.mic size={14} />}
 			badge="live"
 		>
 			<div className="grid grid-cols-1 gap-0 sm:grid-cols-2">
-				<FieldRow code="minScPrice">
+				<Field code="minScPrice">
 					<TNum
 						value={filters.minScPrice}
 						onChange={(v) => setF("minScPrice", v)}
@@ -333,19 +331,16 @@ export function LiveThresholdsSection({
 						max={9999}
 						suffix="元"
 					/>
-				</FieldRow>
-				<FieldRow code="minGuardLevel">
+				</Field>
+				<Field code="minGuardLevel">
 					<Picker<1 | 2 | 3>
 						value={filters.minGuardLevel}
 						onChange={(v) => setF("minGuardLevel", v)}
-						options={[
-							{ value: 3, label: "舰长" },
-							{ value: 2, label: "提督" },
-							{ value: 1, label: "总督" },
-						]}
+						// 由低到高,与这一屏别处同序(见 GuardSection 的 ROLES)。
+						options={[...GUARD_LEVELS].reverse().map((g) => ({ value: g.level, label: g.label }))}
 					/>
-				</FieldRow>
-				<FieldRow code="schedule.pushTime">
+				</Field>
+				<Field code="schedule.pushTime">
 					<TNum
 						value={schedule.pushTime}
 						onChange={(v) => setS("pushTime", v)}
@@ -353,8 +348,8 @@ export function LiveThresholdsSection({
 						max={23}
 						suffix="小时"
 					/>
-				</FieldRow>
-				<FieldRow code="restartPush">
+				</Field>
+				<Field code="restartPush">
 					<div className="flex h-7.5 items-center">
 						<Toggle
 							value={schedule.restartPush}
@@ -362,8 +357,8 @@ export function LiveThresholdsSection({
 							size="sm"
 						/>
 					</div>
-				</FieldRow>
-				<FieldRow
+				</Field>
+				<Field
 					code="schedule.liveEndGrace"
 					hint="开启后下播先等待,期间重新开播即接续为同一场(防网络抖动 / 超管掐流误报)"
 				>
@@ -374,9 +369,9 @@ export function LiveThresholdsSection({
 							size="sm"
 						/>
 					</div>
-				</FieldRow>
+				</Field>
 				{schedule.liveEndGrace ? (
-					<FieldRow code="schedule.liveEndGraceMinutes" hint="下播到重开超过此时长才判定真下播">
+					<Field code="schedule.liveEndGraceMinutes" hint="下播到重开超过此时长才判定真下播">
 						<TNum
 							value={schedule.liveEndGraceMinutes}
 							onChange={(v) => setS("liveEndGraceMinutes", v)}
@@ -384,11 +379,11 @@ export function LiveThresholdsSection({
 							max={10}
 							suffix="分钟"
 						/>
-					</FieldRow>
+					</Field>
 				) : null}
-				<FieldRow code="schedule.quietHours" full>
+				<Field code="schedule.quietHours" full>
 					<QuietHoursEditor value={schedule.quietHours} onChange={(v) => setS("quietHours", v)} />
-				</FieldRow>
+				</Field>
 			</div>
 		</GlassBox>
 	);
@@ -409,12 +404,12 @@ export function SummarySection({
 		<GlassBox
 			title="直播总结"
 			subtitle="弹幕词云停用词 + 直播总结模板"
-			accent="#a29bfe"
+			accent="var(--color-bn-purple)"
 			icon={<Icon.list size={14} />}
 			badge="liveSummary"
 		>
 			<StopWordsHint />
-			<FieldRow code="templates.wordcloudStopWords" full>
+			<Field code="templates.wordcloudStopWords" full>
 				<TArea
 					value={templates.wordcloudStopWords}
 					onChange={(v) => setT("wordcloudStopWords", v)}
@@ -422,17 +417,17 @@ export function SummarySection({
 					mono
 					placeholder="例如：哈哈,2333,前面的,主播"
 				/>
-			</FieldRow>
+			</Field>
 			<div className="my-3 border-t border-bn-border-subtle" />
 			<SummaryVariableHints />
-			<FieldRow code="templates.liveSummary" full>
+			<Field code="templates.liveSummary" full>
 				<TArea
 					value={templates.liveSummary}
 					onChange={(v) => setT("liveSummary", v)}
 					rows={8}
 					mono
 				/>
-			</FieldRow>
+			</Field>
 		</GlassBox>
 	);
 }
@@ -443,16 +438,10 @@ export function SummarySection({
  */
 export function StopWordsHint() {
 	return (
-		<div
-			className="mb-2 rounded-lg border px-3 py-2 text-[11.5px] leading-6 text-bn-text-secondary"
-			style={{ borderColor: "#00AEEC66", background: "#00AEEC1a" }}
-		>
-			<span className="font-bold" style={{ color: "#076e94" }}>
-				弹幕词云停用词:
-			</span>{" "}
+		<HintBar accent="var(--color-bn-blue)" title="弹幕词云停用词:" leading="leading-6">
 			用<b>英文逗号</b>分隔,这些词会在生成词云时被过滤掉。
 			<b>追加</b>到内置中文停用词表之上,不影响弹幕条数 / 发言人数等统计。
-		</div>
+		</HintBar>
 	);
 }
 
@@ -495,7 +484,7 @@ const LIVE_MSG_VARS: VarSpec[] = [
 	{ code: "{watched}", desc: "累计观看人数(直播中)" },
 ];
 
-/** 动态模板已进消息版式:链接是独立部件,{url} 不再出现在变量表(旧模板残留会被剥离)。 */
+/** 动态模板已进消息版式:链接是独立部件,不是模板变量。 */
 const DYNAMIC_MSG_VARS: VarSpec[] = [{ code: "{name}", desc: "UP 主名字" }];
 
 const GUARD_VARS: VarSpec[] = [
@@ -516,39 +505,69 @@ const SPECIAL_ENTER_VARS: VarSpec[] = [
 ];
 
 /**
- * Single visual style for variable cheat-sheet panels above a template
- * editor. `accent` controls the chip color; defaults to the 紫 used by
- * the original SummaryVariableHints for backward compatibility.
+ * 模板编辑器上方那条「可用变量」提示。`accent` 决定描边、底色与标题字的色相;
+ * 缺省是 `SummaryVariableHints` 当年那抹紫,现在走 token,跟皮肤换装。
+ *
+ * **标题字不再单独传** —— 它从 `accent` 现算(见 `sectionTitleColor`)。此前是手调
+ * 死的第二个字面量,强调色一跟皮肤走它就脱节,而且那几个值在暗色主题下压在同样
+ * 深的底上几乎看不见。
  */
+/**
+ * 字段上方那条「浅色染底 + 粗体前缀 + 一段说明」的提示条。
+ *
+ * **三处颜色全从 `accent` 派生**,一个都不许手挑:边 40%、底 10%、标题走
+ * `sectionTitleColor()` 往正文色里调 70%。最后那步是暗色模式的命门 —— 底是半透明的,
+ * 暗色下挡不住黑页面,写死的深色标题会直接糊进背景(`#076e94` 与 `#946800` 都栽过)。
+ * 派生式亮色往黑里调、暗色往白里调,accent 换成什么都跟得住。
+ *
+ * `leading` 是唯一开的口子:变量速查条里嵌着 `<code>` 芯片要 7,纯文字条 6 就够。
+ */
+function HintBar({
+	accent,
+	title,
+	leading = "leading-7",
+	children,
+}: {
+	accent: string;
+	title: string;
+	leading?: string;
+	children: ReactNode;
+}) {
+	return (
+		<div
+			className={`mb-2 rounded-lg border px-3 py-2 text-bn-xs ${leading} text-bn-text-secondary`}
+			style={{
+				borderColor: `color-mix(in srgb, ${accent} 40%, transparent)`,
+				background: `color-mix(in srgb, ${accent} 10%, transparent)`,
+			}}
+		>
+			<span className="font-bold" style={{ color: sectionTitleColor(accent) }}>
+				{title}
+			</span>{" "}
+			{children}
+		</div>
+	);
+}
+
 function VariableHints({
 	vars,
-	accent = "#a29bfe",
-	titleColor = "#5b4fcc",
+	accent = "var(--color-bn-purple)",
 }: {
 	vars: ReadonlyArray<VarSpec>;
 	accent?: string;
-	titleColor?: string;
 }) {
-	const accentBorder = `${accent}66`;
-	const accentBg = `${accent}1a`;
 	return (
-		<div
-			className="mb-2 rounded-lg border px-3 py-2 text-[11.5px] leading-7 text-bn-text-secondary"
-			style={{ borderColor: accentBorder, background: accentBg }}
-		>
-			<span className="font-bold" style={{ color: titleColor }}>
-				可用变量:
-			</span>{" "}
+		<HintBar accent={accent} title="可用变量:">
 			{vars.map((v, i) => (
 				<span key={v.code}>
-					<code className="mx-0.5 rounded bg-bn-surface/70 px-1.5 py-px font-mono text-[11px]">
+					<code className="mx-0.5 rounded-sm bg-bn-surface/70 px-1.5 py-px font-mono text-bn-xs">
 						{v.code}
 					</code>{" "}
 					{v.desc}
 					{i < vars.length - 1 ? " · " : ""}
 				</span>
 			))}
-		</div>
+		</HintBar>
 	);
 }
 
@@ -557,23 +576,23 @@ export function SummaryVariableHints() {
 }
 
 export function LiveMsgVariableHints() {
-	return <VariableHints vars={LIVE_MSG_VARS} accent="#FB7299" titleColor="#b8425d" />;
+	return <VariableHints vars={LIVE_MSG_VARS} accent="var(--color-bn-pink)" />;
 }
 
 export function DynamicMsgVariableHints() {
-	return <VariableHints vars={DYNAMIC_MSG_VARS} accent="#9b6dff" titleColor="#6b46c1" />;
+	return <VariableHints vars={DYNAMIC_MSG_VARS} accent={SECTION_ACCENT.message} />;
 }
 
 export function GuardVariableHints() {
-	return <VariableHints vars={GUARD_VARS} accent="#f2a053" titleColor="#a86120" />;
+	return <VariableHints vars={GUARD_VARS} accent={SECTION_ACCENT.guard} />;
 }
 
 export function SpecialDanmakuVariableHints() {
-	return <VariableHints vars={SPECIAL_DANMAKU_VARS} accent="#fdcb6e" titleColor="#946800" />;
+	return <VariableHints vars={SPECIAL_DANMAKU_VARS} accent={SECTION_ACCENT.persona} />;
 }
 
 export function SpecialEnterVariableHints() {
-	return <VariableHints vars={SPECIAL_ENTER_VARS} accent="#00AEEC" titleColor="#076e94" />;
+	return <VariableHints vars={SPECIAL_ENTER_VARS} accent="var(--color-bn-blue)" />;
 }
 
 // ── 4. Live message templates ────────────────────────────────────────────────
@@ -602,14 +621,14 @@ export function LiveMsgSection({
 		<GlassBox
 			title="直播消息版式"
 			subtitle="开播 / 直播中 / 下播共用的部件排列 / 分条;文本内容按 开播 / 直播中 / 下播 切换编辑"
-			accent="#FB7299"
+			accent="var(--color-bn-pink)"
 			icon={<Icon.chat size={14} />}
 		>
 			<MessageLayoutEditor
 				value={layout}
 				onChange={(next) => onPatch({ defaults: { messageLayout: { live: next } } })}
 				separatorCode="messageLayout.live.separator"
-				accent="#FB7299"
+				accent="var(--color-bn-pink)"
 				textSlot={
 					<>
 						<div className="mb-2">
@@ -619,8 +638,8 @@ export function LiveMsgSection({
 								options={LIVE_TEMPLATE_TABS.map((t) => ({ value: t.key, label: t.label }))}
 							/>
 						</div>
-						<VariableHints vars={active.vars} accent="#FB7299" titleColor="#b8425d" />
-						<FieldRow code={active.code} full>
+						<VariableHints vars={active.vars} accent="var(--color-bn-pink)" />
+						<Field code={active.code} full>
 							<TArea
 								key={active.key}
 								value={templates[active.key]}
@@ -628,7 +647,7 @@ export function LiveMsgSection({
 								rows={3}
 								mono
 							/>
-						</FieldRow>
+						</Field>
 					</>
 				}
 			/>
@@ -661,14 +680,14 @@ export function DynamicMsgSection({
 		<GlassBox
 			title="动态消息版式"
 			subtitle="动态推送的部件排列 / 分条;文本内容按 动态 / 视频投稿 切换编辑"
-			accent="#9b6dff"
+			accent={SECTION_ACCENT.message}
 			icon={<Icon.chat size={14} />}
 		>
 			<MessageLayoutEditor
 				value={layout}
 				onChange={(next) => onPatch({ defaults: { messageLayout: { dynamic: next } } })}
 				separatorCode="messageLayout.dynamic.separator"
-				accent="#9b6dff"
+				accent={SECTION_ACCENT.message}
 				textSlot={
 					<>
 						<div className="mb-2">
@@ -679,7 +698,7 @@ export function DynamicMsgSection({
 							/>
 						</div>
 						<DynamicMsgVariableHints />
-						<FieldRow code={active.code} full>
+						<Field code={active.code} full>
 							<TArea
 								key={active.key}
 								value={templates[active.key]}
@@ -687,7 +706,7 @@ export function DynamicMsgSection({
 								rows={2}
 								mono
 							/>
-						</FieldRow>
+						</Field>
 					</>
 				}
 			/>
@@ -709,17 +728,13 @@ export function GuardSection({
 			defaults: { templates: { guardBuy: { [role]: v } as Partial<GuardBundle> } },
 		});
 	const enabled = templates.guardBuy.enable;
-	type GuardRoleKey = "captain" | "commander" | "governor";
-	const ROLES: { key: GuardRoleKey; label: string; tone: string }[] = [
-		{ key: "captain", label: "舰长", tone: "#4ebcec" },
-		{ key: "commander", label: "提督", tone: "#d8a0e6" },
-		{ key: "governor", label: "总督", tone: "#f2a053" },
-	];
+	// 表按 guard_level 升序(总督在前),这一屏历来是舰长打头、由低到高排。
+	const ROLES = [...GUARD_LEVELS].reverse();
 	return (
 		<GlassBox
 			title="上舰提示"
 			subtitle="默认走 B 站官方上舰图;启用后改用自定义文案与图片"
-			accent="#f2a053"
+			accent={SECTION_ACCENT.guard}
 			icon={<Icon.anchor size={14} />}
 			badge={enabled ? "已启用" : "未启用"}
 			right={<Toggle value={enabled} onChange={(v) => setG("enable", v)} />}
@@ -727,44 +742,45 @@ export function GuardSection({
 			{enabled ? (
 				<>
 					<GuardVariableHints />
-					{ROLES.map(({ key, label, tone }) => {
+					{ROLES.map(({ key, label, color }) => {
 						const entry = templates.guardBuy[key];
 						return (
 							<div
 								key={key}
 								className="mt-2.5 rounded-lg border p-3 first:mt-0"
-								style={{ background: `${tone}0a`, borderColor: `${tone}33` }}
+								style={{
+									background: `color-mix(in srgb, ${color} 4%, transparent)`,
+									borderColor: `color-mix(in srgb, ${color} 20%, transparent)`,
+								}}
 							>
 								<div className="mb-2 flex items-center gap-2">
-									<span className="block h-2 w-2 rounded-sm" style={{ background: tone }} />
-									<span className="text-[12.5px] font-bold text-bn-text-primary">{label}</span>
-									<code className="ml-1 rounded bg-bn-code-bg px-1.5 py-px font-mono text-[10.5px] text-bn-text-tertiary">
+									<span className="block h-2 w-2 rounded-sm" style={{ background: color }} />
+									<span className="text-bn-sm font-bold text-bn-text-primary">{label}</span>
+									<code className="ml-1 rounded-sm bg-bn-code-bg px-1.5 py-px font-mono text-bn-2xs text-bn-text-tertiary">
 										{key}
 									</code>
 								</div>
-								<FieldRow code="template" full>
+								<Field code="template" full>
 									<TInput
 										value={entry.template}
 										onChange={(v) => setG(key, { ...entry, template: v })}
 										mono
 									/>
-								</FieldRow>
-								<FieldRow code="imageUrl" full>
+								</Field>
+								<Field code="imageUrl" full>
 									<TInput
 										value={entry.imageUrl}
 										onChange={(v) => setG(key, { ...entry, imageUrl: v })}
 										mono
 										placeholder="https://..."
 									/>
-								</FieldRow>
+								</Field>
 							</div>
 						);
 					})}
 				</>
 			) : (
-				<div className="py-5 text-center text-[12px] text-bn-text-tertiary">
-					未启用 · 引擎将默认推送 B 站官方上舰图(舰长 / 提督 / 总督)
-				</div>
+				<InheritNote>引擎将默认推送 B 站官方上舰图(舰长 / 提督 / 总督)</InheritNote>
 			)}
 		</GlassBox>
 	);

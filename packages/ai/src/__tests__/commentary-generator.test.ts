@@ -19,6 +19,7 @@ import type { BilibiliAPI } from "@bilibili-notify/api";
 import type { ServiceContext } from "@bilibili-notify/internal";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import { CommentaryGenerator, type CommentaryGeneratorConfig } from "../commentary-generator";
+import { aiConfig, fakeServiceCtx, streamOf, textChunk } from "./harness";
 
 // ---------------------------------------------------------------------------
 // mocks
@@ -53,35 +54,24 @@ vi.mock("../tools", () => ({
 // helpers
 // ---------------------------------------------------------------------------
 
+/** 场景提示词取两个好认的哨兵串 —— 断言靠它们分辨这一段有没有拼进 prompt。 */
 function makeConfig(over: Partial<CommentaryGeneratorConfig> = {}): CommentaryGeneratorConfig {
-	return {
-		apiKey: "sk-test",
-		baseURL: "https://api.test/v1",
-		model: "gpt-test",
-		persona: { preset: "assistant" },
+	return aiConfig({
 		dynamicPrompt: "DYN_SCENE_PROMPT",
 		liveSummaryPrompt: "LIVE_SCENE_PROMPT",
-		enableConversation: true,
-		maxHistory: 5,
-		provider: "custom",
-		enableThinking: false,
-		thinkingLevel: "high",
-		enableVision: false,
 		...over,
-	};
+	});
 }
 
+/** 这个文件的调用点全都解构 `{ gen }` —— 保留这层壳,免得为改形状动上百处。 */
 function makeGen(over: Partial<CommentaryGeneratorConfig> = {}): {
 	gen: CommentaryGenerator;
 } {
-	const ctx: ServiceContext = {
-		logger: { info() {}, warn() {}, error() {}, debug() {} },
-		setInterval: () => ({ dispose() {} }),
-		setTimeout: () => ({ dispose() {} }),
-		onDispose: () => {},
-	};
-	const api = {} as BilibiliAPI;
-	const gen = new CommentaryGenerator({ serviceCtx: ctx, api, config: makeConfig(over) });
+	const gen = new CommentaryGenerator({
+		serviceCtx: fakeServiceCtx(),
+		api: {} as BilibiliAPI,
+		config: makeConfig(over),
+	});
 	return { gen };
 }
 
@@ -429,6 +419,39 @@ describe("CommentaryGenerator.chat — 会话历史", () => {
 		// 解析失败时 executeTool 不会被调用(在 JSON.parse 阶段就 catch)
 		expect(toolsMock.executeTool).not.toHaveBeenCalled();
 	});
+
+	/**
+	 * openai SDK v5 起 `tool_calls` 是**联合类型**(function | custom)。我们从不声明
+	 * custom 工具,所以这一帧只可能来自协议跑偏的兼容网关 —— 但它一旦来了,不许把
+	 * 整轮对话带走,更不许静默跳过:每个 tool_call 都欠一条 tool 消息,少一条下一轮
+	 * 就会被网关判成 tool_call 没有应答而整个请求报错。
+	 */
+	it("网关回了 custom 类型的 tool_call → 不执行、不抛,但仍补上应答让下一轮成立", async () => {
+		const { gen } = makeGen();
+		const customCall = {
+			choices: [
+				{
+					message: {
+						role: "assistant",
+						content: null,
+						tool_calls: [{ id: "c9", type: "custom", custom: { name: "weird", input: "x" } }],
+					},
+				},
+			],
+		};
+		oai.create.mockResolvedValueOnce(customCall).mockResolvedValueOnce(msgResp("收尾"));
+
+		const result = await gen.chat("x", "s1");
+
+		expect(result).toBe("收尾");
+		expect(toolsMock.executeTool).not.toHaveBeenCalled();
+		// 第二轮必须带着那条 id 对得上的 tool 应答,否则网关会拒掉整个请求。
+		const reply = createParams(1).messages.find(
+			(m) => (m as { tool_call_id?: string }).tool_call_id === "c9",
+		);
+		expect(reply).toBeDefined();
+		expect(reply?.role).toBe("tool");
+	});
 });
 
 // ---------------------------------------------------------------------------
@@ -523,6 +546,39 @@ describe("CommentaryGenerator.chatStateless — 调用方自带历史", () => {
 		await expect(gen.chatStateless([])).rejects.toThrow("对话历史为空");
 		expect(oai.create).not.toHaveBeenCalled();
 	});
+
+	it("带独立思考设置 → 压过引擎配置,只对这一次生效", async () => {
+		// 聊天页的思考配置与引擎(点评/总结)分了家:引擎开着 high,聊天自己关了,
+		// 这一单就得发「关」位方言 —— 否则聊天页的开关只是个摆设。
+		const { gen } = makeGen({ provider: "deepseek", enableThinking: true, thinkingLevel: "high" });
+		oai.create.mockResolvedValueOnce(msgResp("回答"));
+		await gen.chatStateless([{ role: "user", content: "问" }], {
+			thinking: { enableThinking: false, thinkingLevel: "high" },
+		});
+		const params = createParams(0) as unknown as Record<string, unknown>;
+		expect(params.thinking).toEqual({ type: "disabled" });
+		expect(params.reasoning_effort).toBeUndefined();
+	});
+
+	it("独立设置的等级也翻译成方言 —— 引擎 high、聊天 low 各走各的", async () => {
+		const { gen } = makeGen({ provider: "deepseek", enableThinking: false, thinkingLevel: "low" });
+		oai.create.mockResolvedValueOnce(msgResp("回答"));
+		await gen.chatStateless([{ role: "user", content: "问" }], {
+			thinking: { enableThinking: true, thinkingLevel: "high" },
+		});
+		const params = createParams(0) as unknown as Record<string, unknown>;
+		expect(params.thinking).toEqual({ type: "enabled" });
+		expect(params.reasoning_effort).toBe("max");
+	});
+
+	it("不带独立设置 → 照旧用引擎配置,老调用方零变化", async () => {
+		const { gen } = makeGen({ provider: "deepseek", enableThinking: true, thinkingLevel: "high" });
+		oai.create.mockResolvedValueOnce(msgResp("回答"));
+		await gen.chatStateless([{ role: "user", content: "问" }]);
+		const params = createParams(0) as unknown as Record<string, unknown>;
+		expect(params.thinking).toEqual({ type: "enabled" });
+		expect(params.reasoning_effort).toBe("max");
+	});
 });
 
 // ---------------------------------------------------------------------------
@@ -530,14 +586,6 @@ describe("CommentaryGenerator.chatStateless — 调用方自带历史", () => {
 // ---------------------------------------------------------------------------
 
 /** 造一个 SDK 风格的流:async iterable of chunks。 */
-function streamOf(chunks: unknown[]): AsyncIterable<unknown> {
-	return {
-		async *[Symbol.asyncIterator]() {
-			for (const c of chunks) yield c;
-		},
-	};
-}
-const textChunk = (text: string) => ({ choices: [{ delta: { content: text } }] });
 /** tool_call 的分片:name / arguments 都是一段段来的,靠 index 归位。 */
 const toolChunk = (index: number, part: Record<string, unknown>) => ({
 	choices: [{ delta: { tool_calls: [{ index, ...part }] } }],
@@ -598,6 +646,29 @@ describe("CommentaryGenerator.summarizeTitle", () => {
 		const { gen } = makeGen();
 		oai.create.mockResolvedValueOnce(msgResp("让我想想,这段对话主要在讲订阅管理。\n\n订阅管理"));
 		expect(await gen.summarizeTitle(ROUND)).toBe("订阅管理");
+	});
+
+	it("显式关思考 —— 起标题是杂务,思维链只会烧光预算让 content 空手而归", async () => {
+		// 现场(2026-08-12):DeepSeek v4 **默认就开思考**,而起标题这一单原本一个
+		// 方言字段都不发,于是思维链把 max_tokens 烧光,content 回来是空的 →
+		// 「模型没给出标题」,每个会话都失败。起标题永远发「关」位方言,与主人的
+		// 思考开关无关 —— 这是一句冷冰冰的概括,不值得烧思考的钱。
+		const { gen } = makeGen({ provider: "deepseek", enableThinking: true, thinkingLevel: "high" });
+		oai.create.mockResolvedValueOnce(msgResp("标题"));
+		await gen.summarizeTitle(ROUND);
+		expect((createParams(0) as unknown as Record<string, unknown>).thinking).toEqual({
+			type: "disabled",
+		});
+	});
+
+	it("自定义服务商起标题照旧一个方言字段都不发 —— 方言未知,发了几乎必然被拒", async () => {
+		const { gen } = makeGen({ provider: "custom", enableThinking: false });
+		oai.create.mockResolvedValueOnce(msgResp("标题"));
+		await gen.summarizeTitle(ROUND);
+		const params = createParams(0) as unknown as Record<string, unknown>;
+		expect(params.thinking).toBeUndefined();
+		expect(params.enable_thinking).toBeUndefined();
+		expect(params.reasoning).toBeUndefined();
 	});
 
 	it("给的 token 预算够模型想一会儿 —— 太抠会让它把额度花在思考上、正文空手而归", async () => {
@@ -706,6 +777,204 @@ describe("CommentaryGenerator.chatStatelessStream — 真流式", () => {
 		expect(seen).toEqual(["答案"]);
 	});
 
+	/**
+	 * 思考流 —— DeepSeek 式「先想后说」的那段草稿。
+	 *
+	 * 方言两派:DeepSeek / 硅基 / 火山 / 百炼在 delta 上吐 `reasoning_content`,
+	 * OpenRouter 吐 `reasoning`。两个都认,但**只认字符串**:有网关会把这些字段
+	 * 塞成对象,盲拼会得到一串 [object Object]。
+	 */
+	describe("思考流(onReasoning)", () => {
+		const thinkChunk = (text: string) => ({ choices: [{ delta: { reasoning_content: text } }] });
+
+		it("reasoning_content 分片走 onReasoning,不混进正文", async () => {
+			const { gen } = makeGen();
+			oai.create.mockResolvedValueOnce(
+				streamOf([thinkChunk("主人问的是"), thinkChunk("天气"), textChunk("晚上好")]),
+			);
+			const think: string[] = [];
+			const text: string[] = [];
+			const result = await gen.chatStatelessStream([{ role: "user", content: "在吗" }], {
+				onDelta: (t) => text.push(t),
+				onReasoning: (t) => think.push(t),
+			});
+			// 思考一个字都不能漏进正文 —— 正文是要落盘、要当上下文回传给模型的。
+			expect(result).toBe("晚上好");
+			expect(text).toEqual(["晚上好"]);
+			expect(think).toEqual(["主人问的是", "天气"]);
+		});
+
+		it("OpenRouter 方言(delta.reasoning)同样认", async () => {
+			const { gen } = makeGen();
+			oai.create.mockResolvedValueOnce(
+				streamOf([{ choices: [{ delta: { reasoning: "想想" } }] }, textChunk("好")]),
+			);
+			const think: string[] = [];
+			await gen.chatStatelessStream([{ role: "user", content: "x" }], {
+				onDelta: () => {},
+				onReasoning: (t) => think.push(t),
+			});
+			expect(think).toEqual(["想想"]);
+		});
+
+		it("字段不是字符串(某些网关塞对象)→ 跳过,不吐 [object Object]", async () => {
+			const { gen } = makeGen();
+			oai.create.mockResolvedValueOnce(
+				streamOf([
+					{ choices: [{ delta: { reasoning_content: { detail: "x" } } }] },
+					textChunk("好"),
+				]),
+			);
+			const think: string[] = [];
+			await gen.chatStatelessStream([{ role: "user", content: "x" }], {
+				onDelta: () => {},
+				onReasoning: (t) => think.push(t),
+			});
+			expect(think).toEqual([]);
+		});
+
+		// 摘方言重试那一轮曾只喂正文不喂思考 —— 与 fetchRound 的非流式回落(补喂
+		// 思考)不一致:兼容网关拒掉方言参数时,模型照想、token 照烧、字段就在
+		// message 上,dashboard 的思考块却无声消失。
+		it("摘方言重试的那一轮,message 上的思考也要补喂 onReasoning", async () => {
+			// 开着思考才有方言参数可摘 —— 默认档的关位一个字段都不发,进不了重试分支。
+			const { gen } = makeGen({ provider: "siliconflow", enableThinking: true });
+			oai.create
+				.mockRejectedValueOnce(new Error("dialect unsupported")) // 流式
+				.mockRejectedValueOnce(new Error("dialect unsupported")) // 非流式回落
+				.mockResolvedValueOnce({
+					choices: [{ message: { role: "assistant", content: "答", reasoning_content: "想了想" } }],
+				}); // 摘掉方言的重试
+			const think: string[] = [];
+			const text: string[] = [];
+			const result = await gen.chatStatelessStream([{ role: "user", content: "x" }], {
+				onDelta: (t) => text.push(t),
+				onReasoning: (t) => think.push(t),
+			});
+			expect(result).toBe("答");
+			expect(text).toEqual(["答"]);
+			expect(think).toEqual(["想了想"]);
+		});
+
+		it("工具轮的思考同样上报 —— 她决定去查什么的过程也是思考", async () => {
+			const { gen } = makeGen();
+			oai.create
+				.mockResolvedValueOnce(
+					streamOf([
+						thinkChunk("得查一下订阅"),
+						toolChunk(0, { id: "c1", function: { name: "fake_tool", arguments: "{}" } }),
+					]),
+				)
+				.mockResolvedValueOnce(streamOf([thinkChunk("查到了,整理一下"), textChunk("答案")]));
+			const think: string[] = [];
+			await gen.chatStatelessStream([{ role: "user", content: "x" }], {
+				onDelta: () => {},
+				onReasoning: (t) => think.push(t),
+			});
+			expect(think).toEqual(["得查一下订阅", "查到了,整理一下"]);
+		});
+
+		it("回落非流式时,message 上的 reasoning_content 一次性交出来", async () => {
+			const { gen } = makeGen();
+			oai.create.mockRejectedValueOnce(new Error("stream is not supported")).mockResolvedValueOnce({
+				choices: [
+					{ message: { role: "assistant", content: "整段", reasoning_content: "整段思考" } },
+				],
+			});
+			const think: string[] = [];
+			await gen.chatStatelessStream([{ role: "user", content: "x" }], {
+				onDelta: () => {},
+				onReasoning: (t) => think.push(t),
+			});
+			expect(think).toEqual(["整段思考"]);
+		});
+
+		it("吐过思考再断 → 不再静默回落 —— 屏幕上已经有字了", async () => {
+			// emitted 的语义是「主人看见过任何输出没有」。思考也是输出:回落重来
+			// 会让同一段思考再播一遍,或者接上一段完全不同的正文。
+			const { gen } = makeGen();
+			async function* broken() {
+				yield thinkChunk("想到一半");
+				throw new Error("connection reset");
+			}
+			oai.create.mockResolvedValueOnce({ [Symbol.asyncIterator]: broken });
+			await expect(
+				gen.chatStatelessStream([{ role: "user", content: "x" }], {
+					onDelta: () => {},
+					onReasoning: () => {},
+				}),
+			).rejects.toThrow(/connection reset/);
+			expect(oai.create).toHaveBeenCalledTimes(1);
+		});
+
+		it("没人听思考(不传 onReasoning)→ 一切照旧", async () => {
+			const { gen } = makeGen();
+			oai.create.mockResolvedValueOnce(streamOf([thinkChunk("想想"), textChunk("好")]));
+			const result = await gen.chatStatelessStream([{ role: "user", content: "x" }], {
+				onDelta: () => {},
+			});
+			expect(result).toBe("好");
+		});
+
+		/**
+		 * DeepSeek v4 的硬性契约:思考 + 工具调用时,工具轮的后续请求必须把
+		 * `reasoning_content` 原样回传,缺了直接 400(官方 thinking_mode 文档)。
+		 * 流式下这条消息是我们自己拼的,漏掉字段就等于每一次「边想边查」都必炸。
+		 */
+		it("思考 + 工具调用:工具轮把 reasoning_content 原样带回给 API", async () => {
+			const { gen } = makeGen();
+			oai.create
+				.mockResolvedValueOnce(
+					streamOf([
+						thinkChunk("得查一下订阅"),
+						toolChunk(0, { id: "c1", function: { name: "fake_tool", arguments: "{}" } }),
+					]),
+				)
+				.mockResolvedValueOnce(streamOf([textChunk("答案")]));
+			await gen.chatStatelessStream([{ role: "user", content: "x" }], {
+				onDelta: () => {},
+				onReasoning: () => {},
+			});
+			const echoed = createParams(1).messages.find(
+				(m) => (m as { role?: string }).role === "assistant",
+			) as unknown as Record<string, unknown>;
+			expect(echoed.reasoning_content).toBe("得查一下订阅");
+		});
+
+		it("回传不看有没有人听 —— 它是 API 契约,不是显示需求", async () => {
+			// koishi 那条路不传 onReasoning,但它同样挂工具;漏了回传,主人在 koishi
+			// 群里用思考模型一样会 400。
+			const { gen } = makeGen();
+			oai.create
+				.mockResolvedValueOnce(
+					streamOf([
+						thinkChunk("想想"),
+						toolChunk(0, { id: "c1", function: { name: "fake_tool", arguments: "{}" } }),
+					]),
+				)
+				.mockResolvedValueOnce(streamOf([textChunk("好")]));
+			await gen.chatStatelessStream([{ role: "user", content: "x" }], { onDelta: () => {} });
+			const echoed = createParams(1).messages.find(
+				(m) => (m as { role?: string }).role === "assistant",
+			) as unknown as Record<string, unknown>;
+			expect(echoed.reasoning_content).toBe("想想");
+		});
+
+		it("没思考的工具轮不凭空多一个字段", async () => {
+			const { gen } = makeGen();
+			oai.create
+				.mockResolvedValueOnce(
+					streamOf([toolChunk(0, { id: "c1", function: { name: "fake_tool", arguments: "{}" } })]),
+				)
+				.mockResolvedValueOnce(streamOf([textChunk("好")]));
+			await gen.chatStatelessStream([{ role: "user", content: "x" }], { onDelta: () => {} });
+			const echoed = createParams(1).messages.find(
+				(m) => (m as { role?: string }).role === "assistant",
+			) as unknown as Record<string, unknown>;
+			expect("reasoning_content" in echoed).toBe(false);
+		});
+	});
+
 	it("网关不支持流式 → 回落非流式,一次性把整段交出去", async () => {
 		// 一个不支持 stream 的兼容网关不该让聊天整个用不了。此时还没吐过任何字,
 		// 悄悄重来一次对主人是无感的。
@@ -772,6 +1041,40 @@ describe("CommentaryGenerator.chatStatelessStream — 真流式", () => {
 		expect(oai.create).toHaveBeenCalledTimes(1);
 	});
 
+	/**
+	 * 超时与账户拒绝同类:**换个参数重来一样会超时**。
+	 *
+	 * 真机现场(2026-08-19 07:45:20 → 07:57:22):皮肤生成那趟非流式调用超时,先被
+	 * 当成「网关不支持流式」回落一次,再被当成「方言参数不受支持」摘掉
+	 * enable_thinking 整轮重来 —— 叠上 SDK 默认的 maxRetries=2,一道 120s 的闸硬生生
+	 * 等成 12 分 02 秒,主人最后只等来一句 `Request timed out.`。
+	 */
+	const timeoutErr = () => {
+		// SDK 那个类不设 name,认得出它的只有 constructor.name 与那句 message。
+		class APIConnectionTimeoutError extends Error {}
+		return new APIConnectionTimeoutError("Request timed out.");
+	};
+
+	it("超时 → 既不回落非流式也不摘方言参数,只发一次", async () => {
+		// siliconflow 连「思考关着」都要发一条 enable_thinking:false,方言降级那条
+		// 分支于是必然命中 —— 它不是偶发路径,是这家网关的常态。
+		const { gen } = makeGen({ provider: "siliconflow", enableThinking: false });
+		oai.create.mockRejectedValue(timeoutErr());
+		await expect(
+			gen.chatStatelessStream([{ role: "user", content: "x" }], { onDelta: () => {} }),
+		).rejects.toThrow(/超时/);
+		expect(oai.create).toHaveBeenCalledTimes(1);
+	});
+
+	it("504 这类上游超时同样只发一次 —— 重来一趟一样会卡在那儿", async () => {
+		const { gen } = makeGen({ provider: "siliconflow", enableThinking: false });
+		oai.create.mockRejectedValue(httpErr(504, "504 Gateway Timeout"));
+		await expect(
+			gen.chatStatelessStream([{ role: "user", content: "x" }], { onDelta: () => {} }),
+		).rejects.toThrow(/超时/);
+		expect(oai.create).toHaveBeenCalledTimes(1);
+	});
+
 	it("500 之类的上游抖动仍然回落 —— 那确实可能换条路就好了", async () => {
 		const { gen } = makeGen();
 		oai.create
@@ -795,6 +1098,105 @@ describe("CommentaryGenerator.chatStatelessStream — 真流式", () => {
 		await expect(
 			gen.chatStatelessStream([{ role: "user", content: "x" }], { onDelta: () => {} }),
 		).rejects.toThrow("connection reset");
+	});
+
+	/**
+	 * 首字节之后的看门狗。
+	 *
+	 * SDK 的 `timeout` 靠 `setTimeout(abort)` + fetch resolve 时 `clearTimeout` 实现
+	 * (`openai/core.js:386`),而 **fetch 在响应头到达时就 resolve** —— 流式一开,
+	 * 那道闸当场失效,后面整段生成没有任何死线,模型 hang 住就是永远转圈。
+	 *
+	 * 所以死线得换个问法:**慢不算错,卡住才算错**。
+	 */
+	const hangingStream = (opts?: { signal?: AbortSignal }, lead?: string) => ({
+		async *[Symbol.asyncIterator]() {
+			if (lead) yield textChunk(lead);
+			// 真 SDK 在 signal abort 时就是这么炸的。
+			await new Promise((_res, rej) => {
+				opts?.signal?.addEventListener("abort", () => rej(new Error("Request was aborted.")));
+			});
+		},
+	});
+
+	it("流开了之后卡住 —— 静默超过看门狗就断,而且只发一次", async () => {
+		vi.useFakeTimers();
+		try {
+			const { gen } = makeGen({ provider: "siliconflow", enableThinking: false });
+			oai.create.mockImplementation(async (_p: unknown, opts?: { signal?: AbortSignal }) =>
+				hangingStream(opts, "开头"),
+			);
+			const caught = gen
+				.chatStatelessStream([{ role: "user", content: "x" }], {
+					onDelta: () => {},
+				})
+				.then(
+					() => null,
+					(e: Error) => e,
+				);
+			await vi.advanceTimersByTimeAsync(70_000);
+			expect((await caught)?.message).toMatch(/卡住|超时/);
+			// 卡住和超时同类:换个姿势重来一样会卡。
+			expect(oai.create).toHaveBeenCalledTimes(1);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("第一片的宽限**更长** —— 网关排队、模型先想很久,都不算卡住", async () => {
+		// 片与片之间静默一分钟一定是死了;但**第一片**之前静默一分钟很正常 ——
+		// 网关在排队,或者推理模型正闷头想。拿片间那一档去卡首片,等于把慢网关
+		// 和长思考一律误杀,比原先那道 120s 的闸还严。
+		vi.useFakeTimers();
+		try {
+			const { gen } = makeGen({ provider: "siliconflow", enableThinking: false });
+			oai.create.mockImplementation(async (_p: unknown, opts?: { signal?: AbortSignal }) =>
+				hangingStream(opts),
+			);
+			const caught = gen
+				.chatStatelessStream([{ role: "user", content: "x" }], {
+					onDelta: () => {},
+				})
+				.then(
+					() => null,
+					(e: Error) => e,
+				);
+			// 片间那一档早就过了,首片这一档还没到 —— 不许掐。
+			await vi.advanceTimersByTimeAsync(90_000);
+			expect(await Promise.race([caught, Promise.resolve("still-running")])).toBe("still-running");
+			// 首片这一档也过了 —— 这才是真卡住。
+			await vi.advanceTimersByTimeAsync(120_000);
+			expect((await caught)?.message).toMatch(/卡住|超时/);
+			expect(oai.create).toHaveBeenCalledTimes(1);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("每来一片就重新计时 —— 慢不算卡住", async () => {
+		// 片与片之间各等 40s,总共 120s 早就超过看门狗那一档,但从没静默满一整档。
+		// 皮肤生成正是这个形状:很长,但一直在出字。
+		vi.useFakeTimers();
+		try {
+			const { gen } = makeGen();
+			oai.create.mockImplementation(async () => ({
+				async *[Symbol.asyncIterator]() {
+					for (const t of ["一", "二", "三"]) {
+						await new Promise((res) => setTimeout(res, 40_000));
+						yield textChunk(t);
+					}
+				},
+			}));
+			const done = gen.chatStatelessStream([{ role: "user", content: "x" }], {
+				onDelta: () => {},
+			});
+			await vi.advanceTimersByTimeAsync(200_000);
+			expect(await done).toBe("一二三");
+			// 收尾要把看门狗撤掉,别把定时器漏在外面。
+			expect(vi.getTimerCount()).toBe(0);
+		} finally {
+			vi.useRealTimers();
+		}
 	});
 
 	it("空历史 → 直接抛,与 chatStateless 同约定", async () => {
@@ -1171,5 +1573,199 @@ describe("CommentaryGenerator — ②8 chat 串行化 / :384 脱敏 (P2)", () =>
 		);
 		expect(msg).not.toContain("sk-test");
 		expect(msg).toContain("Bearer ***");
+	});
+});
+
+describe("CommentaryGenerator.generateRaw(无人格结构化生成)", () => {
+	it("system 原样直达、不叠人格/场景、不挂工具;返回正文", async () => {
+		const { gen } = makeGen();
+		oai.create.mockResolvedValueOnce(streamOf([textChunk('{"a":1}')]));
+		const out = await gen.generateRaw("RAW_SYSTEM", "RAW_USER");
+		expect(out).toBe('{"a":1}');
+		const params = oai.create.mock.calls.at(-1)?.[0] as {
+			messages: ChatMsg[];
+			tools?: unknown;
+		};
+		expect(params.messages[0]).toEqual({ role: "system", content: "RAW_SYSTEM" });
+		expect(params.messages[1]).toEqual({ role: "user", content: "RAW_USER" });
+		expect(params.tools).toBeUndefined();
+	});
+
+	it("走流式 —— 别让整段生成压在一道死线上", async () => {
+		// 非流式时网关要整份生成完才回响应头,SDK 那道闸于是压满全程;流式一开,
+		// 首字节几秒就到,剩下的交给分片看门狗。
+		const { gen } = makeGen();
+		oai.create.mockResolvedValueOnce(streamOf([textChunk('{"a"'), textChunk(":1}")]));
+		expect(await gen.generateRaw("S", "U")).toBe('{"a":1}');
+		expect(createParams(0)).toMatchObject({ stream: true });
+	});
+
+	it("按累计字符数报进度 —— 主人能看见她在写", async () => {
+		const { gen } = makeGen();
+		oai.create.mockResolvedValueOnce(
+			streamOf([textChunk("a".repeat(100)), textChunk("b".repeat(100))]),
+		);
+		const seen: number[] = [];
+		await gen.generateRaw("S", "U", (chars) => seen.push(chars));
+		expect(seen).toEqual([100, 200]);
+	});
+
+	it("不逐片报 —— 一片一帧会一路放大成聊天页的全量重渲", async () => {
+		// 界面上那个数字过千之后只显示到 0.1k,每 100 字报一次,主人看到的不变。
+		// 收尾那一次补的是零头,短回复也就不至于一次都没报过。
+		const { gen } = makeGen();
+		oai.create.mockResolvedValueOnce(streamOf([textChunk("12345"), textChunk("678")]));
+		const seen: number[] = [];
+		await gen.generateRaw("S", "U", (chars) => seen.push(chars));
+		expect(seen).toEqual([8]);
+	});
+
+	it("兜底死线放到 300s,而且**不**让 SDK 偷偷重试", async () => {
+		// 走了流式之后,SDK 这道闸只管到响应头 —— 剩下的交给分片看门狗。留着它是
+		// 兜「网关连响应头都不给」那一种死法。maxRetries 归零则是因为重试改不了慢。
+		const { gen } = makeGen();
+		oai.create.mockResolvedValueOnce(streamOf([textChunk("{}")]));
+		await gen.generateRaw("S", "U");
+		expect(oai.ctorArgs.at(-1)).toMatchObject({ timeout: 300_000, maxRetries: 0 });
+	});
+
+	it("聊天 / 点评那档照旧 120s —— 放宽只给结构化生成", async () => {
+		const { gen } = makeGen();
+		oai.create.mockResolvedValueOnce(msgResp("点评"));
+		await gen.comment("x");
+		expect(oai.ctorArgs.at(-1)).toMatchObject({ timeout: 120_000, maxRetries: 0 });
+	});
+});
+
+// ---------------------------------------------------------------------------
+// 抖一下就好的失败
+// ---------------------------------------------------------------------------
+
+describe("CommentaryGenerator — 限流时按网关点名的时间回来", () => {
+	/**
+	 * `maxRetries: 0` 真正弄丢的只有这一样:SDK 的默认重试**会认 Retry-After**。
+	 *
+	 * 「429 不重来」本身是 2026-07-25 就立下的决定(见上面那节),理由是**立刻**
+	 * 重来只会加剧 —— 那条完全成立,这里不推翻它。只有网关自己回了 Retry-After
+	 * 才重来,并严格按它给的时间等:那不是「立刻重来」,是「按它说的点回来」。
+	 */
+	const limited = (retryAfter?: string) =>
+		Object.assign(new Error("429 Too Many Requests"), {
+			status: 429,
+			...(retryAfter !== undefined ? { headers: { "retry-after": retryAfter } } : {}),
+		});
+
+	it("网关给了 Retry-After → 等它说的那么久,重来一次", async () => {
+		const { gen } = makeGen();
+		oai.create.mockRejectedValueOnce(limited("0")).mockResolvedValueOnce(msgResp("点评"));
+		expect(await gen.comment("x")).toBe("点评");
+		expect(oai.create).toHaveBeenCalledTimes(2);
+	});
+
+	/**
+	 * openai SDK v5 起 `APIError.headers` 是 **Web `Headers` 实例**,不再是普通对象
+	 * —— 也就是说升到 7 之后,真机上恒定走 `retryAfterMs` 里探 `.get` 的那一支,
+	 * 上面几条用字面量 headers 的用例反倒钉的是**再也不会发生**的形状。
+	 * 这条补的就是那个缺口:两种形状都得读得出来,否则限流重试会静默失效
+	 * (读不到就当网关没说,直接放弃重来,而且没有任何报错)。
+	 */
+	it("SDK v5 起 headers 是 Headers 实例 → 照样读得出 Retry-After", async () => {
+		const { gen } = makeGen();
+		const withHeaders = Object.assign(new Error("429 Too Many Requests"), {
+			status: 429,
+			headers: new Headers({ "retry-after": "0" }),
+		});
+		oai.create.mockRejectedValueOnce(withHeaders).mockResolvedValueOnce(msgResp("点评"));
+		expect(await gen.comment("x")).toBe("点评");
+		expect(oai.create).toHaveBeenCalledTimes(2);
+	});
+
+	it("没给 Retry-After → 不重来(既有决定:立刻重来只会加剧)", async () => {
+		const { gen } = makeGen();
+		oai.create.mockRejectedValue(limited());
+		await expect(gen.comment("x")).rejects.toThrow(/频繁|限流/);
+		expect(oai.create).toHaveBeenCalledTimes(1);
+	});
+
+	it("Retry-After 长得离谱 → 干脆不重来,别撞进冷却期再吃一个 429", async () => {
+		// 截成 20 秒照样重来是最糟的一种:网关说要冷却十分钟,二十秒后再敲必然
+		// 又被拒。要么按它说的等,要么就别等。
+		const { gen } = makeGen();
+		oai.create.mockRejectedValue(limited("600"));
+		await expect(gen.comment("x")).rejects.toThrow(/频繁|限流/);
+		expect(oai.create).toHaveBeenCalledTimes(1);
+	});
+
+	it("流式那条路同样认 Retry-After —— dashboard 聊天与皮肤生成全走它", async () => {
+		// 这一条是审计补的:流式的 429 会先被 fatalOf/rejectionOf **重新造一个错误**
+		// 抛出去,原来那个 SDK 错误上的 headers 就此丢失 —— 于是 retryAfterMs 永远
+		// 读不到,整个特性只在非流式那条路上活着,而它本来就是为聊天写的。
+		const { gen } = makeGen();
+		oai.create
+			.mockRejectedValueOnce(limited("0"))
+			.mockResolvedValueOnce(streamOf([textChunk("好")]));
+		const out = await gen.chatStatelessStream([{ role: "user", content: "在吗" }], {
+			onDelta: () => {},
+		});
+		expect(out).toBe("好");
+		expect(oai.create).toHaveBeenCalledTimes(2);
+	});
+
+	it("401 不重来 —— key 无效,重一万次也是无效", async () => {
+		const { gen } = makeGen();
+		oai.create.mockRejectedValue(Object.assign(new Error("401"), { status: 401 }));
+		await expect(gen.comment("x")).rejects.toThrow(/401|Key/);
+		expect(oai.create).toHaveBeenCalledTimes(1);
+	});
+
+	it("超时不重来 —— 重一趟同样慢,只是把主人的等待翻倍", async () => {
+		const { gen } = makeGen();
+		oai.create.mockRejectedValue(new Error("Request timed out."));
+		await expect(gen.comment("x")).rejects.toThrow(/超时/);
+		expect(oai.create).toHaveBeenCalledTimes(1);
+	});
+
+	it("已经吐过字之后再断 → 绝不重来(那半句会凭空变成另一段)", async () => {
+		const { gen } = makeGen();
+		oai.create.mockResolvedValueOnce({
+			async *[Symbol.asyncIterator]() {
+				yield textChunk("半句");
+				throw limited("0");
+			},
+		});
+		const seen: string[] = [];
+		await expect(
+			gen.chatStatelessStream([{ role: "user", content: "在吗" }], {
+				onDelta: (t) => seen.push(t),
+			}),
+		).rejects.toThrow();
+		expect(seen).toEqual(["半句"]);
+		expect(oai.create).toHaveBeenCalledTimes(1);
+	});
+});
+
+describe("CommentaryGenerator — 副路两把闸也别放大超时", () => {
+	/**
+	 * 主路的 maxRetries 归零了,标题与视觉这两个副 client 当时漏了 —— 一道 60s 的
+	 * 视觉闸叠上 SDK 默认的两次重试就是 180s,而视觉在推送热路径上(动态带图就走
+	 * 它)。这两条都是**可降级**的增补(标题没了就用默认标题、图描述不出来就不描述),
+	 * 拿延迟换成功率不划算:归零,快速失败。
+	 */
+	it("标题客户端 maxRetries 归零", async () => {
+		const { gen } = makeGen();
+		oai.create.mockResolvedValueOnce(msgResp("标题"));
+		await gen.summarizeTitle([
+			{ role: "user", content: "本周谁最勤奋" },
+			{ role: "assistant", content: "是 A 君。" },
+		]);
+		expect(oai.ctorArgs.at(-1)).toMatchObject({ maxRetries: 0 });
+	});
+
+	it("视觉客户端 maxRetries 归零", async () => {
+		const { gen } = makeGen({ vision: { model: "v-test" } });
+		oai.create.mockResolvedValue(msgResp("一张图"));
+		await gen.comment("看图说话", "dynamic", ["https://img.test/a.png"]);
+		const visionCtor = oai.ctorArgs.find((a) => (a as { timeout?: number }).timeout === 60_000);
+		expect(visionCtor).toMatchObject({ maxRetries: 0 });
 	});
 });

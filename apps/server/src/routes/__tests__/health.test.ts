@@ -2,8 +2,11 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vite-plus/test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
+import serverPkg from "../../../package.json" with { type: "json" };
 import { MODULE_VERSIONS, resolveAppVersion } from "../health.js";
+
+const serverPkgVersion = serverPkg.version;
 
 describe("resolveAppVersion", () => {
 	let dir: string;
@@ -43,6 +46,26 @@ describe("resolveAppVersion", () => {
 	it("version 缺失或空串时回退 dev", () => {
 		expect(resolveAppVersion(writePkg("a.json", JSON.stringify({ name: "x" })))).toBe("dev");
 		expect(resolveAppVersion(writePkg("b.json", JSON.stringify({ version: "" })))).toBe("dev");
+	});
+
+	/**
+	 * 版本号必须是**当前跑的这份载荷**的版本,不是进程恰好待在哪个目录。
+	 *
+	 * 在线升级后 cwd 仍是容器的 /app(镜像自带那份),而新载荷跑在
+	 * /data/versions/<新版>/ 下 —— 照 cwd 读就会一直报旧版本号,用户升完看仪表盘
+	 * 纹丝不动,只会以为升级压根没成。NapCat 那个恒显 0.0.0 就是这个形态。
+	 */
+	it("不传参时按模块自己的位置找,而不是进程的 cwd", () => {
+		writeFileSync(join(dir, "package.json"), JSON.stringify({ version: "9.9.9-from-cwd" }));
+		const cwdSpy = vi.spyOn(process, "cwd").mockReturnValue(dir);
+
+		try {
+			expect(resolveAppVersion()).not.toBe("9.9.9-from-cwd");
+			// apps/server/package.json —— 源码形态下模块往上找到的就是它。
+			expect(resolveAppVersion()).toBe(serverPkgVersion);
+		} finally {
+			cwdSpy.mockRestore();
+		}
 	});
 });
 

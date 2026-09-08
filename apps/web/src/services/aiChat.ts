@@ -1,4 +1,5 @@
 import type {
+	AiChatMode,
 	AiChatReplyResponse,
 	AiConversationDTO,
 	AiConversationListResponse,
@@ -19,6 +20,7 @@ import { withDesktopTokenHeader } from "./desktop-token";
 
 export type {
 	AiChatMessageDTO,
+	AiChatMode,
 	AiConversationDTO,
 	AiConversationMetaDTO,
 	AiToolTraceDTO,
@@ -31,8 +33,15 @@ export function listConversations(): Promise<AiConversationListResponse> {
 	return api.get<AiConversationListResponse>("/api/ai/conversations");
 }
 
-export async function createConversation(): Promise<AiConversationDTO> {
-	const res = await api.post<AiConversationResponse>("/api/ai/conversations");
+/**
+ * 开一场新对话。`init` 是这场对话的**面孔**,只在这一刻定得了 —— 之后没有任何
+ * 接口能改它(见服务端 newConversationSchema)。
+ */
+export async function createConversation(init?: {
+	mode?: AiChatMode;
+	persona?: boolean;
+}): Promise<AiConversationDTO> {
+	const res = await api.post<AiConversationResponse>("/api/ai/conversations", init ?? {});
 	return res.conversation;
 }
 
@@ -97,20 +106,35 @@ export function createSseParser(): (chunk: string) => SseFrame[] {
 }
 
 /**
- * 一次工具调用的两拍,与服务端 `event: tool` 的载荷同形。
+ * 一次工具调用的几拍,与服务端 `event: tool` 的载荷同形。
  *
- * 工具轮不产生正文,所以那几秒在界面上跟「模型卡住了」长得一模一样 —— 这两拍
- * 就是把那段空白讲出来。`end` 靠 `id` 认回自己的 `start`。
+ * 工具轮不产生正文,所以那几秒在界面上跟「模型卡住了」长得一模一样 —— 这几拍
+ * 就是把那段空白讲出来。`progress` / `end` 都靠 `id` 认回自己的 `start`。
  */
 export type ChatToolEvent =
 	| { phase: "start"; id: string; name: string; args: Record<string, string> }
-	| { phase: "end"; id: string; ok: boolean };
+	| {
+			/** 慢工具的活口:start 与 end 之间可以来任意多拍,也可以一拍都没有。 */
+			phase: "progress";
+			id: string;
+			/** 这个工具到此刻已经产出多少字符。 */
+			chars: number;
+	  }
+	| {
+			phase: "end";
+			id: string;
+			ok: boolean;
+			/** `web_search` 专属:搜到的来源(标题 + 链接),给「来源」折叠列表。 */
+			sources?: Array<{ title: string; url: string; siteName?: string }>;
+	  };
 
 export interface ChatStreamHandlers {
 	/** 正文分片,来一段回调一次。 */
 	onDelta: (text: string) => void;
 	/** 工具调用的两拍。不关心就不传。 */
 	onTool?: (ev: ChatToolEvent) => void;
+	/** 思考分片(思考模型「先想后说」的那段草稿)。不关心就不传。 */
+	onReasoning?: (text: string) => void;
 }
 
 /**
@@ -128,12 +152,29 @@ export async function sendChatMessage(
 	handlers: ChatStreamHandlers,
 	/** 这一问带的图片资产 id(已经传好的),见 {@link uploadChatImage}。 */
 	images?: readonly string[],
+	/**
+	 * 只在这一问里活着的那几样:会话级的两颗胶囊(深度思考 / 联网搜索),以及
+	 * 主人打的斜杠命令点名的技能。都不落盘 —— 不带 = 都关 / 不点名。
+	 * **要发的东西必须走参数**,别从组件闭包里读。
+	 */
+	flags?: { thinking?: boolean; search?: boolean; skill?: string },
 ): Promise<AiChatReplyResponse> {
 	const path = `/api/ai/conversations/${encodeURIComponent(id)}/chat`;
 	const res = await fetch(path, {
 		method: "POST",
 		headers: withDesktopTokenHeader({ "content-type": "application/json" }),
-		body: JSON.stringify({ message, ...(images?.length ? { images: [...images] } : {}) }),
+		body: JSON.stringify({
+			message,
+			...(images?.length ? { images: [...images] } : {}),
+			...(flags?.thinking ? { thinking: true } : {}),
+			...(flags?.search ? { search: true } : {}),
+			// 技能只传**名字**,正文由服务端从库里取 —— 落盘的用户消息就该是主人
+			// 真打的那几个字,不该被一整段技能正文顶掉。
+			...(flags?.skill ? { skill: flags.skill } : {}),
+			// 这里没有 mode:模式归会话所有(开局锁定),服务端 ChatRequestSchema 早
+			// 就不收这个字段了。别再加回来 —— 让请求体决定模式,等于把开写能力那道
+			// 口子的钥匙交给每一条消息。
+		}),
 		credentials: "include",
 	});
 	if (!res.ok || !res.body) {
@@ -154,6 +195,8 @@ export async function sendChatMessage(
 		for (const frame of parse(decoder.decode(value, { stream: true }))) {
 			if (frame.event === "delta") {
 				handlers.onDelta((JSON.parse(frame.data) as { text: string }).text);
+			} else if (frame.event === "reasoning") {
+				handlers.onReasoning?.((JSON.parse(frame.data) as { text: string }).text);
 			} else if (frame.event === "tool") {
 				handlers.onTool?.(JSON.parse(frame.data) as ChatToolEvent);
 			} else if (frame.event === "done") {

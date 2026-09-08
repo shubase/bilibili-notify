@@ -5,15 +5,27 @@
  */
 
 import type {
+	AdapterCapabilities,
 	CachedProfile,
 	FansRefreshEntry,
-	HistorySource,
+	HistoryMessageRole,
+	PushKind,
+	PushStatus,
 	Subscription,
 	SubscriptionState,
 } from "@bilibili-notify/internal";
 import type { LogLevel } from "./ws";
 
-export type { FansRefreshEntry, HistorySource };
+export type { MiniAppCardSupport } from "@bilibili-notify/internal";
+export type { AdapterCapabilities, FansRefreshEntry, HistoryMessageRole, PushKind, PushStatus };
+
+// ---- /api/adapters/capabilities ------------------------------------------
+
+/**
+ * `GET /api/adapters/capabilities`:各适配器的平台能力快照,按 adapter id 索引。只有有能力
+ * 概念的平台(OneBot)在表里;官机 / webhook 不在,面板据此写「这个平台不支持」。
+ */
+export type AdapterCapabilitiesMap = Record<string, AdapterCapabilities>;
 
 // ---- /api/subs ------------------------------------------------------------
 
@@ -35,16 +47,33 @@ export type SubscriptionDTO = Subscription & {
 
 // ---- /api/history ----------------------------------------------------------
 
-export interface HistoryEntryView {
-	id: string;
-	ts: string;
-	source: HistorySource;
-	uid: string;
-	subscriptionId: string;
-	targetIds: string[];
-	ok: boolean;
+/** 一行历史里的一条消息:文案 / 图 / 这条对这个目标的结果。无目标行没有 `ok`。 */
+export interface HistoryMessageView {
 	text?: string;
 	imageRef?: string;
+	role: HistoryMessageRole;
+	ok?: boolean;
+	err?: string;
+}
+
+/**
+ * 推送历史的一行 = 一次推送 × 一个目标。`GET /api/history` 与 WS `push-events` 的
+ * `history-recorded` / `history-updated` 共用这一个形状;后者是同一行追加消息后的整行,
+ * 前端按 `id` 换缓存。
+ */
+export interface HistoryEntryView {
+	id: string;
+	/** 同一次推送落到几个目标就有几行,它们共用这一个。 */
+	pushId: string;
+	ts: string;
+	kind: PushKind;
+	status: PushStatus;
+	uid: string;
+	subscriptionId: string;
+	/** null = 无目标行(这类推送没配目标,或配的全停用)。 */
+	targetId: string | null;
+	/** 首条本体是面板上显示的文案;其余展开看。 */
+	messages: HistoryMessageView[];
 	/** 写入时 snapshot 的 UP 主名称 / 头像;老 entry 无此字段。 */
 	unameSnapshot?: string;
 	uavatarSnapshot?: string;
@@ -58,7 +87,7 @@ export interface HistoryResponse {
 export interface DailyHistoryCount {
 	/** 按 tzOffsetMin 口径的本地日 YYYY-MM-DD。 */
 	d: string;
-	counts: Record<HistorySource, number>;
+	counts: Record<PushKind, number>;
 	total: number;
 	failures: number;
 }
@@ -225,6 +254,37 @@ export interface StatsRoastPushResponse {
 	mode?: "image" | "text";
 }
 
+/**
+ * 一轮定时周报跑完的结局。与服务端 `RoastRunOutcome` 同构 —— 那边是权威定义,
+ * 这里是过 wire 的那份契约。
+ *
+ * **业务性失败不是 HTTP 失败**:生成不出来、没配目标都是 200 + 这里的 kind。
+ * 用 4xx 表达的话,前端 error 分支只拿得到一句 HTTP 错误,原因就丢了。
+ */
+export type StatsRoastRunOutcome =
+	/** 一个推送目标都没配,连模型都没调。 */
+	| { kind: "no-targets" }
+	/** 生成这一步就没过去(AI 没开、数据不够、模型报错…)。 */
+	| { kind: "gen-failed"; why: string }
+	/** 审批开着:已经生成并私聊给主人了,群里还没发,等主人回 y。 */
+	| { kind: "pending-approval"; draftId: string }
+	/** 发了。`failed` 非空 = 部分目标没成,那也算发过了,不是整轮失败。 */
+	| {
+			kind: "sent";
+			mode: "text" | "image";
+			sent: number;
+			/** 因停用而跳过的目标 id —— 不算失败,面板单独说一句「跳过 N 个已停用」。 */
+			skipped: string[];
+			failed: Array<{ targetId: string; err: string }>;
+	  };
+
+/** `POST /api/stats/roast/run-now` 响应。`ok:false` 只用于服务没就绪 / 这一轮抛了异常。 */
+export interface StatsRoastRunNowResponse {
+	ok: boolean;
+	err?: string;
+	outcome?: StatsRoastRunOutcome;
+}
+
 export interface StatsOverviewResponse {
 	/** 实际使用的窗口天数(服务端会 clamp)。 */
 	days: number;
@@ -277,6 +337,11 @@ export interface AiToolTraceDTO {
 	args: Record<string, string>;
 	/** 执行成没成。失败的那次也留着 —— 「查了但没查到」和「压根没查」不一样。 */
 	ok: boolean;
+	/**
+	 * `web_search` 专属:这次搜到的来源(标题 + 链接),给消息里的「来源」折叠
+	 * 列表用。别的工具没有这个字段。
+	 */
+	sources?: Array<{ title: string; url: string; siteName?: string }>;
 }
 
 /** 一条聊天消息。`id` 供前端当列表 key,`ts` 是服务端落盘时刻(ISO)。 */
@@ -287,6 +352,11 @@ export interface AiChatMessageDTO {
 	ts: string;
 	/** 助手消息专有:答这一句时调过的工具。没调过就整个字段缺席。 */
 	tools?: AiToolTraceDTO[];
+	/**
+	 * 助手消息专有:答这一句之前的思考过程(思考模型的那段草稿)。前端折叠展示,
+	 * 永不回传给模型。没思考就整个字段缺席。
+	 */
+	reasoning?: string;
 	/**
 	 * 用户消息专有:这一问带的图片资产 id。前端拿它拼
 	 * `/api/ai/assets/<id>` 显示缩略图。没带图就整个字段缺席。
@@ -300,12 +370,42 @@ export interface AiChatMessageDTO {
  * 列表与详情分开是刻意的:侧栏一次要列几十个会话,把每个会话的整段对话都带上,
  * 光为了显示一行标题就要传几百 KB。点进某个会话时再 `GET /:id` 取全文。
  */
+/**
+ * 一场对话的**面孔**:`chat` = 日常聊天(女仆人格 + B 站只读工具),
+ * `skin` = 皮肤工坊(人格与只读工具全收,只留 create_skin)。
+ *
+ * 它是**会话级且锁定**的:开局定下,整场不再改 —— 聊到一半换面孔,前半段的
+ * 上下文与后半段的工具表对不上,主人也说不清自己在跟谁说话。
+ */
+export type AiChatMode = "chat" | "skin";
+
+/**
+ * 「做一套皮肤」那把工具的名字 —— **三层共用的 wire 标识**,与 {@link AiChatMode}
+ * 同层。
+ *
+ * 服务端拿它建工具、拿它给没有 `mode` 的老会话认面孔;web 拿它判断「这轮跑完要不要
+ * 回灌皮肤状态」。三处各写一份字面量的话,改名会**静默**失效两处:侧栏的「工坊」
+ * 牌子和聊完的状态回灌都不报错,只是不生效。
+ */
+export const AI_TOOL_CREATE_SKIN = "create_skin";
+
 export interface AiConversationMetaDTO {
 	id: string;
 	title: string;
 	createdAt: string;
 	updatedAt: string;
 	messageCount: number;
+	/**
+	 * 见 {@link AiChatMode}。**必填** —— 老会话文件里没有这个字段,但缺省是在读盘
+	 * 那一处补齐的(见 conversation-store),wire 上永远带着。契约描述的是线上真会
+	 * 出现的形状,把「可能缺」写进来只会让边界另一侧再各判一遍。
+	 */
+	mode: AiChatMode;
+	/**
+	 * 带不带女仆人格。同 `mode`,缺省在读盘那一处补齐(老会话按 `true` 算,那正是
+	 * 它们一直以来的样子)。皮肤工坊那一档本来就没有人格,这个字段在那儿不起作用。
+	 */
+	persona: boolean;
 	/**
 	 * 标题是否已由 AI 起过。缺失(旧会话)按 false 算 —— 前端据此决定要不要去要
 	 * 一个标题,所以「不知道」必须落在「还没起过」这一边,否则老会话一个都轮不上。
@@ -397,6 +497,32 @@ export interface QQDiscoveredEntry {
 	/** 最近见到时间戳(ms)。 */
 	lastSeenMs: number;
 }
+
+/** `POST /api/qq/bind/start` 响应 —— 扫码一键建 bot(借道腾讯 lite 通道)。 */
+export interface QQBindStartResponse {
+	/** 轮询用的任务号(腾讯侧生成)。 */
+	taskId: string;
+	/** 二维码图片,data: URI。 */
+	qr: string;
+	/** 建议轮询间隔,秒。消费方**必须**夹一道再用,见 web 的 pollDelayMs。 */
+	interval: number;
+}
+
+/**
+ * `POST /api/qq/bind/poll` 响应。
+ *
+ * web 端按它做**穷尽** switch(default 里 `never` 兜底):这里将来多一条 status,
+ * 前端会直接编译不过,而不是静静地当 pending 接着轮询。
+ *
+ * server 那边的 `QQBindTask` 刻意不在这份契约里 —— 它带着解 AppSecret 的
+ * `bindKey`,只活在 server 内存,不出响应也不落盘。
+ */
+export type QQBindPollResult =
+	| { status: "pending" }
+	| { status: "expired" }
+	| { status: "created"; appId: string; appSecret: string }
+	/** 扫码侧完成但凭据缺失/解不开 —— 业务态错误,与上游故障(抛错)区分。 */
+	| { status: "error"; message: string };
 
 // ---- /api/backup ------------------------------------------------------------
 

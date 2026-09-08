@@ -1,9 +1,14 @@
+import { randomUUID } from "node:crypto";
 import type { LiveRoomInfo } from "@bilibili-notify/api";
+import type { LiveEvent } from "@bilibili-notify/blive";
 import type { CardKind, Disposable } from "@bilibili-notify/internal";
-import type { MsgHandler } from "blive-message-listener";
 import { DateTime } from "luxon";
 import { type CustomCardStyleLike, LivePushType, type SubItemView } from "./push-like";
-import { LiveRoomAccessDeniedError, type RoomContext } from "./room-helpers";
+import {
+	LiveRoomAccessDeniedError,
+	LiveRoomPreflightBlockedError,
+	type RoomContext,
+} from "./room-helpers";
 import { parseStopWords } from "./stop-words";
 import { buildRoomLink } from "./template-renderer";
 import { type LiveData, LiveType, type MasterInfo } from "./types";
@@ -32,6 +37,19 @@ export abstract class RoomSessionBase {
 	protected liveRoomInfo: LiveRoomInfo["data"] | undefined;
 	protected masterInfo: MasterInfo | undefined;
 	protected readonly liveData: LiveData = { likedNum: "0" };
+
+	/**
+	 * 初始房态流程(bootstrapRoomState:拉房间/主播信息、已在播检测、restartPush)
+	 * 是否已完整跑过。预检被风控挡在 bootstrap 门外、事后经长尾重试连上的房间,
+	 * 这里仍是 false —— 重连成功路径据此补跑,而不是误闯「重连核对」分支。
+	 */
+	protected bootstrapped = false;
+	/**
+	 * bootstrapRoomState 在途标志。`bootstrapped` 只在跑**完**才落位,单看它会把
+	 * 「尚未跑完」当「从没跑过」—— bootstrap 窗口内断线的重连会并发再跑一份
+	 * (「正在直播」卡推两张、transition 窗口交错)。重连补跑前必须先看这个。
+	 */
+	protected bootstrapInFlight = false;
 
 	protected pushAtTimeTimer: Disposable | null = null;
 	protected lastLiveStart = 0;
@@ -99,6 +117,31 @@ export abstract class RoomSessionBase {
 		this.sub = sub;
 	}
 
+	/** {@link enqueuePush} 的链尾。永不 reject(失败在链上吞掉,但会抛回发起方)。 */
+	private pushTail: Promise<unknown> = Promise.resolve();
+
+	/**
+	 * 同房间对外推送的串行闸:所有 target 推送(开播 / 下播 / 正在直播 / 词云 / 总结 /
+	 * SC / 上舰)都从这里过,**送达次序 = 发起次序**。
+	 *
+	 * 真实事故:主播下播后几秒内重开,下播流程与新场开播流程是两个互不排队的异步
+	 * 上下文,各自渲染 + 发送 —— 开播卡跑得快就先送达,QQ 与 history(按送达完成序
+	 * 落库)都呈现「开播 → 下播 → 总结」的倒序,一小时后新场的周期复推于是被用户
+	 * 读成「下播了还推正在直播」的误报。
+	 *
+	 * 只包**发送**那一步,不包渲染前的取数与生成:词云 / AI 总结要跑几十秒,把它们
+	 * 也锁进闸里,重开的开播卡就得白等一整段生成。失败不断链:排在后面的推送照常
+	 * 送出,异常原样抛回发起方(各调用点的错误语义与从前一致)。
+	 *
+	 * `safeBroadcast`(特别关注弹幕 / 进房)不在闸内 —— 它本身就是 fire-and-forget、
+	 * 不 await 送达,队列锁不住它真正的送达时刻。
+	 */
+	protected enqueuePush<T>(fn: () => Promise<T>): Promise<T> {
+		const run = this.pushTail.then(fn);
+		this.pushTail = run.catch(() => undefined);
+		return run;
+	}
+
 	/**
 	 * 取某卡片类型的生效样式:优先该 kind 的 per-kind 覆盖,缺失回退基准 `customCardStyle`。
 	 * 始终有定义(基准恒在);是否启用由调用点据 `enable` 自行判定 —— SC / guard 把未启用
@@ -110,7 +153,7 @@ export abstract class RoomSessionBase {
 	 * 否则这些 UP 会一直渲染渲染器内部缓存的静态首图,图廊配再多张也不轮换(回归 bug)。
 	 * 列表 >1 张时经注入的 `pickBackground`(按 `uid:kind` 独立游标)选下一张并强制
 	 * `enable:true`,其余字段留空,靠调用点 `?? this.config.X` 逐字段回退渲染器全局配置。
-	 * 未注入选择器(koishi)/ 列表 ≤1 张 → 原样返回(用首图或渲染器静态兜底)。
+	 * 选择器返回 undefined / 列表 ≤1 张 → 原样返回(用首图或渲染器静态兜底)。
 	 * 每次调用即一次推送,故在此推进游标恰好 = 每推送一次轮换一张。
 	 */
 	protected resolvedCardStyle(kind: CardKind): CustomCardStyleLike {
@@ -264,11 +307,20 @@ export abstract class RoomSessionBase {
 		// 但无 WS,永不收弹幕 / onLiveEnd。建不起来即同"获取信息失败"一并放弃。
 		let listening = false;
 		try {
-			listening = await this.ctx.startLiveRoomListener(this.sub.roomId, this.buildHandler());
+			listening = await this.ctx.startLiveRoomListener(this.sub.roomId, this.buildEventHandler());
 		} catch (e) {
 			if (e instanceof LiveRoomAccessDeniedError) {
 				this.onMonitoringStopped();
 				this.ctx.stopMonitoring(e.message, this.sub.roomId);
+				return;
+			}
+			// 预检被 -352 风控拦截:瞬时风控不放弃房间,交给子类的长尾退避重试
+			// (每轮重新预检拿新 token)。连上后由重连成功路径补跑 bootstrapRoomState。
+			if (e instanceof LiveRoomPreflightBlockedError) {
+				this.ctx.logger.warn(
+					`[conn] 直播间 [${this.sub.roomId}] ${e.message},进入长尾重试,不放弃监测`,
+				);
+				this.onPreflightBlocked();
 				return;
 			}
 			throw e;
@@ -286,29 +338,51 @@ export abstract class RoomSessionBase {
 		// 刷房间/主播信息、算已播时长、渲染并推送「正在直播」卡片,可达数秒。这是全仓
 		// 最长的一段「翻成在播」窗口,期间到达的 END 同样必须记账。
 		this.beginLiveTransition();
+		let stateReady = false;
 		try {
-			await this.bootstrapRoomState();
+			stateReady = await this.bootstrapRoomState();
 		} finally {
 			// 兜底:上面每条提前 return 的路径也要把窗口关掉,不能让标志漏到下一次事件。
 			this.finishLiveTransition();
 		}
+		// 首跑的信息拉取失败按原语义放弃房间;重连补跑路径(room-session)对同一个
+		// false 走长尾重试 —— 放弃与否是调用方的策略,不在 bootstrapRoomState 里定。
+		if (!stateReady) {
+			await this.ctx.push.sendPrivateMsg("获取直播间信息失败，启动直播间弹幕检测失败");
+			this.onMonitoringStopped();
+			this.ctx.closeListener(this.sub.roomId);
+		}
 	}
 
-	/** {@link bootstrap} 装好 listener 之后的部分,整段跑在「翻成在播」窗口里。 */
-	private async bootstrapRoomState(): Promise<void> {
+	/**
+	 * {@link bootstrap} 装好 listener 之后的部分,整段跑在「翻成在播」窗口里。
+	 * protected:预检被风控挡下再经长尾重试连上的房间,从没跑过这段 —— 重连成功
+	 * 路径据 `bootstrapped` 标志识别后补跑(含已在播检测与 restartPush)。
+	 *
+	 * 返回 `false` = 初始信息拉取失败,**不带任何放弃副作用** —— 首跑(bootstrap)
+	 * 据此停止监测,重连补跑据此回长尾重试,策略归调用方。
+	 */
+	protected async bootstrapRoomState(): Promise<boolean> {
+		this.bootstrapInFlight = true;
+		try {
+			return await this.bootstrapRoomStateInner();
+		} finally {
+			this.bootstrapInFlight = false;
+		}
+	}
+
+	private async bootstrapRoomStateInner(): Promise<boolean> {
 		if (
 			!(await this.useLiveRoomInfo(LiveType.FirstLiveBroadcast)) ||
 			!(await this.useMasterInfo(LiveType.FirstLiveBroadcast)) ||
 			!this.liveRoomInfo ||
 			!this.masterInfo
 		) {
-			await this.ctx.push.sendPrivateMsg("获取直播间信息失败，启动直播间弹幕检测失败");
-			this.onMonitoringStopped();
-			this.ctx.closeListener(this.sub.roomId);
-			return;
+			return false;
 		}
 
 		this.onListenerStarted();
+		this.bootstrapped = true;
 		this.ctx.logger.debug(`[stat] 当前粉丝数：${this.masterInfo.liveOpenFollowerNum}`);
 
 		if (this.liveRoomInfo.live_status === 1) {
@@ -317,33 +391,34 @@ export abstract class RoomSessionBase {
 			this.liveData.watchedNum = watched;
 			const diffTime = await this.ctx.getTimeDifference(this.liveTime);
 			const roomLink = buildRoomLink(this.liveRoomInfo);
-			// 消息版式(per-UP ?? 引擎 config 级,两级都缺 = 旧路径)覆盖开播 / 直播中 / 下播,
-			// 与 onLiveStart 同款接线。
-			const messageLayout = this.sub.messageLayout ?? this.ctx.config.messageLayout;
+			// 消息版式来自 per-UP 折叠值(宿主恒填),与 onLiveStart 同款接线。
 			const liveMsg = this.ctx.templateRenderer.renderLiveOngoing({
 				sub: this.sub,
 				globalCustom: this.ctx.config.customLiveMsg,
 				master: this.masterInfo,
 				diffTime,
 				watched,
-				roomLink,
-				omitLink: messageLayout !== undefined,
 			});
 
 			// restartPush 已由 adapter 折算好(per-UP ?? 全局)。
+			// 抓成局部变量再入闸:非空收窄进不了闭包,而且卡片本就该反映**发起时刻**的状态。
+			const liveRoomInfo = this.liveRoomInfo;
+			const master = this.masterInfo;
 			if (this.sub.restartPush) {
-				await this.ctx.sendLiveNotifyCard({
-					liveType: LiveType.LiveBroadcast,
-					liveData: this.liveData,
-					liveRoomInfo: this.liveRoomInfo,
-					master: this.masterInfo,
-					cardStyle: this.resolvedCardStyle("live"),
-					cardLayout: this.sub.cardLayout,
-					uid: this.sub.uid,
-					notifyMsg: liveMsg,
-					messageLayout,
-					roomLink,
-				});
+				await this.enqueuePush(() =>
+					this.ctx.sendLiveNotifyCard({
+						liveType: LiveType.LiveBroadcast,
+						liveData: this.liveData,
+						liveRoomInfo,
+						master,
+						cardStyle: this.resolvedCardStyle("live"),
+						cardLayout: this.sub.cardLayout,
+						uid: this.sub.uid,
+						notifyMsg: liveMsg,
+						messageLayout: this.sub.messageLayout,
+						roomLink,
+					}),
+				);
 			}
 			// 卡片推送也在窗口内,所以裁决放在最后一刻:这几秒里 UP 停播的话,翻成
 			// 在播就再没有第二条 END 能把它翻回来了。
@@ -351,17 +426,21 @@ export abstract class RoomSessionBase {
 				this.ctx.logger.info(
 					`[live] 直播间 [${this.sub.roomId}] 启动期间已收到下播事件，不按在播处理`,
 				);
-				return;
+				return true;
 			}
 			// P2:与 onLiveStart 同序(先 setLiveStatus 再 arm)。此前 bootstrap
 			// 反着写,当前无害但语义不一致 —— 统一为「先翻状态再 arm 周期复推」。
 			this.setLiveStatus(true);
 			this.armPeriodicTimer();
 		}
+		return true;
 	}
 
-	/** Build the platform-specific {@link MsgHandler}; provided by the subclass. */
-	protected abstract buildHandler(): MsgHandler;
+	/** Build the single-callback event funnel for the WS client; provided by the subclass. */
+	protected abstract buildEventHandler(): (ev: LiveEvent) => void;
+
+	/** Hook:bootstrap 期预检被 -352 拦截时进入长尾重试;由子类实现(基类无重连设施)。 */
+	protected onPreflightBlocked(): void {}
 
 	/** Hook for subclass-owned connection-health bookkeeping after listener bootstrap succeeds. */
 	protected onListenerStarted(): void {}
@@ -433,6 +512,21 @@ export abstract class RoomSessionBase {
 		this.ctx.logSideEffectState(`timer:deleted room=${this.sub.roomId}`);
 	}
 
+	/**
+	 * 把「正在直播」复推提前到现在(宿主 devtools 的「复推计时器提前到期」)。走的就是
+	 * 定时器到点调的那个 tick,不另开一条路;没在播就不跑、回 false。定时器本身不动 ——
+	 * 下一次到点照旧。
+	 */
+	async tickNow(): Promise<boolean> {
+		// 跟排程那条对齐:`isLive` 不够。这个 UP 关了「正在直播」复推(pushTime=0)时定时器
+		// 压根没建;进入下播宽限期时定时器已撤而 `liveStatus` **刻意**还留着 true。这两种
+		// 情况排程都不会响,提前到期也就不该响 —— 否则宽限期里那一跑会拉到 live_status=0,
+		// 顺手给主人私聊一条「已下播但未收到 WS 下播事件」的假警报。
+		if (!this.isLive || !this.pushAtTimeTimer) return false;
+		await this.tickPushAtTime();
+		return true;
+	}
+
 	/** Periodic "正在直播" tick (callback for `setInterval`). */
 	protected async tickPushAtTime(): Promise<void> {
 		if (!(await this.useLiveRoomInfo(LiveType.LiveBroadcast)) || !this.liveRoomInfo) {
@@ -459,29 +553,31 @@ export abstract class RoomSessionBase {
 		this.liveData.watchedNum = watched;
 		const diffTime = await this.ctx.getTimeDifference(this.liveTime);
 		const roomLink = buildRoomLink(this.liveRoomInfo);
-		const messageLayout = this.sub.messageLayout ?? this.ctx.config.messageLayout;
 		const liveMsg = this.ctx.templateRenderer.renderLiveOngoing({
 			sub: this.sub,
 			globalCustom: this.ctx.config.customLiveMsg,
 			master: this.masterInfo,
 			diffTime,
 			watched,
-			roomLink,
-			omitLink: messageLayout !== undefined,
 		});
 
-		await this.ctx.sendLiveNotifyCard({
-			liveType: LiveType.LiveBroadcast,
-			liveData: this.liveData,
-			liveRoomInfo: this.liveRoomInfo,
-			master: this.masterInfo,
-			cardStyle: this.resolvedCardStyle("live"),
-			cardLayout: this.sub.cardLayout,
-			uid: this.sub.uid,
-			notifyMsg: liveMsg,
-			messageLayout,
-			roomLink,
-		});
+		// 抓成局部变量再入闸:非空收窄进不了闭包,卡片也本就该反映发起时刻的状态。
+		const liveRoomInfo = this.liveRoomInfo;
+		const master = this.masterInfo;
+		await this.enqueuePush(() =>
+			this.ctx.sendLiveNotifyCard({
+				liveType: LiveType.LiveBroadcast,
+				liveData: this.liveData,
+				liveRoomInfo,
+				master,
+				cardStyle: this.resolvedCardStyle("live"),
+				cardLayout: this.sub.cardLayout,
+				uid: this.sub.uid,
+				notifyMsg: liveMsg,
+				messageLayout: this.sub.messageLayout,
+				roomLink,
+			}),
+		);
 	}
 
 	/** 断流接续等待时长(分钟),per-UP 缺省 2,防御性夹到 [1,10]。 */
@@ -618,7 +714,6 @@ export abstract class RoomSessionBase {
 		const diffTime = precomputedDiffTime ?? (await this.ctx.getTimeDifference(this.liveTime));
 		this.liveData.fansChanged = this.masterInfo.liveFollowerChange;
 		const roomLink = buildRoomLink(this.liveRoomInfo);
-		const messageLayout = this.sub.messageLayout ?? this.ctx.config.messageLayout;
 
 		const liveEndMsg = this.ctx.templateRenderer.renderLiveEnd({
 			sub: this.sub,
@@ -626,28 +721,36 @@ export abstract class RoomSessionBase {
 			master: this.masterInfo,
 			diffTime,
 			followerChange: this.masterInfo.liveFollowerChange,
-			roomLink,
-			omitLink: messageLayout !== undefined,
 		});
 
+		// 抓成局部变量再入闸:非空收窄进不了闭包,卡片也本就该反映发起时刻的状态。
+		const liveRoomInfo = this.liveRoomInfo;
+		const master = this.masterInfo;
 		try {
+			// 下播 = 卡片本体,词云 / 总结是它的附加项:下播关着就整个不推;开着先发卡,
+			// 附加项算好后用同一个 pushId 追加 —— 宿主的历史落同一行。
 			if (this.ctx.isSubscribed(this.sub, "liveEnd")) {
-				await this.ctx.sendLiveNotifyCard({
-					liveType: LiveType.StopBroadcast,
-					liveData: this.liveData,
-					liveRoomInfo: this.liveRoomInfo,
-					master: this.masterInfo,
-					cardStyle: this.resolvedCardStyle("live"),
-					cardLayout: this.sub.cardLayout,
-					uid: this.sub.uid,
-					notifyMsg: liveEndMsg,
-					messageLayout,
-					roomLink,
-				});
+				const pushId = randomUUID();
+				await this.enqueuePush(() =>
+					this.ctx.sendLiveNotifyCard({
+						liveType: LiveType.StopBroadcast,
+						liveData: this.liveData,
+						liveRoomInfo,
+						master,
+						cardStyle: this.resolvedCardStyle("live"),
+						cardLayout: this.sub.cardLayout,
+						uid: this.sub.uid,
+						notifyMsg: liveEndMsg,
+						messageLayout: this.sub.messageLayout,
+						roomLink,
+						pushId,
+					}),
+				);
+				await this.dispatchWordCloudAndSummary(
+					this.sub.customLiveSummary.liveSummary || this.ctx.config.liveSummaryDefault,
+					pushId,
+				);
 			}
-			await this.dispatchWordCloudAndSummary(
-				this.sub.customLiveSummary.liveSummary || this.ctx.config.liveSummaryDefault,
-			);
 		} finally {
 			this.ctx.danmakuCollector.clear(this.sub.roomId);
 			this.ctx.danmakuCollector.registerRoom(this.sub.roomId);
@@ -655,12 +758,15 @@ export abstract class RoomSessionBase {
 	}
 
 	/**
-	 * Run wordcloud + AI live-summary in parallel and dispatch whichever
-	 * succeeded. Skipped entirely when neither feature is subscribed.
+	 * 下播的附加项:词云与 AI 总结并行算,算出来的各自追加到 `pushId` 那次推送里
+	 * (`role: "extra"`)。两个子项都关着就整个跳过 —— 不算词云、不问 AI。
 	 */
-	protected async dispatchWordCloudAndSummary(customLiveSummary: string): Promise<void> {
-		const wantWordcloud = this.ctx.isSubscribed(this.sub, "wordcloud");
-		const wantSummary = this.ctx.isSubscribed(this.sub, "liveSummary");
+	protected async dispatchWordCloudAndSummary(
+		customLiveSummary: string,
+		pushId: string,
+	): Promise<void> {
+		const wantWordcloud = this.sub.liveEndExtras.wordcloud;
+		const wantSummary = this.sub.liveEndExtras.liveSummary;
 		if (!wantWordcloud && !wantSummary) return;
 
 		this.ctx.logger.debug(
@@ -698,15 +804,26 @@ export abstract class RoomSessionBase {
 		if (this.ctx.isDisposed()) return;
 		const wcMsg = img ? this.ctx.contentBuilder.image(img, "image/jpeg") : undefined;
 		const summaryMsg = summary ? this.ctx.contentBuilder.text(summary) : undefined;
+		const asExtra = { pushId, role: "extra" as const };
 		if (wcMsg) {
-			await this.ctx.push.broadcastToTargets(
-				this.sub.uid,
-				wcMsg,
-				LivePushType.WordCloudAndLiveSummary,
+			await this.enqueuePush(() =>
+				this.ctx.push.broadcastToTargets(
+					this.sub.uid,
+					wcMsg,
+					LivePushType.WordCloudAndLiveSummary,
+					asExtra,
+				),
 			);
 		}
 		if (summaryMsg) {
-			await this.ctx.push.broadcastToTargets(this.sub.uid, summaryMsg, LivePushType.LiveSummary);
+			await this.enqueuePush(() =>
+				this.ctx.push.broadcastToTargets(
+					this.sub.uid,
+					summaryMsg,
+					LivePushType.LiveSummary,
+					asExtra,
+				),
+			);
 		}
 	}
 }

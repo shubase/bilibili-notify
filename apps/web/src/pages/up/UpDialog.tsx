@@ -1,12 +1,26 @@
-import { useEffect, useMemo, useState } from "react";
-import { Avatar, Btn, PlatformIcon, Toggle } from "../../components/atoms";
-import { ConfirmDialog, ModalShell } from "../../components/dialog";
-import { Icon } from "../../components/icons";
+import {
+	AddButton,
+	Avatar,
+	Btn,
+	ConfirmDialog,
+	EmptyNote,
+	HintNote,
+	Icon,
+	IconButton,
+	ModalShell,
+	PlatformIcon,
+	Toggle,
+} from "@bilibili-notify/ui";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { TInput } from "../../components/forms";
 import {
 	DEFAULT_FEATURE_FLAGS,
 	FEATURE_KEYS,
 	FEATURE_LABELS,
 	type FeatureKey,
+	LIVE_END_EXTRA_KEYS,
+	LIVE_END_EXTRA_LABELS,
+	type LiveEndExtraKey,
 	type PushTarget,
 	type Subscription,
 } from "../../types/domain";
@@ -30,11 +44,9 @@ const FEATURE_GROUPS: ReadonlyArray<{
 		label: "直播",
 		keys: [
 			{ key: "live", sub: "开播提醒" },
-			{ key: "liveEnd", sub: "下播提醒" },
+			{ key: "liveEnd", sub: "下播卡片;词云 / AI 总结跟着它走" },
 			{ key: "liveGuardBuy", sub: "舰长 / 提督 / 总督" },
 			{ key: "superchat", sub: "Super Chat 提醒" },
-			{ key: "wordcloud", sub: "弹幕词云" },
-			{ key: "liveSummary", sub: "直播结束后 AI 总结" },
 		],
 	},
 	{
@@ -68,6 +80,11 @@ export interface UpDialogProps {
 	 *           为草稿本身就是「待提交的修改」);"取消" 关闭即丢弃,不调任何 API。
 	 */
 	mode?: "create" | "edit";
+	/**
+	 * 打开时滚到哪一节。`"targets"` = 推送目标 —— 无目标小卡上的「去配置」经 `/subs?open=`
+	 * 跳过来时用;缺省从头开始。
+	 */
+	focusSection?: "targets";
 	onClose: () => void;
 	onSave: (next: Subscription) => void;
 	onDelete: () => void;
@@ -94,6 +111,24 @@ function stableStr(value: unknown): string {
 
 function effFeature(sub: Subscription, k: FeatureKey): boolean {
 	return sub.overrides.features?.[k] ?? DEFAULT_FEATURE_FLAGS[k];
+}
+
+/** 下播附加项的生效值:per-UP 覆盖 ?? 全局默认。 */
+function effExtra(sub: Subscription, k: LiveEndExtraKey): boolean {
+	return sub.overrides.features?.liveEndExtras?.[k] ?? DEFAULT_FEATURE_FLAGS.liveEndExtras[k];
+}
+
+type FeaturesOverride = NonNullable<Subscription["overrides"]["features"]>;
+
+/**
+ * 把 features 覆盖收拾干净:附加项小对象空了就去掉,整个对象空了就是 undefined ——
+ * 与默认值相同的开关不落 override,schema 里不留壳。
+ */
+function compactFeatures(f: FeaturesOverride): FeaturesOverride | undefined {
+	const { liveEndExtras, ...flags } = f;
+	const extras = liveEndExtras && Object.keys(liveEndExtras).length > 0 ? liveEndExtras : undefined;
+	const out: FeaturesOverride = extras ? { ...flags, liveEndExtras: extras } : flags;
+	return Object.keys(out).length > 0 ? out : undefined;
 }
 
 /**
@@ -141,6 +176,7 @@ export function UpDialog({
 	onSave,
 	onDelete,
 	saving,
+	focusSection,
 }: UpDialogProps) {
 	const [draft, setDraft] = useState<Subscription | null>(sub);
 	const [customSet, setCustomSet] = useState<Set<string>>(() => inferCustomSet(sub, targets));
@@ -179,6 +215,13 @@ export function UpDialog({
 		() => targets.filter((t) => !attachedIds.has(t.id)),
 		[targets, attachedIds],
 	);
+
+	// 「去配置」跳过来时滚到推送目标一节;别的打开方式从头开始。
+	const targetsSectionRef = useRef<HTMLElement>(null);
+	useEffect(() => {
+		if (focusSection !== "targets") return;
+		targetsSectionRef.current?.scrollIntoView({ block: "start", behavior: "smooth" });
+	}, [focusSection]);
 
 	if (!draft) return null;
 
@@ -225,11 +268,30 @@ export function UpDialog({
 	function setFeatureEnabled(k: FeatureKey, on: boolean): void {
 		setDraft((d) => {
 			if (!d) return d;
-			const overrideObj = { ...(d.overrides.features ?? {}) } as Record<string, boolean>;
-			if (on === DEFAULT_FEATURE_FLAGS[k]) delete overrideObj[k];
-			else overrideObj[k] = on;
-			const features = Object.keys(overrideObj).length > 0 ? overrideObj : undefined;
-			return { ...d, overrides: { ...d.overrides, features } };
+			const { [k]: _drop, ...rest } = d.overrides.features ?? {};
+			const next: FeaturesOverride = on === DEFAULT_FEATURE_FLAGS[k] ? rest : { ...rest, [k]: on };
+			return { ...d, overrides: { ...d.overrides, features: compactFeatures(next) } };
+		});
+	}
+
+	/**
+	 * 下播的附加项(词云 / AI 总结):只写 `overrides.features.liveEndExtras.<k>` 那一个键,
+	 * 与全局默认相同就不落。它们没有自己的路由,跟着下播的开关与目标走。
+	 */
+	function setExtraEnabled(k: LiveEndExtraKey, on: boolean): void {
+		setDraft((d) => {
+			if (!d) return d;
+			const cur = d.overrides.features ?? {};
+			const { [k]: _drop, ...extras } = cur.liveEndExtras ?? {};
+			const nextExtras =
+				on === DEFAULT_FEATURE_FLAGS.liveEndExtras[k] ? extras : { ...extras, [k]: on };
+			return {
+				...d,
+				overrides: {
+					...d.overrides,
+					features: compactFeatures({ ...cur, liveEndExtras: nextExtras }),
+				},
+			};
 		});
 	}
 
@@ -401,27 +463,24 @@ export function UpDialog({
 		<ModalShell
 			onCancel={requestClose}
 			width={560}
-			bodyClassName=""
-			bodyStyle={{
-				maxHeight: "90vh",
-				display: "flex",
-				flexDirection: "column",
-				overflow: "hidden",
-			}}
+			bodyClassName="flex max-h-[90vh] flex-col overflow-hidden"
 		>
 			{/* Cover header */}
 			<div
 				className="relative h-35 px-5 pb-4 pt-4"
-				style={{ background: `linear-gradient(135deg, ${color}, ${color}aa)` }}
+				style={{
+					background: `linear-gradient(135deg, ${color}, color-mix(in srgb, ${color} 67%, transparent))`,
+				}}
 			>
-				<button
-					type="button"
+				<IconButton
+					icon={<Icon.close size={14} />}
+					label="关闭"
 					onClick={requestClose}
-					className="absolute right-3.5 top-3.5 grid h-7 w-7 place-items-center rounded-full bg-bn-inverse-strong text-white backdrop-blur-sm"
-					title="关闭"
-				>
-					<Icon.close size={14} />
-				</button>
+					size="lg"
+					shape="pill"
+					surface="scrim"
+					className="absolute right-3.5 top-3.5"
+				/>
 				<div className="absolute -bottom-7 left-5 flex items-end gap-3">
 					<Avatar
 						name={displayName(draft)}
@@ -430,13 +489,16 @@ export function UpDialog({
 						url={draft.cachedProfile?.avatar}
 						ring
 					/>
-					<div className="pb-2 text-white" style={{ textShadow: "0 1px 4px rgba(0,0,0,0.45)" }}>
-						<div className="text-base font-bold">{displayName(draft)}</div>
+					<div
+						className="pb-2 text-bn-on-solid"
+						style={{ textShadow: "0 1px 4px rgba(0,0,0,0.45)" }}
+					>
+						<div className="text-bn-md font-bold">{displayName(draft)}</div>
 						<div
-							className="mt-0.5 text-[11px] font-semibold"
+							className="mt-0.5 text-bn-xs font-semibold"
 							style={{ color, textShadow: "0 1px 4px rgba(255,255,255,0.4)" }}
 						>
-							<span className="font-mono">UID {draft.uid}</span>
+							<span className="tabular-nums">UID {draft.uid}</span>
 							{draft.cachedProfile?.fans != null ? (
 								<>
 									<span className="mx-1 opacity-70">·</span>
@@ -463,18 +525,15 @@ export function UpDialog({
 							<Toggle value={draft.enabled} onChange={setEnabled} size="sm" />
 						</BasicRow>
 						<BasicRow label="分组" sub="多个分组以英文逗号分隔">
-							<input
-								className="w-40 rounded border border-bn-border px-1.5 py-1 text-[12px] focus:outline-none focus:ring-1 focus:ring-bn-pink"
+							<TInput
+								ariaLabel="分组"
+								width={160}
 								value={draft.groups.join(",")}
-								onChange={(e) => setGroups(e.target.value)}
+								onChange={setGroups}
 							/>
 						</BasicRow>
 						<BasicRow label="备注">
-							<input
-								className="w-40 rounded border border-bn-border px-1.5 py-1 text-[12px] focus:outline-none focus:ring-1 focus:ring-bn-pink"
-								value={draft.notes ?? ""}
-								onChange={(e) => setNotes(e.target.value)}
-							/>
+							<TInput ariaLabel="备注" width={160} value={draft.notes ?? ""} onChange={setNotes} />
 						</BasicRow>
 					</div>
 				</section>
@@ -482,7 +541,7 @@ export function UpDialog({
 				{/* 订阅项总开关 */}
 				<section>
 					<SectionHeader label="订阅项 · 默认推送内容" />
-					<p className="mb-2 text-[11px] text-bn-text-secondary">
+					<p className="mb-2 text-bn-xs text-bn-text-secondary">
 						这是该 UP 的"默认推送内容"。下方的推送目标若未单独自定义,会跟随这里的设置。
 					</p>
 					<div className="space-y-2">
@@ -491,7 +550,7 @@ export function UpDialog({
 								key={g.label}
 								className="overflow-hidden rounded-lg border border-bn-border bg-bn-surface"
 							>
-								<div className="border-b border-bn-border-subtle bg-bn-surface-muted px-3 py-1.5 text-[10.5px] font-bold uppercase tracking-wider text-bn-text-tertiary">
+								<div className="border-b border-bn-border-subtle bg-bn-surface-muted px-3 py-1.5 text-bn-2xs font-bold uppercase tracking-wider text-bn-text-tertiary">
 									{g.label}
 								</div>
 								<div className="grid grid-cols-2 gap-x-4 gap-y-2 px-3 py-2">
@@ -514,6 +573,13 @@ export function UpDialog({
 														onChange={(on) => setAtAllDefault(atAllScope, on)}
 													/>
 												) : null}
+												{key === "liveEnd" ? (
+													<LiveEndExtrasToggles
+														parentOn={parentOn}
+														value={(k) => effExtra(draft, k)}
+														onChange={setExtraEnabled}
+													/>
+												) : null}
 											</div>
 										);
 									})}
@@ -524,18 +590,16 @@ export function UpDialog({
 				</section>
 
 				{/* 推送目标 */}
-				<section>
+				<section ref={targetsSectionRef}>
 					<SectionHeader label="推送目标" />
 					{targets.length === 0 ? (
-						<div className="rounded-md border border-dashed border-bn-border px-3 py-3 text-center text-[11.5px] text-bn-text-secondary">
-							尚未配置任何推送目标 · 请先到「推送目标」页面创建
-						</div>
+						<EmptyNote size="sm">尚未配置任何推送目标 · 请先到「推送目标」页面创建</EmptyNote>
 					) : (
 						<div className="space-y-2">
 							{attachedTargets.length === 0 ? (
-								<div className="rounded-md border border-dashed border-bn-border px-3 py-3 text-center text-[11.5px] text-bn-text-secondary">
+								<EmptyNote size="sm">
 									该订阅尚未指定推送目标 · 点击下方「添加推送目标」选择
-								</div>
+								</EmptyNote>
 							) : (
 								attachedTargets.map((t) => (
 									<TargetRoutingCard
@@ -556,41 +620,36 @@ export function UpDialog({
 								showPicker ? (
 									<div className="rounded-lg border border-bn-border bg-bn-surface p-3">
 										<div className="mb-1.5 flex items-center justify-between">
-											<span className="text-[11.5px] font-semibold text-bn-text-primary">
+											<span className="text-bn-xs font-semibold text-bn-text-primary">
 												选择要添加的推送目标
 											</span>
 											<button
 												type="button"
 												onClick={() => setShowPicker(false)}
-												className="text-[11px] text-bn-text-tertiary hover:text-bn-text-primary"
+												className="text-bn-xs text-bn-text-tertiary hover:text-bn-text-primary"
 											>
 												取消
 											</button>
 										</div>
 										<div className="flex flex-wrap gap-1.5">
 											{unattachedTargets.map((t) => (
-												<button
-													type="button"
+												<AddButton
 													key={t.id}
+													className="bg-bn-surface"
 													onClick={() => attachTarget(t.id)}
-													className="inline-flex items-center gap-1.5 rounded-full border border-dashed border-bn-border bg-bn-surface px-2.5 py-1 text-[11.5px] text-bn-text-secondary hover:border-bn-pink hover:text-bn-pink"
 												>
 													<Icon.plus size={11} />
 													<PlatformIcon platform={t.platform} size={11} />
 													<span className="max-w-35 truncate">{t.name}</span>
-												</button>
+												</AddButton>
 											))}
 										</div>
 									</div>
 								) : (
-									<button
-										type="button"
-										onClick={() => setShowPicker(true)}
-										className="flex w-full items-center justify-center gap-1.5 rounded-lg border border-dashed border-bn-border bg-transparent px-3 py-2.5 text-[12px] text-bn-text-secondary hover:border-bn-pink hover:text-bn-pink"
-									>
+									<AddButton block onClick={() => setShowPicker(true)}>
 										<Icon.plus size={12} />
 										添加推送目标 · 还有 {unattachedTargets.length} 个未添加
-									</button>
+									</AddButton>
 								)
 							) : null}
 						</div>
@@ -601,23 +660,23 @@ export function UpDialog({
 				{staleIds.length > 0 ? (
 					<section>
 						<SectionHeader label="已失效的引用" />
-						<div className="rounded-md border border-dashed border-bn-danger-border bg-bn-danger-soft px-3 py-2">
-							<div className="mb-1.5 text-[11px] text-bn-danger-text">
-								下列推送目标已被删除,但路由中仍有引用 · 点击移除
-							</div>
+						{/* 虚线警示旁注 —— 「引用落了空」,不是「操作失败」,所以不是 ErrorNote。 */}
+						<HintNote tone="danger">
+							<div className="mb-1.5">下列推送目标已被删除,但路由中仍有引用 · 点击移除</div>
 							<div className="flex flex-wrap gap-1.5">
 								{staleIds.map((id) => (
 									<button
 										type="button"
 										key={id}
 										onClick={() => removeStaleId(id)}
-										className="inline-flex items-center gap-1.5 rounded-full border border-bn-danger-border bg-bn-surface px-2.5 py-1 text-[11.5px] text-red-500 hover:bg-red-500/10"
+										data-bn="btn"
+										className="inline-flex items-center gap-1.5 rounded-bn-pill border border-bn-danger-border bg-bn-surface px-2.5 py-1 text-bn-xs text-bn-danger hover:bg-bn-danger/10"
 									>
 										{id.slice(0, 8)} ×
 									</button>
 								))}
 							</div>
-						</div>
+						</HintNote>
 					</section>
 				) : null}
 			</div>
@@ -625,7 +684,7 @@ export function UpDialog({
 			{/* Footer */}
 			<div className="flex flex-col gap-1.5 border-t border-bn-border px-3.5 py-3">
 				{attachedTargets.length === 0 && targets.length > 0 ? (
-					<div className="flex items-start gap-1.5 rounded-md border border-bn-warning-border bg-bn-warning-soft px-2.5 py-1.5 text-[11px] text-bn-warning-text">
+					<div className="flex items-start gap-1.5 rounded-md border border-bn-warning-border bg-bn-warning-soft px-2.5 py-1.5 text-bn-xs text-bn-warning-text">
 						<Icon.warning size={12} className="mt-0.5 shrink-0" />
 						<span>未选中任何推送目标,保存后该订阅不会向任何地方推送消息</span>
 					</div>
@@ -687,7 +746,7 @@ export function UpDialog({
 
 function SectionHeader({ label }: { label: string }) {
 	return (
-		<div className="mb-1.5 text-[10px] font-bold uppercase tracking-wider text-bn-text-tertiary">
+		<div className="mb-1.5 text-bn-2xs font-bold uppercase tracking-wider text-bn-text-tertiary">
 			{label}
 		</div>
 	);
@@ -705,8 +764,8 @@ function BasicRow({
 	return (
 		<div className="flex items-center gap-3 border-b border-bn-border-subtle px-3 py-2.5 last:border-b-0">
 			<div className="min-w-0 flex-1">
-				<div className="text-[12.5px] font-semibold text-bn-text-primary">{label}</div>
-				{sub ? <div className="mt-0.5 text-[11px] text-bn-text-secondary">{sub}</div> : null}
+				<div className="text-bn-sm font-semibold text-bn-text-primary">{label}</div>
+				{sub ? <div className="mt-0.5 text-bn-xs text-bn-text-secondary">{sub}</div> : null}
 			</div>
 			{children}
 		</div>
@@ -731,16 +790,90 @@ function FeatureToggleRow({
 			<Toggle value={value} onChange={onChange} size="sm" />
 			<div className="min-w-0 flex-1">
 				<div
-					className={`text-[12px] font-semibold ${
+					className={`text-bn-sm font-semibold ${
 						value ? "text-bn-text-primary" : "text-bn-text-secondary"
 					}`}
 				>
 					{label}
 				</div>
 				{sub ? (
-					<div className="mt-0.5 truncate text-[10.5px] text-bn-text-secondary">{sub}</div>
+					<div className="mt-0.5 truncate text-bn-2xs text-bn-text-secondary">{sub}</div>
 				) : null}
 			</div>
+		</div>
+	);
+}
+
+// ── 下播附加项 sub-toggles ───────────────────────────────────────────────────
+
+/**
+ * 下播下面的两个附加项(词云 / AI 总结),形制同 @全体 那一行:父项(下播)关着就
+ * 整行灰掉、显示为关、点了不写。
+ */
+/**
+ * 父订阅项下面那一行小开关:「+ 词云」「+ @全体」。父关着时整行变灰、开关禁用 ——
+ * 附加项从来不能脱离本体单独发。三态覆写那一档(AtAllPerTargetToggle)不吃这个:
+ * 它多一个「跟随默认」态、一颗重置钮和平台不支持的提示,揉进来只会让参数比正文长。
+ */
+function SubToggleRow({
+	parentOn,
+	value,
+	onChange,
+	label,
+	hint,
+	offHint,
+	ariaLabel,
+}: {
+	parentOn: boolean;
+	value: boolean;
+	onChange: (on: boolean) => void;
+	label: string;
+	/** 父开着时的 tooltip。 */
+	hint: string;
+	/** 父关着时的 tooltip —— 说清楚「先开哪个」。 */
+	offHint: string;
+	ariaLabel?: string;
+}) {
+	return (
+		<div
+			className={`flex items-center gap-1.5 ${parentOn ? "text-bn-text-secondary" : "text-bn-text-disabled"}`}
+			title={parentOn ? hint : offHint}
+		>
+			<Toggle
+				value={parentOn && value}
+				onChange={(on) => parentOn && onChange(on)}
+				size="sm"
+				disabled={!parentOn}
+				{...(ariaLabel ? { ariaLabel } : {})}
+			/>
+			<span>+ {label}</span>
+		</div>
+	);
+}
+
+function LiveEndExtrasToggles({
+	parentOn,
+	value,
+	onChange,
+}: {
+	parentOn: boolean;
+	value: (k: LiveEndExtraKey) => boolean;
+	onChange: (k: LiveEndExtraKey, on: boolean) => void;
+}) {
+	return (
+		<div className="mt-0.5 ml-9 flex flex-col gap-1 text-bn-xs">
+			{LIVE_END_EXTRA_KEYS.map((k) => (
+				<SubToggleRow
+					key={k}
+					parentOn={parentOn}
+					value={value(k)}
+					onChange={(on) => onChange(k, on)}
+					label={LIVE_END_EXTRA_LABELS[k]}
+					ariaLabel={LIVE_END_EXTRA_LABELS[k]}
+					hint="下播时作为附加消息一起推"
+					offHint="需先开启下播才能推附加项"
+				/>
+			))}
 		</div>
 	);
 }
@@ -767,17 +900,15 @@ function AtAllInlineToggle({
 			? "开播推送时附加 @全体(SC / 上舰 / 词云 / 总结 不 @)"
 			: "动态推送时附加 @全体";
 	return (
-		<div
-			className={`mt-0.5 ml-9 flex items-center gap-1.5 text-[11px] ${parentOn ? "text-bn-text-secondary" : "text-gray-300"}`}
-			title={parentOn ? hint : "需先开启父订阅项才能 @全体"}
-		>
-			<Toggle
-				value={parentOn && value}
-				onChange={(on) => parentOn && onChange(on)}
-				size="sm"
-				disabled={!parentOn}
+		<div className="mt-0.5 ml-9 text-bn-xs">
+			<SubToggleRow
+				parentOn={parentOn}
+				value={value}
+				onChange={onChange}
+				label="@全体"
+				hint={hint}
+				offHint="需先开启父订阅项才能 @全体"
 			/>
-			<span>+ @全体</span>
 		</div>
 	);
 }
@@ -821,7 +952,7 @@ function AtAllPerTargetToggle({
 	return (
 		<div className="mt-0.5 ml-9">
 			<div
-				className={`flex items-center gap-1.5 text-[11px] ${blocked ? "text-gray-300" : "text-bn-text-secondary"}`}
+				className={`flex items-center gap-1.5 text-bn-xs ${blocked ? "text-bn-text-disabled" : "text-bn-text-secondary"}`}
 				title={hint}
 			>
 				<Toggle
@@ -834,19 +965,16 @@ function AtAllPerTargetToggle({
 					+ @全体
 				</span>
 				{isExplicit && parentOn && !unsupported ? (
-					<button
-						type="button"
+					<IconButton
+						icon={<Icon.refresh size={10} />}
+						label="重置为跟随订阅默认"
+						size="xs"
 						onClick={() => onSet(undefined)}
-						aria-label="重置为跟随订阅默认"
-						title="重置为跟随订阅默认"
-						className="grid h-4 w-4 place-items-center rounded text-bn-text-tertiary hover:bg-bn-surface-muted hover:text-bn-text-primary"
-					>
-						<Icon.refresh size={10} />
-					</button>
+					/>
 				) : null}
 			</div>
 			{unsupported && parentOn ? (
-				<div className="mt-0.5 text-[10.5px] text-bn-text-tertiary">
+				<div className="mt-0.5 text-bn-2xs text-bn-text-tertiary">
 					QQ 官方机器人不支持 @全体,发送时会自动跳过
 				</div>
 			) : null}
@@ -883,28 +1011,27 @@ function TargetRoutingCard({
 			<div className="flex items-center gap-2.5 px-3 py-2.5">
 				<PlatformIcon platform={target.platform} size={16} />
 				<div className="min-w-0 flex-1">
-					<div className="truncate text-[12.5px] font-semibold text-bn-text-primary">
+					<div className="truncate text-bn-sm font-semibold text-bn-text-primary">
 						{target.name || "（未命名）"}
 					</div>
-					<div className="mt-0.5 text-[11px] text-bn-text-secondary">
+					<div className="mt-0.5 text-bn-xs text-bn-text-secondary">
 						{isCustom ? "自定义推送内容" : `跟随订阅项 · ${enabledCount} 项已开启`}
 					</div>
 				</div>
 				{isCustom ? (
-					<span className="font-mono text-[10.5px] text-bn-text-tertiary">
+					<span className="text-bn-2xs tabular-nums text-bn-text-tertiary">
 						{enabledCount}/{FEATURE_KEYS.length}
 					</span>
 				) : null}
 				<Toggle value={isCustom} onChange={onToggleMode} size="sm" />
-				<button
-					type="button"
+				<IconButton
+					icon={<Icon.close size={11} />}
+					label="移除该推送目标"
+					size="md"
+					tone="danger"
+					shape="pill"
 					onClick={onDetach}
-					aria-label="移除该推送目标"
-					title="移除该推送目标"
-					className="grid h-6 w-6 place-items-center rounded-full text-bn-text-tertiary hover:bg-red-500/10 hover:text-red-500"
-				>
-					<Icon.close size={11} />
-				</button>
+				/>
 			</div>
 
 			{/* Detail (only when custom) */}
@@ -915,9 +1042,7 @@ function TargetRoutingCard({
 							key={g.label}
 							className="border-b border-bn-border-subtle px-3 py-2 last:border-b-0"
 						>
-							<div className="mb-1.5 text-[10px] font-bold uppercase tracking-wider text-bn-text-tertiary">
-								{g.label}
-							</div>
+							<SectionHeader label={g.label} />
 							<div className="grid grid-cols-2 gap-x-4 gap-y-1.5">
 								{g.keys.map(({ key, sub: featSub }) => {
 									// 仅 dynamic / live 行下方挂 "+ @全体" 子开关(tristate:explicit / inherit)。

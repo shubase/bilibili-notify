@@ -12,7 +12,13 @@ import type {
 	ServiceContext,
 } from "@bilibili-notify/internal";
 import { type RawData, WebSocket } from "ws";
-import type { PlatformAdapter, ProbeResult } from "./types.js";
+import type {
+	InboundGroupMessage,
+	InboundMeta,
+	InboundPrivateMessage,
+	PlatformAdapter,
+	ProbeResult,
+} from "./types.js";
 
 /** QQ 开放平台换取 App Access Token 的端点(与沙箱/正式无关,固定走 bots.qq.com)。 */
 const QQ_TOKEN_ENDPOINT = "https://bots.qq.com/app/getAppAccessToken";
@@ -70,7 +76,7 @@ export const QQ_OPCODE = {
  */
 export const QQ_PUSH_INTENTS = ((1 << 0) | (1 << 25) | (1 << 27) | (1 << 30)) >>> 0;
 
-/** 正式 / 沙箱 REST API base host。沙箱在 api 前插 `sandbox.`(对齐 koishi)。 */
+/** 正式 / 沙箱 REST API base host。沙箱在 api 前插 `sandbox.`(对齐上游 koishi 框架的 qq adapter)。 */
 export function qqApiBase(sandbox: boolean): string {
 	return sandbox ? "https://sandbox.api.sgroup.qq.com" : "https://api.sgroup.qq.com";
 }
@@ -143,7 +149,7 @@ export function qqShouldResetSessionOnClose(code: number): boolean {
 	return code > 4000 && code !== 4008 && code !== 4009;
 }
 
-/** token 提前刷新缓冲(秒);对齐 koishi(快到期前 40s 换新 token)。 */
+/** token 提前刷新缓冲(秒);对齐上游 koishi 框架的 qq adapter(快到期前 40s 换新 token)。 */
 const QQ_TOKEN_REFRESH_BUFFER_SEC = 40;
 
 export interface QQTokenManager {
@@ -225,6 +231,10 @@ export interface QQDiscoveredSession {
  * 从入站事件捞群/C2C 的不透明 openid —— 群/C2C 寻址的唯一来源(QQ 无「列我加入的群」接口,
  * 用户没法手填群号)。群:GROUP_AT_MESSAGE_CREATE / GROUP_ADD_ROBOT → group_openid;
  * C2C:C2C_MESSAGE_CREATE → author.user_openid、FRIEND_ADD → openid。非相关事件返回 null。
+ *
+ * 不认 GROUP_MESSAGE_CREATE(不 @ 的普通群聊):它在「获取群内全部消息」档下是群里每一句话,
+ * 都进发现表的话面板那份「最近优先」的列表会随人说话不停重排。入群与被 @ 两条路已经足够
+ * 让一个群露面 —— 面板提示也是这么写的(「从机器人被 @ 的群消息事件捞」)。
  */
 export function extractQQDiscoveredSession(
 	eventType: string,
@@ -248,6 +258,65 @@ export function extractQQDiscoveredSession(
 		return { scope: "private", openid, ...(hint ? { displayHint: hint } : {}) };
 	}
 	return null;
+}
+
+/** 一条 C2C 私聊消息 —— 审批指令(主人回的 y/n)就是从这儿进来的。 */
+/**
+ * 从 C2C 事件取私聊正文。**只认 C2C_MESSAGE_CREATE**。
+ *
+ * 与 {@link extractQQDiscoveredSession} 分成两个函数而不是合并:那个只要 openid
+ * (拿来当推送地址,群和 C2C 都要),这个要正文且**只能是私聊** —— 群里有人打个 y
+ * 不该把一份待审的周报发出去。合起来写迟早有人顺手把群那条也接上。
+ *
+ * `member_openid` 同样绝不回退,理由见 {@link extractQQDiscoveredSession}:那是群成员
+ * 域的身份,与 C2C 用户 openid 是两个命名空间,拿它去比对主人身份会认错人。
+ *
+ * 交出去的 `userId` 就是 C2C 用户 openid,与 PushTarget 里存的 `session.userOpenid`
+ * 同一命名空间 —— 形状与 OneBot 那边一样,消费者不分平台。
+ */
+export function extractQQPrivateMessage(
+	eventType: string,
+	data: Record<string, unknown>,
+): InboundPrivateMessage | null {
+	if (eventType !== "C2C_MESSAGE_CREATE") return null;
+	const author = data.author as { user_openid?: string } | undefined;
+	const userOpenid = author?.user_openid;
+	if (typeof userOpenid !== "string" || !userOpenid) return null;
+	const content = data.content;
+	if (typeof content !== "string" || !content.trim()) return null;
+	return { userId: userOpenid, text: content };
+}
+
+/**
+ * 从群事件取正文。认两种:`GROUP_AT_MESSAGE_CREATE`(@ 了机器人)与 `GROUP_MESSAGE_CREATE`
+ * (群主把消息范围放到「获取群内全部消息」后,不 @ 的消息走这个)。三档范围是 QQ 那边的
+ * 设置,这里收到什么交什么。@ 消息的正文里可能带 `<@!id>` 与前导空格,原样交出。
+ *
+ * 与 {@link extractQQPrivateMessage} 分开:那条是主人专属的指令入口,这条是谁都能触发的
+ * 群消息,合起来写迟早有人把群那条也当私聊认。
+ *
+ * 不带消息 id:官机的主动群消息已经没有条数限制(2026-09-02 主人告知),回复走主动路径,
+ * 被动回复的 `msg_id` 用不上 —— 留一个没人接的字段只会让人以为被动路径存在。
+ */
+export function extractQQGroupMessage(
+	eventType: string,
+	data: Record<string, unknown>,
+): InboundGroupMessage | null {
+	if (eventType !== "GROUP_AT_MESSAGE_CREATE" && eventType !== "GROUP_MESSAGE_CREATE") return null;
+	const groupOpenid = data.group_openid;
+	if (typeof groupOpenid !== "string" || !groupOpenid) return null;
+	const content = data.content;
+	if (typeof content !== "string" || !content.trim()) return null;
+	const author = data.author as { member_openid?: string } | undefined;
+	const memberOpenid = author?.member_openid;
+	// groupId = 群 openid(与 PushTarget 的 `session.groupOpenid` 同一命名空间);userId =
+	// 发言者在群成员域的 openid,只当身份用。官机的群消息没有分享卡这一说。
+	return {
+		groupId: groupOpenid,
+		userId: typeof memberOpenid === "string" ? memberOpenid : "",
+		text: content,
+		cardLinks: [],
+	};
 }
 
 /** 单 adapter 发现列表上限 —— 内存 ring buffer,超出丢最旧(纯便利选择器,不持久化)。 */
@@ -277,8 +346,11 @@ export function createQQSessionRegistry(opts?: { maxPerAdapter?: number }): QQSe
 	return {
 		record(adapterId, session, atMs) {
 			const prev = byAdapter.get(adapterId) ?? [];
+			// 后到的事件没带 displayHint(GROUP_ADD_ROBOT 不带用户名)时留着先前记住的那个:
+			// 群事件本来就不带群名,那个 hint 是面板上唯一能认的东西。带了就以新的为准。
+			const known = prev.find((e) => keyOf(e) === keyOf(session));
 			const next = prev.filter((e) => keyOf(e) !== keyOf(session));
-			next.unshift({ ...session, lastSeenMs: atMs });
+			next.unshift({ ...known, ...session, lastSeenMs: atMs });
 			if (next.length > max) next.length = max;
 			byAdapter.set(adapterId, next);
 		},
@@ -315,6 +387,15 @@ export interface QQGatewayConnOptions {
 	getToken(): Promise<string>;
 	/** 捞到群/C2C 会话时回调 —— adapter 落进 {@link QQSessionRegistry}。 */
 	onDiscovered(session: QQDiscoveredSession): void;
+	/**
+	 * 收到 C2C 私聊正文时回调 —— 审批指令(主人回的 y/n)靠它送出去。
+	 *
+	 * 可选:没接就当没有入站,这条连接退回纯 push-only(与接这个功能之前一样)。
+	 * 由回调那边决定认不认发送者,这里只负责搬运。
+	 */
+	onInboundPrivate?(msg: InboundPrivateMessage): void;
+	/** 可选:群消息出口(链接解析)。不接就不解析群消息。 */
+	onInboundGroup?(msg: InboundGroupMessage): void;
 	serviceCtx: ServiceContext;
 	logger: Logger;
 	/** 订阅 intents,默认 {@link QQ_PUSH_INTENTS}。 */
@@ -412,6 +493,24 @@ export function createQQGatewayConn(opts: QQGatewayConnOptions): QQGatewayConn {
 		heartbeatTimer = serviceCtx.setInterval(() => heartbeat(), heartbeatInterval);
 	}
 
+	/**
+	 * 一路入站消息:没接就连解析都不做,解出来了才交出去。**catch 不能省** —— 这条
+	 * 连接同时担着推送,下游处理里抛个错不该把整条长连带走。每加一路入站都要重述
+	 * 一遍这条规矩,所以只写这一处。
+	 */
+	function deliver<T>(sink: ((msg: T) => void) | undefined, parse: () => T | null, what: string) {
+		if (!sink) return;
+		const msg = parse();
+		if (!msg) return;
+		try {
+			sink(msg);
+		} catch (err) {
+			logger.warn(
+				`[qq] adapter=${adapterId} 处理入站${what}失败: ${err instanceof Error ? err.message : String(err)}`,
+			);
+		}
+	}
+
 	function onDispatch(frame: QQFrame): void {
 		if (typeof frame.s === "number") lastSeq = frame.s;
 		const t = frame.t;
@@ -435,6 +534,9 @@ export function createQQGatewayConn(opts: QQGatewayConnOptions): QQGatewayConn {
 		if (typeof t === "string") {
 			const discovered = extractQQDiscoveredSession(t, d);
 			if (discovered) opts.onDiscovered(discovered);
+			// 私聊正文另走一路(只有 C2C 认),群消息再一路。
+			deliver(opts.onInboundPrivate, () => extractQQPrivateMessage(t, d), "私聊");
+			deliver(opts.onInboundGroup, () => extractQQGroupMessage(t, d), "群消息");
 		}
 	}
 
@@ -773,12 +875,16 @@ export function qqPayloadToParts(payload: NotificationPayload): QQSendPart[] {
 				else if (seg.type === "image") parts.push({ kind: "image-buffer", buffer: seg.buffer });
 				else if (seg.type === "link")
 					parts.push({ kind: "text", text: seg.title ? `${seg.title} ${seg.href}` : seg.href });
-				// at-all:QQ 群 @全体需特殊权限,best-effort 跳过,不阻断推送。
+				// at-all:QQ 群 @全体需特殊权限,一律丢弃。推送层据 platformSupportsAtAll 不给本平台
+				// 单发 @全体,这里只是兜底 —— 混在别的段里时不让它阻断那条消息。
 			}
 			return attachFollowingTextToImages(parts);
 		}
-		default:
-			return [];
+		case "miniapp-card":
+			// 官机发不了 ark / 小程序,能给的只有标题加链接(与 webhook 的降级同形状)。
+			// 推送层本不会把这种 payload 路到官机(它的 capabilities 里没这一项),留着是
+			// 为了别悄悄发出去一条空消息 —— `default: return []` 那样连报错都无从查起。
+			return [{ kind: "text", text: `${payload.title}\n${payload.jumpUrl}` }];
 	}
 }
 
@@ -889,6 +995,13 @@ export interface QQOfficialAdapterOptions {
 	serviceCtx: ServiceContext;
 	/** 共享发现表 —— 网关捞到的 openid 落这,路由 qq-sessions 读它。 */
 	registry: QQSessionRegistry;
+	/**
+	 * 入站消息的两路出口(私聊 → 指令分发,群 → 链接解析),与 onebot adapter 的同名选项是
+	 * 同一个角色、同一个形状。附上收到这条消息的 adapter id —— 回到来源群要知道该用哪个
+	 * adapter 的凭据发。不接 = 那一路不解析。
+	 */
+	onInboundPrivate?: (msg: InboundPrivateMessage, meta: InboundMeta) => void;
+	onInboundGroup?: (msg: InboundGroupMessage, meta: InboundMeta) => void;
 }
 
 interface QQLive {
@@ -952,6 +1065,18 @@ export function createQQOfficialAdapter(opts: QQOfficialAdapterOptions): Platfor
 			},
 			getToken: () => tm.getToken(),
 			onDiscovered: (s) => registry.record(adapter.id, s, Date.now()),
+			...(opts.onInboundPrivate
+				? {
+						onInboundPrivate: (m: InboundPrivateMessage) =>
+							opts.onInboundPrivate?.(m, { adapterId: adapter.id }),
+					}
+				: {}),
+			...(opts.onInboundGroup
+				? {
+						onInboundGroup: (m: InboundGroupMessage) =>
+							opts.onInboundGroup?.(m, { adapterId: adapter.id }),
+					}
+				: {}),
 			serviceCtx,
 			logger,
 			shouldLogReconnects: () => logReconnectsBox.value,

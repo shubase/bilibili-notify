@@ -1,11 +1,30 @@
 import type { QQDiscoveredEntry, TestResponse } from "@bilibili-notify/contract";
+// 走零依赖的 /constants 子路径 —— 从包根 import 会把 zod 拖进浏览器 bundle。
+import {
+	ONEBOT_FORWARD_MIN_TIMEOUT_MS,
+	ONEBOT_IMAGE_MIN_TIMEOUT_MS,
+} from "@bilibili-notify/internal/constants";
+import {
+	AddCard,
+	Btn,
+	EmptyNote,
+	ErrorNote,
+	Icon,
+	ModalShell,
+	PlatformIcon,
+	platformLabel,
+	platformTint,
+	SectionNav,
+	StatusDot,
+	TOAST_DURATION_MS,
+	Toast,
+	Toggle,
+	ToneChip,
+} from "@bilibili-notify/ui";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { type ReactNode, useEffect, useRef, useState } from "react";
-import { Btn, PlatformIcon, platformLabel, StatusDot, Toggle } from "../components/atoms";
-import { ModalShell } from "../components/dialog";
-import { Field, Picker, TInput, TNum, TSelect } from "../components/forms";
-import { Icon } from "../components/icons";
-import { SectionNav } from "../components/section-nav";
+import { type CSSProperties, type ReactNode, useEffect, useRef, useState } from "react";
+import { FIELD_ROW_CHROME, Field, Picker, TInput, TNum, TSelect } from "../components/forms";
+import { QQQrBindButton } from "../components/qq-qr-bind";
 import { ApiError, api } from "../services/api";
 import {
 	KNOWN_PLATFORMS,
@@ -70,16 +89,6 @@ function scopesFor(platform: PushTarget["platform"]): ReadonlyArray<{
 }
 
 type TestState = "pending" | "ok" | "fail";
-
-const PLATFORM_TINT: Record<string, string> = {
-	onebot: "#3b82f6",
-	"qq-official": "#14b8a6",
-	webhook: "#22c55e",
-};
-
-function tintFor(platform: string): string {
-	return PLATFORM_TINT[platform] ?? "#888";
-}
 
 function scopeLabel(s: PushTargetScope): string {
 	return SCOPES.find((x) => x.value === s)?.label ?? s;
@@ -156,6 +165,47 @@ interface TargetCardProps {
 	readOnly?: boolean;
 }
 
+/** 左竖条色标的一行小状态(「上次推送/测试 OK · 12ms」)。三色查表,别在调用点拼 token 名。 */
+const EDGE_BADGE_TONES = {
+	success: {
+		background: "var(--color-bn-success-soft)",
+		borderLeftColor: "var(--color-bn-success)",
+		color: "var(--color-bn-success-text)",
+	},
+	warning: {
+		background: "var(--color-bn-warning-soft)",
+		borderLeftColor: "var(--color-bn-warning)",
+		color: "var(--color-bn-warning-text)",
+	},
+	danger: {
+		background: "var(--color-bn-danger-soft)",
+		borderLeftColor: "var(--color-bn-danger)",
+		color: "var(--color-bn-danger-text)",
+	},
+} as const;
+
+function EdgeBadge({
+	tone,
+	size = "2xs",
+	className,
+	children,
+}: {
+	tone: keyof typeof EDGE_BADGE_TONES;
+	size?: "2xs" | "xs";
+	/** 外边距与 display(`mb-2` / `mt-2 inline-block`)由摆放处给。 */
+	className?: string;
+	children: ReactNode;
+}) {
+	return (
+		<div
+			className={`rounded-sm border-l-[3px] px-2 py-0.5 ${size === "xs" ? "text-bn-xs" : "text-bn-2xs"} ${className ?? ""}`}
+			style={EDGE_BADGE_TONES[tone]}
+		>
+			{children}
+		</div>
+	);
+}
+
 function TargetCard({
 	target,
 	adapter,
@@ -165,14 +215,14 @@ function TargetCard({
 	testing,
 	readOnly,
 }: TargetCardProps) {
-	const tint = tintFor(target.platform);
+	const tint = platformTint(target.platform);
 	const adapterMissing = !adapter;
 	const status = targetStatusFor(target);
 	const testStatus = target.testStatus;
 
 	return (
 		<div
-			className="rounded-[10px] border bg-bn-surface p-3.5 transition-[border-color] duration-200"
+			className="rounded-bn-sm border bg-bn-surface p-3.5 transition-[border-color] duration-200"
 			style={{
 				borderColor: adapterMissing ? "var(--color-bn-danger-border)" : "var(--color-bn-border)",
 			}}
@@ -180,15 +230,15 @@ function TargetCard({
 			<div className="mb-2.5 flex items-center gap-2.5">
 				<div
 					className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg"
-					style={{ background: `${tint}1a` }}
+					style={{ background: `color-mix(in srgb, ${tint} 10%, transparent)` }}
 				>
 					<PlatformIcon platform={target.platform} size={18} />
 				</div>
 				<div className="min-w-0 flex-1">
-					<div className="truncate text-[13px] font-bold text-bn-text-primary">
+					<div className="truncate text-bn-base font-bold text-bn-text-primary">
 						{target.name || "（未命名）"}
 					</div>
-					<div className="truncate font-mono text-[11px] text-bn-text-tertiary">
+					<div className="truncate font-mono text-bn-xs text-bn-text-tertiary">
 						{targetSessionSummary(target)}
 					</div>
 				</div>
@@ -196,39 +246,27 @@ function TargetCard({
 			</div>
 
 			{testStatus ? (
-				<div
-					className="mb-2 rounded-sm border-l-[3px] px-2 py-0.5 text-[10.5px]"
-					style={
-						testStatus.ok
-							? {
-									background: "var(--color-bn-success-soft)",
-									borderLeftColor: "#22c55e",
-									color: "var(--color-bn-success-text)",
-								}
-							: {
-									background: "var(--color-bn-danger-soft)",
-									borderLeftColor: "#ef4444",
-									color: "var(--color-bn-danger-text)",
-								}
-					}
-				>
+				<EdgeBadge tone={testStatus.ok ? "success" : "danger"} className="mb-2">
 					{testStatus.ok
 						? `上次推送 OK${testStatus.latencyMs != null ? ` · ${testStatus.latencyMs}ms` : ""}`
 						: `上次推送失败${testStatus.err ? ` — ${testStatus.err}` : ""}`}
-				</div>
+				</EdgeBadge>
 			) : null}
 
-			<div className="flex items-center justify-between text-[11.5px] text-bn-text-secondary">
+			<div className="flex items-center justify-between text-bn-xs text-bn-text-secondary">
 				<span className="truncate">
 					{scopeLabel(target.scope)}
 					{" · "}
-					<span style={{ color: adapterMissing ? "#dc2626" : undefined }}>
+					<span style={{ color: adapterMissing ? "var(--color-bn-danger-text)" : undefined }}>
 						{adapterMissing ? "适配器缺失" : `适配器: ${adapter.name}`}
 					</span>
 					{target.enabled ? null : <span className="ml-1.5 text-bn-text-tertiary">(已停用)</span>}
 				</span>
 				<div className="flex shrink-0 gap-1">
+					{/* 导览「发送测试推送」的控件级灯位 —— 只挂在**还没测通**的行上,
+					    待测的每一行一起亮(同名实例=等价入口) */}
 					<Btn
+						data-tour={target.testStatus?.ok === true ? undefined : "target-test"}
 						size="sm"
 						variant="ghost"
 						onClick={onTest}
@@ -245,7 +283,13 @@ function TargetCard({
 					</Btn>
 					{readOnly ? null : (
 						<>
-							<Btn size="sm" variant="ghost" onClick={onEdit}>
+							{/* 导览失败链的灯位:测试失败的行才亮 —— 不改配置,重测永远失败 */}
+							<Btn
+								data-tour={target.testStatus?.ok === false ? "target-config" : undefined}
+								size="sm"
+								variant="ghost"
+								onClick={onEdit}
+							>
 								配置
 							</Btn>
 							<Btn
@@ -262,30 +306,6 @@ function TargetCard({
 				</div>
 			</div>
 		</div>
-	);
-}
-
-// ── Add card (dashed) ───────────────────────────────────────────────────────
-
-interface AddCardProps {
-	label: string;
-	hint: string;
-	onClick: () => void;
-	disabled?: boolean;
-}
-
-function AddCard({ label, hint, onClick, disabled }: AddCardProps) {
-	return (
-		<button
-			type="button"
-			onClick={onClick}
-			disabled={disabled}
-			className="flex h-full min-h-22 flex-col items-center justify-center rounded-[10px] border border-dashed border-bn-border bg-bn-surface px-3 py-4 text-center transition hover:border-bn-pink hover:bg-bn-pink/5 disabled:cursor-not-allowed disabled:opacity-60"
-		>
-			<span className="text-[20px] leading-none text-bn-text-tertiary">＋</span>
-			<span className="mt-1 text-[12.5px] font-semibold text-bn-text-primary">{label}</span>
-			<span className="mt-0.5 text-[10.5px] text-bn-text-tertiary">{hint}</span>
-		</button>
 	);
 }
 
@@ -311,43 +331,33 @@ function AdapterEditorModal({
 	error,
 }: AdapterEditorProps) {
 	const valid = value.name.trim().length > 0;
-	const tint = tintFor(value.platform);
+	// 保存钮灰着时说清楚为什么 —— 扫码回填流程尤其容易只剩名称没填。
+	const invalidHint = valid ? undefined : "请先填写显示名称";
+	const tint = platformTint(value.platform);
 	return (
-		<ModalShell onCancel={onCancel} width={500}>
-			<div className="mb-3 text-[15px] font-bold text-bn-text-primary">
-				{mode === "add" ? "新建适配器" : "配置适配器"}
-			</div>
-
-			<div className="space-y-2.5">
+		<ModalShell
+			onCancel={onCancel}
+			width={500}
+			title={mode === "add" ? "新建适配器" : "配置适配器"}
+		>
+			{/* data-tour:弹窗打开后导览聚光灯从「+ 新建」转移到这张表单上 */}
+			<div data-tour="adapter-form" className="space-y-2.5">
 				<SectionBox title="基本" subtitle="适配器代表一个连接实例,可被多个目标共享" accent={tint}>
 					<Field label="平台" code="adapter.platform" required>
 						<div className="flex flex-wrap gap-1.5">
 							{KNOWN_PLATFORMS.map((p) => {
 								const active = value.platform === p.value;
-								const pTint = tintFor(p.value);
+								const pTint = platformTint(p.value);
 								return (
-									<button
+									<ToneChip
 										key={p.value}
-										type="button"
+										tone={pTint}
+										active={active}
 										onClick={() => onChange(makeEmptyAdapter(p.value, value.name))}
-										className="inline-flex items-center gap-1.5 rounded-md border px-2.5 py-1 text-[12px] font-bold transition"
-										style={
-											active
-												? {
-														background: `${pTint}18`,
-														color: pTint,
-														borderColor: `${pTint}55`,
-													}
-												: {
-														background: "var(--color-bn-surface-muted)",
-														color: "var(--color-bn-text-tertiary)",
-														borderColor: "var(--color-bn-border)",
-													}
-										}
 									>
 										<PlatformIcon platform={p.value} size={13} />
 										{p.label}
-									</button>
+									</ToneChip>
 								);
 							})}
 						</div>
@@ -379,17 +389,16 @@ function AdapterEditorModal({
 				</SectionBox>
 			</div>
 
-			{error ? (
-				<div className="mt-3 rounded border border-bn-danger-border bg-bn-danger-soft p-2 text-xs text-bn-danger-text">
-					{error}
-				</div>
-			) : null}
+			{error ? <ErrorNote className="mt-3">{error}</ErrorNote> : null}
 
-			<div className="mt-4 flex justify-end gap-2">
+			<div className="mt-4 flex items-center justify-end gap-2">
+				{invalidHint ? (
+					<span className="mr-auto text-bn-xs text-bn-text-tertiary">{invalidHint}</span>
+				) : null}
 				<Btn variant="outline" onClick={onCancel} disabled={saving}>
 					取消
 				</Btn>
-				<Btn variant="primary" onClick={onSave} disabled={saving || !valid}>
+				<Btn variant="primary" onClick={onSave} disabled={saving || !valid} title={invalidHint}>
 					{saving ? "保存中…" : "保存"}
 				</Btn>
 			</div>
@@ -414,23 +423,14 @@ function AdapterConnectionFields({
 						{ONEBOT_TRANSPORTS.map((t) => {
 							const active = cfg.transport === t.value;
 							return (
-								<button
+								<ToneChip
 									key={t.value}
-									type="button"
+									tone={platformTint("onebot")}
+									active={active}
 									onClick={() => setCfg(switchOnebotTransport(cfg, t.value))}
-									className="rounded-md border px-2.5 py-1 text-[12px] font-bold transition"
-									style={
-										active
-											? { background: "#3b82f618", color: "#3b82f6", borderColor: "#3b82f655" }
-											: {
-													background: "var(--color-bn-surface-muted)",
-													color: "var(--color-bn-text-tertiary)",
-													borderColor: "var(--color-bn-border)",
-												}
-									}
 								>
 									{t.label}
-								</button>
+								</ToneChip>
 							);
 						})}
 					</div>
@@ -487,17 +487,48 @@ function AdapterConnectionFields({
 						secret
 					/>
 				</Field>
+				{/* 这句 hint 要说的不是「超时是什么」,而是「为什么它看起来没生效」:带图
+				    消息另有更长的下限,不然主人会以为自己调的 15s 被无视了。下限现在就在
+				    下面两栏里,调得动也关得掉 —— 别再让它在代码里悄悄盖掉主人配的数。 */}
 				<Field
 					label={cfg.transport === "http" ? "请求超时" : "响应超时"}
 					code="config.timeoutMs"
-					hint={
+					hint={`${
 						cfg.transport === "http" ? "单次 HTTP 请求总超时(毫秒)" : "等 OneBot echo 响应的超时"
-					}
+					}。纯文字消息按这个数走；带图的另看下面两栏的下限`}
 				>
 					<TNum
 						value={cfg.timeoutMs}
 						onChange={(v) => setCfg({ ...cfg, timeoutMs: v })}
 						min={1000}
+						step={1000}
+						suffix="ms"
+						width={120}
+					/>
+				</Field>
+				<Field
+					label="带图超时下限"
+					code="config.imageMinTimeoutMs"
+					hint={`带图消息实际等 max(上面的超时, 此值)。协议端要先把图传到 QQ 图床才回响应，实测常超 15s，所以单独放宽（默认 ${ONEBOT_IMAGE_MIN_TIMEOUT_MS / 1000}s）。填 0 = 不放宽，严格按上面的超时走`}
+				>
+					<TNum
+						value={cfg.imageMinTimeoutMs}
+						onChange={(v) => setCfg({ ...cfg, imageMinTimeoutMs: v })}
+						min={0}
+						step={1000}
+						suffix="ms"
+						width={120}
+					/>
+				</Field>
+				<Field
+					label="合并转发超时下限"
+					code="config.forwardMinTimeoutMs"
+					hint={`语义同上，只是合并转发要把每张图逐张下载再上传组装，更慢（默认 ${ONEBOT_FORWARD_MIN_TIMEOUT_MS / 1000}s）。填 0 = 不放宽`}
+				>
+					<TNum
+						value={cfg.forwardMinTimeoutMs}
+						onChange={(v) => setCfg({ ...cfg, forwardMinTimeoutMs: v })}
+						min={0}
 						step={1000}
 						suffix="ms"
 						width={120}
@@ -542,6 +573,26 @@ function AdapterConnectionFields({
 		const setCfg = (next: QQOfficialAdapterConfig) => onChange({ ...adapter, config: next });
 		return (
 			<>
+				{/* 行框吃 Field 的 FIELD_ROW_CHROME —— 扫码行要与底下的字段行排同一栏,
+				    此前逐字符手抄,行距一漂两种行就对不齐。 */}
+				<div className={`flex flex-wrap items-center gap-3 ${FIELD_ROW_CHROME}`}>
+					<QQQrBindButton
+						// 回填 = 「用扫出来的这个 lite bot」,顺手把域/沙箱归到它的正确档:
+						// lite bot 无原生 markdown 特权,留在私域档会让图集推送必败。
+						// 显示名称为空时补默认名 —— 扫码流程跳过了表单上半截,名称空着
+						// 会让保存钮一直灰着(唯一前端必填),用户看不出为什么存不了。
+						onCredentials={({ appId, appSecret }) =>
+							onChange({
+								...adapter,
+								name: adapter.name.trim() ? adapter.name : `QQ 机器人 ${appId}`,
+								config: { ...cfg, appId, appSecret, botType: "public", sandbox: false },
+							})
+						}
+					/>
+					<span className="text-bn-xs text-bn-text-secondary">
+						没有机器人?扫码在腾讯页面一键创建,凭据自动回填下方两栏
+					</span>
+				</div>
 				<Field
 					label="AppID"
 					code="config.appId"
@@ -719,30 +770,31 @@ function TargetEditorModal({
 	error,
 }: TargetEditorProps) {
 	const valid = value.name.trim().length > 0 && Boolean(value.adapterId);
-	const tint = tintFor(value.platform);
+	const tint = platformTint(value.platform);
 	// Webhook target 由 adapter 自动托管，不能从手动 target 弹窗创建 / 改挂。
 	const eligibleAdapters = adapters.filter((a) => a.platform !== "webhook");
 	return (
-		<ModalShell onCancel={onCancel} width={500}>
-			<div className="mb-3 text-[15px] font-bold text-bn-text-primary">
-				{mode === "add" ? "新建推送目标" : "配置推送目标"}
-			</div>
-
-			<div className="space-y-2.5">
+		<ModalShell
+			onCancel={onCancel}
+			width={500}
+			title={mode === "add" ? "新建推送目标" : "配置推送目标"}
+		>
+			{/* data-tour:弹窗打开后导览聚光灯从「+ 新建」转移到这张表单上 */}
+			<div data-tour="target-form" className="space-y-2.5">
 				<SectionBox
 					title="选择适配器"
 					subtitle="目标的平台跟随适配器,连接参数(baseUrl/accessToken)在适配器层维护"
 					accent={tint}
 				>
 					{eligibleAdapters.length === 0 ? (
-						<div className="rounded-md border border-dashed border-bn-border px-3 py-3 text-center text-[11.5px] text-bn-text-secondary">
+						<EmptyNote size="sm">
 							尚未配置任何可手动绑定的适配器 · Webhook 目标由系统自动托管
-						</div>
+						</EmptyNote>
 					) : (
 						<div className="space-y-1.5">
 							{eligibleAdapters.map((a) => {
 								const active = value.adapterId === a.id;
-								const aTint = tintFor(a.platform);
+								const aTint = platformTint(a.platform);
 								return (
 									<button
 										key={a.id}
@@ -752,30 +804,28 @@ function TargetEditorModal({
 											// preserve user-typed identity if any
 											onChange({ ...next, id: value.id, enabled: value.enabled });
 										}}
-										className="flex w-full items-center gap-2 rounded-md border px-2.5 py-2 text-left transition"
-										style={
-											active
-												? {
-														background: `${aTint}10`,
-														borderColor: `${aTint}55`,
-													}
-												: {
-														background: "var(--color-bn-surface)",
-														borderColor: "var(--color-bn-border)",
-													}
-										}
+										// 候选行走 option。选中态曾经**只买到一半** —— 底与边写在 `style`
+										// 里(平台 tint),inline 压过一切 author 样式,挂着 option-active
+										// 也白挂;未选中那一档更亏,两个静态 token 也一起锁在了 inline 上。
+										// 现在 inline 只剩 `--bn-tint` 一个值,涂法在 `bn-tint-row` 那条
+										// @utility 里,两态皮肤都盖得动。
+										data-bn={active ? "option option-active" : "option"}
+										className={`flex w-full items-center gap-2 rounded-md border px-2.5 py-2 text-left transition ${
+											active ? "bn-tint-row" : "border-bn-border bg-bn-surface"
+										}`}
+										style={{ "--bn-tint": aTint } as CSSProperties}
 									>
 										<PlatformIcon platform={a.platform} size={16} />
 										<div className="min-w-0 flex-1">
-											<div className="truncate text-[12px] font-semibold text-bn-text-primary">
+											<div className="truncate text-bn-sm font-semibold text-bn-text-primary">
 												{a.name}
 											</div>
-											<div className="truncate font-mono text-[10.5px] text-bn-text-tertiary">
+											<div className="truncate font-mono text-bn-2xs text-bn-text-tertiary">
 												{platformLabel(a.platform)} · {adapterEndpointSummary(a)}
 											</div>
 										</div>
 										{active ? (
-											<span className="text-[11px] font-bold" style={{ color: aTint }}>
+											<span className="text-bn-xs font-bold" style={{ color: aTint }}>
 												已选
 											</span>
 										) : null}
@@ -799,9 +849,9 @@ function TargetEditorModal({
 							{scopesFor(value.platform).map((s) => {
 								const active = value.scope === s.value;
 								return (
-									<button
+									<ToneChip
 										key={s.value}
-										type="button"
+										active={active}
 										onClick={() => {
 											if (value.platform === "onebot") {
 												// OneBot group/private are mutually exclusive — drop the other field
@@ -818,23 +868,9 @@ function TargetEditorModal({
 												onChange({ ...value, scope: s.value });
 											}
 										}}
-										className="rounded-md border px-3 py-1 text-[12px] font-bold transition"
-										style={
-											active
-												? {
-														background: "#FB72991f",
-														color: "#FB7299",
-														borderColor: "#FB729955",
-													}
-												: {
-														background: "var(--color-bn-surface-muted)",
-														color: "var(--color-bn-text-tertiary)",
-														borderColor: "var(--color-bn-border)",
-													}
-										}
 									>
 										{s.label}
-									</button>
+									</ToneChip>
 								);
 							})}
 						</div>
@@ -861,11 +897,7 @@ function TargetEditorModal({
 				) : null}
 			</div>
 
-			{error ? (
-				<div className="mt-3 rounded border border-bn-danger-border bg-bn-danger-soft p-2 text-xs text-bn-danger-text">
-					{error}
-				</div>
-			) : null}
+			{error ? <ErrorNote className="mt-3">{error}</ErrorNote> : null}
 
 			<div className="mt-4 flex justify-end gap-2">
 				<Btn variant="outline" onClick={onCancel} disabled={saving}>
@@ -1039,43 +1071,45 @@ function QQSessionPicker({
 	const list = (data ?? []).filter((e) => e.scope === scope);
 	const label = scope === "group" ? "群" : "用户";
 	return (
-		<div className="mt-1.5 rounded-md border border-dashed border-bn-border px-2.5 py-2">
-			<div className="mb-1 flex items-center justify-between">
-				<span className="text-[11px] font-bold text-bn-text-secondary">发现的{label}会话</span>
-				<Btn variant="ghost" size="sm" onClick={() => refetch()} disabled={isFetching}>
-					{isFetching ? "刷新中…" : "刷新"}
-				</Btn>
-			</div>
+		<CandidateBox
+			title={`发现的${label}会话`}
+			actionLabel="刷新"
+			pendingLabel="刷新中…"
+			pending={isFetching}
+			onAction={() => refetch()}
+		>
 			{isLoading ? (
-				<div className="text-[11px] text-bn-text-tertiary">加载中…</div>
+				<div className="text-bn-xs text-bn-text-tertiary">加载中…</div>
 			) : isError ? (
-				<div className="text-[11px] text-red-500">拉取失败(适配器是否已保存并连上网关?)</div>
+				<div className="text-bn-xs text-bn-danger">拉取失败(适配器是否已保存并连上网关?)</div>
 			) : list.length === 0 ? (
-				<div className="text-[11px] leading-relaxed text-bn-text-tertiary">
+				<div className="text-bn-xs leading-relaxed text-bn-text-tertiary">
 					暂无发现的{label}会话 —— 先让机器人在目标
 					{scope === "group" ? "群里被 @ 一次" : "处收到一条 C2C 消息"}
 					,再点刷新。
 				</div>
 			) : (
 				<div className="flex flex-col gap-1">
+					{/* 候选行走 option —— 从列表里挑一个,不是执行动作,所以不吃按钮的皮。 */}
 					{list.map((e) => (
 						<button
 							key={e.openid}
 							type="button"
 							onClick={() => onPick(e.openid)}
-							className="flex items-center gap-2 rounded border border-bn-border bg-bn-surface px-2 py-1 text-left transition hover:border-bn-pink"
+							data-bn="option"
+							className="flex items-center gap-2 rounded-sm border border-bn-border bg-bn-surface px-2 py-1 text-left transition hover:border-bn-pink"
 						>
-							<span className="truncate text-[11.5px] font-semibold text-bn-text-primary">
+							<span className="truncate text-bn-xs font-semibold text-bn-text-primary">
 								{e.displayHint ?? "(无名称)"}
 							</span>
-							<span className="truncate font-mono text-[10px] text-bn-text-tertiary">
+							<span className="truncate font-mono text-bn-2xs text-bn-text-tertiary">
 								{e.openid}
 							</span>
 						</button>
 					))}
 				</div>
 			)}
-		</div>
+		</CandidateBox>
 	);
 }
 
@@ -1098,36 +1132,38 @@ function QQGuildPicker({
 	const guilds = data ?? [];
 	const fetched = fetchStatus === "idle" && data !== undefined;
 	return (
-		<div className="mt-1.5 rounded-md border border-dashed border-bn-border px-2.5 py-2">
-			<div className="mb-1 flex items-center justify-between">
-				<span className="text-[11px] font-bold text-bn-text-secondary">频道子频道列表</span>
-				<Btn variant="ghost" size="sm" onClick={() => refetch()} disabled={isFetching}>
-					{isFetching ? "拉取中…" : "拉取频道"}
-				</Btn>
-			</div>
+		<CandidateBox
+			title="频道子频道列表"
+			actionLabel="拉取频道"
+			pendingLabel="拉取中…"
+			pending={isFetching}
+			onAction={() => refetch()}
+		>
 			{isError ? (
-				<div className="text-[11px] text-red-500">拉取失败(适配器是否已保存且凭据正确?)</div>
+				<div className="text-bn-xs text-bn-danger">拉取失败(适配器是否已保存且凭据正确?)</div>
 			) : !fetched ? (
-				<div className="text-[11px] text-bn-text-tertiary">点「拉取频道」从 QQ 实时枚举。</div>
+				<div className="text-bn-xs text-bn-text-tertiary">点「拉取频道」从 QQ 实时枚举。</div>
 			) : guilds.length === 0 ? (
-				<div className="text-[11px] text-bn-text-tertiary">未发现任何频道服务器。</div>
+				<div className="text-bn-xs text-bn-text-tertiary">未发现任何频道服务器。</div>
 			) : (
 				<div className="flex flex-col gap-1.5">
 					{guilds.map((g) => (
 						<div key={g.guildId}>
-							<div className="truncate text-[11px] font-semibold text-bn-text-secondary">
+							<div className="truncate text-bn-xs font-semibold text-bn-text-secondary">
 								{g.name}
 							</div>
 							<div className="mt-0.5 flex flex-wrap gap-1">
 								{g.channels.length === 0 ? (
-									<span className="text-[10px] text-bn-text-tertiary">(无文字子频道)</span>
+									<span className="text-bn-2xs text-bn-text-tertiary">(无文字子频道)</span>
 								) : (
+									// 候选 chip 走 option:挑频道,不是执行动作。
 									g.channels.map((ch) => (
 										<button
 											key={ch.channelId}
 											type="button"
 											onClick={() => onPick(g.guildId, ch.channelId)}
-											className="rounded border border-bn-border bg-bn-surface px-2 py-0.5 text-[11px] text-bn-text-primary transition hover:border-bn-pink"
+											data-bn="option"
+											className="rounded-sm border border-bn-border bg-bn-surface px-2 py-0.5 text-bn-xs text-bn-text-primary transition hover:border-bn-pink"
 										>
 											{ch.name}
 										</button>
@@ -1138,6 +1174,38 @@ function QQGuildPicker({
 					))}
 				</div>
 			)}
+		</CandidateBox>
+	);
+}
+
+/**
+ * 候选拉取盒 —— 虚线盒 + 「标题 + ghost 触发钮」头行。QQ 会话与频道两个选择器
+ * 此前各抄一份,连 mb-1 的头行都逐字符相同;拉取状态与候选列表由调用方摆。
+ */
+function CandidateBox({
+	title,
+	actionLabel,
+	pendingLabel,
+	pending,
+	onAction,
+	children,
+}: {
+	title: string;
+	actionLabel: string;
+	pendingLabel: string;
+	pending: boolean;
+	onAction: () => void;
+	children: ReactNode;
+}) {
+	return (
+		<div className="mt-1.5 rounded-md border border-dashed border-bn-border px-2.5 py-2">
+			<div className="mb-1 flex items-center justify-between">
+				<span className="text-bn-xs font-bold text-bn-text-secondary">{title}</span>
+				<Btn variant="ghost" size="sm" onClick={onAction} disabled={pending}>
+					{pending ? pendingLabel : actionLabel}
+				</Btn>
+			</div>
+			{children}
 		</div>
 	);
 }
@@ -1158,13 +1226,16 @@ function SectionBox({
 	return (
 		<div
 			className="rounded-xl border px-3 py-2.5"
-			style={{ borderColor: `${accent}33`, background: `${accent}06` }}
+			style={{
+				borderColor: `color-mix(in srgb, ${accent} 20%, transparent)`,
+				background: `color-mix(in srgb, ${accent} 2%, transparent)`,
+			}}
 		>
 			<div className="mb-1 flex items-baseline gap-2">
-				<span className="text-[12px] font-bold" style={{ color: accent }}>
+				<span className="text-bn-sm font-bold" style={{ color: accent }}>
 					{title}
 				</span>
-				{subtitle ? <span className="text-[10.5px] text-bn-text-tertiary">{subtitle}</span> : null}
+				{subtitle ? <span className="text-bn-2xs text-bn-text-tertiary">{subtitle}</span> : null}
 			</div>
 			<div>{children}</div>
 		</div>
@@ -1191,36 +1262,30 @@ function DeleteModal({
 	error: string | null;
 }) {
 	return (
-		<ModalShell onCancel={onCancel} width={420}>
-			<div className="mb-2 text-[15px] font-bold text-bn-text-primary">
-				{subjectKind === "adapter" ? "删除适配器" : "删除推送目标"}
-			</div>
-			<div className="mb-5 text-[13px] leading-relaxed text-bn-text-secondary">
-				确定要移除 <b className="text-bn-text-primary">{subjectName}</b> 吗？
-				{hint ? (
-					<>
-						<br />
-						{hint}
-					</>
-				) : null}
-			</div>
-			{error ? (
-				<div className="mb-3 rounded border border-bn-danger-border bg-bn-danger-soft p-2 text-xs text-bn-danger-text">
-					{error}
-				</div>
-			) : null}
+		<ModalShell
+			onCancel={onCancel}
+			width={420}
+			title={subjectKind === "adapter" ? "删除适配器" : "删除推送目标"}
+			description={
+				<>
+					确定要移除 <b className="text-bn-text-primary">{subjectName}</b> 吗？
+					{hint ? (
+						<>
+							<br />
+							{hint}
+						</>
+					) : null}
+				</>
+			}
+		>
+			{error ? <ErrorNote className="mb-3">{error}</ErrorNote> : null}
 			<div className="flex justify-end gap-2">
 				<Btn variant="outline" onClick={onCancel} disabled={deleting}>
 					取消
 				</Btn>
-				<button
-					type="button"
-					onClick={onConfirm}
-					disabled={deleting}
-					className="inline-flex h-7.5 items-center justify-center rounded-md border border-transparent bg-red-500 px-3.5 text-[13px] font-bold text-white transition hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50"
-				>
+				<Btn variant="danger-solid" onClick={onConfirm} disabled={deleting}>
 					{deleting ? "移除中…" : "确认移除"}
-				</button>
+				</Btn>
 			</div>
 		</ModalShell>
 	);
@@ -1240,16 +1305,21 @@ function TestConfirmModal({
 	onConfirm: () => void;
 }) {
 	return (
-		<ModalShell onCancel={onCancel} width={420}>
-			<div className="mb-2 text-[15px] font-bold text-bn-text-primary">发送测试推送?</div>
-			<div className="mb-4 text-[13px] leading-relaxed text-bn-text-secondary">
-				将通过 <b className="text-bn-text-primary">{adapter?.name ?? "(未知适配器)"}</b> 向{" "}
-				<b className="text-bn-text-primary">{target.name}</b> 真实发送一条测试消息。
-				<br />
-				<span className="font-mono text-[11.5px] text-bn-text-tertiary">
-					[bilibili-notify] 测试推送已送达 ✓
-				</span>
-			</div>
+		<ModalShell
+			onCancel={onCancel}
+			width={420}
+			title="发送测试推送?"
+			description={
+				<>
+					将通过 <b className="text-bn-text-primary">{adapter?.name ?? "(未知适配器)"}</b> 向{" "}
+					<b className="text-bn-text-primary">{target.name}</b> 真实发送一条测试消息。
+					<br />
+					<span className="font-mono text-bn-xs text-bn-text-tertiary">
+						[bilibili-notify] 测试推送已送达 ✓
+					</span>
+				</>
+			}
+		>
 			<div className="flex justify-end gap-2">
 				<Btn variant="outline" onClick={onCancel}>
 					取消
@@ -1284,21 +1354,32 @@ function AdapterRail({
 			onPick={onPick}
 			onAdd={onAddClick}
 			addLabel="+ 新建"
-			emptyState={
-				<div className="rounded-[9px] border border-dashed border-bn-border bg-bn-surface/55 px-3 py-3 text-center text-[11px] text-bn-text-tertiary">
-					尚未配置任何适配器
-				</div>
-			}
+			// data-tour:导览「新建推送适配器」的常驻灯位(控件级 —— 只框按钮本体)
+			addButtonProps={{ "data-tour": "adapter-add" }}
+			// 不带底色 —— 虚线家族统一成 Subs「添加 UP 主」那样只有虚线框(2026-08-30 主人定案)
+			emptyState={<EmptyNote size="sm">尚未配置任何适配器</EmptyNote>}
 			items={adapters.map((a) => {
 				const count = targetCountByAdapter.get(a.id) ?? 0;
 				return {
 					id: a.id,
 					label: a.name || "（未命名）",
 					desc: `${platformLabel(a.platform)} · ${a.platform === "webhook" ? "单向投递" : `${count} 个目标`}`,
-					icon: <PlatformIcon platform={a.platform} size={12} />,
-					iconTint: tintFor(a.platform),
+					// 选中那格喂 currentColor —— 标识色是中等亮度,摆在皮肤画的实心块上会撞
+					// (QQ官方 #14b8a6 对主人那块粉只有 1.24:1)。平台名在副标题里写着,不丢。
+					icon: (
+						<PlatformIcon
+							platform={a.platform}
+							size={12}
+							tone={a.id === selectedId ? "currentColor" : undefined}
+						/>
+					),
+					iconTint: platformTint(a.platform),
+					// **不写死前景色** —— 它落在左栏选中项内部,而那一项的底由皮肤说了算
+					// (见 SectionNav 的 RAIL_ITEM_ACTIVE)。tertiary 这一档假设底是页面色,
+					// 皮肤把选中项画成实心块之后它就糊在上面了。弱化改由字号 + 字重扛,
+					// 和同一张卡上的副标题同一个办法。
 					badge: !a.enabled ? (
-						<span className="shrink-0 text-[10px] text-bn-text-tertiary">(停用)</span>
+						<span className="shrink-0 text-bn-2xs font-normal">(停用)</span>
 					) : undefined,
 				};
 			})}
@@ -1380,7 +1461,7 @@ export default function Targets() {
 	const showToast = (msg: string, ok = true): void => {
 		setToast({ msg, ok });
 		if (toastTimer.current !== null) window.clearTimeout(toastTimer.current);
-		toastTimer.current = window.setTimeout(() => setToast(null), 2400);
+		toastTimer.current = window.setTimeout(() => setToast(null), TOAST_DURATION_MS);
 	};
 
 	const upsertAdapter = useMutation({
@@ -1607,8 +1688,13 @@ export default function Targets() {
 	const isLoading = adaptersQuery.isLoading || targetsQuery.isLoading;
 
 	return (
-		<div className="bn-anim-fade-in flex flex-col gap-4">
-			<div className="grid gap-4 xl:grid-cols-[220px_1fr]">
+		<div className="bn-anim-page-in flex flex-col gap-4">
+			<div className="grid gap-4 xl:grid-bn-rail">
+				{/* AdapterRail 直接坐在 grid 上,中间不许夹盒子 —— SectionNav 的根在 xl 以下是
+				    `display:contents`,包一层 div 就把它的包含块缩成矮格子,sticky 失去吸附
+				    行程(见 packages/ui/src/section-nav.tsx 的同段注释)。导览挂点(adapter-add)
+				    在内部「+ 新建」按钮本体上,不需要外层盒子 —— 曾框整栏:洞大到点空态占位
+				    也算「点过了」,灯白白退散(真机踩过)。 */}
 				<AdapterRail
 					adapters={adapters}
 					selectedId={selectedAdapterId}
@@ -1619,60 +1705,52 @@ export default function Targets() {
 
 				<div className="space-y-4">
 					{isLoading ? (
-						<div className="rounded-bn-card bg-bn-surface p-6 shadow-bn-card">
-							<div className="h-20 animate-pulse rounded-[10px] bg-bn-surface-muted" />
+						<div className="bn-glass rounded-bn-card p-6 shadow-bn-card">
+							<div className="h-20 animate-pulse rounded-bn-sm bg-bn-surface-muted" />
 						</div>
 					) : !selectedAdapter ? (
-						<div className="rounded-bn-card bg-bn-surface p-8 text-center shadow-bn-card">
-							<div className="mb-1 text-[14px] font-bold text-bn-text-primary">还没有适配器</div>
-							<div className="mb-4 text-[11.5px] text-bn-text-tertiary">
-								先在左侧新建一个适配器(OneBot HTTP / Webhook),再为它配置推送目标。
+						<div className="bn-glass rounded-bn-card p-8 text-center shadow-bn-card">
+							<div className="mb-1 text-bn-md font-bold text-bn-text-primary">还没有适配器</div>
+							<div className="mb-4 text-bn-xs text-bn-text-tertiary">
+								先新建一个适配器(QQ 官方机器人 / OneBot / Webhook),再为它配置推送目标。
 							</div>
-							<Btn variant="primary" size="sm" onClick={startNewAdapter}>
+							{/* 与左栏「+ 新建」同名挂点 —— 同名实例是等价入口,聚光灯一起亮 */}
+							<Btn data-tour="adapter-add" variant="primary" size="sm" onClick={startNewAdapter}>
 								+ 新建适配器
 							</Btn>
 						</div>
 					) : (
 						<>
 							{/* Adapter detail header */}
-							<div className="rounded-bn-card bg-bn-surface p-4 shadow-bn-card">
+							<div className="bn-glass rounded-bn-card p-4 shadow-bn-card">
 								<div className="flex items-start gap-3">
 									<div
 										className="grid h-11 w-11 shrink-0 place-items-center rounded-lg"
-										style={{ background: `${tintFor(selectedAdapter.platform)}1f` }}
+										style={{
+											background: `color-mix(in srgb, ${platformTint(selectedAdapter.platform)} 12%, transparent)`,
+										}}
 									>
 										<PlatformIcon platform={selectedAdapter.platform} size={22} />
 									</div>
 									<div className="min-w-0 flex-1">
 										<div className="flex items-center gap-2">
-											<span className="truncate text-[14.5px] font-bold text-bn-text-primary">
+											<span className="truncate text-bn-md font-bold text-bn-text-primary">
 												{selectedAdapter.name || "（未命名）"}
 											</span>
 											<StatusDot kind={selectedAdapterStatus} />
 											{!selectedAdapter.enabled ? (
-												<span className="text-[10.5px] text-bn-text-tertiary">(已停用)</span>
+												<span className="text-bn-2xs text-bn-text-tertiary">(已停用)</span>
 											) : null}
 										</div>
-										<div className="mt-0.5 truncate font-mono text-[11.5px] text-bn-text-tertiary">
+										<div className="mt-0.5 truncate font-mono text-bn-xs text-bn-text-tertiary">
 											{platformLabel(selectedAdapter.platform)} ·{" "}
 											{adapterEndpointSummary(selectedAdapter)}
 										</div>
 										{selectedAdapterTestStatus ? (
-											<div
-												className="mt-2 inline-block rounded-sm border-l-[3px] px-2 py-0.5 text-[11px]"
-												style={
-													selectedAdapterTestStatus.ok
-														? {
-																background: "var(--color-bn-success-soft)",
-																borderLeftColor: "#22c55e",
-																color: "var(--color-bn-success-text)",
-															}
-														: {
-																background: "var(--color-bn-warning-soft)",
-																borderLeftColor: "#f59e0b",
-																color: "var(--color-bn-warning-text)",
-															}
-												}
+											<EdgeBadge
+												tone={selectedAdapterTestStatus.ok ? "success" : "warning"}
+												size="xs"
+												className="mt-2 inline-block"
 											>
 												{selectedAdapterTestStatus.ok
 													? `上次测试 OK${
@@ -1685,11 +1763,13 @@ export default function Targets() {
 																? ` — ${selectedAdapterTestStatus.err}`
 																: ""
 														}`}
-											</div>
+											</EdgeBadge>
 										) : null}
 									</div>
 									<div className="flex shrink-0 gap-1">
+										{/* 导览「测试适配器连通」一步的控件级灯位 */}
 										<Btn
+											data-tour="adapter-test"
 											size="sm"
 											variant="ghost"
 											onClick={() => testAdapter(selectedAdapter)}
@@ -1710,6 +1790,10 @@ export default function Targets() {
 															: "测试"}
 										</Btn>
 										<Btn
+											// 导览失败链的灯位:测试失败时才亮(同 target-config)
+											data-tour={
+												selectedAdapter.testStatus?.ok === false ? "adapter-config" : undefined
+											}
 											size="sm"
 											variant="ghost"
 											onClick={() => startEditAdapter(selectedAdapter)}
@@ -1732,14 +1816,14 @@ export default function Targets() {
 								</div>
 							</div>
 
-							{/* Targets bound to this adapter */}
-							<div className="rounded-bn-card bg-bn-surface p-4 shadow-bn-card">
+							{/* Targets bound to this adapter。data-tour:导览「发送测试推送」一步聚这整卡 */}
+							<div data-tour="target-list" className="bn-glass rounded-bn-card p-4 shadow-bn-card">
 								<div className="mb-3 flex items-baseline justify-between">
 									<div>
-										<div className="text-[14px] font-bold text-bn-text-primary">
+										<div className="text-bn-md font-bold text-bn-text-primary">
 											{selectedAdapter.platform === "webhook" ? "Webhook 投递目标" : "推送目标"}
 										</div>
-										<div className="text-[11.5px] text-bn-text-tertiary">
+										<div className="text-bn-xs text-bn-text-tertiary">
 											{selectedAdapter.platform === "webhook"
 												? "Webhook 是单向投递终点，保存 URL 后系统会自动创建默认投递目标。"
 												: "本适配器下的会话:群号 / 用户 ID 等。"}
@@ -1747,6 +1831,7 @@ export default function Targets() {
 									</div>
 									{selectedAdapter.platform === "webhook" ? null : (
 										<Btn
+											data-tour="target-add"
 											size="sm"
 											variant="outline"
 											onClick={() => startNewTarget(selectedAdapter)}
@@ -1757,7 +1842,7 @@ export default function Targets() {
 								</div>
 								{selectedAdapter.platform === "webhook" ? (
 									<div className="space-y-2.5">
-										<div className="rounded-[9px] border border-emerald-100 bg-bn-success-soft/70 px-3 py-2 text-[11.5px] leading-relaxed text-emerald-800">
+										<div className="rounded-bn-sm border border-bn-success-border bg-bn-success-soft/70 px-3 py-2 text-bn-xs leading-relaxed text-bn-success-text">
 											无需手动配置额外 PushTarget；订阅页会看到这个 Webhook，可直接选择并投递。
 										</div>
 										{selectedManagedWebhookTarget ? (
@@ -1773,16 +1858,17 @@ export default function Targets() {
 												/>
 											</div>
 										) : (
-											<div className="rounded-[9px] border border-dashed border-bn-border px-3 py-3 text-center text-[11.5px] text-bn-text-secondary">
-												保存 Webhook 后系统会自动创建默认投递目标。
-											</div>
+											<EmptyNote size="sm">保存 Webhook 后系统会自动创建默认投递目标。</EmptyNote>
 										)}
 									</div>
 								) : selectedTargets.length === 0 ? (
 									<div className="grid grid-cols-1 gap-2.5 sm:grid-cols-2">
+										{/* 与右上「+ 新建推送目标」同名挂点 —— 等价入口,聚光灯一起亮 */}
 										<AddCard
+											data-tour="target-add"
 											label="新建推送目标"
 											hint="绑定到当前适配器"
+											className="min-h-22"
 											onClick={() => startNewTarget(selectedAdapter)}
 										/>
 									</div>
@@ -1806,6 +1892,7 @@ export default function Targets() {
 										<AddCard
 											label="新建推送目标"
 											hint="绑定到当前适配器"
+											className="min-h-22"
 											onClick={() => startNewTarget(selectedAdapter)}
 										/>
 									</div>
@@ -1887,15 +1974,7 @@ export default function Targets() {
 				/>
 			) : null}
 
-			{toast ? (
-				<div
-					className={`fixed bottom-4 right-4 z-400 rounded-md px-4 py-2 text-[12.5px] font-semibold text-white shadow-lg ${
-						toast.ok ? "bg-emerald-600" : "bg-red-500"
-					}`}
-				>
-					{toast.msg}
-				</div>
-			) : null}
+			{toast ? <Toast tone={toast.ok ? "ok" : "err"}>{toast.msg}</Toast> : null}
 		</div>
 	);
 }

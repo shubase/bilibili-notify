@@ -1,5 +1,5 @@
 import type { BiliEvents, ConfigScope, Disposable, MessageBus } from "@bilibili-notify/internal";
-import type { ConfigStore } from "../config/store.js";
+import { toHistoryView } from "../history/view.js";
 import type { LogChannel } from "./log-channel.js";
 import { CHANNELS, type ChannelName, type LogEntry, type ServerEventEnvelope } from "./types.js";
 
@@ -16,57 +16,58 @@ type ChannelPublisher = (envelope: ServerEventEnvelope) => void;
 
 export interface ChannelWiringDeps {
 	bus: MessageBus;
-	store: ConfigStore;
 	log: LogChannel;
 	/** Called once per server-pushed event with a fully built envelope. */
 	publish: ChannelPublisher;
 }
 
-/** Compute a fresh `state/hydrate` envelope. The dashboard receives one of these immediately on subscribe. */
-export function buildStateHydrate(store: ConfigStore): ServerEventEnvelope<{
-	globals: ReturnType<ConfigStore["getGlobals"]>;
-	subscriptions: ReturnType<ConfigStore["getSubscriptions"]>;
-	targets: ReturnType<ConfigStore["getTargets"]>;
-}> {
+/**
+ * Compute a `state/hydrate` envelope. The dashboard receives one of these on
+ * subscribe and after every reconnect.
+ *
+ * **It carries no payload, on purpose.** The original design (ba25f2a, stage
+ * 2.3) packed `{ globals, subscriptions, targets }` in here "so the UI can
+ * render without a separate REST round-trip" — written before the dashboard
+ * existed. The dashboard that got built runs on react-query and fetches over
+ * REST; `handleStateEnvelope` reads nothing from this frame, it only
+ * invalidates the three queries. That intent was never realised.
+ *
+ * Meanwhile 25e4210 (`fix(security)`) closed the plaintext-apiKey leak on
+ * `GET /api/globals` and in the DOM, naming the threat model exactly:
+ * "devtools 直接可见,屏幕共享/截图也会泄漏". It missed this path — so every
+ * subscribe and every reconnect shipped unredacted provider keys and search
+ * keys over the wire, straight into the browser's Network panel, for a
+ * consumer that discards them.
+ *
+ * If the round-trip saving is ever wanted, the client must read a **redacted**
+ * snapshot (see `redactGlobals` in routes/globals.ts) — never `getGlobals()`.
+ */
+export function buildStateHydrate(): ServerEventEnvelope<null> {
 	return {
 		type: "state",
 		event: "hydrate",
 		ts: new Date().toISOString(),
-		data: {
-			globals: store.getGlobals(),
-			subscriptions: store.getSubscriptions(),
-			targets: store.getTargets(),
-		},
+		data: null,
 	};
 }
 
-/** Build a `state/config-changed` envelope including the fresh snapshot for that scope. */
+/**
+ * Build a `state/config-changed` envelope. Carries the scope marker only.
+ *
+ * Same reasoning as {@link buildStateHydrate}: the client reads `.scope` and
+ * nothing else, and the `globals` scope would otherwise put plaintext keys on
+ * the wire on every config write. The `secrets` scope was already exempted
+ * when this was first written — the other scopes just never got the same
+ * treatment once redaction landed.
+ */
 function buildConfigChangedEnvelope(
-	store: ConfigStore,
 	scope: ConfigScope,
-): ServerEventEnvelope<{ scope: ConfigScope; snapshot: unknown }> {
-	let snapshot: unknown;
-	switch (scope) {
-		case "globals":
-			snapshot = store.getGlobals();
-			break;
-		case "subscriptions":
-			snapshot = store.getSubscriptions();
-			break;
-		case "targets":
-			snapshot = store.getTargets();
-			break;
-		case "secrets":
-			// Secrets snapshots are NOT pushed over WS — clients must hit a dedicated
-			// REST endpoint that does the redacted shape. Send only the scope marker.
-			snapshot = null;
-			break;
-	}
+): ServerEventEnvelope<{ scope: ConfigScope }> {
 	return {
 		type: "state",
 		event: "config-changed",
 		ts: new Date().toISOString(),
-		data: { scope, snapshot },
+		data: { scope },
 	};
 }
 
@@ -128,32 +129,22 @@ export function attachChannelWiring(deps: ChannelWiringDeps): Disposable {
 	);
 
 	// push-events channel ---------------------------------------------------
-	// Carry the full HistoryEntry view (id, ts, source, uid, ok, text) so the
-	// dashboard's toast can render without a second fetch. Image refs stay as
-	// `imageRef: <filename>` — clients resolve those against /api/history/img.
-	subs.push(
-		deps.bus.on("history-recorded", (entry) => {
-			const view = {
-				id: entry.id,
-				ts: entry.ts,
-				source: entry.source,
-				uid: entry.uid,
-				subscriptionId: entry.subscriptionId,
-				targetIds: entry.targetIds,
-				ok: entry.result.ok,
-				text: entry.payload.text,
-				imageRef: entry.payload.imageRef,
-				unameSnapshot: entry.unameSnapshot,
-				uavatarSnapshot: entry.uavatarSnapshot,
-			};
-			deps.publish({
-				type: "push-events",
-				event: "history-recorded",
-				ts: new Date().toISOString(),
-				data: view,
-			});
-		}),
-	);
+	// 历史那一行的 wire view(与 GET /api/history 同一投影),面板的小卡不用二次 fetch。
+	// `history-recorded` 是建行(本体落地),`history-updated` 是同一行追加了消息 ——
+	// 前端按 id 换缓存、小卡同 id 换字。图片留 `imageRef: <filename>`,客户端对着
+	// /api/history/img 解析。
+	for (const event of ["history-recorded", "history-updated"] as const) {
+		subs.push(
+			deps.bus.on(event, (entry) => {
+				deps.publish({
+					type: "push-events",
+					event,
+					ts: new Date().toISOString(),
+					data: toHistoryView(entry),
+				});
+			}),
+		);
+	}
 	subs.push(
 		deps.bus.on("live-state-changed", (uid, status) =>
 			deps.publish(envelope("push-events", "live-state-changed", [uid, status])),
@@ -193,9 +184,7 @@ export function attachChannelWiring(deps: ChannelWiringDeps): Disposable {
 
 	// state channel ---------------------------------------------------------
 	subs.push(
-		deps.bus.on("config-changed", (scope) =>
-			deps.publish(buildConfigChangedEnvelope(deps.store, scope)),
-		),
+		deps.bus.on("config-changed", (scope) => deps.publish(buildConfigChangedEnvelope(scope))),
 	);
 
 	return {

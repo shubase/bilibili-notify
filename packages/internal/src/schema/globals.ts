@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { BUILTIN_AI_PRESETS, DEFAULT_TEMPLATES } from "../constants";
+import { BUILTIN_AI_PRESETS, DEFAULT_TEMPLATES, MIRROR_PREFIX_RE } from "../constants";
 import { allTemplateFingerprints } from "../template-defaults";
 
 // 模板默认值住在零依赖的 `constants.ts` —— 前端要拿它跟盘上的值比对(「默认文案有
@@ -7,6 +7,10 @@ import { allTemplateFingerprints } from "../template-defaults";
 export { DEFAULT_TEMPLATES } from "../constants";
 
 import { CardLayoutSchema, DEFAULT_CARD_LAYOUT } from "./card-layout";
+import {
+	DEFAULT_COMMAND_CONFIG as DEFAULT_PRIVATE_COMMAND_CONFIG,
+	CommandConfigSchema as PrivateCommandConfigSchema,
+} from "./commands";
 import {
 	AISettingsSchema,
 	CardStyleByKindSchema,
@@ -21,9 +25,11 @@ import {
 	ScheduleConfigSchema,
 	TemplateBundleSchema,
 } from "./common";
+import { DEFAULT_LINK_PARSING, LinkParsingConfigSchema } from "./link-parsing";
 import { DEFAULT_MESSAGE_LAYOUT, MessageLayoutSchema } from "./message-layout";
+import { DEFAULT_ROAST_SCHEDULE, RoastScheduleSchema } from "./roast-schedule";
 
-/** 启动时注入、运行时只读的引导配置。Koishi 端为 undefined（Koishi 接管 lifecycle）。 */
+/** 启动时注入、运行时只读的引导配置。 */
 export const BootstrapConfigSchema = z.object({
 	server: z.object({
 		host: z.string().default("0.0.0.0"),
@@ -45,9 +51,7 @@ export type LogLevel = z.infer<typeof LogLevelSchema>;
 
 /**
  * Per-module log-level overrides. Each key is a Subscription-engine module
- * name; a missing key falls back to `app.logLevel`. Independent of plugin
- * concept — Koishi端解释为 plugin 级,standalone 端为 engine module 级,
- * 接口 / 字段名共用。
+ * name; a missing key falls back to `app.logLevel`.
  */
 export const ModuleLogLevelsSchema = z
 	.object({
@@ -61,7 +65,7 @@ export const ModuleLogLevelsSchema = z
 export type ModuleLogLevels = z.infer<typeof ModuleLogLevelsSchema>;
 
 /**
- * Koishi/standalone 共享的 dynamic 轮询 cron 默认值。对齐 `AppConfigSchema.dynamicCron`。
+ * dynamic 轮询 cron 默认值。对齐 `AppConfigSchema.dynamicCron`。
  *
  * **六字段**(秒 分 时 日 月 周),秒位是 `30` —— 每 2 分钟的第 30 秒拉,而不是整分。
  * 整分是全网默认节拍:一堆客户端(以及本项目此前的所有实例)都卡在 `:00` 同时打
@@ -69,14 +73,14 @@ export type ModuleLogLevels = z.infer<typeof ModuleLogLevelsSchema>;
  * 自己从那个尖峰里挪出来,降低撞上限流(-509)的面。
  *
  * 秒字段是 `cron` 包的可选首字段(3.x 起支持,已实测),标准五字段表达式仍然合法 ——
- * 用户在 dashboard/koishi 配置里填五字段照常工作,这里只是默认值换了形态。
+ * 用户在 dashboard 里填五字段照常工作,这里只是默认值换了形态。
  */
 export const DEFAULT_DYNAMIC_CRON = "30 */2 * * * *";
 
 /**
  * 粉丝数轮询 cron 默认值(独立端 FansPoller)。粉丝曲线要不了动态那样的 2min
  * 精度,独立成一档更慢的节奏 —— 每 UP 一个请求,拉长间隔直接降低风控面。
- * 对齐 `AppConfigSchema.fansCron`;koishi 端携带但不消费(standalone-only)。
+ * 对齐 `AppConfigSchema.fansCron`。
  */
 export const DEFAULT_FANS_CRON = "*/10 * * * *";
 
@@ -95,7 +99,7 @@ export const AppConfigSchema = z.object({
 	/**
 	 * 日志归档保留天数。`startLogRetention` 每轮按此删除更旧的 day 文件。
 	 * 与 `historyRetentionDays` 同模式但默认更短(日志量远高于推送历史、
-	 * 长期价值低)。Koishi 端携带但不消费(standalone-only,同 historyRetentionDays)。
+	 * 长期价值低)。
 	 */
 	logRetentionDays: z.number().int().min(1).max(365).default(7),
 });
@@ -104,14 +108,14 @@ export type AppConfig = z.infer<typeof AppConfigSchema>;
 export const MasterConfigSchema = z.object({
 	/** 用于错误私聊的 PushTarget.id；undefined 时不发私聊。 */
 	targetId: z.uuid().optional(),
-	/** @deprecated 群聊命令主人 QQ 已迁移到 commands.ownerQq；保留兼容旧存档。 */
+	/** @deprecated 群聊命令主人 QQ 已迁移到 groupCommands.ownerQq；保留兼容旧存档。 */
 	ownerQq: z.string().regex(/^\d+$/, "ownerQq must be a numeric QQ string").default("1319870047"),
 });
 export type MasterConfig = z.infer<typeof MasterConfigSchema>;
 
-export const DEFAULT_COMMAND_PREFIX = "bili";
-export const DEFAULT_COMMAND_OWNER_QQ = "1319870047";
-export const DEFAULT_COMMAND_ALIASES = {
+export const DEFAULT_GROUP_COMMAND_PREFIX = "bili";
+export const DEFAULT_GROUP_COMMAND_OWNER_QQ = "1319870047";
+export const DEFAULT_GROUP_COMMAND_ALIASES = {
 	help: "帮助",
 	add: "订阅",
 	del: "取消",
@@ -121,14 +125,14 @@ export const DEFAULT_COMMAND_ALIASES = {
 	delallall: "清空全部",
 	member: "权限",
 } as const;
-export const DEFAULT_VIDEO_PARSE_CONFIG = {
+export const DEFAULT_GROUP_VIDEO_PARSE_CONFIG = {
 	enabled: true,
 } as const;
-export const DEFAULT_COMMAND_CONFIG = {
+export const DEFAULT_GROUP_COMMAND_CONFIG = {
 	enabled: true,
-	prefix: DEFAULT_COMMAND_PREFIX,
-	aliases: DEFAULT_COMMAND_ALIASES,
-	videoParse: DEFAULT_VIDEO_PARSE_CONFIG,
+	prefix: DEFAULT_GROUP_COMMAND_PREFIX,
+	aliases: DEFAULT_GROUP_COMMAND_ALIASES,
+	videoParse: DEFAULT_GROUP_VIDEO_PARSE_CONFIG,
 } as const;
 
 const CommandTokenSchema = z
@@ -138,36 +142,36 @@ const CommandTokenSchema = z
 	.max(24, "command token is too long")
 	.regex(/^\S+$/, "command token must not contain whitespace");
 
-export const CommandAliasesSchema = z.object({
-	help: CommandTokenSchema.default(DEFAULT_COMMAND_ALIASES.help),
-	add: CommandTokenSchema.default(DEFAULT_COMMAND_ALIASES.add),
-	del: CommandTokenSchema.default(DEFAULT_COMMAND_ALIASES.del),
-	list: CommandTokenSchema.default(DEFAULT_COMMAND_ALIASES.list),
-	listall: CommandTokenSchema.default(DEFAULT_COMMAND_ALIASES.listall),
-	delall: CommandTokenSchema.default(DEFAULT_COMMAND_ALIASES.delall),
-	delallall: CommandTokenSchema.default(DEFAULT_COMMAND_ALIASES.delallall),
-	member: CommandTokenSchema.default(DEFAULT_COMMAND_ALIASES.member),
+export const GroupCommandAliasesSchema = z.object({
+	help: CommandTokenSchema.default(DEFAULT_GROUP_COMMAND_ALIASES.help),
+	add: CommandTokenSchema.default(DEFAULT_GROUP_COMMAND_ALIASES.add),
+	del: CommandTokenSchema.default(DEFAULT_GROUP_COMMAND_ALIASES.del),
+	list: CommandTokenSchema.default(DEFAULT_GROUP_COMMAND_ALIASES.list),
+	listall: CommandTokenSchema.default(DEFAULT_GROUP_COMMAND_ALIASES.listall),
+	delall: CommandTokenSchema.default(DEFAULT_GROUP_COMMAND_ALIASES.delall),
+	delallall: CommandTokenSchema.default(DEFAULT_GROUP_COMMAND_ALIASES.delallall),
+	member: CommandTokenSchema.default(DEFAULT_GROUP_COMMAND_ALIASES.member),
 });
-export type CommandAliases = z.infer<typeof CommandAliasesSchema>;
+export type GroupCommandAliases = z.infer<typeof GroupCommandAliasesSchema>;
 
-export const VideoParseConfigSchema = z.object({
+export const GroupVideoParseConfigSchema = z.object({
 	enabled: z.boolean().default(true),
 });
-export type VideoParseConfig = z.infer<typeof VideoParseConfigSchema>;
+export type GroupVideoParseConfig = z.infer<typeof GroupVideoParseConfigSchema>;
 
-export const CommandConfigSchema = z
+export const GroupCommandConfigSchema = z
 	.object({
 		enabled: z.boolean().default(true),
-		prefix: CommandTokenSchema.default(DEFAULT_COMMAND_PREFIX),
+		prefix: CommandTokenSchema.default(DEFAULT_GROUP_COMMAND_PREFIX),
 		/** 群聊命令的主人 QQ；用于执行全局管理命令。未填时回退到默认主人。 */
 		ownerQq: z.string().regex(/^\d+$/, "ownerQq must be a numeric QQ string").optional(),
-		aliases: CommandAliasesSchema.default(DEFAULT_COMMAND_ALIASES),
-		videoParse: VideoParseConfigSchema.default(DEFAULT_VIDEO_PARSE_CONFIG),
+		aliases: GroupCommandAliasesSchema.default(DEFAULT_GROUP_COMMAND_ALIASES),
+		videoParse: GroupVideoParseConfigSchema.default(DEFAULT_GROUP_VIDEO_PARSE_CONFIG),
 	})
 	.superRefine((cfg, ctx) => {
-		const seen = new Map<string, keyof CommandAliases>();
+		const seen = new Map<string, keyof GroupCommandAliases>();
 		for (const [key, value] of Object.entries(cfg.aliases) as Array<
-			[keyof CommandAliases, string]
+			[keyof GroupCommandAliases, string]
 		>) {
 			const prev = seen.get(value);
 			if (prev) {
@@ -180,7 +184,7 @@ export const CommandConfigSchema = z
 			seen.set(value, key);
 		}
 	});
-export type CommandConfig = z.infer<typeof CommandConfigSchema>;
+export type GroupCommandConfig = z.infer<typeof GroupCommandConfigSchema>;
 
 /** 全局默认值；resolve(sub, globals) 在 per-UP overrides 缺字段时回退到这里。 */
 export const GlobalDefaultsSchema = z.object({
@@ -219,11 +223,123 @@ export const GlobalDefaultsSchema = z.object({
 });
 export type GlobalDefaults = z.infer<typeof GlobalDefaultsSchema>;
 
+/**
+ * 新手指引的三态持久标记(2026-08-30 主人定案改版)。
+ *
+ * - **缺失 = 还没问过**:打开面板时屏幕中间弹询问框(新用户开始指引 / 老用户跳过),
+ *   升级上来的存量实例与全新安装都落在这档 —— 所以 `skipped` **刻意不带 default**,
+ *   补成 false 等于永远不问、对老用户直接开导览(上一版正是这么被主人打回的);
+ * - `false` = 要指引:导览(左缘标签 ⇄ 小卡)出现;
+ * - `true` = 不要:整个导览不渲染。写入的三条路 —— 询问框选「老用户」、小卡上的
+ *   「跳过指引」、走完五步毕业;系统页的「重新开启」写回 false。
+ *
+ * 落在配置而非 localStorage:「这台实例问过了没」是实例级事实,换台机器、换个
+ * 浏览器开面板不该再被问一遍。
+ */
+export const OnboardingConfigSchema = z.object({
+	skipped: z.boolean().optional(),
+});
+export type OnboardingConfig = z.infer<typeof OnboardingConfigSchema>;
+
+/** 全新安装 = 还没问过:第一次开面板弹询问框,由用户自己选。 */
+export const DEFAULT_ONBOARDING: OnboardingConfig = {};
+
+/**
+ * 应用内自主升级的用户可调项。
+ *
+ * 三条默认值都是产品定案,别顺手改:
+ *
+ * - **`channel` 默认正式版**。预发布按定义就是没验够的版本;自主升级已经把「发了个
+ *   坏版本」的爆炸半径放大到全体,默认把人放进预发布渠道等于再乘一次。
+ * - **`autoDownload` 默认开,但从不自动应用**。下载是无副作用的 —— 装进一个新的
+ *   版本目录,不碰正在跑的那份;应用要重启服务,那一刻推送会断、直播监听会掉,
+ *   必须是用户按下去的。
+ * - **`mirrors` 默认空**。硬编码一个第三方加速站当默认值,等于让每一个安装都去和
+ *   它说话,它哪天挂了或者易主,我们只能靠发新版本来收回这个默认值。签名保证了
+ *   代理站最多只能拒绝服务(改一个字节就验不过),但「默认和谁说话」仍然该是用户
+ *   的决定。列表**顺序即优先级**,直连永远排在用户填的这些之后。
+ */
+export const UpdateSettingsSchema = z.object({
+	channel: z.enum(["stable", "prerelease"]).default("stable"),
+	autoDownload: z.boolean().default(true),
+	/**
+	 * 只收 `https://` 前缀、封顶 10 条 —— 这是要去真连的地址,和 `POST /api/update/mirrors/probe`
+	 * 那道门一样严:不封顶的话一次检查的总耗时没有上限(N × 超时),期间检查一直挂着;不限
+	 * scheme 的话这里就成了一个让服务端去连任意主机的入口。面板只会写进合法的 —— 判定用的
+	 * 是与面板、路由同一条正则(`MIRROR_PREFIX_RE`),三处不会各判各的。
+	 */
+	mirrors: z
+		.array(z.string().regex(MIRROR_PREFIX_RE, "加速前缀必须是 https:// 开头的地址"))
+		.max(10)
+		.default([]),
+});
+export type UpdateSettings = z.infer<typeof UpdateSettingsSchema>;
+
+export const DEFAULT_UPDATE_SETTINGS: UpdateSettings = {
+	channel: "stable",
+	autoDownload: true,
+	mirrors: [],
+};
+
 export const GlobalConfigSchema = z.object({
 	app: AppConfigSchema,
 	master: MasterConfigSchema,
-	commands: CommandConfigSchema.default(DEFAULT_COMMAND_CONFIG),
 	defaults: GlobalDefaultsSchema,
+	/**
+	 * 榜单周报的定时推送 —— 全局唯一一条。
+	 *
+	 * 放顶层而非 `defaults`:`defaults` 的语义是「per-UP overrides 缺字段时回退到
+	 * 这里」,而榜单周报压根不是 per-UP 的东西,单人锐评那条(挂在 Subscription
+	 * 顶层)也不该继承它 —— 两者内容根本不同。
+	 *
+	 * `.default(...)` 同 imageGroup / cardLayout:缺这个字段的老 globals.json 在
+	 * 独立端启动时被 `parse` 自动补全,否则直接 ConfigValidationError 开不了机。
+	 */
+	roastSchedule: RoastScheduleSchema.default(DEFAULT_ROAST_SCHEDULE),
+	/**
+	 * 全局静音到哪一刻(epoch ms)。`0` = 没在静音。
+	 *
+	 * 放顶层的理由同 `roastSchedule`:`defaults` 的语义是「per-UP overrides 缺字段时
+	 * 回退到这里」,而静音压根不是 per-UP 的东西 —— 它是「现在别推给我」这一个开关。
+	 *
+	 * 存**到期时刻**而不是「剩余多久」,判定就永远是 `now < mutedUntil` 一个比较:
+	 * 重启、时钟跳变、进程睡过去都不影响它,不需要任何定时器或恢复逻辑。落在 globals
+	 * 里则顺带拿到两件事 —— 重启不解除静音,以及网页上看得见(指令能做的事,面板上
+	 * 都得有一份)。
+	 */
+	mutedUntil: z.number().int().min(0).default(0),
+	/**
+	 * 私聊指令的可配置项(前缀 / 别名 / 总开关)。
+	 *
+	 * 放顶层同 `roastSchedule`:它不是「per-UP overrides 缺字段时的回退」。
+	 */
+	commands: PrivateCommandConfigSchema.default(DEFAULT_PRIVATE_COMMAND_CONFIG),
+	/**
+	 * OneBot 群聊 `bili` 指令。
+	 *
+	 * 自定义群聊命令与独立端后来的私聊指令语义不同，不能继续共用 `commands` 命名空间；
+	 * 否则 schema、面板、运行时都会把两套字段混在一起。
+	 */
+	groupCommands: GroupCommandConfigSchema.default(DEFAULT_GROUP_COMMAND_CONFIG),
+	/**
+	 * 链接解析(群里贴视频链接自动出卡片)。独立端专有,放顶层同 `commands`。
+	 * `.default(...)` 是老配置兜底:少了它,存量实例升上来第一件事就是开不了机。
+	 */
+	linkParsing: LinkParsingConfigSchema.default(DEFAULT_LINK_PARSING),
+	/**
+	 * 新手指引的持久状态。
+	 *
+	 * 放顶层同 `commands`:它不是「per-UP overrides 缺字段时的回退」。
+	 * `.default(...)` 是老配置兜底 —— 独立端启动时 `parse` 会补上,理由见
+	 * `./onboarding-skipped.test.ts`。
+	 */
+	onboarding: OnboardingConfigSchema.default(DEFAULT_ONBOARDING),
+	/**
+	 * 自主升级的用户可调项。放顶层同 `commands` —— 它不是「per-UP overrides 缺字段
+	 * 时的回退」。`.default(...)` 是老配置兜底:独立端启动时 `parse` 会补上,
+	 * 少了它,存量实例升上来第一件事就是开不了机。
+	 */
+	update: UpdateSettingsSchema.default(DEFAULT_UPDATE_SETTINGS),
 	bootstrap: BootstrapConfigSchema.optional(),
 });
 export type GlobalConfig = z.infer<typeof GlobalConfigSchema>;
@@ -234,9 +350,9 @@ export const DEFAULT_AI = {
 	persona: BUILTIN_AI_PRESETS[0].persona,
 	dynamicPrompt: BUILTIN_AI_PRESETS[0].dynamicPrompt,
 	liveSummaryPrompt: BUILTIN_AI_PRESETS[0].liveSummaryPrompt,
-	// 全新安装一家服务商都没添加 —— 设置页左栏是空的,引擎按「还没配齐」停用。
-	// provider 指针先停在兜底档,主人添加第一家时会跟着切过去。
-	provider: "custom",
+	// 全新安装一份实例都没添加 —— 设置页左栏是空的,引擎按「还没配齐」停用。
+	// activeProfile 指针先悬空,主人添加第一份时会跟着落过去。
+	activeProfile: "",
 	providers: {},
 	presets: BUILTIN_AI_PRESETS,
 } as const;
@@ -254,12 +370,13 @@ export const DEFAULT_CARD_STYLE = {
 	backgroundImages: [] as string[],
 } as const;
 
-/** 工厂：创建一份完整的默认 GlobalConfig（不含 bootstrap，供 Koishi 端用）。 */
+/** 工厂:创建一份完整的默认 GlobalConfig(不含 bootstrap)—— server 的出厂值与测试夹具共用。 */
 export function makeDefaultGlobalConfig(): GlobalConfig {
 	return GlobalConfigSchema.parse({
 		app: {},
 		master: {},
 		commands: {},
+		groupCommands: {},
 		defaults: {
 			features: DEFAULT_FEATURE_FLAGS,
 			filters: DEFAULT_CONTENT_FILTERS,

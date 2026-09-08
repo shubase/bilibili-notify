@@ -21,25 +21,18 @@ function Assert-WindowsGuiSubsystem {
 function Assert-NoForbiddenRuntimeFiles {
     param(
         [string]$Root,
-        [string]$Label
+        [string]$Label,
+        # 禁止出现的目录来自 apps/desktop/layout.json(posix 分隔),生产端扫的就是同一份。
+        [string[]]$ForbiddenRel
     )
 
+    $forbiddenTails = @($ForbiddenRel | ForEach-Object { "\" + ($_ -replace "/", "\") })
     $forbidden = Get-ChildItem $Root -Recurse -Force | Where-Object {
+        $full = $_.FullName
         $_.Name -in @("bn.config.yaml", "bn.config.yml", "bn.config.json", "master.key") -or
         $_.Name -like ".env*" -or
         $_.Extension -in @(".pem", ".key", ".enc") -or
-        $_.FullName -like "*\resources\app\apps\server\data" -or
-        $_.FullName -like "*\resources\app\apps\server\data\*" -or
-        $_.FullName -like "*\resources\app\apps\server\logs" -or
-        $_.FullName -like "*\resources\app\apps\server\logs\*" -or
-        $_.FullName -like "*\resources\app\node_modules\.pnpm" -or
-        $_.FullName -like "*\resources\app\node_modules\.pnpm\*" -or
-        $_.FullName -like "*\app\apps\server\data" -or
-        $_.FullName -like "*\app\apps\server\data\*" -or
-        $_.FullName -like "*\app\apps\server\logs" -or
-        $_.FullName -like "*\app\apps\server\logs\*" -or
-        $_.FullName -like "*\app\node_modules\.pnpm" -or
-        $_.FullName -like "*\app\node_modules\.pnpm\*"
+        @($forbiddenTails | Where-Object { $full -like "*$_" -or $full -like "*$_\*" }).Count -gt 0
     } | Select-Object -First 1
     if ($forbidden) {
         Write-Error "$Label contains forbidden runtime file: $($forbidden.FullName)"
@@ -62,7 +55,6 @@ function Start-SidecarSmokeProcess {
         [string]$NodePath,
         [string]$ServerDir,
         [string]$ServerEntry,
-        [string]$WebDist,
         [string]$DataDir,
         [int]$Port,
         [string]$StdoutPath,
@@ -71,7 +63,9 @@ function Start-SidecarSmokeProcess {
 
     $psi = [System.Diagnostics.ProcessStartInfo]::new()
     $psi.FileName = $NodePath
-    foreach ($arg in @($ServerEntry, "--host", "127.0.0.1", "--port", $Port.ToString(), "--data-dir", $DataDir, "--web-dist", $WebDist)) {
+    # 与外壳(apps/desktop/src-tauri/src/main.rs)传的参数一致:不传 --web-dist,
+    # dashboard 由服务端按入口就近找(lib/web-dist)。传了就是在测一条用户跑不到的路径。
+    foreach ($arg in @($ServerEntry, "--host", "127.0.0.1", "--port", $Port.ToString(), "--data-dir", $DataDir)) {
         [void]$psi.ArgumentList.Add($arg)
     }
     $psi.WorkingDirectory = $ServerDir
@@ -117,18 +111,19 @@ function Stop-SidecarSmokeProcess {
 $tmp = Join-Path $env:RUNNER_TEMP ("desktop-artifact-check-" + [guid]::NewGuid().ToString("N"))
 New-Item -ItemType Directory -Force $tmp | Out-Null
 Expand-Archive -LiteralPath desktop-artifacts/bilibili-notify-windows-x64.zip -DestinationPath $tmp -Force
+# 布局**只声明一次**,在 apps/desktop/layout.json —— 生产端、外壳、两个闸都读它。
+# 这里不再手抄路径:抄的那份一旦落后于外壳,要到打 tag 那天这条闸才红。
+$layout = Get-Content -LiteralPath "apps/desktop/layout.json" -Raw | ConvertFrom-Json
 $resourcesDir = Join-Path $tmp "resources"
 $desktopExe = Join-Path $tmp "bilibili-notify-desktop.exe"
-$nodePath = Join-Path $resourcesDir "node/bin/node.exe"
-$serverDir = Join-Path $resourcesDir "app/apps/server"
-$serverEntry = Join-Path $serverDir "lib/index.mjs"
-$webDist = Join-Path $resourcesDir "app/apps/web/dist"
+$nodePath = Join-Path $resourcesDir $layout.nodeBinary.windows
+$serverDir = Join-Path $resourcesDir $layout.serverDir
+# 冒烟起的必须就是外壳起的那个入口(boot.mjs —— 先选版再加载载荷,不是 index.mjs 本身)。
+$serverEntry = Join-Path $serverDir (Join-Path $layout.libDir $layout.entry)
 $required = @(
     "bilibili-notify-desktop.exe",
-    "resources/node/bin/node.exe",
-    "resources/app/apps/server/lib/index.mjs",
-    "resources/BUILD_INFO.json"
-)
+    "resources/$($layout.nodeBinary.windows)"
+) + @($layout.requiredUnderResources | ForEach-Object { "resources/$_" })
 foreach ($rel in $required) {
     if (-not (Test-Path (Join-Path $tmp $rel))) {
         Write-Error "Windows portable artifact missing $rel"
@@ -152,7 +147,7 @@ New-Item -ItemType Directory -Force $smokeDataDir | Out-Null
 $port = Get-FreeTcpPort
 $sidecar = $null
 try {
-    $sidecar = Start-SidecarSmokeProcess -NodePath $nodePath -ServerDir $serverDir -ServerEntry $serverEntry -WebDist $webDist -DataDir $smokeDataDir -Port $port -StdoutPath $stdoutPath -StderrPath $stderrPath
+    $sidecar = Start-SidecarSmokeProcess -NodePath $nodePath -ServerDir $serverDir -ServerEntry $serverEntry -DataDir $smokeDataDir -Port $port -StdoutPath $stdoutPath -StderrPath $stderrPath
     $ready = $false
     for ($i = 0; $i -lt 30; $i += 1) {
         if ($sidecar.HasExited) {
@@ -186,4 +181,4 @@ finally {
     Stop-SidecarSmokeProcess $sidecar
 }
 
-Assert-NoForbiddenRuntimeFiles -Root $resourcesDir -Label "Windows portable artifact"
+Assert-NoForbiddenRuntimeFiles -Root $resourcesDir -Label "Windows portable artifact" -ForbiddenRel $layout.forbiddenUnderResources

@@ -1,37 +1,183 @@
 /**
  * 纯常量模块 —— 必须保持**零 import、零副作用**:它经 `@bilibili-notify/internal/constants`
- * 子路径直供浏览器端(apps/web / astrbot/page)运行时消费,不能把 zod 或任何 schema
+ * 子路径直供浏览器端(apps/web)运行时消费,不能把 zod 或任何 schema
  * 模块拽进前端 bundle。schema/common.ts 反向引用这里(`z.enum(FEATURE_KEYS)`)并从根
- * 入口重导出,后端消费者(koishi / sidecar / server)照旧从根入口拿 —— 两条路径同一份值。
+ * 入口重导出,后端消费者(server)照旧从根入口拿 —— 两条路径同一份值。
  */
 
-/** 全部可订阅的特性键。新增或删除会扩散到 FeatureFlags、SubscriptionRouting、Subscription.overrides。 */
+/**
+ * 全部可订阅的特性键 —— 每一把都是一类**能单独开关、能配路由**的推送。新增或删除会扩散到
+ * FeatureFlags、SubscriptionRouting、Subscription.overrides。
+ *
+ * 词云与 AI 总结不在这里:它们是下播的两个附加项(见 {@link LIVE_END_EXTRA_KEYS}),
+ * 跟着下播的开关与目标走,自己没有路由。
+ */
 export const FEATURE_KEYS = [
 	"dynamic",
 	"live",
 	"liveEnd",
 	"liveGuardBuy",
 	"superchat",
-	"wordcloud",
-	"liveSummary",
 	"specialDanmaku",
 	"specialUserEnter",
 ] as const;
 
 export type FeatureKey = (typeof FEATURE_KEYS)[number];
 
+/**
+ * 下播推送的附加项:像开播的 @全体那样挂在下播下面 —— 下播关了它们一起关,下播推到
+ * 哪儿它们就跟到哪儿。卡片本体先发,词云 / 总结算好了作为同一次推送的后续消息追加。
+ */
+export const LIVE_END_EXTRA_KEYS = ["wordcloud", "liveSummary"] as const;
+
+export type LiveEndExtraKey = (typeof LIVE_END_EXTRA_KEYS)[number];
+
+export type LiveEndExtras = Record<LiveEndExtraKey, boolean>;
+
+/** 每个特性的开关 + 下播的两个附加项。schema 本体在 schema/common.ts(`FeatureFlagsSchema`)。 */
+export type FeatureFlagValues = Record<FeatureKey, boolean> & { liveEndExtras: LiveEndExtras };
+
 /** 默认全局值；resolve() 在 per-UP overrides 缺失字段时回退到这里。 */
-export const DEFAULT_FEATURE_FLAGS: Record<FeatureKey, boolean> = {
+export const DEFAULT_FEATURE_FLAGS: FeatureFlagValues = {
 	dynamic: true,
 	live: true,
 	liveEnd: true,
 	liveGuardBuy: false,
 	superchat: false,
-	wordcloud: true,
-	liveSummary: true,
 	specialDanmaku: false,
 	specialUserEnter: false,
+	liveEndExtras: { wordcloud: true, liveSummary: true },
 };
+
+/**
+ * 推送目标平台词表。schema 本体在 schema/targets.ts(`PushTargetPlatformSchema`),那边从
+ * 这里取值 —— 与 FEATURE_KEYS 同一套安排:词表住零依赖模块,前端也拿得到。
+ */
+export const PUSH_TARGET_PLATFORMS = ["onebot", "webhook", "qq-official"] as const;
+
+// ---------------------------------------------------------------------------
+// UP 主强调色
+// ---------------------------------------------------------------------------
+//
+// dashboard 的卡片 / 头像 / 图表线 / Tab 圆点,以及**服务端渲染的周报图片**都取自
+// 这里 —— 同一位 UP 在页面上和推到群里的图片上必须是同一个颜色,两边各存一份调色板
+// 迟早会漂。
+//
+// 住在这个零依赖模块而不是 `util/` 里,理由与 BUILTIN_AI_PRESETS 一样:`util/` 只能
+// 从根入口拿,而根入口带 zod —— 页面为了一个调色板把整个 zod 拖进 bundle。
+
+/**
+ * 曾经只有 8 色,其中 `#FF6699` 与 `#FB7299` 的 ΔE2000 只有 2.4(肉眼就是同一个粉),
+ * 实际可辨的只有 7 种;而分配是 `hash(uid) % 8`,按生日悖论**订阅 4 位就有约 65%
+ * 概率撞色**,订阅 10 位几乎必然重复。
+ *
+ * **试过纯按 uid 连续取色(LCh 空间取点、不设调色板),结论是更差,别再回去。**
+ * 完全同色确实没了,但「有点像、分不清哪个是哪个」的比例反而从 4.0% 涨到 7.4% ——
+ * 调色板是人为按 ΔE 摆开的,随机撒点做不到;而且逐色相取最大彩度会在黄绿区扫出
+ * 一片芥末色、橄榄色,不好看。指标上「ΔE<6 完全难分」是降了,但人眼看的是前一档。
+ *
+ * 这 24 色是在 CIE Lab 里按「两两 ΔE2000 ≥ 11」贪心挑出来的,明度锁在 L\* 64–81,
+ * 且**黄到黄绿那段(Lab 色相 55–125°)强制 L\* ≥ 78** —— 那一段明度一低就发闷成
+ * 芥末 / 橄榄,是上一版最招人嫌的地方。品牌粉 / 蓝 / 紫三色原样占位,保住辨识度。
+ *
+ * **调这里时注意**:头像是白色粗体首字母直接压在这个颜色上(见 web 的 `atoms.tsx`
+ * Avatar 与周报卡),所以别往更浅走 —— 这一族对白字的对比度只有 1.65–2.78,是这套
+ * 设计有意选的浅调,再浅白字就糊了。测试只锁「两两分得开」,明度与调性靠这段说明。
+ */
+export const UP_COLORS = [
+	"#fb7299",
+	"#ff6b6d",
+	"#ff9c89",
+	"#ff6e42",
+	"#ffaf7b",
+	"#ffb22e",
+	"#e0bf20",
+	"#b3cd2f",
+	"#67ad1b",
+	"#6cd557",
+	"#01b355",
+	"#03d98e",
+	"#02b088",
+	"#05d6bd",
+	"#03ada8",
+	"#03dfe7",
+	"#01b9d2",
+	"#00aeec",
+	"#489dff",
+	"#a29bfe",
+	"#d7a9ff",
+	"#bf7cff",
+	"#ee66db",
+	"#ff93d1",
+] as const;
+
+/**
+ * Stable per-UP color derived from uid; gives every UP a recognisable accent.
+ *
+ * 哈希用 FNV-1a 而不是原来的 `h * 31 + c`:B 站 uid 是纯数字,字符只在 '0'–'9' 这
+ * 十个码位里取值,多项式哈希在 24 这种模数下散得不够开(实测 2 万个随机 uid,
+ * χ² 41.4 vs FNV 的 19.5)—— 那样加再多颜色也只会集中用到其中几个。
+ */
+export function colorFromUid(uid: string): string {
+	let h = 0x811c9dc5;
+	for (let i = 0; i < uid.length; i++) {
+		h ^= uid.charCodeAt(i);
+		// imul 才是 32 位整数乘法;直接 `*` 会溢出成浮点,低位精度丢光。
+		h = Math.imul(h, 0x01000193);
+	}
+	return UP_COLORS[(h >>> 0) % UP_COLORS.length] as string;
+}
+
+// ---------------------------------------------------------------------------
+// 自带字体的体积口径
+// ---------------------------------------------------------------------------
+
+/**
+ * 单款字体的硬上限。完整中文字库的 ttf/otf 单字重就有 15-25MB,卡太死会把正常字体
+ * 挡在门外,所以留到 20MB。
+ *
+ * 两端共享:服务端据它拒收(`apps/server/src/runtime/font-assets.ts`),前端据它写
+ * 说明文案。
+ */
+export const MAX_FONT_ASSET_BYTES = 20 * 1024 * 1024;
+
+/**
+ * 超过它就在上传后提醒换 woff2。
+ *
+ * 上限那个数是按「文件本身多大」定的,**没算出图时的开销**:字体会被 base64 内联进
+ * 渲染 HTML(再涨三分之一),而 Docker 镜像里 V8 的 old-space 上限只有 512MB
+ * (见 `apps/Dockerfile`)。传一款 20MB 的 ttf 完全合法,出图时却可能把服务撑爆。
+ *
+ * 做成**提醒而不是拒收**:降上限会把已经传上去的字体挡在门外,那是破坏性的;而同一套
+ * 字转成 woff2 通常只占 ttf 的三分之一,说清楚就够主人自己决定了。
+ */
+export const FONT_ASSET_WARN_BYTES = 8 * 1024 * 1024;
+
+// ---------------------------------------------------------------------------
+// OneBot 慢动作的超时下限
+// ---------------------------------------------------------------------------
+
+/**
+ * 带图普通消息(`send_group_msg` / `send_private_msg` 里含 image 段)的超时下限。
+ *
+ * 协议端收到带图消息后要先把图落盘、上传到 QQ 图床、拿回 fileid 才组消息回响应,
+ * 这个往返与图多大关系不大(卡片图只有 0.1MB 量级),但稳定压在十几秒 —— 默认的
+ * 15s 正好卡在临界点上,于是时好时坏。用户实测(LLOneBot):词云 / 动态卡反复标
+ * 失败,服务端日志每一条都恰好停在 `响应超时 (15000ms)`,而同时段纯文字全部秒回。
+ *
+ * 只作**下限**(取 `max(配置值, 此值)`):主人把超时调得更大是有意为之,别被压低。
+ * 纯文字不适用 —— 协议端真挂了的场景,每条文本都多等半分钟只会让失败来得更晚。
+ *
+ * 两端共享:服务端据它放宽超时(`apps/server/src/platforms/onebot.ts`),前端据它
+ * 写超时那栏的说明文案,免得两边各写一个数、改了一处另一处照旧。
+ */
+export const ONEBOT_IMAGE_MIN_TIMEOUT_MS = 30_000;
+
+/**
+ * 合并转发(`send_*_forward_msg`)的超时下限。比单图那档长一倍:forward 要把每张图
+ * 逐张下载再上传组装,9 图常要 20~60s。
+ */
+export const ONEBOT_FORWARD_MIN_TIMEOUT_MS = 60_000;
 
 // ---------------------------------------------------------------------------
 // AI 服务商注册表
@@ -48,6 +194,7 @@ export const AI_PROVIDER_IDS = [
 	"openrouter",
 	"volcengine",
 	"siliconflow",
+	"bailian",
 	"deepseek",
 	"custom",
 ] as const;
@@ -56,6 +203,42 @@ export type AIProviderId = (typeof AI_PROVIDER_IDS)[number];
 /** 配置面上统一的三档思考深度,各家在适配层各自映射。 */
 export const THINKING_LEVELS = ["low", "medium", "high"] as const;
 export type ThinkingLevel = (typeof THINKING_LEVELS)[number];
+
+/**
+ * 实例桶的「接口风味」—— 同一家服务商的两套 wire 协议。`chat` 在前作默认位:
+ * 老配置零迁移,谁都不会被静默换协议。`responses` 是 OpenAI 2025 起的接任协议,
+ * 思考在那边是一等公民(`reasoning.effort` 与三档天然对齐),不再走各家方言。
+ */
+export const API_FLAVOR_IDS = ["chat", "responses"] as const;
+export type APIFlavorId = (typeof API_FLAVOR_IDS)[number];
+
+/**
+ * 联网搜索的后端。与 AI 服务商是**两个正交的选择**:搜索不走各家 LLM 的原生
+ * 联网方言(分裂且 DeepSeek 官方压根没有),而是我们自己的 `web_search` 工具,
+ * 由这里选定的后端真正执行 —— 所以任何支持 function calling 的服务商都能联网。
+ */
+export const WEB_SEARCH_BACKEND_IDS = ["bocha", "tavily"] as const;
+export type WebSearchBackendId = (typeof WEB_SEARCH_BACKEND_IDS)[number];
+
+export interface WebSearchBackendMeta {
+	id: WebSearchBackendId;
+	/** 配置面上的显示名。 */
+	label: string;
+	/** 申请 key 的入口,只作提示。 */
+	keyUrl: string;
+}
+
+export const WEB_SEARCH_BACKENDS: readonly WebSearchBackendMeta[] = [
+	// 博查在前:B 站语境下中文搜索质量是主场景。
+	{ id: "bocha", label: "博查", keyUrl: "https://open.bochaai.com" },
+	{ id: "tavily", label: "Tavily", keyUrl: "https://app.tavily.com" },
+];
+
+/** 按 id 取搜索后端元数据。id 只可能来自 zod 校验过的配置,不做兜底。 */
+export function webSearchBackendMeta(id: WebSearchBackendId): WebSearchBackendMeta {
+	// biome-ignore lint/style/noNonNullAssertion: 枚举封闭,zod 已挡住未知 id
+	return WEB_SEARCH_BACKENDS.find((b) => b.id === id)!;
+}
 
 export interface AIProviderMeta {
 	id: AIProviderId;
@@ -84,6 +267,14 @@ export interface AIProviderMeta {
 	 * 只会让主人以为设置没存上。
 	 */
 	temperatureIgnoredWhenThinking: boolean;
+	/**
+	 * 这家有没有 **Responses API**(`/responses`,OpenAI 2025 起的接任协议)。
+	 * 决定设置页「接口风味」选项露不露 —— 未确认支持的家不开放,免得选出
+	 * 必然 404 的组合;日后他们支持了,这里改一行即可。2026-08 核实:
+	 * DeepSeek 生产级、百炼 qwen3-max 系、OpenRouter beta;硅基/火山未见。
+	 * custom 恒 true:能力未知时不替主人做减法(OpenAI 官方正是经此接入)。
+	 */
+	supportsResponses: boolean;
 	/** 配置面上的参考地址,只作提示,不自动填。 */
 	baseUrlHint: string;
 }
@@ -96,6 +287,7 @@ export const AI_PROVIDERS: readonly AIProviderMeta[] = [
 		thinkingDefaultsOn: false,
 		supportsVision: true,
 		temperatureIgnoredWhenThinking: false,
+		supportsResponses: true,
 		baseUrlHint: "https://openrouter.ai/api/v1",
 	},
 	{
@@ -105,6 +297,7 @@ export const AI_PROVIDERS: readonly AIProviderMeta[] = [
 		thinkingDefaultsOn: true,
 		supportsVision: true,
 		temperatureIgnoredWhenThinking: false,
+		supportsResponses: false,
 		baseUrlHint: "https://ark.cn-beijing.volces.com/api/v3",
 	},
 	{
@@ -114,7 +307,21 @@ export const AI_PROVIDERS: readonly AIProviderMeta[] = [
 		thinkingDefaultsOn: true,
 		supportsVision: true,
 		temperatureIgnoredWhenThinking: false,
+		supportsResponses: false,
 		baseUrlHint: "https://api.siliconflow.cn/v1",
+	},
+	{
+		id: "bailian",
+		label: "阿里云百炼",
+		supportsThinking: true,
+		// 百炼的默认按**模型**分:qwen-plus / qwen-flash / qwen3-max 默认关,
+		// qwen3.7+ 商业版与开源版默认开。填 true 让「关」位显式发 enable_thinking:false
+		// —— 对默认开的模型这是唯一能关掉的路,对默认关的模型这个字段也合法无害。
+		thinkingDefaultsOn: true,
+		supportsVision: true,
+		temperatureIgnoredWhenThinking: false,
+		supportsResponses: true,
+		baseUrlHint: "https://dashscope.aliyuncs.com/compatible-mode/v1",
 	},
 	{
 		id: "deepseek",
@@ -123,6 +330,7 @@ export const AI_PROVIDERS: readonly AIProviderMeta[] = [
 		thinkingDefaultsOn: true,
 		supportsVision: false,
 		temperatureIgnoredWhenThinking: true,
+		supportsResponses: true,
 		baseUrlHint: "https://api.deepseek.com",
 	},
 	{
@@ -132,6 +340,7 @@ export const AI_PROVIDERS: readonly AIProviderMeta[] = [
 		thinkingDefaultsOn: false,
 		supportsVision: true,
 		temperatureIgnoredWhenThinking: false,
+		supportsResponses: true,
 		baseUrlHint: "任何 OpenAI 兼容地址",
 	},
 ];
@@ -142,14 +351,36 @@ export function providerMeta(id: AIProviderId): AIProviderMeta {
 }
 
 /**
+ * 这份实例能不能开「深度思考」—— chat 风味看这家有没有适配过的方言
+ * (`supportsThinking`),responses 风味一律解禁:那套协议里思考是标准字段
+ * (`reasoning.effort`),不再是「方言未知不敢发」。
+ *
+ * **谓词只能有这一份。**它曾在三处各手抄一遍(聊天胶囊 / 实例编辑器 /
+ * 「AI 聊天」设置块),第三处漏掉 responses 解锁 —— 胶囊点得亮、服务端真在
+ * 发思考参数,设置页却藏起档位还宣称「不会发」。
+ */
+export function canProfileThink(p: { provider: AIProviderId; apiFlavor?: APIFlavorId }): boolean {
+	return providerMeta(p.provider).supportsThinking || (p.apiFlavor ?? "chat") === "responses";
+}
+
+/**
  * 一家服务商的整套配置(与 `schema/common.ts#AIProviderProfileSchema` 同形)。
  * 类型声明在这里而不是 schema 里,是为了让**零依赖**的 {@link resolveAIProfile}
  * 也能用上 —— 设置页经 `/constants` 子路径运行时消费它,不能把 zod 拖进前端 bundle。
  */
 export interface AIProviderProfileShape {
+	/**
+	 * 这桶配置属于哪家服务商 —— 决定「开思考」翻译成哪家方言。桶键只是**实例 id**
+	 * (同一家可以有多份实例),方言归属必须写在桶里,不能再从键名推。
+	 */
+	provider: AIProviderId;
+	/** 实例的显示名。空串 = 用注册表里那家的名字(避免把家名抄进配置,改名会过期)。 */
+	label: string;
 	apiKey: string;
 	baseUrl: string;
 	model: string;
+	/** 这桶走哪套 wire 协议。默认 `chat`;能否选 `responses` 见 {@link AIProviderMeta.supportsResponses}。 */
+	apiFlavor: APIFlavorId;
 	temperature: number;
 	enableThinking: boolean;
 	thinkingLevel: ThinkingLevel;
@@ -163,9 +394,12 @@ export interface AIProviderProfileShape {
  * 一致** —— 那边有一条测试拿 `parse({})` 与这里比深等,写歪了会当场红。
  */
 export const EMPTY_AI_PROVIDER_PROFILE: AIProviderProfileShape = {
+	provider: "custom",
+	label: "",
 	apiKey: "",
 	baseUrl: "",
 	model: "",
+	apiFlavor: "chat",
 	temperature: 0.7,
 	enableThinking: false,
 	thinkingLevel: "medium",
@@ -177,8 +411,8 @@ export const EMPTY_AI_PROVIDER_PROFILE: AIProviderProfileShape = {
 /**
  * 取当前生效的那一套配置。
  *
- * `provider` 指向的桶可能不存在(主人刚把它删掉、配置是手改的、或者这就是一份
- * 全新配置),这时返回一套**空默认值**而不是 undefined:调用方拿到空 `model` 会按
+ * `activeProfile` 指向的实例可能不存在(主人刚把它删掉、配置是手改的、或者这就是
+ * 一份全新配置),这时返回一套**空默认值**而不是 undefined:调用方拿到空 `model` 会按
  * 既有规矩判定「还没配齐」并停用 AI —— 那是它们本来就处理得了的情形;返回
  * undefined 则会在各处炸出读属性的 TypeError。
  *
@@ -186,11 +420,86 @@ export const EMPTY_AI_PROVIDER_PROFILE: AIProviderProfileShape = {
  * 局部状态与后端的完整配置,前者在数据还没到齐时就会渲染。
  */
 export function resolveAIProfile(ai: {
-	provider?: AIProviderId;
-	providers?: Partial<Record<AIProviderId, AIProviderProfileShape>>;
+	activeProfile?: string;
+	providers?: Record<string, AIProviderProfileShape | undefined>;
 }): AIProviderProfileShape {
-	const id = ai.provider ?? "custom";
-	return ai.providers?.[id] ?? EMPTY_AI_PROVIDER_PROFILE;
+	return ai.providers?.[ai.activeProfile ?? ""] ?? EMPTY_AI_PROVIDER_PROFILE;
+}
+
+/**
+ * AI 聊天此刻用的思考**等级**。
+ *
+ * `ai.chat` 与实例桶里的那两格是**分了家的**:桶里的管引擎(点评 / 总结 / 锐评),
+ * `ai.chat` 管聊天页。chat 里没写等级就跟随当前实例(「初始默认值从女仆读取」),
+ * 写过就压过实例、从此互不牵动。方言翻译仍按当前实例的 `provider` 走。
+ *
+ * 只剩**等级**没有开关:聊天的思考开关是**会话级**的(输入框旁那颗胶囊,默认关、
+ * 手动开、不落盘),按消息走请求体 —— 配置里没有它的位置。
+ */
+export function resolveChatThinkingLevel(ai: {
+	activeProfile?: string;
+	providers?: Record<string, AIProviderProfileShape | undefined>;
+	chat?: { thinkingLevel?: ThinkingLevel };
+}): ThinkingLevel {
+	return ai.chat?.thinkingLevel ?? resolveAIProfile(ai).thinkingLevel;
+}
+
+/**
+ * 一份人格(与 `schema/common.ts#AIPersonaSchema` 同形)。类型声明在这里的理由与
+ * {@link AIProviderProfileShape} 一样:让下面那个**零依赖**的解析函数能直供浏览器端。
+ */
+export interface AIPersonaShape {
+	name: string;
+	addressUser: string;
+	addressSelf: string;
+	traits: string;
+	catchphrase: string;
+	baseRole: string;
+	extraSystemPrompt: string;
+}
+
+/** 人格库里的一份 —— 两段 prompt 缺席 = 「用全局那份」。 */
+export interface AIPresetShape {
+	id: string;
+	persona: AIPersonaShape;
+	dynamicPrompt?: string;
+	liveSummaryPrompt?: string;
+}
+
+/** 当前生效的那份人格与它的两段 prompt。 */
+export interface ActivePersonaShape {
+	persona: AIPersonaShape;
+	dynamicPrompt: string;
+	liveSummaryPrompt: string;
+}
+
+/**
+ * 全局此刻用的是哪份人格 —— **「当前用哪份」只能有这一个读法**。
+ *
+ * 人格住在 `presets[]` 里,`activePreset` 是指着其中一份的指针,且**不改写**
+ * `ai.persona`(切回原来那份时主人手写的内容原封不动地回来)。代价是 `ai.persona`
+ * 自指针上线就再没有界面入口 —— 它只剩两个身份:老配置的原值、以及指针落空时的
+ * 安全网。**谁直读它,谁那条路上的人格就永远停在老值上**:主人在设置页换来换去,
+ * 那一侧的女仆还是原来那位,而界面上高亮、指示器全都指着新那份,看不出哪儿不对。
+ * (「换了人格没反应」就是这么来的,一次同时坑了常驻 generator、试一句、锐评与
+ * 聊天窗抬头四处。)
+ *
+ * 指针落空 —— 没填、或指着一份刚被删掉 / 备份换掉的预设 —— 静静回落 `ai.persona`。
+ * 两段 prompt 逐段回落:预设里缺席 = 「用全局那段」,不是「发一段空的」。
+ */
+export function resolveActivePersona(ai: {
+	persona: AIPersonaShape;
+	dynamicPrompt: string;
+	liveSummaryPrompt: string;
+	activePreset?: string;
+	presets?: readonly AIPresetShape[];
+}): ActivePersonaShape {
+	const active = ai.activePreset ? ai.presets?.find((p) => p.id === ai.activePreset) : undefined;
+	return {
+		persona: active?.persona ?? ai.persona,
+		dynamicPrompt: active?.dynamicPrompt ?? ai.dynamicPrompt,
+		liveSummaryPrompt: active?.liveSummaryPrompt ?? ai.liveSummaryPrompt,
+	};
 }
 
 // 第一个 AI 人格预设「温柔女仆」。同时作为 DEFAULT_AI 的默认 persona / prompt 来源,
@@ -288,7 +597,7 @@ export const BUILTIN_AI_PRESETS = [
  * 模板默认值（占位，可由 UI 编辑）。
  *
  * 占位符统一 `{key}` 语法,由 `LiveTemplateRenderer.applyTemplate` / `interpolate`
- * 替换(`applyTemplate` 同时兼容 koishi 旧存档的 legacy `-key`)。变量集严格对齐
+ * 替换(`applyTemplate` 同时兼容旧存档的 legacy `-key`)。变量集严格对齐
  * 渲染器实际提供的字段:
  * - 直播:`{name}` `{time}` `{follower}` `{follower_change}` `{watched}`
  * - 上舰:`{uname}` `{mname}` `{guard}`
@@ -297,8 +606,7 @@ export const BUILTIN_AI_PRESETS = [
  * - 动态:`{name}`
  *
  * 链接不再是模板变量:动态 / 视频 / 开播的链接是消息版式的独立「链接」部件
- * (显隐 / 位置由版式或 koishi 端的开关决定)。旧存档模板里残留的 `{url}` /
- * `{link}` 在版式路径渲染时连同前导分隔符一起剥离,不会双链接。
+ * (显隐 / 位置由版式决定),模板里没有链接变量。
  *
  * liveStart/liveOngoing/liveEnd 与 packages/live 的 `DEFAULT_LIVE_TEMPLATES`
  * 保持字面量一致 —— 这样「自定义关闭时实际推送的内建默认」== 「自定义打开时
@@ -337,3 +645,155 @@ export const DEFAULT_TEMPLATES = {
 		},
 	},
 } as const;
+
+// ── 锐评定时推送 ──────────────────────────────────────────────────────────────
+// 住在这里而不是 `schema/roast-schedule.ts`:配置页要拿它们做输入提示,而
+// `apps/web` 不能把 zod 拉进浏览器 bundle —— 从那个文件 import 就会。
+
+/** 锐评统计窗口下界。schema 校验与 `apps/server` 的取数共用,别在两处各定一份。 */
+export const ROAST_MIN_DAYS = 1;
+/** 锐评统计窗口上界。取数与 AI prompt 都按这个上界设计。 */
+export const ROAST_MAX_DAYS = 90;
+/** 定时锐评的默认 cron —— 每周一早九点,「周报」最符合直觉的那档,用户可改。 */
+export const DEFAULT_ROAST_CRON = "0 9 * * 1";
+/** 默认统计窗口,与默认 cron 的一周间隔对齐。周期与窗口本身是解耦的两个字段。 */
+export const DEFAULT_ROAST_DAYS = 7;
+
+/**
+ * 一条**关着**的定时锐评配置。
+ *
+ * 住在这里而不是 schema 文件:`apps/web` 造空订阅时要用它,而那个文件 import 了
+ * zod —— 从那儿取一份默认值就把 zod 拉进浏览器 bundle 了。schema 侧拿它当
+ * `.default()`,两边同一份。
+ *
+ * `enabled: false` 是硬要求:存量用户升级上来,不该有任何东西开始自己往群里发帖。
+ */
+export const DEFAULT_ROAST_SCHEDULE = {
+	enabled: false,
+	cron: DEFAULT_ROAST_CRON,
+	days: DEFAULT_ROAST_DAYS,
+	targets: [] as string[],
+	approval: false,
+	notifyOnError: true,
+} as const;
+
+/**
+ * 已经**实现了入站消息解析**的推送平台。
+ *
+ * 列的是「主人在这里回一句话，我们真的收得到」，不是「协议上理论可行」。审批要靠
+ * 它把 y/n 收回来 —— 一个平台如果只是协议上支持而我们没解析，配置页放行就等于让
+ * 主人开了一个永远等不到回复的开关，草稿全部超时作废。宁可少列。
+ *
+ * webhook 天生不可能:它就是个出站 HTTP POST,没有回程。将来薄插件桥接进来的平台
+ * 协议上收得到、只是还没接时 —— 说法见 {@link inboundGapReason},别写成平台的毛病。
+ */
+export const INBOUND_CAPABLE_PLATFORMS = ["onebot", "qq-official"] as const;
+
+/** 这个平台收不收得到主人的回复。审批开关能不能用就看它。 */
+export function platformCanReceiveReply(platform: string): boolean {
+	return (INBOUND_CAPABLE_PLATFORMS as readonly string[]).includes(platform);
+}
+
+/**
+ * 为什么这个平台上收不到主人的回复 —— 一句给人看的话。
+ *
+ * **不能一律说成「这个通道只能发不能收」**:除了 webhook,别的平台协议上都收得到,
+ * 只是我们还没解析(qq-official 甚至连 WS 网关和 USER_MESSAGE intent 都已经在跑了,
+ * 只差把正文接出来)。把实现缺口说成平台的毛病,主人会对着一个「明明能收」的通道
+ * 反复怀疑自己配错了。
+ */
+export function inboundGapReason(platform: string): string {
+	return platform === "webhook"
+		? "webhook 只是一个出站 HTTP 请求、没有回程，主人没法在上面回话"
+		: `女仆还没在 ${platform} 上接入站消息，主人回的 y 送不到女仆手里`;
+}
+
+/**
+ * 该平台能不能 @全体成员。QQ 官方机器人在群里 @全体要特殊权限,适配器对 at-all 段一律
+ * 丢弃 —— 推送层据此不给这种目标单发 @全体(否则那条到适配器就成了空消息,每次都记一条
+ * 失败),UP 抽屉里这种目标的 @全体开关也据此禁用并写着「发送时会自动跳过」。两边必须是
+ * 同一份判断,界面上说跳过就得真的跳过。
+ */
+export function platformSupportsAtAll(platform: (typeof PUSH_TARGET_PLATFORMS)[number]): boolean {
+	return platform !== "qq-official";
+}
+
+/**
+ * 「这个推送目标现在算不算暂停」。目标自己的开关关了,或它挂在一个已停用的适配器下面
+ * (投递层对这两种情况一律回不可达),都算。
+ *
+ * 住在这里而不是服务端:面板上的「已停用」标记与运行时的「跳过」必须是同一句话 ——
+ * 前端只看 `target.enabled` 的话,适配器停用的目标在选择器里显示为启用,发的时候却被
+ * 跳过。入参按形状收,免得为了两个类型把 schema 拖进这个零依赖模块。
+ */
+export function isTargetPaused(
+	target: { enabled: boolean; adapterId: string },
+	adapters: readonly { id: string; enabled: boolean }[],
+): boolean {
+	if (!target.enabled) return true;
+	return !adapters.find((a) => a.id === target.adapterId)?.enabled;
+}
+
+/**
+ * 一行历史的四态。词表在这儿(schema 用它 enum),两个谓词也在这儿 —— 服务端的按日
+ * 聚合与面板上的乐观补丁吃的是同一份口径,各写一遍的话,加第五态时只会改一边:KPI
+ * 两头对不上,而门禁一点都不红。
+ */
+export const PUSH_STATUSES = ["delivered", "partial", "failed", "no-targets"] as const;
+
+/** 算不算「推到了某个地方」—— 进不进「今日推送」与趋势图。无目标行没推到任何地方。 */
+export function countsAsDelivery(status: (typeof PUSH_STATUSES)[number]): boolean {
+	return status !== "no-targets";
+}
+
+/** 算不算「今日失败」。部分失败(本体到了、附加没到)也算 —— 有件事该看一眼。 */
+export function countsAsFailure(status: (typeof PUSH_STATUSES)[number]): boolean {
+	return status === "failed" || status === "partial";
+}
+
+/**
+ * 链接解析回什么:图片卡,或 QQ 小程序卡(B 站 App「分享到 QQ」那种,点开进小程序播放)。
+ * 小程序卡要目标所在的 OneBot 实现能向腾讯签 ark(`get_mini_app_ark`,今天已知只有 NapCat),
+ * 签不了的一律回落图片卡。只有这两档,没有「两个都发」。
+ */
+export const LINK_REPLY_FORMS = ["image", "miniapp"] as const;
+
+export type LinkReplyForm = (typeof LINK_REPLY_FORMS)[number];
+
+/**
+ * 链接解析的硬上限。**不进面板**:面板上那条冷却只防「同一个视频反复贴」,这几条防的是
+ * 换着视频刷 —— 谁都能触发的功能,资源面得有个不靠主人调的底。
+ *
+ * 放在这里而不是服务端里:面板的说明文字要把这两个数字念给主人听(web 只能从这个零依赖
+ * 子入口拿运行时值),各写一份的话调了上限、说明还在念旧数字,而且什么都不会红。
+ */
+export interface LinkLimits {
+	/** 单个群每分钟最多出几张链接卡。 */
+	groupPerMinute: number;
+	/**
+	 * 全局同时在处理(取信息 / 渲染 / 发送)的链接卡上限;超了直接放弃,不排队。
+	 *
+	 * 它管的是**积压量**,不是给推送卡让路 —— 让路由渲染队列的低优先级车道做(链接卡在
+	 * 正常车道排空之前不渲染)。这个数只是别让一群人刷链接时攒下几十个悬着的请求。
+	 */
+	maxInflight: number;
+	/** 冷却表 / 群额度表各自的容量,满了丢最久没碰的 —— 忘一条顶多多出一张卡,表不会越涨越慢。 */
+	tableCap: number;
+}
+
+export const LINK_LIMITS: LinkLimits = { groupPerMinute: 6, maxInflight: 3, tableCap: 2000 };
+
+/**
+ * 一条加速前缀长得合不合法:`https://` 开头、后面真有个主机名。空串(直连)不走这里,
+ * 由调用方各自判。
+ *
+ * 三处要判得一模一样:落盘的 schema(`UpdateSettingsSchema.mirrors`,最终说了算的那道
+ * 门)、服务端守 `POST /api/update/mirrors/probe` 的那道(这是一个让服务端去连任意主机
+ * 的入口)、面板决定自定义那一格能不能选的那道。各写一份正则的话,用户会遇到「测得通、
+ * 存不进去」—— 所以正则只有这一条,契约包从这里转出去给面板与路由。
+ */
+export const MIRROR_PREFIX_RE = /^https:\/\/[^\s/]+/;
+
+export function isMirrorPrefix(value: string): boolean {
+	return MIRROR_PREFIX_RE.test(value);
+}

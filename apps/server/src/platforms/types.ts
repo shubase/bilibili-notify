@@ -1,4 +1,5 @@
 import type {
+	AdapterCapabilities,
 	DeliveryResult,
 	NotificationPayload,
 	PushAdapter,
@@ -30,6 +31,11 @@ export interface ProbeResult {
 	err?: string;
 }
 
+/**
+ * 方法**不依赖 `this`**:三个实现都是工厂里返回的闭包字面量,状态全在闭包里。这条是承重的 ——
+ * devtools 的装饰器(截流闸、能力注入)拿展开语法叠在外面(`{ ...inner, send }`),被复制过去的
+ * 方法会以装饰器对象为 `this` 被调;要是哪天有实现按 `this` 写,叠上去就悄悄丢状态。
+ */
 export interface PlatformAdapter {
 	/** Platforms this adapter handles ("onebot" / "webhook"). */
 	readonly platforms: readonly string[];
@@ -58,4 +64,44 @@ export interface PlatformAdapter {
 	reconcile?(adapters: readonly PushAdapter[]): void;
 	/** Stateful adapters only — close all connections / listeners / timers on shutdown. Idempotent. */
 	dispose?(): void | Promise<void>;
+	/**
+	 * 平台能力快照(探测结果的缓存,同步读、不打网络)。没有能力概念的平台不实现 ——
+	 * 调用方按「没实现 = 什么都不支持」处理。
+	 */
+	capabilities?(adapter: PushAdapter): AdapterCapabilities;
+	/** 主动探一次能力,结果进缓存。连上时、健康探测时、用之前都可以叫;零副作用。 */
+	probeCapabilities?(adapter: PushAdapter): Promise<AdapterCapabilities>;
+}
+
+/**
+ * 入站消息 —— 各平台事件帧到「谁在哪说了什么」的收口。**归一化在 adapter 里做**:
+ * 消费者(指令分发、链接解析)只认下面两个形状,谁也不该再去碰平台的原始帧。两个
+ * adapter 交出来的是同一个形状,接线层才不用替每个平台各写一份映射。
+ */
+
+/** 收到这条消息的那条连接 —— 「回到消息来的那个群」得知道用哪个 adapter 的凭据发。 */
+export interface InboundMeta {
+	adapterId: string;
+}
+
+/** 一条私聊。指令分发器只认这个;`userId` 在 OneBot 是 QQ 号,在官机是 C2C 用户 openid。 */
+export interface InboundPrivateMessage {
+	userId: string;
+	text: string;
+}
+
+/** 一条群消息。链接解析只认这个;`groupId` 在 OneBot 是群号,在官机是群 openid。 */
+export interface InboundGroupMessage {
+	groupId: string;
+	/** 发言者。官机给的是群成员域的 openid,与 C2C 用户 openid 不是一个命名空间,别拿去比对主人。 */
+	userId: string;
+	/** 收到这条消息的 bot 自己的号(OneBot 有);与 userId 相同就是自己发的。 */
+	selfId?: string;
+	/** 用户敲的正文 —— 就是正文,不掺别的。 */
+	text: string;
+	/**
+	 * 分享卡(json / xml 段)里的链接候选,按出现顺序。与正文分开放:下一个群消息消费者
+	 * 拿到的 `text` 得还是「用户敲的那句话」,而不是被接了一串卡片链接的东西。
+	 */
+	cardLinks: string[];
 }

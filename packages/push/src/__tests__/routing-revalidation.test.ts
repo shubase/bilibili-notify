@@ -17,7 +17,6 @@
 
 import type {
 	DeliveryResult,
-	Logger,
 	NotificationSink,
 	PushTarget,
 	ServiceContext,
@@ -27,13 +26,7 @@ import { makeEmptySubscription } from "@bilibili-notify/internal";
 import type { SubscriptionStore } from "@bilibili-notify/subscription";
 import { describe, expect, it, vi } from "vite-plus/test";
 import { BilibiliPush } from "../bilibili-push";
-
-const silentLogger: Logger = {
-	debug: () => {},
-	info: () => {},
-	warn: () => {},
-	error: () => {},
-};
+import { pushBase, silentLogger } from "./helpers";
 
 /** 受控 serviceCtx:setTimeout 只登记,不自动触发,由测试手动 fire。 */
 function makeControlledServiceCtx(): { ctx: ServiceContext; pending: Array<() => void> } {
@@ -82,12 +75,19 @@ describe("BilibiliPush — 退避重试期间的路由复检", () => {
 		const send = vi.fn(async (): Promise<DeliveryResult> => ({ ok: true, latencyMs: 1 }));
 		const sink: NotificationSink = {
 			isAvailable: (id) => (id === "target-a" ? aAvailable : true),
+			isEnabled: () => true,
 			send: () => send(),
 			sendPrivate: async (): Promise<DeliveryResult> => ({ ok: false, latencyMs: 0 }),
 			resolve: (id) => ({ id, name: id, platform: "test" }) as unknown as PushTarget,
 		};
 
-		const push = new BilibiliPush({ sink, store, logger: silentLogger, serviceCtx: ctx });
+		const push = new BilibiliPush({
+			...pushBase(),
+			sink,
+			store,
+			logger: silentLogger,
+			serviceCtx: ctx,
+		});
 		push.start();
 
 		const resultPromise = push.sendToTarget(
@@ -132,12 +132,19 @@ describe("BilibiliPush — 退避重试期间的路由复检", () => {
 		const send = vi.fn(async (): Promise<DeliveryResult> => ({ ok: true, latencyMs: 1 }));
 		const sink: NotificationSink = {
 			isAvailable: () => available,
+			isEnabled: () => true,
 			send: () => send(),
 			sendPrivate: async (): Promise<DeliveryResult> => ({ ok: false, latencyMs: 0 }),
 			resolve: (id) => ({ id, name: id, platform: "test" }) as unknown as PushTarget,
 		};
 
-		const push = new BilibiliPush({ sink, store, logger: silentLogger, serviceCtx: ctx });
+		const push = new BilibiliPush({
+			...pushBase(),
+			sink,
+			store,
+			logger: silentLogger,
+			serviceCtx: ctx,
+		});
 		push.start();
 
 		const resultPromise = push.sendToTarget(

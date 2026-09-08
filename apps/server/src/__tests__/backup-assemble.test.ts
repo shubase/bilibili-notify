@@ -8,9 +8,12 @@ import { assembleFullBackup, openFullBackup } from "../backup/assemble.js";
  * 的完整配置 + cookie;错 PIN 抛错。
  */
 function withDeepseekKey(g: ReturnType<typeof makeDefaultGlobalConfig>, k: string) {
-	g.defaults.ai.provider = "deepseek";
+	g.defaults.ai.activeProfile = "deepseek";
 	g.defaults.ai.providers = {
 		deepseek: {
+			provider: "deepseek",
+			apiFlavor: "chat",
+			label: "",
 			apiKey: k,
 			baseUrl: "https://api.deepseek.com",
 			model: "deepseek-v4-pro",
@@ -43,6 +46,8 @@ function onebot(id: string, token: string): PushAdapter {
 			accessToken: token,
 			protocolVersion: "v11",
 			timeoutMs: 15_000,
+			imageMinTimeoutMs: 30_000,
+			forwardMinTimeoutMs: 60_000,
 			retryTimes: 0,
 			retryIntervalMs: 1_000,
 		},

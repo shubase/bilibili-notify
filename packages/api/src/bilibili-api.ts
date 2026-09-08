@@ -24,7 +24,8 @@ import type {
 	UserCardsBatchData,
 	V_VoucherCaptchaData,
 	ValidateCaptchaData,
-	VideoInfoData,
+	VideoInfo,
+	VideoRef,
 } from "./types";
 import { buildTicketParams, encWbi, type WbiKeys } from "./wbi";
 
@@ -70,7 +71,7 @@ export function classifyRefreshCode(code: number): RefreshOutcome {
  * `this.retry` 的 `shouldRetry` 识别并 **fail-fast** —— 持续风控再快速重试 3 轮只会
  * 放大打在被限流账号上的请求量。区别于瞬时网络错误(仍应退避重试)。
  */
-class RiskControlError extends Error {
+export class RiskControlError extends Error {
 	constructor(message: string) {
 		super(message);
 		this.name = "RiskControlError";
@@ -128,6 +129,10 @@ export class BilibiliAPI {
 	 */
 	private readonly selfInfoCache: SelfInfoCache = createSelfInfoCache(this);
 
+	/** finger/spi 的 buvid3 进程内缓存(设备指纹,不随账号变)。 */
+	private buvid3Cache = "";
+	private buvid3Inflight: Promise<string> | undefined;
+
 	constructor(opts: BilibiliAPIOptions) {
 		this.serviceCtx = opts.serviceCtx;
 		this.config = opts.config;
@@ -169,12 +174,21 @@ export class BilibiliAPI {
 	 * `undefined` / 空串 → 回退到内置默认 Firefox UA。
 	 */
 	setUserAgent(userAgent: string | undefined): void {
-		const ua = userAgent?.trim() ? userAgent : this.browserIdentity.userAgent;
 		this.config = { ...this.config, userAgent };
+		const ua = this.getUserAgent();
 		if (this.client) {
 			this.client.setHeader("User-Agent", ua);
 			this.logger.info(`[init] User-Agent 已更新: ${ua}`);
 		}
+	}
+
+	/**
+	 * 当前生效的 User-Agent(用户配置 trim 后优先,空/纯空白回退内置)。
+	 * HTTP 默认头与弹幕 WSS 建连都从这里取 —— 判定必须单点收口,分叉会让
+	 * 一个进程发两套指纹。
+	 */
+	getUserAgent(): string {
+		return this.config.userAgent?.trim() || this.browserIdentity.userAgent;
 	}
 
 	// ---- Initialization ----
@@ -190,8 +204,9 @@ export class BilibiliAPI {
 				// axios 时代由其默认值隐式外发,换 fetch 后需显式钉死(风控指纹对齐)。
 				Accept: "application/json, text/plain, */*",
 				// UA/sec-ch-ua 来自同一份生成身份,版本互相咬合(旧默认是 Firefox UA
-				// 配 Chrome sec-ch-ua 的拼接怪);用户配置的 userAgent 仍优先。
-				"User-Agent": this.config.userAgent || this.browserIdentity.userAgent,
+				// 配 Chrome sec-ch-ua 的拼接怪);用户配置的 userAgent 仍优先,
+				// 判定统一走 getUserAgent(与 WSS 同指纹)。
+				"User-Agent": this.getUserAgent(),
 				Origin: "https://www.bilibili.com",
 				Referer: "https://www.bilibili.com/",
 				priority: "u=1, i",
@@ -735,14 +750,6 @@ export class BilibiliAPI {
 		);
 	}
 
-	async getVideoInfo(options: { bvid?: string; aid?: number }): Promise<VideoInfoData> {
-		const params = new URLSearchParams();
-		if (options.bvid) params.set("bvid", options.bvid);
-		else if (options.aid !== undefined) params.set("aid", String(options.aid));
-		else throw new Error("getVideoInfo requires bvid or aid");
-		return this.getJson(`${EP.GET_VIDEO_INFO}?${params.toString()}`, "getVideoInfo");
-	}
-
 	/**
 	 * 关系状态数(粉丝/关注)。粉丝计数轮询稳态用这个替代 `getUserCardInfo` ——
 	 * 载荷远小于整张主页卡,更贴近 B 站对「实时粉丝计数」的预期用法。
@@ -787,6 +794,40 @@ export class BilibiliAPI {
 			`${EP.GET_LIVE_ROOM_INFO}?room_id=${encodeURIComponent(roomId)}`,
 			"getLiveRoomInfo",
 		);
+	}
+
+	/**
+	 * 真 buvid3(设备指纹,与登录态无关)。弹幕连接认证包要用它 —— cookie 罐里那条
+	 * 是 loadCookies 填的占位假值,不能进认证包。成功后进程内缓存;失败返回空串
+	 * 且不缓存(认证包缺 buvid 仍可尝试,下次调用重试)。
+	 */
+	async getBuvid3(): Promise<string> {
+		if (this.buvid3Cache) return this.buvid3Cache;
+		// 在途合流(同 createSelfInfoCache 模式):启动时 N 个房间并发 bootstrap,
+		// 缓存落位前各自联网等于把 N 条相同请求同时打在风控敏感面上。
+		if (!this.buvid3Inflight) {
+			this.buvid3Inflight = this.fetchBuvid3().finally(() => {
+				this.buvid3Inflight = undefined;
+			});
+		}
+		return this.buvid3Inflight;
+	}
+
+	private async fetchBuvid3(): Promise<string> {
+		try {
+			const res = await this.getJson<{ code: number; data?: { b_3?: string } }>(
+				EP.GET_FINGER_SPI,
+				"getBuvid3",
+			);
+			const b3 = res?.data?.b_3;
+			if (typeof b3 === "string" && b3) {
+				this.buvid3Cache = b3;
+				return b3;
+			}
+		} catch (e) {
+			this.logger.warn(`[conn] finger/spi 获取 buvid3 失败: ${(e as Error).message}`);
+		}
+		return "";
 	}
 
 	async getMasterInfo(uid: string): Promise<MasterInfoData> {
@@ -841,6 +882,68 @@ export class BilibiliAPI {
 			"getUserVideos",
 			BilibiliAPI.retryUnlessRiskControl,
 		);
+	}
+
+	/**
+	 * 单个视频的信息。接口 code 非 0(-404 不存在 / 62002 不可见 / 62012 仅自己可见…)
+	 * 直接抛,带上对方的 message —— 调用方(链接解析)对任何失败都保持沉默,只记日志。
+	 */
+	async getVideoInfo(ref: VideoRef): Promise<VideoInfo> {
+		const query =
+			"bvid" in ref ? `bvid=${encodeURIComponent(ref.bvid)}` : `aid=${encodeURIComponent(ref.aid)}`;
+		// wire 上的 data 字段远不止这些;`VideoInfo` 就是「我们用得到的那几个」的那份声明,
+		// 下面逐字段抄一遍 —— 照单全收但不透传。
+		const result = await this.getJson<{ code: number; message?: string; data?: VideoInfo }>(
+			`${EP.GET_VIDEO_INFO}?${query}`,
+			"getVideoInfo",
+		);
+		if (result.code !== 0 || !result.data) {
+			throw new Error(`获取视频信息失败(${result.code}): ${result.message ?? "unknown"}`);
+		}
+		const d = result.data;
+		return {
+			bvid: d.bvid,
+			aid: d.aid,
+			title: d.title,
+			pic: d.pic,
+			desc: d.desc,
+			duration: d.duration,
+			pubdate: d.pubdate,
+			tname: d.tname,
+			owner: { mid: d.owner.mid, name: d.owner.name, face: d.owner.face },
+			stat: {
+				view: d.stat.view,
+				danmaku: d.stat.danmaku,
+				reply: d.stat.reply,
+				favorite: d.stat.favorite,
+				coin: d.stat.coin,
+				share: d.stat.share,
+				like: d.stat.like,
+			},
+		};
+	}
+
+	/**
+	 * 把 b23.tv 短链解成落地地址。只认 b23.tv 输入、只认落在 bilibili.com 的目标 ——
+	 * 短链是别人贴的,跟到哪儿就是让谁指挥我们。拿不到重定向、落到别处,一律 null。
+	 */
+	async resolveShortLink(url: string): Promise<string | null> {
+		let parsed: URL;
+		try {
+			parsed = new URL(url);
+		} catch {
+			return null;
+		}
+		if (parsed.hostname !== "b23.tv") return null;
+		const location = await this.client.redirectLocation(parsed.toString());
+		if (!location) return null;
+		try {
+			const host = new URL(location).hostname;
+			if (host !== "bilibili.com" && !host.endsWith(".bilibili.com")) return null;
+		} catch {
+			return null;
+		}
+		return location;
 	}
 
 	async searchByType(

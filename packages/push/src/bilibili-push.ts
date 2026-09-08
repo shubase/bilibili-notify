@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import type {
 	DeliveryResult,
 	Disposable,
@@ -7,10 +8,16 @@ import type {
 	NotificationPayload,
 	NotificationSink,
 	PayloadSegment,
+	PushKind,
 	PushTarget,
 	ServiceContext,
 } from "@bilibili-notify/internal";
-import { inQuietHours, resolve } from "@bilibili-notify/internal";
+import {
+	featureToPushKind,
+	inQuietHours,
+	platformSupportsAtAll,
+	resolve,
+} from "@bilibili-notify/internal";
 import type { SubscriptionStore } from "@bilibili-notify/subscription";
 
 /**
@@ -30,18 +37,66 @@ function makeAtAllPayload(): NotificationPayload {
 const INITIAL_RETRY_DELAY_MS = 3000;
 const MAX_RETRY_DELAY_MS = INITIAL_RETRY_DELAY_MS * 2 ** 5;
 
-/**
- * Per-send context fired after每条 `sendToTarget` 结束(成功/失败均触发)。Adapter
- * 用它把 history 记录里的 `uid` 与 `source` 拼对 —— multiplex sink 拿不到
- * 这两个字段(它只看 PushTarget),所以历史只能从这一层注入。
- */
-export interface PushSendInfo {
-	uid: string;
-	feature: FeatureKey | "private";
-	target: PushTarget;
+/** 一条消息是推送的本体(卡片 / 分条正文)还是附加项(@全体、图集、词云、总结)。 */
+export type PushMessageRole = "main" | "extra";
+
+export interface PushMessage {
 	payload: NotificationPayload;
+	role: PushMessageRole;
+}
+
+export interface PushMessageOutcome extends PushMessage {
 	result: DeliveryResult;
-	private: boolean;
+}
+
+interface PushSendBase {
+	/**
+	 * 一次推送的身份。同一次推送可以分好几次广播(下播卡先发,词云 / 总结算好了再发;
+	 * 动态主卡之后是图集),调用方传同一个 `pushId`,历史就落在同一行里追加。
+	 */
+	pushId: string;
+	uid: string;
+	feature: FeatureKey;
+	/** 历史里记成哪一类推送(8 类之一)。 */
+	kind: PushKind;
+}
+
+/**
+ * 一次广播对**每个目标**回调一次(`sendBatch` 收完该目标的整段序列后),带这一段的全部
+ * 消息与逐条结果 —— 历史一行 = 一次推送 × 一个目标。@全体 是 fire-and-forget,落地后
+ * 以附加项的身份对同一目标再回调一次。
+ *
+ * 这类推送**没有任何可用目标**(没配,或配的全停用)时以 `target: null` 回调一次,消息
+ * 照带、没有结果 —— 宿主据此落「无目标」那一行,面板上才看得见。上游闸(静音 / 特性关 /
+ * 免扰 / 无订阅)不回调:那不是「无目标」,是本来就不该推。
+ *
+ * multiplex sink 拿不到 uid / feature(它只看 PushTarget),所以历史只能从这一层注入。
+ */
+export type PushSendInfo =
+	| (PushSendBase & { target: PushTarget; messages: PushMessageOutcome[] })
+	| (PushSendBase & { target: null; messages: PushMessage[] });
+
+/** 一次广播在发送层内部带着走的上下文。 */
+export interface SendContext {
+	uid: string;
+	feature: FeatureKey;
+	kind: PushKind;
+	pushId: string;
+	role: PushMessageRole;
+}
+
+export interface BroadcastOptions {
+	/** 见 {@link PushSendInfo.pushId};不传就现生成一个(只在这一次广播里通用)。 */
+	pushId?: string;
+	/** 显式 false 抑制 @全体(周期「正在直播」等非开播的 live 推送);不传 = 按 feature 决定。 */
+	allowAtAll?: boolean;
+	/** 这一段消息是本体还是附加项;缺省本体。@全体 不由它管,恒为附加项。 */
+	role?: PushMessageRole;
+	/**
+	 * 历史里记成哪一类推送。缺省按 feature 翻译;只有 `live` 那把键分不出开播与周期
+	 * 「正在直播」,调用方知道是哪种时显式传。
+	 */
+	kind?: PushKind;
 }
 
 /** Options for constructing a BilibiliPush instance. */
@@ -55,34 +110,39 @@ export interface BilibiliPushOptions {
 	/** Logger instance. */
 	logger: Logger;
 	/**
-	 * 可选 ServiceContext。传入后,retry backoff 的 sleep 走 `serviceCtx.setTimeout`,
-	 * plugin/runtime dispose 时可被立即 clear,不会留 32s 空跑 timer。stop() 也会
-	 * 唤醒所有 sleeping retry 循环立即收敛。
-	 *
-	 * 不传则退化为裸 setTimeout + stop() 唤醒(过渡期兼容,仍能 dispose-safe)。
+	 * 宿主的 ServiceContext:retry backoff 的 sleep 走 `serviceCtx.setTimeout`,runtime dispose
+	 * 时可被立即 clear,不会留 32s 空跑 timer。stop() 也会唤醒所有 sleeping retry 循环立即收敛。
 	 */
-	serviceCtx?: ServiceContext;
+	serviceCtx: ServiceContext;
 	/**
 	 * Latest `GlobalDefaults` provider — used to resolve `EffectiveSubscription`
 	 * per push so `features.X` and `schedule.quietHours` gates work against the
 	 * current globals state (not a stale snapshot).
-	 *
-	 * 可选:若不传,broadcastToFeature 退化为「仅 routing 决定是否发」的旧行为,
-	 * 用于过渡期的 Koishi adapter 还没接 globals 的场景。
 	 */
-	defaults?: () => GlobalDefaults;
-	/**
-	 * Optional hook fired after every successful or failed send. Receives the
-	 * resolved `target` plus the originating `uid` / `feature` — fields the
-	 * multiplex sink can't see. Standalone wires this to history-store append.
-	 */
+	defaults: () => GlobalDefaults;
+	/** 推送落地的回调,契约见 {@link PushSendInfo}。独立端接到历史仓。 */
 	onSend?: (info: PushSendInfo) => void;
+	/**
+	 * 全局静音 —— 「安静一会儿」。返回 true 时 {@link BilibiliPush.broadcastToFeature}
+	 * 整条短路,所有 feature 一起挡。
+	 *
+	 * **每条推送现问一次**,不快照:静音是有到期时刻的,快照下来就得等下次重启才恢复。
+	 *
+	 * 发给主人的私聊(`sendToMaster` / `sendPrivateMsg`)**不受它管** —— 指令回复走的
+	 * 就是那条路,连同挡掉的话主人只会看到指令毫无反应。
+	 */
+	muted: () => boolean;
+	/**
+	 * 免扰时段按哪一刻判。缺省真时钟;宿主的 devtools 用它做「当作现在是 xx:xx」的单点覆盖 ——
+	 * 只影响这一处判定,不是假时钟,延迟 / 超时 / 历史时间戳都还是真的。
+	 */
+	quietHoursNow?: () => Date;
 }
 
 /**
  * Platform-neutral push router.
  *
- * Replaces the old koishi-coupled BilibiliPush. Routing comes from
+ * The standalone runtime's push router. Routing comes from
  * store.findByUid(uid)?.routing[feature] → targetId[] → sink.send(targetId, payload).
  * The old pushArrMap, broadcastToTargets, sendPrivateMsg/sendErrorMsg are gone.
  */
@@ -97,9 +157,11 @@ export class BilibiliPush {
 	 */
 	private masterReachable?: boolean;
 	private readonly logger: Logger;
-	private readonly defaults?: () => GlobalDefaults;
+	private readonly defaults: () => GlobalDefaults;
+	private readonly muted: () => boolean;
+	private readonly quietHoursNow: () => Date;
 	private readonly onSend?: (info: PushSendInfo) => void;
-	private readonly serviceCtx?: ServiceContext;
+	private readonly serviceCtx: ServiceContext;
 	private disposed = false;
 	/**
 	 * Per-lifecycle generation token。每次 `start()` 自增;in-flight retry 循环
@@ -109,8 +171,8 @@ export class BilibiliPush {
 	 */
 	private generation = 0;
 	/**
-	 * 正在 sleep 等重试的 wake 函数集合 — `stop()` 时全部触发立即返回,避免裸 setTimeout
-	 * 路径下 retry 循环卡到 32s 才退出。
+	 * 正在 sleep 等重试的 wake 函数集合 — `stop()` 时全部触发立即返回,避免
+	 * retry 循环卡到 32s 才退出。
 	 */
 	private readonly sleepWakers = new Set<() => void>();
 
@@ -120,6 +182,8 @@ export class BilibiliPush {
 		this.master = opts.master ?? null;
 		this.logger = opts.logger;
 		this.defaults = opts.defaults;
+		this.muted = opts.muted;
+		this.quietHoursNow = opts.quietHoursNow ?? (() => new Date());
 		this.onSend = opts.onSend;
 		this.serviceCtx = opts.serviceCtx;
 	}
@@ -171,18 +235,6 @@ export class BilibiliPush {
 		if (this.master) this.refreshMasterReachability();
 	}
 
-	/**
-	 * 外部触发的 master 可达性复检。koishi 端在 bot 上线(`login-updated` / `login-added`)
-	 * 时调用——`refreshMasterReachability` 只在 `start()`(常早于 bot 连上)和 `sendToMaster()`
-	 * 被调,没有它,启动期那条「master 目标不可达」会一直挂着没有下文(bot 后来上线
-	 * 也无人复检)。这里让边沿状态机在 bot 真正连上后打出「已恢复可达」并复位边沿。
-	 * 无 master / 已 dispose 时 no-op。
-	 */
-	recheckMasterReachability(): void {
-		if (this.disposed || !this.master) return;
-		this.refreshMasterReachability();
-	}
-
 	stop(): void {
 		this.disposed = true;
 		// 唤醒所有 sleeping retry 循环;snapshot 一份避免迭代中 Set 被 wake 删除。
@@ -190,33 +242,43 @@ export class BilibiliPush {
 	}
 
 	/**
-	 * Broadcast a notification to all targets registered for a given uid + feature.
-	 * Returns an array of DeliveryResult (one per target).
+	 * 向某位 UP 某类推送的全部目标广播。返回每条消息的投递结果(一个目标一段序列;
+	 * @全体 是 fire-and-forget,不计入返回值)。
+	 *
+	 * 闸门按代价排:全局静音 → 无订阅 → 特性总开关 → 免扰时段,任一挡下都静默返回 —— 这些
+	 * 不是「无目标」。过了闸再看目标:路由里**启用的**(目标启用、所属适配器启用)才是候选,
+	 * 停用的既不发也不进可达性重试;一个候选都没有就是「无目标」,回调 `onSend` 落一行。
 	 *
 	 * @全体成员 修饰(仅 `feature === "dynamic" | "live"` 且 `opts.allowAtAll !== false` 进入):
 	 * - 订阅级默认 `sub.atAllDefaults.X` 决定 inherit-state 的 target 是否 @
 	 * - per-target tristate Map `sub.atAll.X[targetId]` 显式覆写:`true` 强 ON、`false` 强 OFF
 	 * - Map 里没有该 key → 走默认
+	 * - 目标平台不支持 @全体(`platformSupportsAtAll`,今天只有 QQ 官方机器人)→ 一律不 @,
+	 *   默认与覆写都不看 —— 单发的那条只含 at-all 段,到适配器就成了空消息
 	 *
 	 * `feature === "live"` 仅作用于开播。但 live adapter 把「开播」和周期「正在直播」
-	 * 复推都翻译成 `feature === "live"`(routing/总开关共用 live,模型里没有独立的
-	 * ongoing key),仅靠 feature 无法区分。调用方据 `LivePushType` 判定:非开播的
-	 * live 推送(周期 ongoing 等)必须传 `opts.allowAtAll = false` 显式抑制 @全体,
-	 * 否则会每条直播推送都 @全体(本次修复的 bug)。SC/上舰/词云/总结/下播 走它们
-	 * 自己的 feature key,本就不进 atAll 分支,传不传 allowAtAll 无影响。不传 opts
-	 * = 保持「feature 决定」的旧行为(dynamic 调用点据此不变)。
+	 * 复推都翻译成 `feature === "live"`(routing/总开关共用 live),仅靠 feature 无法区分。
+	 * 调用方据 `LivePushType` 判定:非开播的 live 推送必须传 `opts.allowAtAll = false`
+	 * 显式抑制 @全体,否则会每条直播推送都 @全体(修过的 bug)。
 	 */
 	async broadcastToFeature(
 		uid: string,
 		feature: FeatureKey,
 		payload: NotificationPayload | NotificationPayload[],
-		opts?: { allowAtAll?: boolean },
+		opts?: BroadcastOptions,
 	): Promise<DeliveryResult[]> {
 		if (this.disposed) return [];
-		// 消息版式分条:一次推送可以是多条 payload 的序列。单 payload(koishi 旧调用)
-		// 归一成单元素序列,后续路径统一按序列处理,行为与旧签名逐字一致。
+		// 消息版式分条:一次推送可以是多条 payload 的序列。单 payload 归一成单元素序列,
+		// 后续路径统一按序列处理。
 		const payloads = Array.isArray(payload) ? payload : [payload];
 		if (payloads.length === 0) return [];
+
+		// 全局静音闸,排在所有查询之前 —— 静音期间一次订阅查找都不必做。
+		// 只挡订阅推送;发给主人的私聊不走这里,理由见 `muted` 的注释。
+		if (this.muted()) {
+			this.logger.debug(`[push] uid=${uid} feature=${feature} 处于全局静音，跳过`);
+			return [];
+		}
 
 		const sub = this.store.findByUid(uid);
 		if (!sub) {
@@ -224,25 +286,35 @@ export class BilibiliPush {
 			return [];
 		}
 
-		// 「features 总开关」与「quietHours 免扰时段」两道 runtime gate。两者都需要把 sub
-		// 折叠成 EffectiveSubscription 才能读 —— 仅在 defaults provider 有传时启用,过渡期
-		// 没传则退化到「routing-only」的旧行为(顺带保持 BilibiliPush 单元测试的简单构造)。
-		const defaults = this.defaults?.();
-		if (defaults) {
-			const eff = resolve(sub, defaults);
-			if (!eff.features[feature]) {
-				this.logger.debug(`[push] uid=${uid} feature=${feature} 总开关 OFF，跳过`);
-				return [];
-			}
-			if (inQuietHours(eff.schedule.quietHours, new Date())) {
-				this.logger.debug(`[push] uid=${uid} feature=${feature} 落在免扰时段，跳过`);
-				return [];
-			}
+		// 「features 总开关」与「quietHours 免扰时段」两道 runtime gate:把 sub 折叠成
+		// EffectiveSubscription 后按当前 globals 判定。
+		const defaults = this.defaults();
+		const eff = resolve(sub, defaults);
+		if (!eff.features[feature]) {
+			this.logger.debug(`[push] uid=${uid} feature=${feature} 总开关 OFF，跳过`);
+			return [];
+		}
+		if (inQuietHours(eff.schedule.quietHours, this.quietHoursNow())) {
+			this.logger.debug(`[push] uid=${uid} feature=${feature} 落在免扰时段，跳过`);
+			return [];
 		}
 
-		const targetIds = sub.routing[feature] ?? [];
+		const ctx: SendContext = {
+			uid,
+			feature,
+			kind: opts?.kind ?? featureToPushKind(feature),
+			pushId: opts?.pushId ?? randomUUID(),
+			role: opts?.role ?? "main",
+		};
+		// 只有启用的目标才是候选:停用的目标 / 停用的适配器不进重试、不落历史。
+		const targetIds = (sub.routing[feature] ?? []).filter((id) => this.sink.isEnabled(id));
 		if (targetIds.length === 0) {
-			this.logger.debug(`[push] uid=${uid} feature=${feature} 无目标，跳过`);
+			this.logger.debug(`[push] uid=${uid} feature=${feature} 无可用目标`);
+			this.onSend?.({
+				...ctx,
+				target: null,
+				messages: payloads.map((p) => ({ payload: p, role: ctx.role })),
+			});
 			return [];
 		}
 
@@ -259,7 +331,7 @@ export class BilibiliPush {
 
 		this.logger.info(`[push] uid=${uid} feature=${feature} → ${targetIds.length} 个目标`);
 		if (!atAllScope) {
-			return this.sendBatch(targetIds, payloads, { uid, feature });
+			return this.sendBatch(targetIds, payloads, ctx);
 		}
 
 		const defaultOn = sub.atAllDefaults[atAllScope];
@@ -267,12 +339,15 @@ export class BilibiliPush {
 		const atAllTargets: string[] = [];
 		const plainTargets: string[] = [];
 		for (const id of targetIds) {
+			// 平台不支持 @全体的目标不进 @全体 分支:抽屉里它的开关本就显示为关。
+			const target = this.sink.resolve(id);
+			const supported = target !== undefined && platformSupportsAtAll(target.platform);
 			const explicit = overrides[id];
-			const shouldAtAll = explicit ?? defaultOn;
+			const shouldAtAll = supported && (explicit ?? defaultOn);
 			(shouldAtAll ? atAllTargets : plainTargets).push(id);
 		}
 		if (atAllTargets.length === 0) {
-			return this.sendBatch(plainTargets, payloads, { uid, feature });
+			return this.sendBatch(plainTargets, payloads, ctx);
 		}
 
 		// 「@全体单独一条 → 原 payload」两条独立消息:@ 提醒在前、卡片正文在后。
@@ -282,15 +357,16 @@ export class BilibiliPush {
 		// 标失败)。现在卡片不再被 @全体 的重试拖住,@全体 失败也只异步落历史。
 		const results: DeliveryResult[] = [];
 		if (plainTargets.length > 0) {
-			results.push(...(await this.sendBatch(plainTargets, payloads, { uid, feature })));
+			results.push(...(await this.sendBatch(plainTargets, payloads, ctx)));
 		}
-		results.push(...(await this.sendAtAllThenCard(atAllTargets, payloads, { uid, feature })));
+		results.push(...(await this.sendAtAllThenCard(atAllTargets, payloads, ctx)));
 		return results;
 	}
 
 	/**
 	 * atAllTargets 的发送序列:每个目标先「即发」一条独立 @全体(**不 await**,
-	 * best-effort),紧接着 await 卡片正文。@全体 的结果异步记入推送历史。
+	 * best-effort),紧接着 await 卡片正文。@全体 落地后以附加项身份再回调一次 onSend ——
+	 * 排在本体那次回调之后,历史那一行先由本体建起来,小卡上的首条文案不会是「@全体」。
 	 *
 	 * 为什么不 await @全体:无管理权限的群发 @全体 会被 onebot/协议端拒绝并触发
 	 * adapter 的 retryTimes×retryIntervalMs 重试,顺序 await 会让卡片正文等满整个
@@ -304,89 +380,90 @@ export class BilibiliPush {
 	private async sendAtAllThenCard(
 		atAllTargets: string[],
 		payloads: NotificationPayload[],
-		ctx: { uid: string; feature: FeatureKey },
+		ctx: SendContext,
 	): Promise<DeliveryResult[]> {
 		if (this.disposed) return [];
 		const myGen = this.generation;
-		const atAllPayload = makeAtAllPayload();
+		const routing = { uid: ctx.uid, feature: ctx.feature };
 		const results: DeliveryResult[] = [];
-		outer: for (const id of atAllTargets) {
+		for (const id of atAllTargets) {
 			if (this.disposed || this.generation !== myGen) break;
-			// @全体 best-effort:同步发起(先于序列首条入 sink),不 await,结果异步落历史。
-			void this.sendToTarget(id, atAllPayload, { routing: ctx })
-				.then((r) => this.recordSend(id, atAllPayload, r, ctx))
+			// @全体 best-effort:同步发起(先于序列首条入 sink),不 await。
+			const atAllPayload = makeAtAllPayload();
+			const atAllJob = this.sendToTarget(id, atAllPayload, { routing });
+			const outcomes = await this.sendSequence(id, payloads, ctx, myGen);
+			if (outcomes === null) break;
+			results.push(...outcomes.map((o) => o.result));
+			this.emit(ctx, id, outcomes);
+			// 本体那次回调已经发出,@全体 的结果再追加 —— 就算它早就落地了也排在后面。
+			void atAllJob
+				.then((result) => this.emit(ctx, id, [{ payload: atAllPayload, role: "extra", result }]))
 				.catch(() => {});
-			for (const payload of payloads) {
-				const result = await this.sendToTarget(id, payload, { routing: ctx });
-				if (this.disposed || this.generation !== myGen) break outer;
-				this.recordSend(id, payload, result, ctx);
-				results.push(result);
-				// 序列语义:该 target 某条失败即中止其后续条(失败后大概率继续失败,
-				// 且乱序补发比缺失更糟);其他 target 不受牵连。
-				if (!result.ok) break;
-			}
 		}
 		return results;
 	}
 
 	/**
-	 * Send a notification to all targets in the list.
-	 * Failures are captured per-target; does not throw.
-	 * Optional `ctx` carries the originating uid/feature so adapter hooks
-	 * (history append) get the correct fields. broadcastToFeature passes ctx;
-	 * legacy callers without ctx get history rows with empty uid.
+	 * 把同一段消息序列发给一批目标。失败逐目标捕获,不抛。
+	 *
+	 * 每个目标收完整段序列后回调一次 onSend(见 {@link PushSendInfo});生命周期翻转
+	 * (stop→start)时放弃剩余目标,最后那条已 in-flight 的结果是生命周期 artifact,
+	 * 不回调、不计入。
 	 */
 	async sendBatch(
 		targetIds: string[],
 		payload: NotificationPayload | NotificationPayload[],
-		ctx?: { uid: string; feature: FeatureKey | "private" },
+		ctx: SendContext,
 	): Promise<DeliveryResult[]> {
 		if (this.disposed) return [];
 		const payloads = Array.isArray(payload) ? payload : [payload];
 		if (payloads.length === 0) return [];
-		// ②7:per-batch generation 快照。此前 sendBatch 仅入口判 disposed,逐条
-		// 间无 generation 校验 —— stop()→start() 中途切换会让单次广播跨生命周期
-		// 拆发。本批属于发起时的那个 generation;lifecycle 翻转即放弃剩余目标,
-		// 且最后那条已 in-flight 的结果是生命周期 artifact,不 onSend / 不计入。
 		const myGen = this.generation;
-		const routing =
-			ctx && ctx.feature !== "private" ? { uid: ctx.uid, feature: ctx.feature } : undefined;
 		const results: DeliveryResult[] = [];
-		outer: for (const id of targetIds) {
+		for (const id of targetIds) {
 			if (this.disposed || this.generation !== myGen) break;
-			for (const p of payloads) {
-				const result = await this.sendToTarget(id, p, { routing });
-				if (this.disposed || this.generation !== myGen) break outer;
-				if (ctx) this.recordSend(id, p, result, ctx);
-				results.push(result);
-				// 序列语义:该 target 某条失败即中止其后续条;其他 target 不受牵连。
-				if (!result.ok) break;
-			}
+			const outcomes = await this.sendSequence(id, payloads, ctx, myGen);
+			if (outcomes === null) break;
+			results.push(...outcomes.map((o) => o.result));
+			this.emit(ctx, id, outcomes);
 		}
 		return results;
 	}
 
 	/**
-	 * 把单条 send 结果交给 `onSend` hook(adapter 据此 append 推送历史)。multiplex
-	 * sink 看不到 uid/feature,只能从这一层注入;target 由 sink 反解 id 得到。
-	 * onSend 未配置或 id 反解不到 target 时静默跳过。
+	 * 一个目标的一段序列:顺序发,某条失败即中止其后续条(失败后大概率继续失败,且乱序
+	 * 补发比缺失更糟);失败那条留在结果里,被中止的不在。返回 null = 生命周期翻转,
+	 * 这一段作废。
 	 */
-	private recordSend(
-		id: string,
-		payload: NotificationPayload,
-		result: DeliveryResult,
-		ctx: { uid: string; feature: FeatureKey | "private" },
-	): void {
+	private async sendSequence(
+		targetId: string,
+		payloads: NotificationPayload[],
+		ctx: SendContext,
+		myGen: number,
+	): Promise<PushMessageOutcome[] | null> {
+		const routing = { uid: ctx.uid, feature: ctx.feature };
+		const outcomes: PushMessageOutcome[] = [];
+		for (const payload of payloads) {
+			const result = await this.sendToTarget(targetId, payload, { routing });
+			if (this.disposed || this.generation !== myGen) return null;
+			outcomes.push({ payload, role: ctx.role, result });
+			if (!result.ok) break;
+		}
+		return outcomes;
+	}
+
+	/** 把一个目标这一段的结果交给 onSend。target 由 sink 反解 id 得到,反解不到就静默跳过。 */
+	private emit(ctx: SendContext, targetId: string, messages: PushMessageOutcome[]): void {
 		if (!this.onSend) return;
-		const target = this.sink.resolve(id);
+		const target = this.sink.resolve(targetId);
 		if (!target) return;
 		this.onSend({
+			pushId: ctx.pushId,
 			uid: ctx.uid,
 			feature: ctx.feature,
+			kind: ctx.kind,
 			target,
-			payload,
-			result,
-			private: false,
+			messages,
 		});
 	}
 
@@ -491,17 +568,7 @@ export class BilibiliPush {
 				resolveSleep();
 			};
 			this.sleepWakers.add(wake);
-			if (this.serviceCtx) {
-				release = this.serviceCtx.setTimeout(wake, ms);
-			} else {
-				// 退化路径:裸 setTimeout + stop() 主动 wake。timer 自身会再走一遍 wake
-				// 但 sleepWakers.delete 是幂等的,resolve 也是。
-				const id = setTimeout(wake, ms);
-				// P2:退化裸 setTimeout 必须 unref —— 否则一个 in-flight 重试
-				// sleep 会顶住事件循环、阻塞进程优雅退出。
-				id.unref?.();
-				release = { dispose: () => clearTimeout(id) };
-			}
+			release = this.serviceCtx.setTimeout(wake, ms);
 		});
 	}
 }

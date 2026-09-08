@@ -1,14 +1,20 @@
 import { z } from "zod";
-import { FEATURE_KEYS } from "../constants";
+import { DEFAULT_TEMPLATES, FEATURE_KEYS, LIVE_END_EXTRA_KEYS } from "../constants";
 import { checkUserRegex } from "../util/regex-safety";
 
-export type { FeatureKey } from "../constants";
+export type { FeatureKey, LiveEndExtraKey, LiveEndExtras } from "../constants";
 
 // 值与类型的单一来源在 ../constants(零依赖,供前端经 /constants 子路径运行时消费);
 // 这里重导出维持根入口的既有 API 面,后端消费者无感。
-import { AI_PROVIDER_IDS, BUILTIN_AI_PRESETS, THINKING_LEVELS } from "../constants";
+import {
+	AI_PROVIDER_IDS,
+	API_FLAVOR_IDS,
+	BUILTIN_AI_PRESETS,
+	THINKING_LEVELS,
+	WEB_SEARCH_BACKEND_IDS,
+} from "../constants";
 
-export { DEFAULT_FEATURE_FLAGS, FEATURE_KEYS } from "../constants";
+export { DEFAULT_FEATURE_FLAGS, FEATURE_KEYS, LIVE_END_EXTRA_KEYS } from "../constants";
 
 /** blockRegex/whitelistRegex 的单元素校验:保存期即拦非法 / 超长 / 疑似 ReDoS 正则。 */
 const UserRegexString = z.string().superRefine((src, ctx) => {
@@ -19,21 +25,98 @@ const UserRegexString = z.string().superRefine((src, ctx) => {
 /** 全部可订阅的特性键(键列表本体在 ../constants)。 */
 export const FeatureKeySchema = z.enum(FEATURE_KEYS);
 
-/** 每个特性的开关；使用 record 而非 z.record(boolean) 是为了让 inherit-merge 时类型保留键名。 */
-export const FeatureFlagsSchema = z.object({
+/** 下播的两个附加项(词云 / AI 总结)。没有自己的路由,只跟着下播的开关与目标走。 */
+export const LiveEndExtrasSchema = z.object({
+	wordcloud: z.boolean(),
+	liveSummary: z.boolean(),
+});
+
+/**
+ * 老 features 的形状:词云 / 总结曾是两把独立的特性键(各有开关、各有路由),平铺在顶层。
+ * 顶层还带着这两把键就是老数据 —— 新形状把它们收进 `liveEndExtras`,顶层不会再出现。
+ */
+function hasLegacyExtras(raw: object): raw is Record<string, unknown> {
+	return LIVE_END_EXTRA_KEYS.some((k) => k in raw);
+}
+
+function pickExtras(raw: Record<string, unknown>): Record<string, unknown> {
+	const extras: Record<string, unknown> = {};
+	for (const k of LIVE_END_EXTRA_KEYS) if (k in raw) extras[k] = raw[k];
+	return extras;
+}
+
+function stripLegacyExtras(raw: Record<string, unknown>): Record<string, unknown> {
+	const { wordcloud: _w, liveSummary: _s, ...rest } = raw;
+	return rest;
+}
+
+/**
+ * 全局 features 的迁移:下播开关 = 旧下播 ∨ 词云 ∨ 总结,两个子项照旧值。
+ *
+ * 只开了词云 / 总结、没开下播的人,迁完会多收一张下播卡 —— 「宁可多收一张卡,不能少掉
+ * 一条推送」,CHANGELOG 有 ⚠️ 说明。新形状(已有 `liveEndExtras`)一律不动:关掉下播、
+ * 子项留着开,下次加载不会被翻回来。
+ */
+function migrateLegacyFeatureFlags(raw: unknown): unknown {
+	if (typeof raw !== "object" || raw === null || !hasLegacyExtras(raw)) return raw;
+	const legacy = LIVE_END_EXTRA_KEYS.map((k) => raw[k]);
+	return {
+		...stripLegacyExtras(raw),
+		liveEnd: raw.liveEnd === true || legacy.includes(true),
+		liveEndExtras: pickExtras(raw),
+	};
+}
+
+/**
+ * per-UP 覆盖(partial)的迁移。覆盖是稀疏的,拿不到全局值,只能就地判:
+ * - 三者有一个显式 true → `liveEnd: true`(不管全局怎样,这位 UP 以前一定收得到东西)
+ * - 三者都显式 false → `liveEnd: false`(以前什么都收不到,现在也是)
+ * - 其余(有的关、有的没写)→ 不写 liveEnd,继承全局。全局迁完只会更宽,顶多多收一张卡
+ *
+ * 单看一份 partial,只有 `{ liveEnd: false }` 分不出新老;整条订阅能看 routing 的形状,
+ * 认出是老的就传 `force` 让这份覆盖也按老规矩迁(见 subscriptions.ts)。
+ */
+export function migrateLegacyFeatureFlagsPartial(raw: unknown, force = false): unknown {
+	if (typeof raw !== "object" || raw === null) return raw;
+	if (!force && !hasLegacyExtras(raw)) return raw;
+	const r = raw as Record<string, unknown>;
+	const trio = [r.liveEnd, ...LIVE_END_EXTRA_KEYS.map((k) => r[k])];
+	const { liveEnd: _l, ...rest } = stripLegacyExtras(r);
+	const out: Record<string, unknown> = { ...rest, liveEndExtras: pickExtras(r) };
+	if (trio.includes(true)) out.liveEnd = true;
+	else if (trio.every((v) => v === false)) out.liveEnd = false;
+	return out;
+}
+
+const FeatureFlagsObjectSchema = z.object({
 	dynamic: z.boolean(),
 	live: z.boolean(),
 	liveEnd: z.boolean(),
 	liveGuardBuy: z.boolean(),
 	superchat: z.boolean(),
-	wordcloud: z.boolean(),
-	liveSummary: z.boolean(),
 	specialDanmaku: z.boolean(),
 	specialUserEnter: z.boolean(),
+	liveEndExtras: LiveEndExtrasSchema,
 });
-export type FeatureFlags = z.infer<typeof FeatureFlagsSchema>;
 
-export const FeatureFlagsPartialSchema = FeatureFlagsSchema.partial();
+/**
+ * 每个特性的开关 + 下播的两个附加项。使用显式 object 而非 z.record(boolean) 是为了让
+ * inherit-merge 时类型保留键名。老形状(词云 / 总结平铺在顶层)在这里就地迁成新形状。
+ */
+export const FeatureFlagsSchema = z.preprocess(migrateLegacyFeatureFlags, FeatureFlagsObjectSchema);
+export type FeatureFlags = z.infer<typeof FeatureFlagsObjectSchema>;
+
+/**
+ * per-UP 覆盖:七把开关各自可选,附加项是一个**内部也可选**的小对象 —— 只关词云不该顺手
+ * 把总结也盖掉(resolve 对它做嵌套合并)。
+ */
+export const FeatureFlagsPartialSchema = z.preprocess(
+	// 包一层:zod 给 preprocess 传的第二个参数是 ctx,直接传函数会把它当成 `force`。
+	(raw) => migrateLegacyFeatureFlagsPartial(raw),
+	FeatureFlagsObjectSchema.partial().extend({
+		liveEndExtras: LiveEndExtrasSchema.partial().optional(),
+	}),
+);
 export type FeatureFlagsPartial = z.infer<typeof FeatureFlagsPartialSchema>;
 
 /**
@@ -132,14 +215,14 @@ export const TemplateBundleSchema = z.object({
 	liveEnd: z.string(),
 	liveSummary: z.string(),
 	/**
-	 * 动态推送文本模板(非视频动态)。变量:`{name}` UP 名、`{url}` 动态链接。
-	 * `.default(...)` 让缺 dynamic 字段的老 globals.json(本字段加入前写入的)
-	 * 仍能通过 schema 校验 —— 与下方 imageGroup 同源的老配置兜底策略。默认值须与
-	 * `DEFAULT_TEMPLATES.dynamic` 保持一致。
+	 * 动态推送文本模板(非视频动态)。变量:`{name}` UP 名;链接是消息版式的独立部件,
+	 * 不是模板变量。`.default(...)` 让缺 dynamic 字段的老 globals.json
+	 * (本字段加入前写入的)仍能通过 schema 校验 —— 与下方 imageGroup 同源的老配置兜底策略;
+	 * 默认值直接取 `DEFAULT_TEMPLATES`,不另抄一份(抄的那份 2026-08 漂过一次)。
 	 */
-	dynamic: z.string().default("{name}发布了一条动态：{url}"),
-	/** 视频投稿推送文本模板。变量:`{name}` UP 名、`{url}` 视频链接 / BV。默认值须与 `DEFAULT_TEMPLATES.dynamicVideo` 一致。 */
-	dynamicVideo: z.string().default("{name}发布了新视频：{url}"),
+	dynamic: z.string().default(DEFAULT_TEMPLATES.dynamic),
+	/** 视频投稿推送文本模板。变量:`{name}` UP 名;链接同上。 */
+	dynamicVideo: z.string().default(DEFAULT_TEMPLATES.dynamicVideo),
 	/**
 	 * 弹幕词云的额外停用词,英文逗号分隔,**追加**到内置中文停用词表后再分词。
 	 * `.default("")` 让缺该字段的老 globals.json 仍能通过 schema 校验(与 dynamic /
@@ -180,17 +263,34 @@ export const AIPersonaSchema = z.object({
 export type AIPersona = z.infer<typeof AIPersonaSchema>;
 
 /**
- * **一家服务商的整套配置。**
+ * **一份服务商实例的整套配置。**
  *
- * 每家各存一份(见 {@link AISettingsSchema} 的 `providers`) —— 换家不必把 key
- * 重敲一遍,也不会出现「地址还是上一家的、模型名已经换了」这种半截状态。
+ * 按**实例**各存一份(见 {@link AISettingsSchema} 的 `providers`),同一家服务商
+ * 可以有多份实例(两个 DeepSeek 号、一个测试用的百炼)。换来换去不必把 key 重敲
+ * 一遍,也不会出现「地址还是上一份的、模型名已经换了」这种半截状态。
  *
- * 全部字段带默认值:设置页新添一家时只塞一个 `{}` 即可,余下由 schema 补齐。
+ * 除 `provider` 外全部字段带默认值:设置页新添一份时塞 `{ provider }` 即可,
+ * 余下由 schema 补齐。`provider` 刻意**无默认**:桶键只是实例 id,方言归属认不出
+ * 又没写明时(手改坏的数据)宁可拒收,也不猜一个、更不悄悄吞掉。
  */
 export const AIProviderProfileSchema = z.object({
+	/**
+	 * 这桶配置属于哪家服务商 —— 决定「开思考」翻译成哪家的方言。上一代配置
+	 * 以服务商名当桶键,迁移时按键名盖章(见 {@link AISettingsSchema} 的 preprocess)。
+	 */
+	provider: z.enum(AI_PROVIDER_IDS),
+	/** 实例的显示名。空串 = 用注册表里那家的名字(不把家名抄进配置,免得改名过期)。 */
+	label: z.string().default(""),
 	apiKey: z.string().default(""),
 	baseUrl: z.string().default(""),
 	model: z.string().default(""),
+	/**
+	 * 这桶走哪套 wire 协议:`chat`(chat completions,现状)或 `responses`
+	 * (OpenAI 2025 起的接任协议)。默认 `chat`,老配置零迁移;哪些家能选
+	 * `responses` 由 providerMeta 的 `supportsResponses` 把门(设置页不露选项),
+	 * schema 这层不掺和 —— 手改配置选了未确认的家,后果(404)自负且可逆。
+	 */
+	apiFlavor: z.enum(API_FLAVOR_IDS).default("chat"),
 	/** chat.completions 的 temperature(0–2)。 */
 	temperature: z.number().min(0).max(2).default(0.7),
 	/**
@@ -249,20 +349,75 @@ const AISettingsObjectSchema = z.object({
 	dynamicPrompt: z.string(),
 	liveSummaryPrompt: z.string(),
 	/**
-	 * 当前用哪家。**只认主人明确选过的那一个,绝不按 baseUrl 猜** —— 猜错就是
-	 * 替主人往别家发方言参数(几乎必然 400),而主人选了「自定义」却被地址悄悄
-	 * 改回去的话,怎么改都改不掉。
+	 * 当前用哪份实例(指向 {@link providers} 的键)。**只认主人明确选过的那一份,
+	 * 绝不按 baseUrl 猜** —— 猜错就是替主人往别家发方言参数(几乎必然 400)。
+	 * 与人格的 `activePreset` 同一套指针语义;上一代的 `provider` 字段迁移时改名至此。
 	 */
-	provider: z.enum(AI_PROVIDER_IDS).default("custom"),
+	activeProfile: z.string().default(""),
 	/**
-	 * 各家各一套配置。**稀疏** —— 键存在 = 主人添加过这家,不存在 = 还没添加。
-	 * 设置页左栏据此只列已添加的那几块;若改成五键恒在,一打开就会列出五家,
-	 * 与「点添加才出现」的交互直接冲突。
+	 * 各实例各一套配置,键是**实例 id**(同一家服务商可以有多份)。**稀疏** ——
+	 * 键存在 = 主人添加过这份,不存在 = 还没添加。设置页左栏据此只列已添加的那几块。
 	 *
-	 * {@link provider} 指向的桶**可能不存在**(比如刚被删掉),取值一律经
+	 * 上一代「一家一桶」的配置,桶键就是服务商名;迁移时**键名原样保留**(密钥
+	 * 加密袋的袋键 = 桶键,搬键名等于重启后密钥对不上号),只按键名往桶里盖
+	 * `provider` 章。
+	 *
+	 * {@link activeProfile} 指向的桶**可能不存在**(比如刚被删掉),取值一律经
 	 * {@link resolveAIProfile},它会兜一套空默认值回来。
 	 */
-	providers: z.partialRecord(z.enum(AI_PROVIDER_IDS), AIProviderProfileSchema).default({}),
+	providers: z.record(z.string(), AIProviderProfileSchema).default({}),
+	/**
+	 * AI 聊天页自己的思考**等级**,独立于实例桶里的那两格 —— 那两格是引擎的
+	 * (动态点评 / 直播总结 / 锐评),聊天页曾经直接改它,于是在对话里拨一下,
+	 * 整个女仆的点评行为跟着变。
+	 *
+	 * 字段是 optional 的「没写 = 跟随当前实例」:调过一次就写实,此后两边互不
+	 * 牵动。取值一律经 `resolveChatThinkingLevel`。
+	 *
+	 * 这里**没有开关**:聊天的思考开关是会话级的(输入框旁那颗胶囊,默认关、
+	 * 手动开、不落盘),按消息走请求体。曾经有过一格 `enableThinking`,未发版
+	 * 即删 —— 老数据里若残留,zod 会静默剥掉。
+	 */
+	chat: z
+		.object({
+			thinkingLevel: z.enum(THINKING_LEVELS).optional(),
+		})
+		.default({}),
+	/**
+	 * 联网搜索(`web_search` 工具)的配置。与选哪家 AI 服务商**正交**:搜索不走
+	 * 各家 LLM 的原生联网方言,由这里选定的后端真正执行,所以任何支持 function
+	 * calling 的服务商都能联网。
+	 *
+	 * key 按后端**各存一格**:换后端不丢另一家的 key(对齐实例桶「换来换去不必
+	 * 重敲 key」的纪律)。落盘前会被抠进加密袋,袋键 `search:<backend>`,见
+	 * `apps/server/src/config/ai-secrets.ts`。
+	 *
+	 * `engines` 三个开关**默认全关**:搜索按次付费,自动路径(点评/总结)一旦
+	 * 开了,每条推送都可能烧额度,必须主人亲手点亮。聊天页不在此列 —— 那颗
+	 * 胶囊是会话级的,不落盘。
+	 */
+	search: z
+		.object({
+			backend: z.enum(WEB_SEARCH_BACKEND_IDS).default("bocha"),
+			keys: z
+				.object({
+					bocha: z.string().default(""),
+					tavily: z.string().default(""),
+				})
+				.default({ bocha: "", tavily: "" }),
+			engines: z
+				.object({
+					dynamic: z.boolean().default(false),
+					live: z.boolean().default(false),
+					roast: z.boolean().default(false),
+				})
+				.default({ dynamic: false, live: false, roast: false }),
+		})
+		.default({
+			backend: "bocha",
+			keys: { bocha: "", tavily: "" },
+			engines: { dynamic: false, live: false, roast: false },
+		}),
 	/**
 	 * 全局此刻启用哪一份人格。**不填 = 用 `persona`**(老配置一字不变,无需迁移);
 	 * 填了就用 `presets` 里那一份。
@@ -317,7 +472,9 @@ const LEGACY_FLAT_KEYS = [
  */
 export const AISettingsSchema = z.preprocess((raw) => {
 	if (raw === null || typeof raw !== "object") return raw;
-	return migratePersonaPointer(migrateFlatProviderFields(raw as Record<string, unknown>));
+	return migratePersonaPointer(
+		migrateProviderInstances(migrateFlatProviderFields(raw as Record<string, unknown>)),
+	);
 }, AISettingsObjectSchema);
 
 function migrateFlatProviderFields(o: Record<string, unknown>): Record<string, unknown> {
@@ -332,6 +489,43 @@ function migrateFlatProviderFields(o: Record<string, unknown>): Record<string, u
 	// 一个字段都没有的话不造桶 —— 那是一份全新配置,左栏该是空的。
 	if (Object.keys(legacy).length === 0) return { ...rest, providers: {} };
 	return { ...rest, provider: "custom", providers: { custom: legacy } };
+}
+
+/**
+ * 上一代「一家一桶」→ 当代「实例桶」:
+ *
+ * - 指针改名:`provider` → `activeProfile`(值原样 —— 老指针指的服务商名恰好
+ *   就是迁移后那只桶的实例 id)。
+ * - 桶盖章:键是认得的服务商名、桶里又没写 `provider` 的,按键名补上。键名
+ *   **原样保留**:密钥加密袋的袋键就是桶键,搬键名等于重启后密钥对不上号。
+ *
+ * 认不出的键(不是服务商名、桶里也没写 provider)**不盖章**,留给 schema 拒收
+ * —— 那是手改坏的数据,猜一个方言归属比报错更糟。
+ */
+function migrateProviderInstances(o: Record<string, unknown>): Record<string, unknown> {
+	const out = { ...o };
+	if (out.activeProfile === undefined && typeof out.provider === "string") {
+		out.activeProfile = out.provider;
+	}
+	delete out.provider;
+
+	const providers = out.providers;
+	if (providers !== null && typeof providers === "object" && !Array.isArray(providers)) {
+		const next: Record<string, unknown> = { ...(providers as Record<string, unknown>) };
+		for (const [key, bucket] of Object.entries(next)) {
+			if (
+				bucket !== null &&
+				typeof bucket === "object" &&
+				!Array.isArray(bucket) &&
+				(bucket as Record<string, unknown>).provider === undefined &&
+				(AI_PROVIDER_IDS as readonly string[]).includes(key)
+			) {
+				next[key] = { ...bucket, provider: key };
+			}
+		}
+		out.providers = next;
+	}
+	return out;
 }
 
 /** 结构比较用。schema 全是纯数据,键序由 zod 定死,`JSON.stringify` 足够可靠。 */
@@ -403,11 +597,23 @@ const CardStyleObjectSchema = z.object({
 	cardColorStart: z.string(),
 	cardColorEnd: z.string(),
 	/**
-	 * CSS font-family。`packages/image/styles.cssReset` 在用户值后面追加
+	 * 字体家族名。`packages/image` 的 `renderCard` 在它后面追加
 	 * `"Microsoft YaHei","Source Han Sans","Noto Sans CJK",sans-serif` 兜底链,
 	 * 缺字体不会渲染崩。`.default(...)` 让缺该字段的老 globals.json 加载时自动补全。
+	 *
+	 * 独立端的设置页已改成**字体选择器**,交出来的是单个家族名(空串 = 只走兜底链);
+	 * 逗号列表只会来自老配置与「手填(高级)」那一档,`cssFontFamily` 会逐项处理。
+	 * 想用主人自己的字体文件走下面的 `fontAsset`,它优先。
 	 */
 	font: z.string().default("PingFang SC, sans-serif"),
+	/**
+	 * 主人上传的字体文件资产 id(与卡片背景图同一套「落盘 + id 引用 +
+	 * 渲染期解析成 data URL」形态)。
+	 *
+	 * 设了就**优先于 `font`**:渲染期由服务端读盘拼成 `@font-face` 内联给模版。指向一个
+	 * 已被删掉的资产时静静回落 `font` —— 与背景图同一条纪律,不让一次删除把出图弄崩。
+	 */
+	fontAsset: z.string().optional(),
 	/**
 	 * 直播卡「数据区」各项显示开关(仅直播卡用;其它卡类型忽略)。数据区由原 `stats`(人气·
 	 * 点赞 + 分区)与 `follower`(粉丝数据)两块合并而来,这三个开关控制其内部具体显示哪几项。

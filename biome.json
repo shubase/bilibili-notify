@@ -1,5 +1,5 @@
 {
-	"$schema": "https://biomejs.dev/schemas/2.4.14/schema.json",
+	"$schema": "https://biomejs.dev/schemas/2.5.10/schema.json",
 	"root": true,
 	"files": {
 		"includes": [
@@ -7,20 +7,17 @@
 			"!**/node_modules",
 			"!**/lib",
 			"!**/dist",
-			"**/*.vue",
+			"!**/*.svg",
 			"!**/src/static",
 			"!**/.interface",
 			"!.bn-design",
 			"!.claude",
 			"!data",
 			"!apps/**/data",
+			"!apps/**/data.test-*",
 			"!apps/desktop/src-tauri/gen",
 			"!apps/desktop/src-tauri/resources",
-			"!apps/desktop/src-tauri/target",
-			"!astrbot/core/sidecar/app",
-			"!astrbot/core/pages",
-			"!astrbot/core/sidecar/state",
-			"!astrbot/core/sidecar/logs"
+			"!apps/desktop/src-tauri/target"
 		]
 	},
 	"formatter": {
@@ -34,7 +31,7 @@
 	"linter": {
 		"enabled": true,
 		"rules": {
-			"recommended": true,
+			"preset": "recommended",
 			"suspicious": {
 				"noExplicitAny": "warn"
 			},
@@ -44,6 +41,16 @@
 			}
 		}
 	},
+	"overrides": [
+		{
+			"includes": ["apps/web/**", "apps/desktop/src/**", "packages/ui/**"],
+			"linter": {
+				"domains": {
+					"react": "recommended"
+				}
+			}
+		}
+	],
 	"assist": {
 		"enabled": true,
 		"actions": {

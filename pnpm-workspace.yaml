@@ -1,34 +1,49 @@
 packages:
   - "packages/*"
-  - "koishi"
   - "apps/*"
-  - "astrbot/*"
 
-# Vite+ replaces vite via npm overrides rather than coexisting, and we scope the
-# override to each React frontend sub-tree — `@bilibili-notify/web>vite` /
-# `@bilibili-notify/astrbot-page>vite` match "vite" anywhere reachable from those
-# dep graphs (so @vitejs/plugin-react, @tailwindcss/vite etc. all fall under it),
-# but leave @koishijs/client → vite ^5.4.10 alone. Without the dependent prefix,
-# the override would also rewrite the koishi console UI's vite 5 to vite 8 (vp's
-# bundled vite), which is a 3-major-version jump with breaking config/plugin API.
-#
-# vitest is deliberately NOT overridden: it needs a real vite ^6/^7/^8, and root
-# declares `vitest` directly so pnpm nests it one. See vite.config.ts — dropping
-# that root declaration only breaks on a clean install, so it is easy to "verify"
-# as safe and still take CI down.
+# The pnpm version lives in package.json#packageManager (vp reads it and fetches
+# that pnpm on demand); nothing here pins it. Two things to know when bumping it:
+#   1. Since pnpm 12, `pnpm-lock.yaml` is TWO YAML documents. The first one is
+#      pnpm describing ITSELF — `packageManagerDependencies` plus a `@pnpm/exe.*`
+#      entry per platform, with integrity hashes. So a pnpm bump now shows up as
+#      a lockfile diff; that is expected, not drift. It is a record only, nothing
+#      gets materialized: there is still no `pnpm` in node_modules or on PATH.
+#   2. pnpm 12 errors on unknown keys here (ERR_PNPM_UNRECOGNIZED_WORKSPACE_
+#      SETTINGS) instead of silently ignoring them, so a typo'd setting fails the
+#      install rather than quietly doing nothing. Every key in this file is valid
+#      as of 12.1.0.
+# Note pnpm 12 is published under the `next-12` dist-tag; `latest` is still on
+# the 11 line, so `vp info pnpm` will look like 12 does not exist. Ask for it by
+# exact version.
+
+# Vite+ replaces vite via npm overrides rather than coexisting. The override is
+# scoped to each React frontend sub-tree — `@bilibili-notify/web>vite` matches
+# "vite" anywhere reachable from that dep graph (so @vitejs/plugin-react,
+# @tailwindcss/vite etc. all fall under it) — instead of the README's global
+# `vite:` form, so that nothing outside the frontends (vitest inside vite-plus,
+# vp pack) gets its vite silently swapped by a side effect. scripts/vite-alias.test.mjs
+# pins the invariant the overrides exist for: every frontend resolves bare `vite`
+# to the Vite+ core, on one version. A missing override is silent otherwise —
+# real vite also builds and tests fine, and only misbehaves at runtime.
 #
 # Bumping vite-plus? Three things move in lockstep, and missing any one of them
 # silently leaves half the toolchain on the old version:
 #   1. root `vite-plus` + `@voidzero-dev/vite-plus-core` devDeps
-#   2. the two overrides below (else the React frontends keep the old core)
-#   3. root `vitest` — vite-plus pins vitest EXACTLY (0.2.4 -> 4.1.10). Drift here
-#      installs a second vitest copy; @vitest/spy then has two identities and
-#      mocks stop matching, which surfaces as absurd test failures, not as a
-#      version error.
+#   2. the overrides below (else the React frontends keep the old core)
+#   3. apps/Dockerfile `VP_BUILDER_IMAGE` ARG — the Docker builder builds on the
+#      official toolchain image and must run the same vp as everywhere else.
+# Also: upgrade the global vp CLI FIRST (`vp upgrade`), then edit these
+# declarations — installing a newer vite-plus package with an older CLI has
+# corrupted the lockfile before (biome's entry took on vite-plus's resolution).
+# vitest is not declared at the root: vite-plus pins it exactly and brings its
+# own copy; a root declaration on a different version would install a second
+# vitest, and @vitest/spy would then have two identities (mocks stop matching,
+# which surfaces as absurd test failures, not as a version error).
 #
 # There used to be a fourth: a `minimumReleaseAgeExclude` list, carried forward
 # and version-bumped at each upgrade. It is gone because it was doing nothing.
-# pnpm 11's release-age floor defaults to 1440 min = 1 DAY, so any release we
+# pnpm's release-age floor defaults to 1440 min = 1 DAY, so any release we
 # adopt a day or more after publication clears it unaided (verified: install is
 # clean with no exclusions at all). The list only ever mattered for same-day
 # adoption, which is how it got added in the first place. If you ever must take a
@@ -37,19 +52,46 @@ packages:
 # those are published in the same minute. Otherwise: just wait 24h, which is the
 # entire point of the policy.
 overrides:
-  "@bilibili-notify/web>vite": "npm:@voidzero-dev/vite-plus-core@0.2.4"
-  "@bilibili-notify/astrbot-page>vite": "npm:@voidzero-dev/vite-plus-core@0.2.4"
+  "@bilibili-notify/web>vite": "npm:@voidzero-dev/vite-plus-core@0.3.0"
+  "@bilibili-notify/desktop>vite": "npm:@voidzero-dev/vite-plus-core@0.3.0"
 
-# Match the previous yarn classic-style flat hoist, so koishi's plugin loader
-# (which expects deps to live in a single hoisted node_modules tree) keeps
-# working as before. pnpm 11 reads nodeLinker from pnpm-workspace.yaml; the
-# old .npmrc (`node-linker=hoisted`) is no longer the source of truth at the
-# workspace level.
-nodeLinker: hoisted
+# Shared dependency versions. Every package declares these as `"<dep>": "catalog:"`;
+# the version lives only here, so a bump is one edit and per-package drift (the
+# historical @types/ws ^8.5 / ^8.18 split, desktop's vite alias stuck on 0.2.8)
+# cannot recur.
+#
+# One deliberate exclusion: vite stays out. The React frontends pin it through the
+# overrides above as part of the vite-plus lockstep (see that comment); a second
+# source of truth in the catalog would reintroduce the drift the overrides exist
+# to prevent.
+catalog:
+  "@tailwindcss/vite": ^4.3.3
+  "@testing-library/dom": ^10.4.1
+  "@testing-library/react": ^16.3.2
+  "@testing-library/user-event": ^14.6.1
+  "@types/luxon": ^3.7.5
+  "@types/qrcode": ^1.5.6
+  "@types/react": ^19.2.18
+  "@types/react-dom": ^19.2.5
+  "@types/ws": ^8.18.1
+  "@vitejs/plugin-react": ^6.1.0
+  cron: ^4.4.0
+  cross-env: ^10.1.0
+  fflate: ^0.8.3
+  jsdom: ^30.0.1
+  luxon: ^3.5.0
+  puppeteer-core: ^25.9.0
+  qrcode: ^1.5.4
+  react: ^19.2.8
+  react-dom: ^19.2.8
+  tailwindcss: ^4.3.3
+  tsx: ^4.23.12
+  ws: ^8.21.3
+  zod: ^4.4.3
 
-# pnpm 11 makes postinstall opt-in by default to mitigate supply-chain
+# pnpm 11+ makes postinstall opt-in by default to mitigate supply-chain
 # risk. Each entry below is a transitive dep that ships a build script.
-# All five are widely-used, well-known packages whose postinstalls are
+# All four are widely-used, well-known packages whose postinstalls are
 # benign (native binary builds + git-hook installer). Re-evaluate when
 # bumping versions; CI fails install if a *new* unapproved entry appears.
 allowBuilds:
@@ -57,4 +99,7 @@ allowBuilds:
   esbuild: true # downloads matching native binary
   lefthook: true # repo's git hooks installer (root prepare script)
   protobufjs: true # generates .js from .proto at install time
-  vue-demi: true # writes vue 2/3 shim at install time
+
+patchedDependencies:
+  css-tree: patches/css-tree.patch
+  jsdom: patches/jsdom.patch

@@ -1,17 +1,20 @@
 // @vitest-environment jsdom
 /**
- * AiChatDock 的开合与两种主视图。
+ * 聊天页(/chat)的开合与两种主视图。
  *
- * 重点钉三件在页面上不容易反复验的事:
- *   - 关着时**不发任何请求**(会话列表不该在后台被拉起来)
- *   - 主题色切换会落到 DOM 的 data-chat-theme 上 —— 整页配色全靠这个属性驱动,
- *     CSS 变量在 jsdom 里量不出来,但属性变没变量得出来
+ * 聊天是一条**路由**,不是盖在当前页上的 overlay:胶囊把主人送到 /chat,
+ * 「返回控制台」回来路。重点钉四件在页面上不容易反复验的事:
+ *   - 不在聊天页时**不发任何请求**(会话列表不该在后台被拉起来)
+ *   - 开合走路由:直接落在 /chat(书签)也能进、也回得去
+ *   - 四色预设已砍:chat 根不再挂 data-chat-theme,默认主题定义在 styles.css
+ *     的 :root 上,换观感一律走皮肤包
  *   - 有消息 / 没消息切两种版式(空态问候页 vs 消息流)
  */
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import type { ReactNode } from "react";
+import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
 const H = vi.hoisted(() => ({
@@ -31,6 +34,10 @@ const H = vi.hoisted(() => ({
 	toolEvents: [] as Array<Record<string, unknown>>,
 	/** 落盘后那条回复上带的工具痕迹 —— 交接与刷新之后靠它显示。 */
 	replyTools: null as Array<Record<string, unknown>> | null,
+	/** 思考分片,在工具与正文**之前**逐个吐 —— 先想后说,真实顺序就是这样。 */
+	reasoningChunks: [] as string[],
+	/** 落盘后那条回复上带的完整思考 —— 交接与刷新之后靠它显示。 */
+	replyReasoning: null as string | null,
 }));
 
 vi.mock("../../../services/aiChat", async (orig) => {
@@ -80,8 +87,17 @@ vi.mock("../../../services/aiChat", async (orig) => {
 			async (
 				_id: string,
 				message: string,
-				h: { onDelta: (t: string) => void; onTool?: (ev: Record<string, unknown>) => void },
+				h: {
+					onDelta: (t: string) => void;
+					onTool?: (ev: Record<string, unknown>) => void;
+					onReasoning?: (t: string) => void;
+				},
 			) => {
+				// 思考先于一切 —— 她是想完才决定查什么、说什么的。
+				for (const t of H.reasoningChunks) {
+					await new Promise<void>((r) => H.gate.push(r));
+					h.onReasoning?.(t);
+				}
 				// 工具轮排在正文之前 —— 她是查完才开口的。
 				for (const ev of H.toolEvents) {
 					await new Promise<void>((r) => H.gate.push(r));
@@ -98,6 +114,7 @@ vi.mock("../../../services/aiChat", async (orig) => {
 					content: H.chunks.join(""),
 					ts: "2026-07-25T00:00:01.000Z",
 					...(H.replyTools ? { tools: H.replyTools } : {}),
+					...(H.replyReasoning ? { reasoning: H.replyReasoning } : {}),
 				};
 				const user = {
 					id: "u1",
@@ -117,6 +134,8 @@ vi.mock("../../../services/aiChat", async (orig) => {
 						createdAt: "2026-07-25T00:00:00.000Z",
 						updatedAt: "2026-07-25T00:00:01.000Z",
 						messageCount: 2,
+						mode: "chat",
+						persona: true,
 					},
 				};
 			},
@@ -127,25 +146,65 @@ vi.mock("../../../services/aiChat", async (orig) => {
 const G = vi.hoisted(() => ({
 	ai: {
 		// 模型名住在当前生效的那个服务商桶里(各家一套配置)。
-		provider: "deepseek",
+		activeProfile: "deepseek",
 		providers: { deepseek: { model: "gpt-test" } },
 		persona: { name: "小绫", addressSelf: "小绫", addressUser: "主人" },
 	} as Record<string, unknown>,
 }));
 
 vi.mock("../../../services/api", () => ({
-	api: { get: vi.fn(async () => ({ defaults: { ai: G.ai } })) },
+	api: {
+		get: vi.fn(async (path: string) =>
+			// 技能清单与全局配置走同一个 get,按路径分流 —— 一律回 globals 的话,
+			// 斜杠菜单那份清单永远是空的,空态那句引导语也就永远不出现。
+			path.startsWith("/api/maid-skills")
+				? {
+						list: [
+							{
+								name: "weekly-report",
+								description: "评选本周鸽王",
+								disableModelInvocation: false,
+								body: "步骤",
+								builtin: true,
+							},
+						],
+						problems: [],
+					}
+				: { defaults: { ai: G.ai } },
+		),
+	},
 }));
 
 import { createConversation, retitleConversation, sendChatMessage } from "../../../services/aiChat";
-import { DEFAULT_GLASS_OPACITY, useAiChatStore } from "../../../store/aiChat";
+import { useAiChatStore } from "../../../store/aiChat";
 import { useAuthStore } from "../../../store/auth";
 import { BiliLoginStatus } from "../../../types/auth";
-import { AiChatDock } from "../index";
+import { AiChatDock, ChatPage } from "../index";
 
-function wrap(node: ReactNode) {
+/** ChatPage 用 useNavigate / useLocation,得裹在 Router 里;单渲染聊天页时来路无所谓。 */
+function wrap(node: ReactNode, initialPath = "/chat") {
 	const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-	return <QueryClientProvider client={qc}>{node}</QueryClientProvider>;
+	return (
+		<QueryClientProvider client={qc}>
+			<MemoryRouter initialEntries={[initialPath]}>{node}</MemoryRouter>
+		</QueryClientProvider>
+	);
+}
+
+/**
+ * 完整的开合链路:胶囊 + 两条路由。验「点胶囊进得去、返回出得来」必须两页都在 ——
+ * 只渲染 ChatPage 的话,导航发生了也看不见任何变化。
+ */
+function shell() {
+	return (
+		<>
+			<AiChatDock />
+			<Routes>
+				<Route path="/" element={<div data-testid="console-page" />} />
+				<Route path="/chat" element={<ChatPage />} />
+			</Routes>
+		</>
+	);
 }
 
 beforeEach(() => {
@@ -159,22 +218,17 @@ beforeEach(() => {
 	H.convGate = [];
 	H.toolEvents = [];
 	H.replyTools = null;
+	H.reasoningChunks = [];
+	H.replyReasoning = null;
 	vi.mocked(createConversation).mockClear();
 	vi.mocked(retitleConversation).mockClear();
 	G.ai = {
 		// 模型名住在当前生效的那个服务商桶里(各家一套配置)。
-		provider: "deepseek",
+		activeProfile: "deepseek",
 		providers: { deepseek: { model: "gpt-test" } },
 		persona: { name: "小绫", addressSelf: "小绫", addressUser: "主人" },
 	};
-	useAiChatStore.setState({
-		open: false,
-		rail: true,
-		theme: "lime",
-		activeId: null,
-		glassOpacity: DEFAULT_GLASS_OPACITY,
-		glassClear: false,
-	});
+	useAiChatStore.setState({ rail: true, activeId: null });
 });
 afterEach(() => {
 	// 卸载前把还挂着的 getConversation 放掉,免得未 settle 的 promise 跨用例悬着。
@@ -182,16 +236,30 @@ afterEach(() => {
 	cleanup();
 });
 
-describe("AiChatDock — 收起态", () => {
+describe("AiChatDock — 不在聊天页时", () => {
 	it("只显示右下角那颗胶囊", () => {
-		render(wrap(<AiChatDock />));
+		render(wrap(shell(), "/"));
 		expect(screen.getByTitle("打开女仆 AI 聊天")).toBeTruthy();
-		expect(screen.queryByRole("dialog")).toBeNull();
+		expect(screen.queryByRole("region")).toBeNull();
 	});
 
-	it("关着时一个请求都不发 —— 不在后台悄悄拉会话列表", async () => {
+	/**
+	 * 这颗胶囊是**全局**入口,又长着一副自成一套的样子(`.bn-ai-fab`:自带渐变、
+	 * 玻璃、流光)。不挂 hook 的话,皮肤 CSS 一个字都够不到它 —— 整站换成像素窗口,
+	 * 只有右下角这颗还是圆头紫胶囊(2026-08-20 主人真机指出)。
+	 *
+	 * 断言挂点而不是断言样式:挂上 `btn btn-primary`,皮肤 CSS 是无层 author 样式,
+	 * 压得过 `.bn-ai-fab` 所在的 `@layer components`,想接管什么就接管什么。
+	 */
+	it("挂着皮肤挂点 —— 否则皮肤够不到这颗全局胶囊", () => {
+		render(wrap(shell(), "/"));
+		const fab = screen.getByTitle("打开女仆 AI 聊天");
+		expect(fab.getAttribute("data-bn")?.split(/\s+/)).toContain("btn-primary");
+	});
+
+	it("一个请求都不发 —— 不在后台悄悄拉会话列表", async () => {
 		// 这颗胶囊在每一页都挂着,顺手起个轮询就是全站常驻的无谓流量。
-		render(wrap(<AiChatDock />));
+		render(wrap(shell(), "/"));
 		await new Promise((r) => setTimeout(r, 20));
 		expect(H.listCalls).toBe(0);
 	});
@@ -201,25 +269,50 @@ describe("AiChatDock — 收起态", () => {
 		// 恒压过 @layer utilities 里的 .fixed —— 按钮回到常规流,再叠上 display:flex
 		// 就摊成了一整条横幅。样式表那边已改成 @layer components;这里守住调用处
 		// 确实挂了定位类(jsdom 没有 layout,量不出实际位置,只能查类名)。
-		render(wrap(<AiChatDock />));
+		render(wrap(shell(), "/"));
 		const fab = screen.getByTitle("打开女仆 AI 聊天");
 		expect(fab.className).toContain("fixed");
 		expect(fab.className).toContain("right-5");
 	});
 });
 
-describe("AiChatDock — 展开态", () => {
-	it("点胶囊展开整页聊天", async () => {
-		render(wrap(<AiChatDock />));
+describe("聊天页 — 路由开合", () => {
+	it("点胶囊 → 去 /chat,整页聊天出现", async () => {
+		render(wrap(shell(), "/"));
 		screen.getByTitle("打开女仆 AI 聊天").click();
-		await waitFor(() => expect(screen.getByRole("dialog", { name: "女仆 AI 聊天" })).toBeTruthy());
+		await waitFor(() => expect(screen.getByRole("region", { name: "女仆 AI 聊天" })).toBeTruthy());
 	});
 
-	it("没有消息 → 空态问候页,带技能胶囊", async () => {
-		useAiChatStore.setState({ open: true });
-		render(wrap(<AiChatDock />));
+	it("聊天页上胶囊不再显示 —— 自己叠在自己的入口上没有意义", async () => {
+		render(wrap(shell(), "/chat"));
+		await screen.findByRole("region", { name: "女仆 AI 聊天" });
+		expect(screen.queryByTitle("打开女仆 AI 聊天")).toBeNull();
+	});
+
+	it("「返回控制台」回来路,胶囊回来", async () => {
+		render(wrap(shell(), "/"));
+		screen.getByTitle("打开女仆 AI 聊天").click();
+		await screen.findByRole("region", { name: "女仆 AI 聊天" });
+
+		screen.getByText("返回控制台").click();
+		await waitFor(() => expect(screen.getByTestId("console-page")).toBeTruthy());
+		expect(screen.queryByRole("region")).toBeNull();
+		expect(screen.getByTitle("打开女仆 AI 聊天")).toBeTruthy();
+	});
+
+	it("直接落在 /chat(书签 / 手输网址)→ 「返回控制台」回首页,不是退出站点", async () => {
+		// 历史里没有上一页,navigate(-1) 无处可退 —— 这时必须显式回 /。
+		render(wrap(shell(), "/chat"));
+		(await screen.findByText("返回控制台")).click();
+		await waitFor(() => expect(screen.getByTestId("console-page")).toBeTruthy());
+	});
+
+	it("没有消息 → 空态问候页,带一句「打个 / 」的引导", async () => {
+		// 技能胶囊那一排整个拆了(ADR-0001 决策 10):技能改成主人自己写的之后,
+		// 预置几枚胶囊就成了「我们替他挑的那几条」;斜杠菜单本身就是完整目录。
+		render(wrap(<ChatPage />));
 		await waitFor(() => expect(screen.getByText(/今天想让小绫帮主人做点什么呢/)).toBeTruthy());
-		expect(screen.getByText("评选鸽王与勤奋 UP,毒舌锐评")).toBeTruthy();
+		await waitFor(() => expect(screen.getByText(/看看小绫会做的事/)).toBeTruthy());
 	});
 
 	it("有消息 → 切成消息流,不再显示问候页", async () => {
@@ -227,19 +320,12 @@ describe("AiChatDock — 展开态", () => {
 			{ id: "m1", role: "user", content: "本周谁最勤奋", ts: "2026-07-24T00:00:00.000Z" },
 			{ id: "m2", role: "assistant", content: "小铃看了一下～", ts: "2026-07-24T00:00:01.000Z" },
 		];
-		useAiChatStore.setState({ open: true, activeId: "c1" });
-		render(wrap(<AiChatDock />));
+		useAiChatStore.setState({ activeId: "c1" });
+		render(wrap(<ChatPage />));
 
 		await waitFor(() => expect(screen.getByText("本周谁最勤奋")).toBeTruthy());
 		expect(screen.getByText("小铃看了一下～")).toBeTruthy();
 		expect(screen.queryByText(/今天想让小铃帮主人做点什么呢/)).toBeNull();
-	});
-
-	it("「返回控制台」收回胶囊态", async () => {
-		useAiChatStore.setState({ open: true });
-		render(wrap(<AiChatDock />));
-		screen.getByText("返回控制台").click();
-		await waitFor(() => expect(screen.getByTitle("打开女仆 AI 聊天")).toBeTruthy());
 	});
 });
 
@@ -266,8 +352,8 @@ describe("AiChatDock — 发送与流式渲染", () => {
 	}
 
 	async function typeAndSend(text: string) {
-		useAiChatStore.setState({ open: true, activeId: "c1" });
-		render(wrap(<AiChatDock />));
+		useAiChatStore.setState({ activeId: "c1" });
+		render(wrap(<ChatPage />));
 		const ta = await screen.findByLabelText("聊天输入");
 		fireEvent.change(ta, { target: { value: text } });
 		fireEvent.keyDown(ta, { key: "Enter" });
@@ -384,6 +470,8 @@ describe("AiChatDock — 发送与流式渲染", () => {
 						createdAt: "2026-07-25T00:00:00.000Z",
 						updatedAt: "2026-07-25T00:00:03.000Z",
 						messageCount: 4,
+						mode: "chat",
+						persona: true,
 					},
 				};
 			});
@@ -409,8 +497,7 @@ describe("AiChatDock — 发送与流式渲染", () => {
 	});
 
 	it("发出去之后立刻离开空态问候页", async () => {
-		useAiChatStore.setState({ open: true });
-		render(wrap(<AiChatDock />));
+		render(wrap(<ChatPage />));
 		const ta = await screen.findByLabelText("聊天输入");
 		fireEvent.change(ta, { target: { value: "在吗" } });
 		fireEvent.keyDown(ta, { key: "Enter" });
@@ -432,8 +519,8 @@ describe("AiChatDock — Markdown 渲染", () => {
 	const inChat = () => within(screen.getByTestId("chat-messages"));
 
 	async function typeAndSend(text: string) {
-		useAiChatStore.setState({ open: true, activeId: "c1" });
-		render(wrap(<AiChatDock />));
+		useAiChatStore.setState({ activeId: "c1" });
+		render(wrap(<ChatPage />));
 		const ta = await screen.findByLabelText("聊天输入");
 		fireEvent.change(ta, { target: { value: text } });
 		fireEvent.keyDown(ta, { key: "Enter" });
@@ -457,8 +544,8 @@ describe("AiChatDock — Markdown 渲染", () => {
 				ts: "2026-07-24T00:00:01.000Z",
 			},
 		];
-		useAiChatStore.setState({ open: true, activeId: "c1" });
-		render(wrap(<AiChatDock />));
+		useAiChatStore.setState({ activeId: "c1" });
+		render(wrap(<ChatPage />));
 		await waitFor(() => expect(inChat().getByText("重点")).toBeTruthy());
 		expect(inChat().getByText("重点").tagName).toBe("STRONG");
 		expect(screen.getByTestId("chat-messages").querySelectorAll("li")).toHaveLength(2);
@@ -507,8 +594,8 @@ describe("AiChatDock — 工具调用小条", () => {
 	const chips = () => inChat().queryAllByTestId("tool-trace");
 
 	async function typeAndSend(text: string) {
-		useAiChatStore.setState({ open: true, activeId: "c1" });
-		render(wrap(<AiChatDock />));
+		useAiChatStore.setState({ activeId: "c1" });
+		render(wrap(<ChatPage />));
 		const ta = await screen.findByLabelText("聊天输入");
 		fireEvent.change(ta, { target: { value: text } });
 		fireEvent.keyDown(ta, { key: "Enter" });
@@ -530,6 +617,7 @@ describe("AiChatDock — 工具调用小条", () => {
 		args,
 	});
 	const end = (id: string, ok: boolean) => ({ phase: "end", id, ok });
+	const progress = (id: string, chars: number) => ({ phase: "progress", id, chars });
 
 	it("工具一开跑就冒出一条小条,正文一个字都还没到", async () => {
 		H.toolEvents = [start("0-0", "list_subscriptions")];
@@ -558,6 +646,80 @@ describe("AiChatDock — 工具调用小条", () => {
 		await release();
 		await waitFor(() => expect(chips()[0]?.dataset.state).toBe("failed"));
 		expect(chips()[0]?.textContent).toContain("查看直播状态");
+	});
+
+	it("入参被截短了 → 小条能点开,看得到完整那一段", async () => {
+		// brief 是主人唯一能核对「女仆理解对了没」的东西,几百字压成十几个字之后
+		// 界面上原本再没有别的地方看得到它 —— 连悬停提示用的都是截断后的那份。
+		H.toolEvents = [
+			start("0-0", "create_skin", {
+				brief:
+					"以《主播女孩重度依赖》超天酱为主题的暗色霓虹风格皮肤。整体氛围是赛博网络主播舞台的绚烂与危险感，暗色底上叠加糖果粉与薄荷青作为霓虹高光。",
+			}),
+		];
+		await typeAndSend("做套皮肤");
+		await release();
+		await waitFor(() => expect(chips()).toHaveLength(1));
+
+		const chip = chips()[0] as HTMLElement;
+		expect(chip.getAttribute("aria-expanded")).toBe("false");
+		fireEvent.click(chip);
+		await waitFor(() => expect(chip.getAttribute("aria-expanded")).toBe("true"));
+		expect(inChat().getByText(/绚烂与危险感/)).toBeTruthy();
+
+		// 再点收起 —— 一整段需求占着屏幕,得赶得走。
+		fireEvent.click(chip);
+		await waitFor(() => expect(inChat().queryByText(/绚烂与危险感/)).toBeNull());
+	});
+
+	it("入参本来就短 → 不给展开钮,点了也没有别的东西可看", async () => {
+		H.toolEvents = [start("0-0", "search_user", { keyword: "咩栗" })];
+		await typeAndSend("找找咩栗");
+		await release();
+		await waitFor(() => expect(chips()).toHaveLength(1));
+		expect(chips()[0]?.getAttribute("aria-expanded")).toBeNull();
+	});
+
+	it("进度长在小条上 —— 一趟几分钟的活儿不能只有一个转圈", async () => {
+		// 做一套皮肤要几分钟,而工具轮不产生正文:没有这个数字,主人只能盯着一个
+		// 转圈猜她是在写还是已经死了。
+		H.toolEvents = [start("0-0", "list_subscriptions"), progress("0-0", 860)];
+		await typeAndSend("我订了谁");
+		await release();
+		await waitFor(() => expect(chips()).toHaveLength(1));
+		await release();
+		await waitFor(() => expect(chips()[0]?.textContent).toContain("860"));
+		// 报进度不等于收尾 —— 还在跑。
+		expect(chips()[0]?.dataset.state).toBe("running");
+	});
+
+	it("收了尾也留着总数 —— 「这趟写了多少」是结果的一部分", async () => {
+		H.toolEvents = [start("0-0", "list_subscriptions"), progress("0-0", 860), end("0-0", true)];
+		await typeAndSend("我订了谁");
+		await release();
+		await release();
+		await release();
+		await waitFor(() => expect(chips()[0]?.dataset.state).toBe("ok"));
+		expect(chips()[0]?.textContent).toContain("860");
+	});
+
+	it("上千之后收成 k —— 精确到个位只会看见一个乱跳的计数器", async () => {
+		H.toolEvents = [start("0-0", "list_subscriptions"), progress("0-0", 3247)];
+		await typeAndSend("我订了谁");
+		await release();
+		await release();
+		await waitFor(() => expect(chips()[0]?.textContent).toContain("3.2k"));
+		expect(chips()[0]?.textContent).not.toContain("3247");
+	});
+
+	it("没写成就不报数 —— 半截的字数说明不了什么", async () => {
+		H.toolEvents = [start("0-0", "list_subscriptions"), progress("0-0", 860), end("0-0", false)];
+		await typeAndSend("我订了谁");
+		await release();
+		await release();
+		await release();
+		await waitFor(() => expect(chips()[0]?.dataset.state).toBe("failed"));
+		expect(chips()[0]?.textContent).not.toContain("860");
 	});
 
 	it("入参带进小条 —— 「搜了什么」比「搜过」有用得多", async () => {
@@ -595,6 +757,39 @@ describe("AiChatDock — 工具调用小条", () => {
 		expect(chips()[0]?.dataset.state).toBe("ok");
 	});
 
+	it("展开着 brief 时回复落盘 —— 不能在交接那一刻塌下去", async () => {
+		// 在途那份小条和落盘那份是两个不同的渲染位置,展开态放在小条自己身上就会
+		// 随实例一起没掉:主人正读着几百字的需求,女仆一说完就啪地合上。思考块那条
+		// 「不能在最后一刻塌下去」是同一类事故。
+		H.toolEvents = [
+			start("0-0", "create_skin", {
+				brief:
+					"以《主播女孩重度依赖》超天酱为主题的暗色霓虹风格皮肤。整体氛围是赛博网络主播舞台的绚烂与危险感，暗色底上叠加糖果粉与薄荷青作为霓虹高光。",
+			}),
+			end("0-0", false),
+		];
+		H.replyTools = [
+			{
+				name: "create_skin",
+				args: {
+					brief:
+						"以《主播女孩重度依赖》超天酱为主题的暗色霓虹风格皮肤。整体氛围是赛博网络主播舞台的绚烂与危险感，暗色底上叠加糖果粉与薄荷青作为霓虹高光。",
+				},
+				ok: false,
+			},
+		];
+		await typeAndSend("做套皮肤");
+		await release();
+		fireEvent.click(chips()[0] as HTMLElement);
+		await waitFor(() => expect(inChat().getByText(/绚烂与危险感/)).toBeTruthy());
+
+		await release();
+		await release();
+		await release();
+		await waitFor(() => expect(inChat().getByText("主人晚上好")).toBeTruthy());
+		expect(inChat().queryByText(/绚烂与危险感/)).toBeTruthy();
+	});
+
 	it("重开一个老会话也看得到她当时查过什么", async () => {
 		H.messages = [
 			{ id: "m1", role: "user", content: "我订了谁", ts: "2026-07-24T00:00:00.000Z" },
@@ -606,8 +801,8 @@ describe("AiChatDock — 工具调用小条", () => {
 				tools: [{ name: "list_subscriptions", args: {}, ok: true }],
 			},
 		];
-		useAiChatStore.setState({ open: true, activeId: "c1" });
-		render(wrap(<AiChatDock />));
+		useAiChatStore.setState({ activeId: "c1" });
+		render(wrap(<ChatPage />));
 		await waitFor(() => expect(inChat().getByText("一共 3 位")).toBeTruthy());
 		expect(chips()).toHaveLength(1);
 		expect(chips()[0]?.textContent).toContain("查看订阅列表");
@@ -632,58 +827,117 @@ describe("AiChatDock — 工具调用小条", () => {
 	});
 });
 
-describe("AiChatDock — 玻璃质感设置落到 DOM", () => {
-	/**
-	 * jsdom 没有布局也不算 calc,所以这里只验**交界**:设置有没有送到 CSS 手上。
-	 * 送到之后长什么样(alpha 缩放、磨砂去没去掉)是 CSS 的事,只能真机看。
-	 */
-	const glassVars = async () => {
-		const dialog = await screen.findByRole("dialog");
-		return {
-			glass: dialog.style.getPropertyValue("--bn-chat-glass"),
-			blur: dialog.style.getPropertyValue("--bn-chat-blur"),
-			saturate: dialog.style.getPropertyValue("--bn-chat-saturate"),
-		};
-	};
+/**
+ * 思考预览(DeepSeek 式)—— 思考模型「先想后说」的那段草稿,实时streaming、
+ * 折叠可看。它跟工具小条解决同一类问题:回答到来之前那十几秒不能是一片死寂,
+ * 而思考恰恰是那段时间里唯一真实发生着的事。
+ */
+describe("AiChatDock — 思考预览", () => {
+	const inChat = () => within(screen.getByTestId("chat-messages"));
+	const block = () => inChat().queryByTestId("thinking-block");
 
-	/**
-	 * 主人报的:拉到最低时显出了背景色,却**比背景本身还鲜艳**。
-	 *
-	 * 元凶是 backdrop-filter 里的 saturate —— 它加工的是**背后**的像素。底色实的
-	 * 时候被白层盖着看不出来,底色一透,它还在那儿把背后的主题辉光按倍数放大。
-	 * 所以饱和度必须跟着透明度一起退场:玻璃都没了,就不该再给背景加料。
-	 */
-	it("拉到最低时饱和度回到 1 —— 玻璃没了就不该再给背景加料", async () => {
-		useAiChatStore.setState({ open: true, glassOpacity: 0 });
-		render(wrap(<AiChatDock />));
-		expect((await glassVars()).saturate).toBe("1");
+	async function typeAndSend(text: string) {
+		useAiChatStore.setState({ activeId: "c1" });
+		render(wrap(<ChatPage />));
+		const ta = await screen.findByLabelText("聊天输入");
+		fireEvent.change(ta, { target: { value: text } });
+		fireEvent.keyDown(ta, { key: "Enter" });
+	}
+
+	async function release() {
+		await waitFor(() => expect(H.gate.length).toBeGreaterThan(0));
+		const open = H.gate.shift();
+		await act(async () => {
+			open?.();
+		});
+	}
+
+	it("思考分片实时上屏 —— 正文一个字都没到,也看得见她在想什么", async () => {
+		H.reasoningChunks = ["主人在问", "天气"];
+		await typeAndSend("明天天气如何");
+		await release();
+		await waitFor(() => expect(block()?.textContent).toContain("主人在问"));
+		// 还在想:标头是进行时。
+		expect(block()?.textContent).toContain("思考中");
+		// 正文区确实还没开口。
+		expect(inChat().queryByText(/晚上好/)).toBeNull();
+		await release();
+		await waitFor(() => expect(block()?.textContent).toContain("主人在问天气"));
 	});
 
-	it("完全透明同理 —— 三个值一起退到「这块玻璃不存在」", async () => {
-		useAiChatStore.setState({ open: true, glassClear: true });
-		render(wrap(<AiChatDock />));
-		expect(await glassVars()).toEqual({ glass: "0", blur: "0", saturate: "1" });
+	it("正文一开口,标头翻成「已深度思考」", async () => {
+		H.reasoningChunks = ["想想"];
+		await typeAndSend("在吗");
+		await release(); // 思考
+		await release(); // 第一片正文
+		await waitFor(() => expect(inChat().getByText("主人")).toBeTruthy());
+		expect(block()?.textContent).toContain("已深度思考");
+		expect(block()?.textContent).not.toContain("思考中");
 	});
 
-	it("透明度直接就是 alpha,原样送到 CSS 手上", async () => {
-		useAiChatStore.setState({ open: true, glassOpacity: 0.4 });
-		render(wrap(<AiChatDock />));
-		// 饱和度跟着走:1(不加料)→ 1.8(满档质感)之间线性。
-		expect(await glassVars()).toEqual({ glass: "0.4", blur: "1", saturate: "1.4" });
+	it("落盘交接后思考还在,而且保持展开 —— 不能在最后一刻塌下去", async () => {
+		H.reasoningChunks = ["想想"];
+		H.replyReasoning = "想想";
+		await typeAndSend("在吗");
+		await release();
+		await release();
+		await release();
+		await waitFor(() => expect(inChat().getByText("主人晚上好")).toBeTruthy());
+		// 真身接手之后草稿还挂在原地、开着。
+		expect(block()?.textContent).toContain("想想");
 	});
 
-	it("默认那一档也照常送出去", async () => {
-		useAiChatStore.setState({ open: true });
-		render(wrap(<AiChatDock />));
-		expect((await glassVars()).glass).toBe(String(DEFAULT_GLASS_OPACITY));
+	it("点标头折叠,再点展开 —— 长思考不能占着整屏赶不走", async () => {
+		H.reasoningChunks = ["一大段思考"];
+		await typeAndSend("在吗");
+		await release();
+		await waitFor(() => expect(block()?.textContent).toContain("一大段思考"));
+
+		fireEvent.click(within(block() as HTMLElement).getByRole("button"));
+		expect(block()?.textContent).not.toContain("一大段思考");
+
+		fireEvent.click(within(block() as HTMLElement).getByRole("button"));
+		expect(block()?.textContent).toContain("一大段思考");
 	});
 
-	it("完全透明压过滑块 —— 拉过的值留着,但这会儿不算数", async () => {
-		useAiChatStore.setState({ open: true, glassOpacity: 0.5, glassClear: true });
-		render(wrap(<AiChatDock />));
-		expect((await glassVars()).glass).toBe("0");
-		// store 里那一档没被抹掉,关掉完全透明就回得去。
-		expect(useAiChatStore.getState().glassOpacity).toBe(0.5);
+	it("重开老会话:默认折叠成一行「已深度思考」,点开才看全文", async () => {
+		H.messages = [
+			{ id: "m1", role: "user", content: "在吗", ts: "2026-07-24T00:00:00.000Z" },
+			{
+				id: "m2",
+				role: "assistant",
+				content: "在的",
+				ts: "2026-07-24T00:00:01.000Z",
+				reasoning: "主人在确认我在不在",
+			},
+		];
+		useAiChatStore.setState({ activeId: "c1" });
+		render(wrap(<ChatPage />));
+		await waitFor(() => expect(inChat().getByText("在的")).toBeTruthy());
+		// 折叠态:标头在,正文不在。
+		expect(block()?.textContent).toContain("已深度思考");
+		expect(block()?.textContent).not.toContain("主人在确认我在不在");
+
+		fireEvent.click(within(block() as HTMLElement).getByRole("button"));
+		expect(block()?.textContent).toContain("主人在确认我在不在");
+	});
+
+	it("没思考的回复不画这个块 —— 非思考模型的对话不该多一行摆设", async () => {
+		await typeAndSend("在吗");
+		await release();
+		await release();
+		await waitFor(() => expect(inChat().getByText("主人晚上好")).toBeTruthy());
+		expect(block()).toBeNull();
+	});
+});
+
+describe("AiChatDock — 玻璃质感不再有 chat 专属参数", () => {
+	it("chat 根不再写玻璃内联变量 —— 玻璃族直接吃 --bn-glass-* token,调玻璃走皮肤编辑器", async () => {
+		render(wrap(<ChatPage />));
+		const dialog = await screen.findByRole("region");
+		expect(dialog.style.getPropertyValue("--bn-chat-glass")).toBe("");
+		expect(dialog.style.getPropertyValue("--bn-chat-blur")).toBe("");
+		expect(dialog.style.getPropertyValue("--bn-chat-saturate")).toBe("");
 	});
 });
 
@@ -696,8 +950,8 @@ describe("AiChatDock — 开启新对话", () => {
 	 */
 	it("只回到空态,不去服务端建一个空会话", async () => {
 		H.messages = [{ id: "m1", role: "user", content: "你好", ts: "2026-07-25T00:00:00.000Z" }];
-		useAiChatStore.setState({ open: true, activeId: "c1" });
-		render(wrap(<AiChatDock />));
+		useAiChatStore.setState({ activeId: "c1" });
+		render(wrap(<ChatPage />));
 		await waitFor(() => expect(screen.getByTestId("chat-messages")).toBeTruthy());
 
 		fireEvent.click(screen.getByText("开启新对话"));
@@ -707,8 +961,8 @@ describe("AiChatDock — 开启新对话", () => {
 	});
 
 	it("退回空态后再发一句,这时才建会话", async () => {
-		useAiChatStore.setState({ open: true, activeId: "c1" });
-		render(wrap(<AiChatDock />));
+		useAiChatStore.setState({ activeId: "c1" });
+		render(wrap(<ChatPage />));
 		fireEvent.click(await screen.findByText("开启新对话"));
 		expect(vi.mocked(createConversation)).not.toHaveBeenCalled();
 
@@ -726,7 +980,7 @@ describe("AiChatDock — AI 起标题", () => {
 	 * 那一列就全是同一个词。聊完第一轮让女仆看一眼,起个概括主题的名字。
 	 */
 	async function sendOnce(text: string) {
-		render(wrap(<AiChatDock />));
+		render(wrap(<ChatPage />));
 		const ta = await screen.findByLabelText("聊天输入");
 		fireEvent.change(ta, { target: { value: text } });
 		fireEvent.keyDown(ta, { key: "Enter" });
@@ -740,7 +994,7 @@ describe("AiChatDock — AI 起标题", () => {
 	}
 
 	it("第一轮聊完 → 去要一个标题", async () => {
-		useAiChatStore.setState({ open: true, activeId: "c1" });
+		useAiChatStore.setState({ activeId: "c1" });
 		await sendOnce("你好");
 		await waitFor(() => expect(vi.mocked(retitleConversation)).toHaveBeenCalled());
 		// react-query 会往 mutationFn 里多塞一个 context 参数,只看第一个实参。
@@ -767,12 +1021,14 @@ describe("AiChatDock — AI 起标题", () => {
 					createdAt: "2026-07-20T00:00:00.000Z",
 					updatedAt: "2026-07-25T00:00:03.000Z",
 					messageCount: 8,
-					// 老文件里没有这个字段。
+					mode: "chat",
+					persona: true,
+					// 老文件里没有 autoTitled 这个字段。
 				},
 			};
 		});
-		useAiChatStore.setState({ open: true, activeId: "c1" });
-		render(wrap(<AiChatDock />));
+		useAiChatStore.setState({ activeId: "c1" });
+		render(wrap(<ChatPage />));
 		const ta = await screen.findByLabelText("聊天输入");
 		fireEvent.change(ta, { target: { value: "再问一句" } });
 		fireEvent.keyDown(ta, { key: "Enter" });
@@ -781,7 +1037,7 @@ describe("AiChatDock — AI 起标题", () => {
 	});
 
 	it("已经起过名字的会话不再要 —— 路标不该被反复挪", async () => {
-		useAiChatStore.setState({ open: true, activeId: "c1" });
+		useAiChatStore.setState({ activeId: "c1" });
 		await sendOnce("你好");
 		await waitFor(() => expect(vi.mocked(retitleConversation)).toHaveBeenCalledTimes(1));
 
@@ -795,6 +1051,8 @@ describe("AiChatDock — AI 起标题", () => {
 				createdAt: "2026-07-25T00:00:00.000Z",
 				updatedAt: "2026-07-25T00:00:03.000Z",
 				messageCount: 4,
+				mode: "chat",
+				persona: true,
 				// 第一轮已经起过名字了,服务端在这里回 true。
 				autoTitled: true,
 			},
@@ -809,40 +1067,20 @@ describe("AiChatDock — AI 起标题", () => {
 
 	it("起名失败不打扰主人 —— 刚聊完的界面上不该冒红字", async () => {
 		vi.mocked(retitleConversation).mockRejectedValueOnce(new Error("402 余额不足"));
-		useAiChatStore.setState({ open: true, activeId: "c1" });
+		useAiChatStore.setState({ activeId: "c1" });
 		await sendOnce("你好");
 		await waitFor(() => expect(vi.mocked(retitleConversation)).toHaveBeenCalled());
 		expect(screen.queryByRole("alert")).toBeNull();
 	});
 });
 
-describe("AiChatDock — 设置弹层里的玻璃质感两项", () => {
-	async function openSettings() {
-		useAiChatStore.setState({ open: true });
-		render(wrap(<AiChatDock />));
+describe("AiChatDock — 设置弹层不再有玻璃质感项", () => {
+	it("滑杆与完全透明开关都不在了 —— 玻璃调整只属于皮肤编辑器", async () => {
+		render(wrap(<ChatPage />));
 		fireEvent.click(await screen.findByLabelText("聊天设置"));
-	}
-
-	it("滑块拉一下,透明度跟着走", async () => {
-		await openSettings();
-		const slider = screen.getByLabelText("玻璃片透明度") as HTMLInputElement;
-		expect(slider.value).toBe(String(DEFAULT_GLASS_OPACITY));
-		fireEvent.change(slider, { target: { value: "0.3" } });
-		expect(useAiChatStore.getState().glassOpacity).toBe(0.3);
-	});
-
-	it("完全透明开关翻一下就生效", async () => {
-		await openSettings();
-		fireEvent.click(screen.getByLabelText("完全透明(去磨砂模糊)"));
-		expect(useAiChatStore.getState().glassClear).toBe(true);
-	});
-
-	it("开着完全透明时滑块禁用 —— 拉了也不生效,就别让人白拉", async () => {
-		// 不是把滑块藏起来:藏掉的话主人看不见自己原来调的是哪一档,关掉完全透明
-		// 之后会突然跳回一个记不得的值。留在原地、灰着,才看得出「等下就回来」。
-		useAiChatStore.setState({ glassClear: true });
-		await openSettings();
-		expect((screen.getByLabelText("玻璃片透明度") as HTMLInputElement).disabled).toBe(true);
+		await waitFor(() => expect(screen.getByText("思考深度")).toBeTruthy());
+		expect(screen.queryByLabelText("玻璃片透明度")).toBeNull();
+		expect(screen.queryByLabelText("完全透明(去磨砂模糊)")).toBeNull();
 	});
 });
 
@@ -853,22 +1091,20 @@ describe("AiChatDock — 称呼跟人格走", () => {
 	 * 漏掉任何一处,表现都是「侧栏写着 A、她自己开口自称 B」。
 	 */
 	const RINKO = {
-		provider: "deepseek",
+		activeProfile: "deepseek",
 		providers: { deepseek: { model: "gpt-test" } },
 		persona: { name: "凛子", addressSelf: "本小姐", addressUser: "笨蛋" },
 	};
 
 	it("侧栏标题用配置里的名字,不是设计稿的「小铃」", async () => {
-		useAiChatStore.setState({ open: true });
-		render(wrap(<AiChatDock />));
+		render(wrap(<ChatPage />));
 		await waitFor(() => expect(screen.getByText(/女仆AI · 小绫/)).toBeTruthy());
 		expect(screen.queryByText(/小铃/)).toBeNull();
 	});
 
 	it("输入框 placeholder 也用配置里的名字", async () => {
 		G.ai = RINKO;
-		useAiChatStore.setState({ open: true });
-		render(wrap(<AiChatDock />));
+		render(wrap(<ChatPage />));
 		await waitFor(() =>
 			expect(screen.getByLabelText("聊天输入").getAttribute("placeholder")).toContain(
 				"给凛子发消息",
@@ -878,63 +1114,81 @@ describe("AiChatDock — 称呼跟人格走", () => {
 
 	it("空态那句问候用「自称 + 对主人的称呼」,两处都跟着人格变", async () => {
 		G.ai = RINKO;
-		useAiChatStore.setState({ open: true });
-		render(wrap(<AiChatDock />));
+		render(wrap(<ChatPage />));
 		await waitFor(() => expect(screen.getByText(/今天想让本小姐帮笨蛋做点什么呢/)).toBeTruthy());
 	});
 
 	it("没登录时问候语里的称呼回落到人格的 addressUser,不硬写「主人」", async () => {
 		G.ai = RINKO;
 		useAuthStore.setState({ snapshot: null } as never);
-		useAiChatStore.setState({ open: true });
-		render(wrap(<AiChatDock />));
+		render(wrap(<ChatPage />));
 		// getAll:问候语和侧栏底部各显示一次称呼,两处都该跟着人格走。
 		await waitFor(() => expect(screen.getAllByText("笨蛋").length).toBeGreaterThanOrEqual(2));
 		expect(screen.queryByText("主人")).toBeNull();
 	});
 
+	/**
+	 * 名字得跟着**指针**走,不是跟着 `ai.persona` 走。
+	 *
+	 * `ai.persona` 自人格指针上线就没有界面入口了,永远冻在老值上。直读它的话,
+	 * 主人在「智能女仆」页换成谁,聊天窗抬头都还写着原来那位 —— 而她开口自称的
+	 * 又是新那位(那一侧走的是后端 resolve),两边对不上。
+	 */
+	it("换了人格 → 抬头跟着指针指的那份走,不是冻着的 ai.persona", async () => {
+		G.ai = {
+			activeProfile: "deepseek",
+			providers: { deepseek: { model: "gpt-test" } },
+			persona: { name: "小绫", addressSelf: "小绫", addressUser: "主人" },
+			activePreset: "tsundere",
+			presets: [
+				{ id: "gentle-maid", label: "温柔女仆", persona: { name: "小绫" } },
+				{
+					id: "tsundere",
+					label: "傲娇毒舌",
+					persona: { name: "凛子", addressSelf: "本小姐", addressUser: "笨蛋" },
+				},
+			],
+		};
+		render(wrap(<ChatPage />));
+		await waitFor(() => expect(screen.getByText(/女仆AI · 凛子/)).toBeTruthy());
+	});
+
 	it("人格里名字被清空 → 回落成「女仆」,不显示空白", async () => {
 		G.ai = {
-			provider: "deepseek",
+			activeProfile: "deepseek",
 			providers: { deepseek: { model: "gpt-test" } },
 			persona: { name: "", addressSelf: "", addressUser: "" },
 		};
-		useAiChatStore.setState({ open: true });
-		render(wrap(<AiChatDock />));
+		render(wrap(<ChatPage />));
 		await waitFor(() => expect(screen.getByText(/女仆AI · 女仆/)).toBeTruthy());
 	});
 
 	it("底部显示配置里的模型名", async () => {
-		useAiChatStore.setState({ open: true });
-		render(wrap(<AiChatDock />));
+		render(wrap(<ChatPage />));
 		await waitFor(() => expect(screen.getByText("gpt-test")).toBeTruthy());
 	});
 });
 
 describe("AiChatDock — 侧栏与主题", () => {
 	it("收起侧栏后换成展开按钮", async () => {
-		useAiChatStore.setState({ open: true });
-		render(wrap(<AiChatDock />));
+		render(wrap(<ChatPage />));
 		screen.getByLabelText("收起侧栏").click();
 		await waitFor(() => expect(screen.getByLabelText("打开侧栏")).toBeTruthy());
 		expect(screen.queryByLabelText("收起侧栏")).toBeNull();
 	});
 
-	it("换主题色 → data-chat-theme 跟着变(整页配色全靠它驱动)", async () => {
-		useAiChatStore.setState({ open: true });
-		render(wrap(<AiChatDock />));
-		const dialog = screen.getByRole("dialog", { name: "女仆 AI 聊天" });
-		expect(dialog.getAttribute("data-chat-theme")).toBe("lime");
+	it("四色预设已砍:chat 根不再有 data-chat-theme,设置弹层里也没有主题色节", async () => {
+		render(wrap(<ChatPage />));
+		const dialog = screen.getByRole("region", { name: "女仆 AI 聊天" });
+		expect(dialog.getAttribute("data-chat-theme")).toBeNull();
 
 		screen.getByLabelText("聊天设置").click();
-		await waitFor(() => expect(screen.getByTitle("蜜桃")).toBeTruthy());
-		screen.getByTitle("蜜桃").click();
-		await waitFor(() => expect(dialog.getAttribute("data-chat-theme")).toBe("peach"));
+		await waitFor(() => expect(screen.getByText("思考深度")).toBeTruthy());
+		expect(screen.queryByText("主题色")).toBeNull();
 	});
 
 	it("一次都没聊过时侧栏给一句引导,不是空白", async () => {
-		useAiChatStore.setState({ open: true });
-		render(wrap(<AiChatDock />));
+		render(wrap(<ChatPage />));
 		await waitFor(() => expect(screen.getByText(/还没有聊过天呢/)).toBeTruthy());
 	});
 
@@ -945,8 +1199,7 @@ describe("AiChatDock — 侧栏与主题", () => {
 				data: { card: { name: "晨风UP主", face: "https://i0.hdslb.com/face.jpg" } },
 			},
 		} as never);
-		useAiChatStore.setState({ open: true });
-		render(wrap(<AiChatDock />));
+		render(wrap(<ChatPage />));
 
 		const img = await screen.findByAltText("晨风UP主");
 		expect(img.getAttribute("src")).toBe("https://i0.hdslb.com/face.jpg");
@@ -958,8 +1211,7 @@ describe("AiChatDock — 侧栏与主题", () => {
 		useAuthStore.setState({
 			snapshot: { status: BiliLoginStatus.LOGGED_IN, data: { card: { name: "晨风UP主" } } },
 		} as never);
-		useAiChatStore.setState({ open: true });
-		render(wrap(<AiChatDock />));
+		render(wrap(<ChatPage />));
 
 		await waitFor(() => expect(screen.getAllByText("晨").length).toBeGreaterThan(0));
 		expect(screen.queryByAltText("晨风UP主")).toBeNull();
@@ -970,8 +1222,7 @@ describe("AiChatDock — 侧栏与主题", () => {
 		H.conversations = [
 			{ id: "c1", title: "本周谁最勤奋", createdAt: today, updatedAt: today, messageCount: 2 },
 		];
-		useAiChatStore.setState({ open: true });
-		render(wrap(<AiChatDock />));
+		render(wrap(<ChatPage />));
 		await waitFor(() => expect(screen.getByText("本周谁最勤奋")).toBeTruthy());
 		expect(screen.getByText("今天")).toBeTruthy();
 	});

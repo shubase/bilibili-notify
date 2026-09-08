@@ -7,7 +7,7 @@ export interface Disposable {
 	dispose(): void;
 }
 
-/** 业务核心从 adapter 获取的 logger 抽象。Koishi 端包 ctx.logger，独立端包 pino。 */
+/** 业务核心从宿主获取的 logger 抽象(独立端包 pino)。 */
 export interface Logger {
 	info(msg: string, ...args: unknown[]): void;
 	warn(msg: string, ...args: unknown[]): void;
@@ -16,7 +16,7 @@ export interface Logger {
 }
 
 /**
- * Service runtime 上下文。替代业务代码中直接吃 koishi `Context` 的写法。
+ * Service runtime 上下文 —— 业务代码不直接吃任何宿主框架的 Context。
  * - logger：日志门面
  * - setInterval / setTimeout：返回 Disposable，dispose 后停止
  * - onDispose：注册关闭钩子（adapter 在生命周期结束时调用）
@@ -41,8 +41,7 @@ export type SubscriptionOp =
 	| { type: "update"; sub: Subscription };
 
 /**
- * 业务核心唯一事件源。所有 Koishi `bilibili-notify/*` 事件 + 独立端 WS channel 都源自这里。
- * Koishi adapter 将这些事件桥接到 ctx.emit('bilibili-notify/<event>')；独立端 adapter 直接 mitt-like 实现。
+ * 业务核心唯一事件源。独立端 WS channel 都源自这里;宿主 adapter 以 mitt-like 实现。
  */
 export interface BiliEvents {
 	"auth-lost": () => void;
@@ -59,11 +58,16 @@ export interface BiliEvents {
 	ready: () => void;
 	"config-changed": (scope: ConfigScope) => void;
 	/**
-	 * 一条推送被 HistoryStore 写入后立刻 emit。
+	 * 历史仓建起一行(一次推送 × 一个目标,本体落地那一刻)后立刻 emit。
 	 * 载荷是完整 entry,WS push-events 直接转发给前端做 toast/通知,
 	 * 无需前端再二次 fetch detail。
 	 */
 	"history-recorded": (entry: HistoryEntry) => void;
+	/**
+	 * 同一次推送的后续消息(词云 / 总结 / 图集 / @全体)追加到已有那一行之后 emit。
+	 * 载荷是合并后的整行;前端按 id 换缓存、小卡同 id 换字,不重弹。
+	 */
+	"history-updated": (entry: HistoryEntry) => void;
 	/**
 	 * 直播状态翻转。
 	 *
@@ -171,7 +175,7 @@ export type PayloadSegment =
 /**
  * 图集单图 —— url + 可选原始像素尺寸。尺寸来自 B站图集元数据(opus.pics / draw.items
  * 的 width/height),仅 QQ 官方原生 markdown 多图(`![文字 #宽px #高px](url)`)需要它来
- * 正常渲染;OneBot / koishi / webhook 等只用 `url`,尺寸缺失不影响。
+ * 正常渲染;OneBot / webhook 等只用 `url`,尺寸缺失不影响。
  */
 export interface ForwardImage {
 	url: string;
@@ -180,8 +184,7 @@ export interface ForwardImage {
 }
 
 /**
- * 平台中立的消息载荷。Adapter 翻译为各平台原生格式：
- * - Koishi: kind:text → bot.sendMessage(text)；image → h.image(buffer, mime)；composite → h('message', segments)
+ * 平台中立的消息载荷。Adapter 翻译为各平台原生格式:
  * - OneBot: text/image → message segment 数组；composite → 段拼接
  * - Webhook: 序列化为 JSON
  */
@@ -192,14 +195,32 @@ export type NotificationPayload =
 	/**
 	 * 图集 payload(典型来源:动态图集 / 多张大图)。`forward` 决定 adapter 用哪种
 	 * 平台原生形式投递:
-	 *   - `true` —— 走 OneBot `send_group_forward_msg` / koishi `h("message", {forward:true})`,
+	 *   - `true` —— 走 OneBot `send_group_forward_msg`,
 	 *     渲染成「聊天记录」卡片。视觉好但走长消息通道(NapCat 的 `SsoSendLongMsg`
 	 *     trpc 在某些部署上不稳),失败时所有图都丢。
-	 *   - `false` —— 走 OneBot `send_group_msg` 多 image segment / koishi `h("message", ...)`
+	 *   - `false` —— 走 OneBot `send_group_msg` 多 image segment。
 	 *     普通多图。稳但 N+ 张大图会一排刷屏。
 	 * 默认值由上游 dynamic engine config(`imageGroupForward`)决定。
 	 */
-	| { kind: "forward-images"; images: ForwardImage[]; forward: boolean };
+	| { kind: "forward-images"; images: ForwardImage[]; forward: boolean }
+	/**
+	 * QQ 小程序卡(B 站 App「分享到 QQ」那种,点开进小程序播放)。只有能向腾讯签 ark 的
+	 * OneBot 实现发得出(扩展接口 `get_mini_app_ark`,见 server 的 platforms/onebot.ts);
+	 * 别的平台一律回 `ok: false`,由链接解析那头回落图片卡。
+	 *
+	 * `path` 是**小程序里的页面路径**(B 站小程序的视频页是 `pages/video/video?bvid=…`),
+	 * `jumpUrl` 是网页链接。两个都要:签卡协议里页面路径决定点开落在哪一页,网页链接落到卡的
+	 * `qqdocurl`;把网址填进页面路径签出来的卡点开是「页面不存在」(2026-09-07 群友反馈那次)。
+	 * 签不了 ark 的平台降级成文字时只用 `jumpUrl`。
+	 */
+	| {
+			kind: "miniapp-card";
+			title: string;
+			desc: string;
+			picUrl: string;
+			path: string;
+			jumpUrl: string;
+	  };
 
 /**
  * 推送出口接口。业务核心持有此接口，按 PushTarget.id 投递。
@@ -210,6 +231,11 @@ export interface NotificationSink {
 	sendPrivate(targetId: string, payload: NotificationPayload): Promise<DeliveryResult>;
 	/** 允许 adapter 通过 id 查目标的元数据（platform / scope / 启停状态）。 */
 	resolve(targetId: string): PushTarget | undefined;
+	/**
+	 * 配置层面能不能推:目标存在、目标启用、所属适配器启用。停用的目标不是候选 ——
+	 * 推送层既不发也不等它「恢复可达」。与 {@link isAvailable} 分开:那是运行时的健康。
+	 */
+	isEnabled(targetId: string): boolean;
 	/** 健康检查：目标当前是否可投递（bot 在线 / endpoint 可达）。 */
 	isAvailable(targetId: string): boolean;
 }
@@ -218,4 +244,35 @@ export interface DeliveryResult {
 	ok: boolean;
 	latencyMs: number;
 	err?: string;
+	/**
+	 * 这条投递**没有真的出网**(目前只有 devtools 的推送截流会这么标)。结果照样往上回,
+	 * 好让调用链跑完;但它不携带任何「目标通不通」的信息 —— 拿它去翻 `target.testStatus`
+	 * 就是凭空把一个发不出去的目标标成绿的,而且会落盘、活得比截流本身还久。
+	 * 读之前先过 {@link isReachabilityEvidence}。
+	 */
+	synthetic?: true;
+}
+
+/**
+ * 这条投递结果算不算「目标可达」的证据。历史那行照记不误(它记的是这次推送发生了什么),
+ * 只有可达性判断要过这道。
+ */
+export function isReachabilityEvidence(result: DeliveryResult): boolean {
+	return result.synthetic !== true;
+}
+
+/**
+ * 一个适配器能不能发 QQ 小程序卡。认接口不认实现名:拿空参数探 OneBot 扩展接口
+ * `get_mini_app_ark`,按 OneBot 11 的 retcode 判 —— 1404「不支持的动作」= 不支持,
+ * 1400「参数错」= 接口在、支持;别的(连不上、别的错)= 还没探出来,带原因。
+ * 面板上就是这三态;发送失败不翻它,只有再收到 1404 才翻成不支持。
+ */
+export type MiniAppCardSupport =
+	| { state: "supported"; checkedAt: number }
+	| { state: "unsupported"; reason: string; checkedAt: number }
+	| { state: "unknown"; reason?: string };
+
+/** 适配器的平台能力快照。今天只有一项;将来薄插件接进来时按需加。 */
+export interface AdapterCapabilities {
+	miniAppCard: MiniAppCardSupport;
 }

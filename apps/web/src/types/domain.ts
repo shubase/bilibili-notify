@@ -14,21 +14,36 @@
 
 import type { SubscriptionDTO } from "@bilibili-notify/contract";
 import type {
-	PushAdapter as CanonPushAdapter,
-	PushTarget as CanonPushTarget,
-	PushTargetPlatform as CanonPushTargetPlatform,
 	OnebotAdapterConfig,
 	OnebotTransport,
+	PushAdapter,
+	PushTarget,
+	PushTargetPlatform,
 	WebhookProvider,
 } from "@bilibili-notify/internal";
 import {
+	countsAsDelivery,
+	countsAsFailure,
 	DEFAULT_FEATURE_FLAGS,
+	DEFAULT_ROAST_SCHEDULE,
 	FEATURE_KEYS,
 	type FeatureKey,
+	isTargetPaused,
+	LIVE_END_EXTRA_KEYS,
+	type LiveEndExtraKey,
+	ONEBOT_FORWARD_MIN_TIMEOUT_MS,
+	ONEBOT_IMAGE_MIN_TIMEOUT_MS,
 } from "@bilibili-notify/internal/constants";
 
-export type { FeatureKey };
-export { DEFAULT_FEATURE_FLAGS, FEATURE_KEYS };
+export type { FeatureKey, LiveEndExtraKey };
+export {
+	countsAsDelivery,
+	countsAsFailure,
+	DEFAULT_FEATURE_FLAGS,
+	FEATURE_KEYS,
+	isTargetPaused,
+	LIVE_END_EXTRA_KEYS,
+};
 
 /**
  * Dashboard 消费的订阅一直是 wire DTO 形状(internal Subscription + 服务端
@@ -50,6 +65,10 @@ export type {
 	OnebotAdapterConfig,
 	OnebotSession,
 	OnebotTransport,
+	// 推送平台类型直接用 internal 的定义:将来薄插件桥接进来的平台加进那条 union 就自动出现在这里。
+	PushAdapter,
+	PushTarget,
+	PushTargetPlatform,
 	PushTargetScope,
 	QQOfficialAdapterConfig,
 	QQOfficialBotType,
@@ -62,15 +81,6 @@ export type {
 	WebhookProvider,
 } from "@bilibili-notify/internal";
 
-/**
- * Dashboard 只编辑独立端可用平台;宿主专用隐藏平台(Koishi / AstrBot)由对应
- * 宿主壳消费,不进入 apps/web 的平台工厂和普通选择器。
- */
-type HostOnlyPlatform = "koishi-bot" | "astrbot";
-export type PushAdapter = Exclude<CanonPushAdapter, { platform: HostOnlyPlatform }>;
-export type PushTarget = Exclude<CanonPushTarget, { platform: HostOnlyPlatform }>;
-export type PushTargetPlatform = Exclude<CanonPushTargetPlatform, HostOnlyPlatform>;
-
 // ---- UI 文案 -----------------------------------------------------------
 
 export const FEATURE_LABELS: Record<FeatureKey, string> = {
@@ -79,10 +89,14 @@ export const FEATURE_LABELS: Record<FeatureKey, string> = {
 	liveEnd: "下播",
 	liveGuardBuy: "上舰",
 	superchat: "SC",
-	wordcloud: "词云",
-	liveSummary: "直播总结",
 	specialDanmaku: "特别弹幕",
 	specialUserEnter: "特别用户进房",
+};
+
+/** 下播的两个附加项(像开播的 @全体,挂在下播下面)。 */
+export const LIVE_END_EXTRA_LABELS: Record<LiveEndExtraKey, string> = {
+	wordcloud: "弹幕词云",
+	liveSummary: "AI 总结",
 };
 
 export const WEBHOOK_PROVIDERS: ReadonlyArray<{ value: WebhookProvider; label: string }> = [
@@ -179,6 +193,9 @@ export function makeEmptySubscription(uid: string): Subscription {
 		atAllDefaults: { dynamic: false, live: true },
 		atAll: { dynamic: {}, live: {} },
 		overrides: {},
+		// 新订阅不自带定时锐评 —— 加一个 UP 不该顺手给群里排一条周期推送。
+		// 与服务端的 makeEmptySubscription 保持一致。
+		roastSchedule: { ...DEFAULT_ROAST_SCHEDULE },
 		specialUsers: [],
 		state: {
 			lastDynamicId: undefined,
@@ -200,6 +217,8 @@ export function makeEmptyAdapter(platform: PushTargetPlatform, name: string): Pu
 				protocolVersion: "v11",
 				headers: {},
 				timeoutMs: 15_000,
+				imageMinTimeoutMs: ONEBOT_IMAGE_MIN_TIMEOUT_MS,
+				forwardMinTimeoutMs: ONEBOT_FORWARD_MIN_TIMEOUT_MS,
 				retryTimes: 0,
 				retryIntervalMs: 1_000,
 			},
@@ -222,7 +241,13 @@ export function makeEmptyAdapter(platform: PushTargetPlatform, name: string): Pu
 /** OneBot 三种连接方式(transport)共用的连接字段。 */
 type OnebotAdapterConfigCommon = Pick<
 	OnebotAdapterConfig,
-	"accessToken" | "protocolVersion" | "timeoutMs" | "retryTimes" | "retryIntervalMs"
+	| "accessToken"
+	| "protocolVersion"
+	| "timeoutMs"
+	| "imageMinTimeoutMs"
+	| "forwardMinTimeoutMs"
+	| "retryTimes"
+	| "retryIntervalMs"
 >;
 
 /**
@@ -238,6 +263,8 @@ export function switchOnebotTransport(
 		accessToken: cfg.accessToken,
 		protocolVersion: cfg.protocolVersion ?? "v11",
 		timeoutMs: cfg.timeoutMs,
+		imageMinTimeoutMs: cfg.imageMinTimeoutMs,
+		forwardMinTimeoutMs: cfg.forwardMinTimeoutMs,
 		retryTimes: cfg.retryTimes || (transport === "http" ? 0 : 3),
 		retryIntervalMs: cfg.retryIntervalMs,
 	};

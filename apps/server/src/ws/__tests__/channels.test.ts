@@ -4,30 +4,17 @@
  * 守护契约:
  *   - envelope() 参数 unwrap:0 参 → data=null;1 参 → 直接 unwrap;N 参 → 保留 tuple
  *   - `cookies-refreshed` **安全脱敏**:绝不转发 cookiesJson/refreshToken,只发 {refreshedAt, ok?}
- *   - `history-recorded` 投影成精简 view(非 raw HistoryEntry)
+ *   - `history-recorded` / `history-updated` 投影成精简 view(非 raw HistoryEntry)
  *   - `config-changed` 按 scope 带快照;secrets scope → snapshot=null
  *   - log channel:LogChannel.push → {type:"log",event:level,ts:entry.ts,data:{msg,args}}
  *   - dispose() 解绑所有 bus 订阅(之后再 emit 不再 publish)
  */
 
 import { beforeEach, describe, expect, it, vi } from "vite-plus/test";
-import type { ConfigStore } from "../../config/store.js";
 import { createNodeMessageBus } from "../../runtime/message-bus.js";
 import { ALL_CHANNELS, attachChannelWiring, buildStateHydrate } from "../channels.js";
 import { createLogChannel } from "../log-channel.js";
 import type { ServerEventEnvelope } from "../types.js";
-
-const GLOBALS = { app: { logLevel: "info" } };
-const SUBS = [{ id: "s1" }];
-const TARGETS = [{ id: "t1" }];
-
-function makeStore(): ConfigStore {
-	return {
-		getGlobals: () => GLOBALS,
-		getSubscriptions: () => SUBS,
-		getTargets: () => TARGETS,
-	} as unknown as ConfigStore;
-}
 
 interface Harness {
 	bus: ReturnType<typeof createNodeMessageBus>;
@@ -42,7 +29,7 @@ function wire(): Harness {
 	const bus = createNodeMessageBus();
 	const log = createLogChannel();
 	const publish = vi.fn();
-	const handle = attachChannelWiring({ bus, store: makeStore(), log, publish });
+	const handle = attachChannelWiring({ bus, log, publish });
 	return {
 		bus,
 		log,
@@ -54,12 +41,22 @@ function wire(): Harness {
 }
 
 describe("buildStateHydrate", () => {
-	it("从 store 三视图组装 state/hydrate 信封", () => {
-		const env = buildStateHydrate(makeStore());
+	/**
+	 * 这条钉的是「**不带载荷**」。
+	 *
+	 * 原来它打包 { globals, subscriptions, targets },而 globals 里有各家 AI 的
+	 * 明文 apiKey 与联网搜索 key —— `GET /api/globals` 早就走 redactGlobals 脱敏了
+	 * (25e4210),WS 这条路漏了。客户端 handleStateEnvelope 又一个字节都不读,
+	 * 只 invalidate 三个 query,所以明文一路传过去然后进垃圾。
+	 *
+	 * 谁要是想把载荷加回来省一次 REST 往返:先过 redactGlobals,别直接 getGlobals()。
+	 */
+	it("state/hydrate 不带载荷 —— 明文 key 不上线", () => {
+		const env = buildStateHydrate();
 		expect(env.type).toBe("state");
 		expect(env.event).toBe("hydrate");
 		expect(typeof env.ts).toBe("string");
-		expect(env.data).toEqual({ globals: GLOBALS, subscriptions: SUBS, targets: TARGETS });
+		expect(env.data).toBeNull();
 	});
 
 	it("ALL_CHANNELS 即四频道注册表", () => {
@@ -110,40 +107,84 @@ describe("attachChannelWiring — envelope 参数 unwrap", () => {
 	});
 });
 
-describe("attachChannelWiring — history-recorded 投影", () => {
-	it("投影为精简 view,不外泄 raw entry 结构", () => {
+const ROW = {
+	id: "h1",
+	pushId: "p1",
+	ts: "2026-05-16T00:00:00.000Z",
+	kind: "live-end",
+	uid: "u1",
+	subscriptionId: "sub1",
+	targetId: "t1",
+	status: "partial",
+	messages: [
+		{
+			payload: { kind: "image", text: "[卡片图]", imageRef: "h1-0.png" },
+			role: "main",
+			result: { ok: true, latencyMs: 5 },
+		},
+		{
+			payload: { kind: "text", text: "总结" },
+			role: "extra",
+			result: { ok: false, latencyMs: 9, err: "boom" },
+		},
+	],
+	unameSnapshot: "UP",
+	uavatarSnapshot: "http://a/x.jpg",
+};
+
+const ROW_VIEW = {
+	id: "h1",
+	pushId: "p1",
+	ts: "2026-05-16T00:00:00.000Z",
+	kind: "live-end",
+	status: "partial",
+	uid: "u1",
+	subscriptionId: "sub1",
+	targetId: "t1",
+	messages: [
+		{ text: "[卡片图]", imageRef: "h1-0.png", role: "main", ok: true },
+		{ text: "总结", imageRef: undefined, role: "extra", ok: false, err: "boom" },
+	],
+	unameSnapshot: "UP",
+	uavatarSnapshot: "http://a/x.jpg",
+};
+
+describe("attachChannelWiring — history-recorded / history-updated 投影", () => {
+	it("history-recorded 投影为精简 view:消息逐条带文案 / 图 / 结果,不外泄 payload.kind 与 latency", () => {
 		const h = wire();
-		const entry = {
-			id: "h1",
-			ts: "2026-05-16T00:00:00.000Z",
-			source: "dynamic",
-			uid: "u1",
-			subscriptionId: "sub1",
-			targetIds: ["t1"],
-			result: { ok: true, per: [{ targetId: "t1", ok: true, latencyMs: 5 }] },
-			payload: { kind: "text", text: "hello", imageRef: undefined },
-			unameSnapshot: "UP",
-			uavatarSnapshot: "http://a/x.jpg",
-		};
-		h.bus.emit("history-recorded", entry as never);
+		h.bus.emit("history-recorded", ROW as never);
 		const env = h.last();
 		expect(env.type).toBe("push-events");
 		expect(env.event).toBe("history-recorded");
-		expect(env.data).toEqual({
-			id: "h1",
-			ts: "2026-05-16T00:00:00.000Z",
-			source: "dynamic",
-			uid: "u1",
-			subscriptionId: "sub1",
-			targetIds: ["t1"],
-			ok: true,
-			text: "hello",
-			imageRef: undefined,
-			unameSnapshot: "UP",
-			uavatarSnapshot: "http://a/x.jpg",
+		expect(env.data).toEqual(ROW_VIEW);
+	});
+
+	it("history-updated 走同一投影、事件名不同 —— 前端按 id 换缓存", () => {
+		const h = wire();
+		h.bus.emit("history-updated", ROW as never);
+		expect(h.last()).toMatchObject({
+			type: "push-events",
+			event: "history-updated",
+			data: ROW_VIEW,
 		});
-		// 不应携带内部 result.per 等结构。
-		expect(env.data).not.toHaveProperty("result");
+	});
+
+	it("无目标行:targetId 为 null,消息没有 ok", () => {
+		const h = wire();
+		h.bus.emit("history-recorded", {
+			...ROW,
+			targetId: null,
+			status: "no-targets",
+			messages: [{ payload: { kind: "text", text: "卡片" }, role: "main" }],
+		} as never);
+		expect(h.last().data).toMatchObject({
+			targetId: null,
+			status: "no-targets",
+			messages: [{ text: "卡片", role: "main" }],
+		});
+		expect(
+			(h.last().data as { messages: Array<Record<string, unknown>> }).messages[0],
+		).not.toHaveProperty("ok");
 	});
 });
 
@@ -187,19 +228,17 @@ describe("attachChannelWiring — config-changed 按 scope 带快照", () => {
 		h = wire();
 	});
 
-	it("globals / subscriptions / targets 带对应快照", () => {
-		h.bus.emit("config-changed", "globals");
-		expect(h.last()).toMatchObject({ type: "state", event: "config-changed" });
-		expect(h.last().data).toEqual({ scope: "globals", snapshot: GLOBALS });
-		h.bus.emit("config-changed", "subscriptions");
-		expect(h.last().data).toEqual({ scope: "subscriptions", snapshot: SUBS });
-		h.bus.emit("config-changed", "targets");
-		expect(h.last().data).toEqual({ scope: "targets", snapshot: TARGETS });
-	});
-
-	it("secrets scope:snapshot=null(绝不经 WS 推 secrets)", () => {
-		h.bus.emit("config-changed", "secrets");
-		expect(h.last().data).toEqual({ scope: "secrets", snapshot: null });
+	/**
+	 * 四个 scope 一律**只带 scope 标记**。secrets 从第一天起就是这样(注释写着
+	 * 「绝不经 WS 推 secrets」),其余三个是在脱敏纪律落地后才补齐的 —— globals
+	 * 那份快照里有明文 apiKey,而客户端只读 .scope。
+	 */
+	it("四个 scope 都只带 scope 标记,不带快照", () => {
+		for (const scope of ["globals", "subscriptions", "targets", "secrets"] as const) {
+			h.bus.emit("config-changed", scope);
+			expect(h.last()).toMatchObject({ type: "state", event: "config-changed" });
+			expect(h.last().data).toEqual({ scope });
+		}
 	});
 });
 

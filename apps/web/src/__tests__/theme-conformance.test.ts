@@ -20,9 +20,14 @@ const BANNED = [
 		re: /\btext-gray-(?:600|700|800|900)\b/g,
 		hint: "改用 text-bn-text-secondary / text-bn-text-tertiary",
 	},
-	{ re: /\bborder-black\/5\b/g, hint: "改用 border-bn-border-subtle" },
-	{ re: /\bbg-black\/5\b/g, hint: "改用 bg-bn-code-bg / bg-bn-hover-muted" },
-	{ re: /\bhover:bg-black\/5\b/g, hint: "改用 hover:bg-bn-hover-muted" },
+	// 透明度写死成 /5 是原始写法的洞:同族的 /4 /6 /8 /10 /15 一共 15 处全从守卫底下
+	// 溜过去了(2026-08-20 清扫查出)。黑色描边在深色皮肤/暗色主题上等于没有,而
+	// border-bn-* 系列都带 [data-theme="dark"] 覆盖。合法用途(恒深容器、图上遮罩)
+	// 登记进下面的 ALLOWED —— 归一化会摘掉 /N 后缀,一条覆盖全部透明度变体。
+	{
+		re: /\b(?:hover:)?(?:bg|border|ring)-black\/\d+\b/g,
+		hint: "改用 border-bn-border(-subtle) / bg-bn-overlay / bg-bn-hover-muted",
+	},
 	{ re: /\bhover:bg-gray-50\b/g, hint: "改用 hover:bg-bn-surface-muted" },
 	// arbitrary 浅色 hex(#e/#f 开头,如 bg-[#fafafa]/hover:bg-[#fdf2f5])在暗色下不翻转 → 必须走
 	// 语义 token(bg-bn-*/border-bn-*)。深色 arbitrary(#0/#1 开头,如 bg-[#0f1115] 终端)合法,不拦。
@@ -49,6 +54,12 @@ const BANNED = [
 const ALLOWED = new Set<string>([
 	// 灵动岛(恒深 pill)内的「保存」CTA —— 固定白底黑字,不能跟随主题翻转成深底黑字。
 	"components/draft-island.tsx:bg-white",
+	// 灵动岛自身的 pill / 面板底 —— 它是全站唯一「两套主题都恒定深色」的容器,
+	// 整套深色语汇(白字 + white/10 描边)建在这个黑底上,跟随主题翻转会整个散架。
+	"components/draft-island.tsx:bg-black",
+	// 图库缩略图右上角的删除角标 —— 压在用户上传的图片上,底色不可预测,
+	// 只能用固定的半透明黑保证白色 × 号在任何图上都读得出来。
+	"pages/cards/GalleryPicker.tsx:bg-black",
 ]);
 
 async function listTsxFiles(dir: string): Promise<string[]> {
@@ -64,6 +75,29 @@ async function listTsxFiles(dir: string): Promise<string[]> {
 		}
 	}
 	return out;
+}
+
+/** 从 theme.css 的某个块里抓出 `--color-*: value` 的映射。 */
+function readTokenBlock(css: string, blockRe: RegExp): Record<string, string> {
+	const body = css.match(blockRe)?.[1] ?? "";
+	const out: Record<string, string> = {};
+	for (const m of body.matchAll(/(--color-[a-z0-9-]+)\s*:\s*([^;]+);/g)) out[m[1]] = m[2].trim();
+	return out;
+}
+
+/** WCAG 相对亮度 —— 只认 #rrggbb(梯子上的三档与 surface 都是实色 hex)。 */
+function luminance(hex: string): number {
+	const n = hex.replace("#", "");
+	const chan = (i: number): number => {
+		const c = Number.parseInt(n.slice(i, i + 2), 16) / 255;
+		return c <= 0.03928 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4;
+	};
+	return 0.2126 * chan(0) + 0.7152 * chan(2) + 0.0722 * chan(4);
+}
+
+function contrast(fg: string, bg: string): number {
+	const [a, b] = [luminance(fg), luminance(bg)];
+	return (Math.max(a, b) + 0.05) / (Math.min(a, b) + 0.05);
 }
 
 describe("theme conformance", () => {
@@ -90,9 +124,9 @@ describe("theme conformance", () => {
 	/**
 	 * 聊天界面的强调色必须走 `--bn-chat-*`,不能写死。
 	 *
-	 * 四套聊天主题(青柠 / 紫罗兰 / 天青 / 蜜桃)只换那几个变量的值。设计稿通篇
-	 * 是紫色,照抄进 JSX 的结果就是「换什么主题,滑块 / 光标 / 气泡 / 发送键还是
-	 * 紫的」—— 主题色只剩四颗色点在动,别处纹丝不动。
+	 * 换观感只换那几个变量的值(默认主题在 styles.css 的 :root、皮肤经
+	 * composeSkinVars 注入)。设计稿通篇是紫色,照抄进 JSX 的结果就是
+	 * 「换什么皮肤,滑块 / 光标 / 气泡 / 发送键还是紫的」。
 	 *
 	 * 这条守在源码上:jsdom 不算样式,颜色对不对量不出来;而「又从设计稿抄了一段
 	 * 紫色进来」恰恰是最容易反复发生的事。
@@ -111,19 +145,38 @@ describe("theme conformance", () => {
 		expect(findings).toEqual([]);
 	});
 
-	it("四套主题各自备齐强调色的三种形态", async () => {
-		// 实色(色点 / 光标)、rgb 分量(半透明底,rgba 要拆开的分量)、渐变副色。
-		// 缺任何一个,那套主题下就会有一处悄悄回落到 var() 的兜底值 —— 不报错,
-		// 只是那一处永远是别的主题的颜色。
-		const css = await readFile(fileURLToPath(new URL("../styles.css", import.meta.url)), "utf8");
-		for (const theme of ["lime", "violet", "sky", "peach"]) {
-			const start = css.indexOf(`[data-chat-theme="${theme}"] {`);
-			expect(start).toBeGreaterThan(-1);
-			const block = css.slice(start, css.indexOf("\n\t}", start));
-			expect(`${theme}: ${block.includes("--bn-chat-dot:")}`).toBe(`${theme}: true`);
-			expect(`${theme}: ${block.includes("--bn-chat-accent-rgb:")}`).toBe(`${theme}: true`);
-			expect(`${theme}: ${block.includes("--bn-chat-accent-2:")}`).toBe(`${theme}: true`);
+	/**
+	 * 「女仆 AI」那抹深紫**刻意不随皮肤换装**(AI 件的固定品牌色),但它仍该只有
+	 * 一个正主:`styles.css` 的 `--bn-ai-purple`,JS 侧引 `config/colors.ts` 的
+	 * `AI_PURPLE`。
+	 *
+	 * styles.css 那条注释曾记着搬不过来的理由 ——「GlassPanel 的 accent 要拼
+	 * `${accent}1f` 造 alpha,只收十六进制字面量」。那条约束早就随玻璃件改用
+	 * `color-mix()` 而失效了,注释却还在,于是六处字面量一直留着。这条守着它
+	 * 不再回流。
+	 */
+	it("--bn-ai-purple 只有一个正主 —— JS 侧不许再写 #6c5ce7", async () => {
+		const findings: string[] = [];
+		for (const file of await listTsxFiles(SRC_DIR)) {
+			const source = await readFile(file, "utf8");
+			for (const match of source.matchAll(/#6c5ce7/gi)) {
+				const line = source.slice(0, match.index).split("\n").length;
+				findings.push(`${relative(SRC_DIR, file)}:${line}`);
+			}
 		}
+		expect(findings).toEqual([]);
+	});
+
+	it("默认聊天主题在 :root 上备齐强调色形态;四色预设已砍干净", async () => {
+		// 实色(色点 / 光标)与渐变副色;半透明纱一律 color-mix 从 --bn-chat-dot 现调,
+		// 不再维护 rgb 分量副本。缺任何一个就有一处悄悄回落到 var() 的兜底值。
+		const css = await readFile(fileURLToPath(new URL("../styles.css", import.meta.url)), "utf8");
+		for (const varName of ["--bn-chat-dot:", "--bn-chat-accent-2:"]) {
+			expect(`${varName} ${css.includes(varName)}`).toBe(`${varName} true`);
+		}
+		expect(css.includes("--bn-chat-accent-rgb")).toBe(false);
+		// 预设选择器一个都不许剩:剩一块就是一段永远不命中的死 CSS。
+		expect(css.includes("data-chat-theme")).toBe(false);
 	});
 
 	it("ships a synchronous anti-FOUC theme script in index.html", async () => {
@@ -135,5 +188,61 @@ describe("theme conformance", () => {
 		expect(html).toContain(THEME_STORAGE_KEY);
 		// <head> 内必须有同步 <script>(非 module)在 React 挂载前设置 data-theme。
 		expect(html).toMatch(/<head>[\s\S]*<script>[\s\S]*dataset\.theme[\s\S]*<\/head>/);
+	});
+
+	/**
+	 * 文字色三档在**两套主题里必须同向**:亮色越往下越浅、暗色越往下越深,
+	 * 且 secondary 永远比 tertiary 更抢眼。
+	 *
+	 * 为什么要静态守:调用点是按**名字语义**挑档的(正文/说明走 secondary,
+	 * UID/时间戳/协议行走 tertiary,`text-bn-text-tertiary hover:text-bn-text-secondary`
+	 * 这种「悬停变亮」的写法更是把顺序写死了)。可亮色默认装从 `.bn-design` 的
+	 * 设计稿原样抄来时,secondary(#999) 反而比 tertiary(#666) 浅 —— 于是同一个
+	 * className 在亮色下是「最淡的一档」、在暗色和**每一套皮肤**里都是「较重的一档」,
+	 * 层次逐主题翻转,正文按 2.85:1 渲染(AA 要 4.5:1)。
+	 *
+	 * jsdom 不算样式,这事测不出来也看不出来 —— 只能拿 token 值本身算对比度。
+	 */
+	it("亮暗两套的文字色梯子同向,secondary 恒重于 tertiary 且都过 AA", async () => {
+		const css = await readFile(join(SRC_DIR, "../../../packages/ui/src/theme.css"), "utf8");
+		const light = readTokenBlock(css, /@theme\s*\{([\s\S]*?)\n\}/);
+		const dark = readTokenBlock(css, /:root\[data-theme="dark"\]\s*\{([\s\S]*?)\n\}/);
+
+		for (const [mode, vars] of [
+			["亮色", light],
+			["暗色", dark],
+		] as const) {
+			const surface = vars["--color-bn-surface"];
+			const ramp = (["primary", "secondary", "tertiary"] as const).map((k) => ({
+				key: k,
+				hex: vars[`--color-bn-text-${k}`],
+			}));
+			for (const step of ramp) {
+				expect(`${mode} ${step.key} 已定义 ${step.hex !== undefined}`).toBe(
+					`${mode} ${step.key} 已定义 true`,
+				);
+			}
+
+			// 同向:对比度必须逐档单调下降(primary 最重 → tertiary 最轻)。
+			const ratios = ramp.map((s) => contrast(s.hex, surface));
+			expect(`${mode} 梯子单调 ${ratios.map((r) => r.toFixed(2)).join(" > ")}`).toBe(
+				`${mode} 梯子单调 ${[...ratios]
+					.sort((a, b) => b - a)
+					.map((r) => r.toFixed(2))
+					.join(" > ")}`,
+			);
+
+			// 光单调还不够:两档挨太近等于没有层次。暗色现为 1.73×,亮色 1.44×。
+			expect(`${mode} secondary/tertiary ≥ 1.25× ${ratios[1] / ratios[2] >= 1.25}`).toBe(
+				`${mode} secondary/tertiary ≥ 1.25× true`,
+			);
+
+			// secondary / tertiary 都承载可读文字(正文、说明、UID),AA 正文档 4.5:1 是底线。
+			for (const [i, step] of ramp.entries()) {
+				expect(`${mode} ${step.key} ${step.hex} 过 AA ${ratios[i] >= 4.5}`).toBe(
+					`${mode} ${step.key} ${step.hex} 过 AA true`,
+				);
+			}
+		}
 	});
 });

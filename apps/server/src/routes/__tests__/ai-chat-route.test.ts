@@ -35,12 +35,24 @@ const H = vi.hoisted(() => ({
 	titleInput: null as Array<{ role: string; content: string }> | null,
 	/** 置上就在吐正文**之前**按这个剧本回调 onToolEvent —— 真实顺序就是这样。 */
 	toolEvents: null as ToolEv[] | null,
+	/** 置上就在正文之前按分片回调 onReasoning —— 思考先于开口,真实顺序就是这样。 */
+	reasoningChunks: null as string[] | null,
+	/** 最后一次收到的独立思考设置 —— 聊天的思考配置与引擎分家后,路由必须带上它。 */
+	lastThinking: null as unknown,
+	/** 最后一次收到的联网搜索开关 —— 聊天页那颗胶囊是会话级的,按消息传。 */
+	lastWebSearch: null as boolean | null | undefined,
 }));
 
 /** {@link ToolTraceEvent} 的测试侧影本 —— 这个包在测试里是 mock 掉的。 */
 type ToolEv =
 	| { phase: "start"; id: string; name: string; args: Record<string, string> }
-	| { phase: "end"; id: string; ok: boolean };
+	| { phase: "progress"; id: string; chars: number }
+	| {
+			phase: "end";
+			id: string;
+			ok: boolean;
+			sources?: Array<{ title: string; url: string; siteName?: string }>;
+	  };
 
 /**
  * 流式版:按 `H.chunks` 逐段回调 onDelta,再返回拼起来的整段。`H.error` 置上就
@@ -49,9 +61,18 @@ type ToolEv =
 const chatStatelessStream = vi.fn(
 	async (
 		messages: Array<{ role: string; content: string }>,
-		opts: { onDelta: (t: string) => void; onToolEvent?: (ev: ToolEv) => void },
+		opts: {
+			onDelta: (t: string) => void;
+			onToolEvent?: (ev: ToolEv) => void;
+			onReasoning?: (t: string) => void;
+			thinking?: unknown;
+			webSearch?: boolean;
+		},
 	) => {
 		H.lastHistory = messages;
+		H.lastThinking = opts.thinking ?? null;
+		H.lastWebSearch = opts.webSearch;
+		for (const t of H.reasoningChunks ?? []) opts.onReasoning?.(t);
 		for (const ev of H.toolEvents ?? []) opts.onToolEvent?.(ev);
 		for (const c of H.chunks ?? []) opts.onDelta(c);
 		if (H.error) throw H.error;
@@ -84,6 +105,8 @@ interface StubOpts {
 	aiEnabled?: boolean;
 	/** baseUrl / apiKey 没填齐时 engines.commentary 就是 null。 */
 	noCommentary?: boolean;
+	/** 追加进 `defaults.ai` 的字段(activeProfile / providers / chat …)。 */
+	aiConfig?: Record<string, unknown>;
 }
 
 async function makeDeps(opts: StubOpts = {}) {
@@ -92,7 +115,9 @@ async function makeDeps(opts: StubOpts = {}) {
 	const conversationStore = createConversationStore({ dataDir, logger });
 	const deps = {
 		store: {
-			getGlobals: () => ({ defaults: { ai: { enabled: opts.aiEnabled ?? true } } }),
+			getGlobals: () => ({
+				defaults: { ai: { enabled: opts.aiEnabled ?? true, ...(opts.aiConfig ?? {}) } },
+			}),
 			getTargets: () => [],
 			getSubscriptions: () => [],
 		},
@@ -123,6 +148,9 @@ beforeEach(() => {
 	H.title = "本周勤奋榜";
 	H.titleInput = null;
 	H.toolEvents = null;
+	H.reasoningChunks = null;
+	H.lastWebSearch = null;
+	H.lastThinking = null;
 	chatStatelessStream.mockClear();
 	summarizeTitle.mockClear();
 });
@@ -199,13 +227,17 @@ describe("会话增删查", () => {
 		expect((await readJson(res)).conversations).toEqual([]);
 	});
 
-	it("POST 建会话 → 能在列表里看到", async () => {
+	it("POST 建会话 → 聊过之后才进列表,空壳不露面", async () => {
+		// 会话必须在**发送之前**就建好(前端要拿到 id 才能开那条 SSE),而整轮失败时
+		// 服务端一个字都不落盘 —— 侧栏于是冒出一条点进去空空如也的「对话」。
 		const { deps } = await makeDeps();
 		const app = createAiRoute(deps);
 		const created = (await readJson(await createConv(app))).conversation;
 		expect(created.id).toBeTruthy();
 		expect(created.messages).toEqual([]);
+		expect((await readJson(await listConvs(app))).conversations).toEqual([]);
 
+		await chatDrained(app, created.id, { message: "第一句" });
 		const list = (await readJson(await listConvs(app))).conversations;
 		expect(list.map((c: any) => c.id)).toEqual([created.id]);
 	});
@@ -349,6 +381,12 @@ describe("POST /conversations/:id/chat — 聊天", () => {
 		const app = createAiRoute(deps);
 		const first = (await readJson(await createConv(app))).conversation.id;
 		const second = (await readJson(await createConv(app))).conversation.id;
+		// 两边都得先聊过 —— 空壳不进列表(见上面那条)。second 先聊,first 后聊。
+		await chatDrained(app, second, { message: "先聊这边" });
+		// 隔开一小会儿再聊第二条。落盘的时间戳只到毫秒,两次 chat 在真实时钟下常常
+		// 落在**同一毫秒**里 —— 那时排序是并列的,这条断言通过与否全看运气(实测
+		// 六次里红三次)。同款理由见 conversation-store 测试里的 useClock 那段。
+		await new Promise((resolve) => setTimeout(resolve, 5));
 		await chatDrained(app, first, { message: "把它顶上去" });
 
 		const list = (await readJson(await listConvs(app))).conversations;
@@ -380,6 +418,49 @@ describe("POST /conversations/:id/chat — 聊天", () => {
  * 需要两件事:流里实时报一声,以及跟着回复一起落盘 —— 只报不存的话,`done` 一到、
  * 真身把在途副本换下来的那一刻,几条小条就凭空消失了。
  */
+describe("POST /conversations/:id/chat — 思考流", () => {
+	it("思考分片实时变成 reasoning 事件,不混进 delta", async () => {
+		const { deps } = await makeDeps();
+		const app = createAiRoute(deps);
+		const id = (await readJson(await createConv(app))).conversation.id;
+		H.reasoningChunks = ["主人问的是", "订阅"];
+		H.chunks = ["晚上好"];
+
+		const events = await chatDrained(app, id, { message: "在吗" });
+		const think = events.filter((e) => e.event === "reasoning").map((e) => e.data.text);
+		expect(think).toEqual(["主人问的是", "订阅"]);
+		// 正文那条路一个思考字都不能带 —— 它是要落盘当上下文的。
+		const text = events.filter((e) => e.event === "delta").map((e) => e.data.text);
+		expect(text).toEqual(["晚上好"]);
+	});
+
+	it("思考随回复一起落盘,done 与重开会话都带着", async () => {
+		const { deps } = await makeDeps();
+		const app = createAiRoute(deps);
+		const id = (await readJson(await createConv(app))).conversation.id;
+		H.reasoningChunks = ["想了", "一下"];
+		H.chunks = ["答案"];
+
+		const events = await chatDrained(app, id, { message: "x" });
+		const done = events.find((e) => e.event === "done")?.data;
+		expect(done.reply.reasoning).toBe("想了一下");
+
+		const stored = (await readJson(await getConv(app, id))).conversation;
+		expect(stored.messages[1]?.reasoning).toBe("想了一下");
+	});
+
+	it("没思考的回复不背这个字段 —— done 和盘上都没有", async () => {
+		const { deps } = await makeDeps();
+		const app = createAiRoute(deps);
+		const id = (await readJson(await createConv(app))).conversation.id;
+
+		const events = await chatDrained(app, id, { message: "x" });
+		const done = events.find((e) => e.event === "done")?.data;
+		expect(done.reply.reasoning).toBeUndefined();
+		expect(events.some((e) => e.event === "reasoning")).toBe(false);
+	});
+});
+
 describe("POST /conversations/:id/chat — 工具调用痕迹", () => {
 	const listSubs: ToolEv[] = [
 		{ phase: "start", id: "0-0", name: "list_subscriptions", args: {} },
@@ -644,5 +725,120 @@ describe("POST /conversations/:id/chat — 前置条件", () => {
 		const res = await chat(app, id, { message: "在吗" });
 		expect(res.status).toBe(400);
 		expect((await readJson(res)).err).toMatch(/baseUrl|apiKey/i);
+	});
+});
+
+describe("聊天的独立思考设置 —— 开关会话级、等级从配置读", () => {
+	const PROFILE = {
+		activeProfile: "deepseek",
+		providers: {
+			deepseek: { provider: "deepseek", enableThinking: true, thinkingLevel: "high" },
+		},
+	};
+
+	it("不带 thinking flag → 关。引擎那格开着也不影响 —— 配置里已没有聊天开关", async () => {
+		// 曾经这里回落 ai.chat.enableThinking;胶囊改会话级后,「不带 = 关」,
+		// 引擎实例的 enableThinking 更不该渗进来(那是分家前的病)。
+		const { deps } = await makeDeps({ aiConfig: { ...PROFILE, chat: {} } });
+		const app = createAiRoute(deps);
+		const id = (await readJson(await createConv(app))).conversation.id;
+
+		await chatDrained(app, id, { message: "在吗" });
+
+		expect(H.lastThinking).toEqual({ enableThinking: false, thinkingLevel: "high" });
+	});
+
+	it("等级:chat 段写过 → 压过实例,引擎那格怎么调都不影响聊天", async () => {
+		// 主人报的原病:聊天页拨思考等级,整个女仆引擎的设置跟着变。分家后聊天
+		// 等级只读 ai.chat,这里验证路由真的把独立值带给了引擎。
+		const { deps } = await makeDeps({
+			aiConfig: { ...PROFILE, chat: { thinkingLevel: "low" } },
+		});
+		const app = createAiRoute(deps);
+		const id = (await readJson(await createConv(app))).conversation.id;
+
+		await chatDrained(app, id, { message: "在吗", thinking: true });
+
+		expect(H.lastThinking).toEqual({ enableThinking: true, thinkingLevel: "low" });
+	});
+});
+
+describe("POST /conversations/:id/chat — 联网搜索 flag 与来源", () => {
+	/**
+	 * 聊天页的「联网搜索」胶囊是**会话级**的(默认关、手动开、不落盘),所以开关
+	 * 按消息走请求体,路由原样透传给生成器 —— 存进配置的只有搜索后端和 key。
+	 */
+	it("body 带 search:true → 生成器收到 webSearch:true", async () => {
+		const { deps } = await makeDeps();
+		const app = createAiRoute(deps);
+		const id = (await readJson(await createConv(app))).conversation.id;
+		await chatDrained(app, id, { message: "今天有什么新闻", search: true });
+		expect(H.lastWebSearch).toBe(true);
+	});
+
+	it("不带 search → 不开(默认不烧钱)", async () => {
+		const { deps } = await makeDeps();
+		const app = createAiRoute(deps);
+		const id = (await readJson(await createConv(app))).conversation.id;
+		await chatDrained(app, id, { message: "在吗" });
+		expect(H.lastWebSearch ?? false).toBe(false);
+	});
+
+	it("body 带 thinking → 压过配置里的 chat 段;思考等级仍从配置读", async () => {
+		const { deps } = await makeDeps({
+			aiConfig: { chat: { enableThinking: true, thinkingLevel: "high" } },
+		});
+		const app = createAiRoute(deps);
+		const id = (await readJson(await createConv(app))).conversation.id;
+		await chatDrained(app, id, { message: "1+1", thinking: false });
+		expect(H.lastThinking).toEqual({ enableThinking: false, thinkingLevel: "high" });
+	});
+
+	it("progress 实时转发,但**不**落盘 —— 它是「此刻」的东西", async () => {
+		// 一趟皮肤生成要几分钟,那几分钟里 SSE 上只有这几拍能证明她还活着。但存进
+		// 历史就变成一条过期的数字:重开会话看到「已写 860 字」毫无意义。
+		const { deps } = await makeDeps();
+		const app = createAiRoute(deps);
+		const id = (await readJson(await createConv(app))).conversation.id;
+		H.toolEvents = [
+			{ phase: "start", id: "0-0", name: "create_skin", args: { brief: "赛博" } },
+			{ phase: "progress", id: "0-0", chars: 120 },
+			{ phase: "progress", id: "0-0", chars: 860 },
+			{ phase: "end", id: "0-0", ok: true },
+		];
+
+		const events = await chatDrained(app, id, { message: "做套皮肤" });
+		const tools = events.filter((e) => e.event === "tool");
+		expect(tools.map((e) => e.data.phase)).toEqual(["start", "progress", "progress", "end"]);
+		expect(tools[1]?.data).toMatchObject({ chars: 120 });
+
+		const conv = (await readJson(await getConv(app, id))).conversation;
+		expect(conv.messages[1].tools).toEqual([
+			{ name: "create_skin", args: { brief: "赛博" }, ok: true },
+		]);
+	});
+
+	it("web_search 的 end 事件带 sources → SSE 带出去,并随痕迹落盘", async () => {
+		const { deps } = await makeDeps();
+		const app = createAiRoute(deps);
+		const id = (await readJson(await createConv(app))).conversation.id;
+		const SOURCES = [
+			{ title: "T1", url: "https://a.example/1", siteName: "站A" },
+			{ title: "T2", url: "https://b.example/2" },
+		];
+		H.toolEvents = [
+			{ phase: "start", id: "0-0", name: "web_search", args: { query: "b站 新闻" } },
+			{ phase: "end", id: "0-0", ok: true, sources: SOURCES },
+		];
+
+		const events = await chatDrained(app, id, { message: "搜搜", search: true });
+		const toolEnd = events.filter((e) => e.event === "tool").at(-1);
+		expect(toolEnd?.data.sources).toEqual(SOURCES);
+
+		// 落盘的痕迹也带来源 —— 重开会话还能点开「来源」。
+		const conv = (await readJson(await getConv(app, id))).conversation;
+		expect(conv.messages[1].tools).toEqual([
+			{ name: "web_search", args: { query: "b站 新闻" }, ok: true, sources: SOURCES },
+		]);
 	});
 });

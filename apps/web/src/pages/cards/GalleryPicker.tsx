@@ -4,9 +4,9 @@
  * 1 = 单张,>1 = 轮换。删被引用的图被服务端 409 拦截,这里把 referencedBy 提示出来。
  */
 
+import { AddFileButton, Icon, IconButton } from "@bilibili-notify/ui";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { useState } from "react";
-import { Icon } from "../../components/icons";
+import { type ReactNode, useState } from "react";
 import { ApiError, api } from "../../services/api";
 import { removeFromGallery, toggleSelected } from "./gallery-ops";
 import { useAssetObjectUrl } from "./useAssetObjectUrl";
@@ -17,6 +17,25 @@ interface GalleryListResponse {
 }
 
 /** 单张缩略图:点击切换选中(角标显示轮换序号),hover 出现删盘按钮。 */
+/**
+ * 缩略图左上角那个序号角标。选中态与「已失效」态此前各写一遍,共用一串 90 字符
+ * 的类名 —— 两边只差一个底色,却是两份会各自漂的定位与字号。
+ *
+ * 不进组件库:全站只有这一处用得上「绝对定位的方形序号角标」,库里 `Pill` 管的是
+ * 行内徽章,两者不是一回事。
+ */
+function OrderBadge({ tone, children }: { tone: "pink" | "danger"; children: ReactNode }) {
+	return (
+		<span
+			className={`absolute left-1 top-1 grid h-4 min-w-4 place-items-center rounded-bn-pill px-1 text-bn-micro font-bold text-bn-on-solid ${
+				tone === "pink" ? "bg-bn-pink" : "bg-bn-danger-text"
+			}`}
+		>
+			{children}
+		</span>
+	);
+}
+
 function Thumb({
 	id,
 	order,
@@ -46,25 +65,22 @@ function Thumb({
 				{url ? (
 					<img src={url} alt="背景图" className="h-full w-full object-cover" />
 				) : (
-					<span className="grid h-full w-full place-items-center bg-bn-surface-muted text-[10px] text-bn-text-tertiary">
+					<span className="grid h-full w-full place-items-center bg-bn-surface-muted text-bn-2xs text-bn-text-tertiary">
 						…
 					</span>
 				)}
 			</button>
-			{selected ? (
-				<span className="absolute left-1 top-1 grid h-4 min-w-4 place-items-center rounded-full bg-bn-pink px-1 text-[9px] font-bold text-white">
-					{order + 1}
-				</span>
-			) : null}
-			<button
-				type="button"
-				title="从图廊删除"
-				aria-label="从图廊删除"
+			{selected ? <OrderBadge tone="pink">{order + 1}</OrderBadge> : null}
+			<IconButton
+				icon={<Icon.close size={10} />}
+				label="从图廊删除"
 				onClick={onDelete}
-				className="absolute right-1 top-1 hidden h-4 w-4 place-items-center rounded-full bg-black/55 text-white transition hover:bg-bn-danger-text group-hover:grid"
-			>
-				<Icon.close size={10} />
-			</button>
+				size="xs"
+				shape="pill"
+				tone="danger"
+				surface="scrim"
+				className="absolute right-1 top-1 opacity-0 group-hover:opacity-100"
+			/>
 		</div>
 	);
 }
@@ -161,42 +177,37 @@ export function GalleryPicker({
 						key={id}
 						data-testid="gallery-ghost"
 						title="引用的图片文件已被删除,点 × 从选择中移除"
-						className="relative grid aspect-[16/10] w-24 shrink-0 place-items-center overflow-hidden rounded-lg border border-dashed border-bn-danger-text/50 bg-bn-surface-muted"
+						// 边走 danger-border token —— 此前写的 border-bn-danger-text/50 是拿**字色**
+						// 当边色,全站独一份,皮肤改字色时这圈虚线会跟着漂。
+						className="relative grid aspect-[16/10] w-24 shrink-0 place-items-center overflow-hidden rounded-lg border border-dashed border-bn-danger-border bg-bn-surface-muted"
 					>
-						<span className="absolute left-1 top-1 grid h-4 min-w-4 place-items-center rounded-full bg-bn-danger-text px-1 text-[9px] font-bold text-white">
-							{value.indexOf(id) + 1}
-						</span>
-						<span className="text-[10px] text-bn-danger-text">已失效</span>
-						<button
-							type="button"
-							title="移除失效引用"
-							aria-label="移除失效引用"
+						<OrderBadge tone="danger">{value.indexOf(id) + 1}</OrderBadge>
+						<span className="text-bn-2xs text-bn-danger-text">已失效</span>
+						<IconButton
+							icon={<Icon.close size={10} />}
+							label="移除失效引用"
 							onClick={() => onChange(removeFromGallery(value, id))}
-							className="absolute right-1 top-1 grid h-4 w-4 place-items-center rounded-full bg-black/55 text-white transition hover:bg-bn-danger-text"
-						>
-							<Icon.close size={10} />
-						</button>
+							size="xs"
+							shape="pill"
+							tone="danger"
+							surface="scrim"
+							className="absolute right-1 top-1"
+						/>
 					</div>
 				))}
-				<label className="grid aspect-[16/10] w-24 shrink-0 cursor-pointer place-items-center rounded-lg border border-dashed border-bn-border text-[11px] text-bn-text-tertiary transition hover:border-bn-pink hover:text-bn-pink">
-					{uploading ? (
-						"上传中…"
-					) : (
-						<span className="flex flex-col items-center gap-0.5">
-							<Icon.plus size={16} />
-							<span>上传</span>
-						</span>
-					)}
-					<input
-						type="file"
-						accept="image/png,image/jpeg,image/webp"
-						className="hidden"
-						disabled={uploading}
-						onChange={(e) => onFile(e.target.files?.[0])}
-					/>
-				</label>
+				<AddFileButton
+					accept="image/png,image/jpeg,image/webp"
+					uploading={uploading}
+					onFile={onFile}
+					className="grid aspect-[16/10] w-24 shrink-0 place-items-center rounded-lg text-bn-xs"
+				>
+					<span className="flex flex-col items-center gap-0.5">
+						<Icon.plus size={16} />
+						<span>上传</span>
+					</span>
+				</AddFileButton>
 			</div>
-			<div className="flex items-center justify-between text-[11px]">
+			<div className="flex items-center justify-between text-bn-xs">
 				<span className="text-bn-text-tertiary">
 					{value.length === 0
 						? (emptyHint ?? "未选择(用渐变背景)")

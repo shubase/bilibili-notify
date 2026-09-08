@@ -11,10 +11,27 @@
 		"cargo:test": "cargo test --manifest-path src-tauri/Cargo.toml --locked",
 		"cargo:check": "cargo check --manifest-path src-tauri/Cargo.toml --locked",
 		"check:rust": "vp run prepare-rust-check && vp run cargo:fmt && vp run cargo:clippy && vp run cargo:test && vp run cargo:check",
+		"front:dev": "vp dev",
+		"front:build": "vp build",
+		"typecheck": "tsc --noEmit",
 		"dev": "node scripts/prepare-resources.mjs && vpx tauri dev",
 		"tauri:build": "node scripts/prepare-resources.mjs && node scripts/tauri-build.mjs"
 	},
+	"dependencies": {
+		"@bilibili-notify/ui": "workspace:*",
+		"react": "catalog:",
+		"react-dom": "catalog:"
+	},
 	"devDependencies": {
-		"@tauri-apps/cli": "^2.11.2"
+		"@tailwindcss/vite": "catalog:",
+		"@tauri-apps/cli": "^2.11.4",
+		"@testing-library/dom": "catalog:",
+		"@testing-library/react": "catalog:",
+		"@types/react": "catalog:",
+		"@types/react-dom": "catalog:",
+		"@vitejs/plugin-react": "catalog:",
+		"jsdom": "catalog:",
+		"tailwindcss": "catalog:",
+		"vite": "*"
 	}
 }

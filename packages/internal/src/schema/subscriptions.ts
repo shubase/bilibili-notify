@@ -1,7 +1,6 @@
 import { z } from "zod";
 import { CardLayoutSchema } from "./card-layout";
 import {
-	AIPersonaSchema,
 	CardStyleByKindSchema,
 	CardStylePartialSchema,
 	ContentFiltersPartialSchema,
@@ -9,10 +8,13 @@ import {
 	FeatureFlagsPartialSchema,
 	type FeatureKey,
 	ImageGroupSettingsPartialSchema,
+	LIVE_END_EXTRA_KEYS,
+	migrateLegacyFeatureFlagsPartial,
 	ScheduleConfigPartialSchema,
 	TemplateBundlePartialSchema,
 } from "./common";
 import { MessageLayoutSchema } from "./message-layout";
+import { DEFAULT_ROAST_SCHEDULE, RoastScheduleSchema } from "./roast-schedule";
 
 /**
  * 路由：每个特性 → PushTarget.id[]。空数组 = 该特性不推。
@@ -26,22 +28,60 @@ const SubscriptionRoutingObjectSchema = z.object(
 export type SubscriptionRouting = z.infer<typeof SubscriptionRoutingObjectSchema>;
 
 /**
+ * 老 routing 的形状:词云 / 总结曾各有一份目标列表。迁成「下播目标 = 下播 ∪ 词云 ∪ 总结」
+ * (保序:先下播、再词云、再总结;去重交给下面的 transform),老键不留。
+ * 新形状(没这两把键)原样过。
+ */
+function isLegacyRouting(raw: unknown): raw is Record<string, unknown> {
+	return typeof raw === "object" && raw !== null && LIVE_END_EXTRA_KEYS.some((k) => k in raw);
+}
+
+function migrateLegacyRouting(raw: unknown): unknown {
+	if (!isLegacyRouting(raw)) return raw;
+	const { wordcloud, liveSummary, ...rest } = raw;
+	const lists = [rest.liveEnd, wordcloud, liveSummary].filter(Array.isArray);
+	return { ...rest, liveEnd: lists.flat() };
+}
+
+/**
+ * 整条老订阅的迁移。routing 自己认得出新老(见 {@link migrateLegacyRouting});
+ * `overrides.features` 单看分不出 —— `{ liveEnd: false }` 在新老形状里长得一样,含义却不同:
+ * 老的只关了下播卡(词云 / 总结照收),新的是整个下播都关。所以 routing 是老的就把这份
+ * 覆盖也按老规矩迁(`force`),别让那位 UP 的词云 / 总结跟着没了。
+ */
+function migrateLegacySubscription(raw: unknown): unknown {
+	if (typeof raw !== "object" || raw === null) return raw;
+	const sub = raw as Record<string, unknown>;
+	if (!isLegacyRouting(sub.routing)) return raw;
+	const overrides = sub.overrides;
+	if (typeof overrides !== "object" || overrides === null) return raw;
+	const features = (overrides as Record<string, unknown>).features;
+	if (features === undefined) return raw;
+	return {
+		...sub,
+		overrides: { ...overrides, features: migrateLegacyFeatureFlagsPartial(features, true) },
+	};
+}
+
+/**
  * 解析时按 feature 去重 target UUID。重复 UUID 会让同一 feature 对同一目标
  * 重复推送 + 重复 delivery 记录。用**幂等 transform**而非 refine:既归一化
  * 当前/历史数据,又不会让既有含重复项的持久化配置在 parse 时直接 reject。
  */
-export const SubscriptionRoutingSchema = SubscriptionRoutingObjectSchema.transform((r) => {
-	const out = {} as SubscriptionRouting;
-	for (const k of FEATURE_KEYS) out[k] = [...new Set(r[k])];
-	return out;
-});
+export const SubscriptionRoutingSchema = z
+	.preprocess(migrateLegacyRouting, SubscriptionRoutingObjectSchema)
+	.transform((r) => {
+		const out = {} as SubscriptionRouting;
+		for (const k of FEATURE_KEYS) out[k] = [...new Set(r[k])];
+		return out;
+	});
 
 /**
  * 缓存的 UP 主档案，用于 UI 显示。non-authoritative。
  *
  * **不再内嵌于 Subscription**（高频 fans/lastRefreshedAt 写入会污染配置写路径）。
  * 独立端持久化到 apps/server 的 SubRuntimeStore（`<dataDir>/state/sub-runtime.json`）；
- * koishi 端不产生它。schema/type 仍导出，供 SubRuntimeStore + `/api/subs` join 复用。
+ * schema/type 仍导出,供 SubRuntimeStore + `/api/subs` join 复用。
  */
 export const CachedProfileSchema = z.object({
 	name: z.string(),
@@ -65,42 +105,25 @@ export const SpecialUserSchema = z.object({
 export type SpecialUser = z.infer<typeof SpecialUserSchema>;
 
 /**
- * AI 覆盖 —— **两端语义不同的一个结构**,改之前先读完这段。
+ * AI 覆盖 —— per-UP 只做一件事:**从 `GlobalConfig.defaults.ai.presets` 里挑一份**。
  *
- * ## 独立端 / AstrBot(走 `resolveAI`)
+ * `preset` 是**指针**:指向 presets 里的一份。指不着就完整继承全局 —— 老值 `'inherit'`
+ * (当年那档「继承全局」)、`'custom'`(当年那档「完全自定义」)、以及指向一份已被删掉
+ * 的人格,三者在 `resolveAI` 里殊途同归。
  *
- * `preset` 是**指针**:指向 `GlobalConfig.defaults.ai.presets` 里的一份。指不着就
- * 完整继承全局 —— 老值 `'inherit'`(当年那档「继承全局」)、`'custom'`(当年那档
- * 「完全自定义」)、以及指向一份已被删掉的人格,三者在那儿殊途同归。
- *
- * 这一侧**不读** `persona` / `dynamicPrompt` / `liveSummaryPrompt`。人格一律在
- * 「智能女仆」页里写,per-UP 只负责挑一份;设置页那档「完全自定义」已经撤掉,
- * 盘上的残留继续生效就成了界面上看不见、实际仍在起作用的鬼配置。设置页在开启
- * 覆盖时会顺手把它们显式清成 `null`。
- *
- * ## koishi 端(走 `koishi/src/live/sub-view.ts#buildAiOverride`,**不经过** `resolveAI`)
- *
- * 那一侧压根不暴露 preset 选择,`customAi.enable` 即「我自己填」——
- * `koishi/src/subscriptions/advanced.ts` 恒写 `preset: "custom"` 外加一整份
- * persona,再由 `buildAiOverride` 原样读回去。所以这三个字段**必须留在 schema 里**,
- * 删掉等于把 koishi 那半边的 per-UP 人格整个打死。
+ * 当年「完全自定义」写在这里的 `persona` / `dynamicPrompt` / `liveSummaryPrompt` 已经
+ * 不在 schema 里(它们后来只为 koishi 插件那一侧留着):人格一律在「智能女仆」页里写,
+ * per-UP 只负责挑一份。盘上残留的旧字段在解析时被丢弃,设置页保存时也会显式清掉
+ * (见 apps/web PerUpEditor 的 `pickAiOverride`)。
  *
  * ## 为什么 preset 是裸 string
  *
- * 单 schema:persona/prompts 无论 preset 取何值都允许。写成 z.union 会让 TS 在
- * 「具名 id vs 那两个历史常量」之间 narrowing 失败。
+ * 单 schema:preset 取何值都允许。写成 z.union 会让 TS 在「具名 id vs 那两个历史常量」
+ * 之间 narrowing 失败。
  */
 export const AIOverrideSchema = z.object({
 	preset: z.string(),
-	persona: AIPersonaSchema.optional(),
-	dynamicPrompt: z.string().optional(),
-	liveSummaryPrompt: z.string().optional(),
 	temperature: z.number().min(0).max(2).optional(),
-	/**
-	 * per-UP 指定的 AstrBot 人格 id(留空继承全局 --ai-persona-id)。与 preset 无关,
-	 * 仅 AstrBot 端消费(让某个 UP 的总结用不同 AstrBot 人格);koishi/独立端忽略。
-	 */
-	personaId: z.string().optional(),
 });
 export type AIOverride = z.infer<typeof AIOverrideSchema>;
 
@@ -191,7 +214,7 @@ export type SubscriptionState = z.infer<typeof SubscriptionStateSchema>;
  * SubRuntimeStore（见 CachedProfileSchema / SubscriptionStateSchema 注释）。Zod
  * 默认 strip 未知键——旧 subscriptions.json 内嵌的这两个字段 load 时自动剥离。
  */
-export const SubscriptionSchema = z
+const SubscriptionObjectSchema = z
 	.object({
 		id: z.uuid(),
 		uid: z.string().regex(/^\d+$/, "uid must be a numeric Bilibili UID string"),
@@ -204,6 +227,16 @@ export const SubscriptionSchema = z
 		atAllDefaults: SubscriptionAtAllDefaultsSchema.default({ dynamic: false, live: true }),
 		atAll: SubscriptionAtAllSchema.default({ dynamic: {}, live: {} }),
 		overrides: SubscriptionOverridesSchema,
+		/**
+		 * 这位 UP 的单人锐评定时推送。
+		 *
+		 * 与 `specialUsers` 同类:per-UP 独有、**不参与 `resolve()` 折叠**,所以放
+		 * 顶层而不是 `overrides`。塞进 overrides 的话它会去继承全局那条,而全局那
+		 * 条是**榜单**周报 —— 继承过来的 cron / targets 跟界面上显示的对不上。
+		 *
+		 * UP 退订时这条配置跟着一起消失,不留孤儿调度。
+		 */
+		roastSchedule: RoastScheduleSchema.default(DEFAULT_ROAST_SCHEDULE),
 		specialUsers: z.array(SpecialUserSchema).default([]),
 	})
 	.refine((s) => Object.keys(s.atAll.dynamic).every((t) => s.routing.dynamic.includes(t)), {
@@ -214,7 +247,8 @@ export const SubscriptionSchema = z
 		message: "atAll.live keys must be a subset of routing.live",
 		path: ["atAll", "live"],
 	});
-export type Subscription = z.infer<typeof SubscriptionSchema>;
+export const SubscriptionSchema = z.preprocess(migrateLegacySubscription, SubscriptionObjectSchema);
+export type Subscription = z.infer<typeof SubscriptionObjectSchema>;
 
 /** 工厂：创建一个完全继承全局默认的空 Subscription（routing 全空、overrides 全 undefined）。 */
 export function makeEmptySubscription(opts: { id: string; uid: string }): Subscription {
@@ -232,6 +266,8 @@ export function makeEmptySubscription(opts: { id: string; uid: string }): Subscr
 		atAllDefaults: { dynamic: false, live: true },
 		atAll: { dynamic: {}, live: {} },
 		overrides: {},
+		// 新订阅不自带定时锐评 —— 加一个 UP 不该顺手给群里排一条周期推送。
+		roastSchedule: { ...DEFAULT_ROAST_SCHEDULE },
 		specialUsers: [],
 	};
 }

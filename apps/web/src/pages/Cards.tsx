@@ -15,11 +15,21 @@
 
 import type { PreviewResponse, TestPushResponse } from "@bilibili-notify/contract";
 import { buildPatch } from "@bilibili-notify/internal/patch";
+import {
+	Btn,
+	ConfirmDialog,
+	GlassBox,
+	HintNote,
+	Icon,
+	type IconName,
+	LoadingBlock,
+	Pill,
+	SectionNav,
+	Toggle,
+} from "@bilibili-notify/ui";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useMemo, useState } from "react";
-import { Btn, Pill, Toggle } from "../components/atoms";
 import { ChromeAutoDetect } from "../components/chrome-autodetect";
-import { ConfirmDialog } from "../components/dialog";
 import {
 	Field,
 	LogLevelPicker,
@@ -28,16 +38,22 @@ import {
 	TArea,
 	TColor,
 	TInput,
+	TSelect,
 } from "../components/forms";
-import { GlassBox } from "../components/glass-box";
-import { Icon, type IconName } from "../components/icons";
+import { HeroStrip } from "../components/hero-strip";
+import { InheritNote } from "../components/inherit-note";
+import { OverrideBox } from "../components/override-box";
 import { type Scope, ScopeTabs } from "../components/scope-tabs";
-import { SectionNav } from "../components/section-nav";
+import { GUARD_LEVELS } from "../config/guard-levels";
+import { PUSH_TONE } from "../config/push-kinds";
+import { SECTION_ACCENT } from "../config/section-accents";
 import { useDirtyDraft } from "../hooks/useDirtyDraft";
 import { ApiError, api } from "../services/api";
 import type { CardLayoutFull, PushTarget, Subscription } from "../types/domain";
 import type { CardStyle, GlobalConfig, LogLevel } from "../types/globals";
 import { CardLayoutEditor } from "./cards/CardLayoutEditor";
+import { FontPicker } from "./cards/FontPicker";
+import { removeFontFromByKind, removeFontFromStyle } from "./cards/font-ops";
 import { GalleryPicker } from "./cards/GalleryPicker";
 import { removeAssetFromByKind, removeAssetFromStyle } from "./cards/gallery-ops";
 import {
@@ -45,6 +61,8 @@ import {
 	resolveKindStyle,
 	type CardKind as StyleKind,
 } from "./cards/perkind";
+import { previewErrorHint, previewErrorTitle } from "./cards/preview-error";
+import { enqueuePreview, PREVIEW_TIMEOUT_MS } from "./cards/preview-queue";
 import {
 	colorOnly,
 	hasColorOverride,
@@ -87,17 +105,11 @@ const DEFAULT_PREVIEW_CONTENT: PreviewContent = {
 	guard: { text: "", level: 3 },
 };
 
-const GUARD_LEVELS: { v: 1 | 2 | 3; label: string; tone: string }[] = [
-	{ v: 1, label: "总督", tone: "#e84393" },
-	{ v: 2, label: "提督", tone: "#a29bfe" },
-	{ v: 3, label: "舰长", tone: "#74b9ff" },
-];
-
 const KIND_LABELS: Record<CardKind, { label: string; tone: string; icon: IconName }> = {
-	live: { label: "直播开播", tone: "#FF6699", icon: "live" },
-	dyn: { label: "动态发布", tone: "#00AEEC", icon: "dyn" },
-	sc: { label: "SC 提醒", tone: "#fdcb6e", icon: "sc" },
-	guard: { label: "上舰提醒", tone: "#f2a053", icon: "guard" },
+	live: { label: "直播开播", tone: PUSH_TONE.live, icon: "live" },
+	dyn: { label: "动态发布", tone: PUSH_TONE.dynamic, icon: "dyn" },
+	sc: { label: "SC 提醒", tone: PUSH_TONE.sc, icon: "sc" },
+	guard: { label: "上舰提醒", tone: PUSH_TONE.guard, icon: "guard" },
 };
 
 /** 左侧类型导航的副标题(对齐 Rules 左栏的「label + desc」观感)。 */
@@ -143,13 +155,21 @@ function PreviewImage({
 
 	const query = useQuery({
 		queryKey: ["card-preview", debouncedSpec],
-		queryFn: async () => {
-			const res = await api.post<PreviewResponse>("/api/cards/preview", debouncedSpec);
-			if (!res.ok || !res.dataUrl) {
-				throw new ApiError(500, res, res.err ?? "preview failed");
-			}
-			return res.dataUrl;
-		},
+		// 经串行队列 —— 全家福一屏四张卡,四个请求一起打出去的话,后三个只是挂在服务端
+		// 渲染闸门口空等(服务端本来就串行,见 runtime/serial-gate.ts)。等在浏览器这边
+		// 总耗时一样,但每条连接的存活时间只剩自己那张卡的渲染时间,不会被反代的读超时
+		// 连坐掐断。详见 cards/preview-queue.ts。
+		queryFn: () =>
+			enqueuePreview(async () => {
+				// 带死线:队伍是串行的,一个永不落地的请求会让后面几张卡连发都发不出去。
+				const res = await api.post<PreviewResponse>("/api/cards/preview", debouncedSpec, {
+					timeoutMs: PREVIEW_TIMEOUT_MS,
+				});
+				if (!res.ok || !res.dataUrl) {
+					throw new ApiError(500, res, res.err ?? "preview failed");
+				}
+				return res.dataUrl;
+			}),
 		retry: false,
 	});
 
@@ -158,16 +178,20 @@ function PreviewImage({
 	const status = apiErr?.status;
 
 	const body = showSkeleton ? (
-		<div className="flex w-full max-w-95 flex-col items-center gap-3 rounded-xl bg-bn-surface/70 p-6">
-			<div className="bn-anim-spin h-8 w-8 rounded-full border-2 border-bn-pink/30 border-t-bn-pink" />
-			<div className="text-[12px] font-bold text-bn-text-secondary">puppeteer 渲染中…</div>
-		</div>
+		/* `inset` + 自带外壳:这块占的是预览图的位置,底与宽度要跟着预览框走,
+		   `card` 变体那层玻璃会和外面的预览区叠成玻璃叠玻璃。 */
+		<LoadingBlock
+			label="puppeteer 渲染中"
+			variant="inset"
+			className="w-full max-w-95 rounded-bn-card bg-bn-surface/70"
+		/>
 	) : query.error ? (
-		<div className="w-full max-w-95 rounded-xl bg-bn-surface p-4 text-[12px]">
-			<div className="mb-1 font-bold text-bn-danger-text">
-				{status === 503 ? "puppeteer 未配置" : status === 501 ? "kind 暂未支持" : "渲染失败"}
-			</div>
+		<div className="w-full max-w-95 rounded-xl bg-bn-surface p-4 text-bn-sm">
+			<div className="mb-1 font-bold text-bn-danger-text">{previewErrorTitle(status)}</div>
 			<div className="text-bn-text-secondary">{apiErr?.message ?? "未知错误"}</div>
+			{previewErrorHint(status) ? (
+				<div className="mt-2 text-bn-xs text-bn-text-tertiary">{previewErrorHint(status)}</div>
+			) : null}
 			{status === 503 ? <ChromeAutoDetect onEnabled={() => query.refetch()} /> : null}
 		</div>
 	) : (
@@ -191,33 +215,6 @@ function PreviewImage({
 		<div className="relative flex min-h-105 items-center justify-center rounded-bn-card border border-bn-border p-7">
 			{body}
 		</div>
-	);
-}
-
-function CardPreview({
-	kind,
-	style,
-	content,
-	layout,
-	fallback,
-	frame,
-}: {
-	kind: CardKind;
-	style: CardStyle;
-	content: Record<string, unknown>;
-	layout: CardLayoutFull | null;
-	fallback: boolean;
-	frame?: boolean;
-}) {
-	return (
-		<PreviewImage
-			kind={kind}
-			style={style}
-			content={content}
-			layout={layout}
-			fallback={fallback}
-			frame={frame}
-		/>
 	);
 }
 
@@ -283,7 +280,7 @@ function TestPushCard({
 		<GlassBox
 			title="预览内容 · 测试推送"
 			subtitle="编辑该类型预览内容,并把当前预览卡片(草稿样式)推送到所选目标"
-			accent="#00b894"
+			accent={SECTION_ACCENT.capability}
 			icon={<Icon.bell size={14} />}
 			badge="test-push"
 		>
@@ -296,22 +293,17 @@ function TestPushCard({
 			/>
 			<div className="my-3 border-t border-bn-border-subtle" />
 			<Field code="targetId" full>
-				<select
+				<TSelect
+					full
 					value={targetId}
-					onChange={(e) => setTargetId(e.target.value)}
+					onChange={setTargetId}
 					disabled={targets.length === 0}
-					className="w-full rounded-md border border-bn-border bg-bn-surface px-2.5 py-2 text-[12.5px] text-bn-text-primary outline-none focus:border-bn-pink disabled:opacity-50"
-				>
-					{targets.length === 0 ? (
-						<option value="">无可用推送目标</option>
-					) : (
-						targets.map((t) => (
-							<option key={t.id} value={t.id}>
-								{t.name}
-							</option>
-						))
-					)}
-				</select>
+					options={
+						targets.length === 0
+							? [{ value: "", label: "无可用推送目标" }]
+							: targets.map((t) => ({ value: t.id, label: t.name }))
+					}
+				/>
 			</Field>
 			<div className="pt-2.5">
 				<Btn
@@ -324,11 +316,13 @@ function TestPushCard({
 					{push.isPending ? "推送中…" : "测试推送"}
 				</Btn>
 				{push.isError ? (
-					<div className="mt-2 text-[11px] text-bn-danger-text">
+					<div className="mt-2 text-bn-xs text-bn-danger-text">
 						推送失败:{(push.error as ApiError)?.message ?? "未知错误"}
 					</div>
 				) : push.isSuccess ? (
-					<div className="mt-2 text-[11px] text-emerald-600">已送达 · {push.data.latencyMs}ms</div>
+					<div className="mt-2 text-bn-xs text-bn-success-text">
+						已送达 · {push.data.latencyMs}ms
+					</div>
 				) : null}
 			</div>
 		</GlassBox>
@@ -378,7 +372,11 @@ export function CardStyleFields({
 				<TColor value={style.cardColorEnd} onChange={(v) => set("cardColorEnd", v)} />
 			</Field>
 			<Field code="font" full>
-				<TInput value={style.font} onChange={(v) => set("font", v)} />
+				<FontPicker
+					value={{ font: style.font, fontAsset: style.fontAsset }}
+					onChange={(next) => onChange({ ...style, font: next.font, fontAsset: next.fontAsset })}
+					onAssetDeleted={onAssetDeleted}
+				/>
 			</Field>
 			<Field code="glassOpacity" full>
 				<div className="flex flex-col gap-2">
@@ -400,18 +398,18 @@ export function CardStyleFields({
 									onChange={(e) => set("glassOpacity", Number(e.target.value))}
 									className="flex-1 accent-bn-pink"
 								/>
-								<span className="w-9 shrink-0 text-right font-mono text-[11px] text-bn-text-secondary">
+								<span className="w-9 shrink-0 text-right font-mono text-bn-xs text-bn-text-secondary">
 									{style.glassOpacity.toFixed(2)}
 								</span>
 							</>
 						) : (
-							<span className="text-[11px] text-bn-text-tertiary">
+							<span className="text-bn-xs text-bn-text-tertiary">
 								{style.glassClear ? "已开启完全透明" : "默认（各卡内置基线）"}
 							</span>
 						)}
 					</div>
 					{/* 子选项:完全透明(去磨砂模糊),与上方透明度二选一。 */}
-					<div className="flex items-center gap-2 text-[11px] text-bn-text-secondary">
+					<div className="flex items-center gap-2 text-bn-xs text-bn-text-secondary">
 						<Toggle
 							size="sm"
 							value={style.glassClear}
@@ -581,6 +579,25 @@ function PerUpDataSection({
 }
 
 /**
+ * 「这条预览用的是真实数据」的绿色说明条。四个 kind 分支各自写了一遍,连
+ * `realDataLabel` 缺省时的那句兜底也抄了两份;局部收编后又与 FontPicker /
+ * UpDialog 的旁注各配各的圆角 —— 观感统一升进了库的 {@link HintNote},这里
+ * 只剩「这条旁注是报喜档」这层领域语义。
+ */
+function RealDataNote({ children }: { children: React.ReactNode }) {
+	return <HintNote tone="success">{children}</HintNote>;
+}
+
+/** 「这一档的某些样式不归你管」的中性说明条 —— SC 与上舰各一条。 */
+function KindHintNote({ children }: { children: React.ReactNode }) {
+	return <HintNote>{children}</HintNote>;
+}
+
+/** per-UP 作用域没给 `realDataLabel` 时的兜底说明。 */
+const REAL_DATA_FALLBACK =
+	"使用该 UP 的真实数据渲染预览；未开播 / 无动态 / 网络异常时自动回退示例数据。";
+
+/**
  * 「预览内容」框 —— 卡片类型切换 + 各类型的 mock/真实内容字段。与作用域无关
  * (预览的是哪类卡片、用什么内容,跟改谁的样式独立)。
  */
@@ -624,18 +641,14 @@ function PreviewContentFields({
 								placeholder="1"
 							/>
 						</Field>
-						<div className="rounded border border-dashed bg-bn-success-soft/60 p-2.5 text-[11px] text-emerald-800">
-							{realDataLabel ??
-								"使用该 UP 的真实数据渲染预览；未开播 / 无动态 / 网络异常时自动回退示例数据。"}
-						</div>
+						<RealDataNote>{realDataLabel ?? REAL_DATA_FALLBACK}</RealDataNote>
 					</>
 				) : (
-					<div className="rounded border border-dashed bg-bn-success-soft/60 p-2.5 text-[11px] text-emerald-800">
+					<RealDataNote>
 						{kind === "live"
-							? (realDataLabel ??
-								"使用该 UP 的真实数据渲染预览；未开播 / 无动态 / 网络异常时自动回退示例数据。")
+							? (realDataLabel ?? REAL_DATA_FALLBACK)
 							: "SC / 上舰:接收方为该 UP(真实名字 / 头像),发送者 / 新舰长取当前登录账号;解析失败回退示例。"}
-					</div>
+					</RealDataNote>
 				)
 			) : kind === "live" ? (
 				<>
@@ -646,9 +659,9 @@ function PreviewContentFields({
 							placeholder="留空则使用示例数据"
 						/>
 					</Field>
-					<div className="rounded border border-dashed bg-bn-success-soft/60 p-2.5 text-[11px] text-emerald-800">
+					<RealDataNote>
 						需要后端账号已登录 B 站；填入后将真实拉取该直播间数据并渲染。留空则继续使用示例数据。
-					</div>
+					</RealDataNote>
 				</>
 			) : kind === "dyn" ? (
 				<>
@@ -669,9 +682,9 @@ function PreviewContentFields({
 							placeholder="1"
 						/>
 					</Field>
-					<div className="rounded border border-dashed bg-bn-success-soft/60 p-2.5 text-[11px] text-emerald-800">
+					<RealDataNote>
 						需要后端账号已登录 B 站；填入后将拉取该 UP 的 space 动态列表，按 offset 选取并渲染。
-					</div>
+					</RealDataNote>
 				</>
 			) : kind === "sc" ? (
 				<>
@@ -688,25 +701,24 @@ function PreviewContentFields({
 							placeholder="30"
 						/>
 					</Field>
-					<div className="rounded border border-dashed bg-bn-surface-muted p-2.5 text-[11px] text-bn-text-tertiary">
-						左侧渐变色对 SC 不生效；SC 卡片背景色由价格档位自动决定。
-					</div>
+					<KindHintNote>左侧渐变色对 SC 不生效；SC 卡片背景色由价格档位自动决定。</KindHintNote>
 				</>
 			) : (
 				<>
 					<Field code="level">
 						<div className="flex flex-wrap gap-1.5">
 							{GUARD_LEVELS.map((g) => {
-								const active = content.guard.level === g.v;
+								const active = content.guard.level === g.level;
 								return (
 									<button
 										type="button"
-										key={g.v}
-										onClick={() => setGuard({ level: g.v })}
-										className="rounded px-3 py-1 text-[11.5px] font-semibold transition"
+										key={g.level}
+										onClick={() => setGuard({ level: g.level })}
+										data-bn={active ? "chip chip-active" : "chip"}
+										className="rounded-sm px-3 py-1 text-bn-xs font-semibold transition"
 										style={
 											active
-												? { background: g.tone, color: "white" }
+												? { background: g.color, color: "var(--color-bn-on-solid)" }
 												: {
 														background: "var(--color-bn-hover-muted)",
 														color: "var(--color-bn-text-tertiary)",
@@ -731,19 +743,22 @@ function PreviewContentFields({
 							rows={2}
 						/>
 					</Field>
-					<div className="rounded border border-dashed bg-bn-surface-muted p-2.5 text-[11px] text-bn-text-tertiary">
+					<KindHintNote>
 						左侧渐变色对上舰不生效；卡片背景色与徽章图由舰长等级自动决定。
-					</div>
+					</KindHintNote>
 				</>
 			)}
 		</>
 	);
 }
 
-/** 关闭态下方一行说明文字。 */
-function InheritNote({ children }: { children: React.ReactNode }) {
+/** 预览列的头行:左粗标题 + 右小字说明 —— 全家福与单卡两分支此前各抄一份。 */
+function PreviewHead({ title, note }: { title: React.ReactNode; note: React.ReactNode }) {
 	return (
-		<div className="py-6 text-center text-[12px] text-bn-text-tertiary">未启用 · {children}</div>
+		<div className="flex items-center justify-between text-bn-base text-bn-text-primary">
+			<span className="font-bold">{title}</span>
+			<span className="text-bn-xs font-normal text-bn-text-secondary">{note}</span>
+		</div>
 	);
 }
 
@@ -797,15 +812,25 @@ export default function Cards() {
 	const [puByKind, setPuByKind] = useState<CardStyleByKind>({});
 	const [puLayout, setPuLayout] = useState<CardLayoutFull | undefined>(undefined);
 
-	// 图廊删盘后清扫页面上所有仍引用该 id 的样式草稿(全局基准 / 全局 per-kind / per-UP
-	// 基准 / per-UP per-kind 的背景图 + 直播封面)。picker 自身的 onChange 只清它绑定的
-	// 那一个字段;其余草稿若攥着这个 id 不放,下次保存就落盘成悬空引用(幽灵占轮换位)。
-	// 服务端 409 只拦「已保存配置」里的引用,未保存草稿只能靠这里。
+	// 删盘后清扫页面上所有仍引用该 id 的样式草稿(全局基准 / 全局 per-kind / per-UP
+	// 基准 / per-UP per-kind 的背景图 + 直播封面 + 字体)。picker 自身的 onChange 只清它
+	// 绑定的那一个字段;其余草稿若攥着这个 id 不放,下次保存就落盘成悬空引用(背景图是
+	// 幽灵占轮换位,字体是出图静静回落兜底)。服务端 409 只拦「已保存配置」里的引用,
+	// 未保存草稿只能靠这里。
+	//
+	// 图与字体两套清扫都跑:两类资产 id 各自随机 32 位 hex,撞不到一起,所以对另一类
+	// 是纯 no-op —— 比让两个 picker 各带一个回调简单,也不会漏。
+	const sweep = <
+		T extends { backgroundImages?: string[]; liveCoverImages?: string[]; fontAsset?: string },
+	>(
+		s: T,
+		id: string,
+	): T => removeFontFromStyle(removeAssetFromStyle(s, id), id);
 	const sweepDeletedAsset = (id: string) => {
-		setGStyle((s) => (s ? removeAssetFromStyle(s, id) : s));
-		setGByKind((bk) => removeAssetFromByKind(bk, id));
-		setPuStyle((s) => (s ? removeAssetFromStyle(s, id) : s));
-		setPuByKind((bk) => removeAssetFromByKind(bk, id));
+		setGStyle((s) => (s ? sweep(s, id) : s));
+		setGByKind((bk) => removeFontFromByKind(removeAssetFromByKind(bk, id), id));
+		setPuStyle((s) => (s ? sweep(s, id) : s));
+		setPuByKind((bk) => removeFontFromByKind(removeAssetFromByKind(bk, id), id));
 	};
 
 	// 左侧导航:「全局」(基准通用样式)或某卡片类型。与作用域无关。
@@ -1049,11 +1074,7 @@ export default function Cards() {
 	});
 
 	if (!gStyle) {
-		return (
-			<div className="bn-glass rounded-bn-card p-10 text-center text-sm text-bn-text-secondary shadow-bn-card">
-				加载卡片样式中…
-			</div>
-		);
+		return <LoadingBlock label="加载卡片样式中" />;
 	}
 
 	// 按 kind 求「生效样式」:全局作用域 = 全局基准 + 该类型覆盖;per-UP = 再叠该 UP 基准 /
@@ -1093,54 +1114,36 @@ export default function Cards() {
 	const KindIcon = Icon[KIND_LABELS[kind].icon];
 
 	return (
-		<div className="bn-anim-fade-in flex flex-col gap-4">
+		<div className="bn-anim-page-in flex flex-col gap-4">
 			{/* Hero strip — 全局插件信息 + (仅全局作用域)总开关 */}
-			<div
-				className="relative rounded-bn-card border p-5"
-				style={{
-					background: "linear-gradient(135deg, rgba(162,155,254,0.18), rgba(0,174,236,0.08))",
-					borderColor: "rgba(162,155,254,0.25)",
-				}}
-			>
-				<div className="flex items-center gap-3.5">
-					<div
-						className="grid shrink-0 place-items-center rounded-2xl text-white"
-						style={{
-							background: "linear-gradient(135deg, #a29bfe, #00AEEC)",
-							boxShadow: "0 6px 18px rgba(108,92,231,0.35)",
-							width: 52,
-							height: 52,
-						}}
-					>
-						<Icon.eye size={26} />
-					</div>
-					<div className="flex-1">
-						<div className="flex items-center gap-2 text-[15.5px] font-bold text-bn-text-primary">
-							卡片渲染
-							<Pill color="#a29bfe" subtle size="sm">
-								image
-							</Pill>
-						</div>
-						<div className="mt-1 text-xs text-bn-text-tertiary">
-							puppeteer-core 把 Vue/UnoCSS 模板渲染成 PNG;关闭后 push 流程仅发送文本回退。
-						</div>
-					</div>
-					{isGlobalScope ? (
+			<HeroStrip
+				icon={<Icon.eye size={26} />}
+				title={
+					<>
+						卡片渲染
+						<Pill color="var(--color-bn-purple)" subtle size="sm">
+							image
+						</Pill>
+					</>
+				}
+				subtitle="puppeteer-core 把 Vue/UnoCSS 模板渲染成 PNG;关闭后 push 流程仅发送文本回退。"
+				right={
+					isGlobalScope ? (
 						<Picker
 							value={gStyle.enabled}
 							onChange={(v) => setGStyle((d) => (d ? { ...d, enabled: v } : d))}
 							options={[
-								{ value: true, label: "启用", color: "#a29bfe" },
-								{ value: false, label: "停用", color: "#94a3b8" },
+								{ value: true, label: "启用", color: "var(--color-bn-purple)" },
+								{ value: false, label: "停用", color: "var(--color-bn-inactive)" },
 							]}
 						/>
 					) : (
-						<span className="rounded-md border border-bn-border-subtle bg-bn-surface/70 px-2.5 py-1 text-[11px] text-bn-text-tertiary">
+						<span className="rounded-md border border-bn-border-subtle bg-bn-surface/70 px-2.5 py-1 text-bn-xs text-bn-text-tertiary">
 							总开关在全局作用域
 						</span>
-					)}
-				</div>
-			</div>
+					)
+				}
+			/>
 
 			{/* 作用域切换 */}
 			<ScopeTabs
@@ -1194,7 +1197,7 @@ export default function Cards() {
 							<GlassBox
 								title="卡片渲染样式 · 全局通用"
 								subtitle="image plugin · 所有卡片的基准渐变 / 字体 / 玻璃片 / 背景;各类型可在对应标签单独覆盖"
-								accent="#a29bfe"
+								accent="var(--color-bn-purple)"
 								icon={<Icon.edit size={14} />}
 								badge="cardStyle"
 							>
@@ -1213,18 +1216,14 @@ export default function Cards() {
 							</GlassBox>
 						) : (
 							// 「全局」tab · per-UP:该 UP 的样式覆盖(一套管该 UP 全部卡片)。
-							<GlassBox
+							<OverrideBox
 								title="卡片样式覆盖"
 								subtitle="开 = 该 UP 用自定义渐变 / 字体 / 玻璃片 / 背景;关 = 继承全局样式"
-								accent="#a29bfe"
+								accent="var(--color-bn-purple)"
 								icon={<Icon.edit size={14} />}
-								badge={puStyle ? "覆盖中" : "继承"}
-								right={
-									<Toggle
-										value={puStyle !== undefined}
-										onChange={(on) => setPuStyle(on ? { ...gStyle } : undefined)}
-									/>
-								}
+								enabled={puStyle !== undefined}
+								onToggle={(on) => setPuStyle(on ? { ...gStyle } : undefined)}
+								inheritNote="该 UP 继承全局卡片样式"
 							>
 								{puStyle ? (
 									<CardStyleFields
@@ -1232,10 +1231,8 @@ export default function Cards() {
 										onChange={(n) => setPuStyle(n)}
 										onAssetDeleted={sweepDeletedAsset}
 									/>
-								) : (
-									<InheritNote>该 UP 继承全局卡片样式</InheritNote>
-								)}
-							</GlassBox>
+								) : null}
+							</OverrideBox>
 						)
 					) : isGlobalScope ? (
 						// 类型 tab · 全局作用域:该卡片单独样式开关,打开才展开覆盖。
@@ -1407,27 +1404,21 @@ export default function Cards() {
 								</GlassBox>
 							) : null
 						) : (
-							<GlassBox
+							<OverrideBox
 								title="卡片版式覆盖"
 								subtitle="开 = 该 UP 用自定义版式(整份复制全局后编辑);关 = 继承全局版式"
 								accent={KIND_LABELS[kind].tone}
 								icon={<KindIcon size={14} />}
-								badge={puLayout ? "覆盖中" : "继承"}
-								right={
-									<Toggle
-										value={puLayout !== undefined}
-										onChange={(on) =>
-											setPuLayout(on ? structuredClone(gLayout ?? serverGlobalLayout) : undefined)
-										}
-									/>
+								enabled={puLayout !== undefined}
+								onToggle={(on) =>
+									setPuLayout(on ? structuredClone(gLayout ?? serverGlobalLayout) : undefined)
 								}
+								inheritNote="该 UP 继承全局卡片版式"
 							>
 								{puLayout ? (
 									<CardLayoutEditor kind={kind} layout={puLayout} onChange={setPuLayout} />
-								) : (
-									<InheritNote>该 UP 继承全局卡片版式</InheritNote>
-								)}
-							</GlassBox>
+								) : null}
+							</OverrideBox>
 						))}
 
 					{/* 测试推送 + 预览内容编辑 —— 仅「类型」tab(全局只看四卡全家福,不带测试推送)。 */}
@@ -1454,14 +1445,10 @@ export default function Cards() {
 				<div className="flex flex-col gap-2.5">
 					{isGlobalTab ? (
 						<>
-							<div className="flex items-center justify-between text-[13px] text-bn-text-primary">
-								<span className="font-bold">
-									卡片全家福 · 实时反映{isGlobalScope ? "全局" : "该 UP"}配置
-								</span>
-								<span className="text-[11px] font-normal text-bn-text-secondary">
-									四种卡片各自生效样式 · puppeteer 真实渲染
-								</span>
-							</div>
+							<PreviewHead
+								title={<>卡片全家福 · 实时反映{isGlobalScope ? "全局" : "该 UP"}配置</>}
+								note="四种卡片各自生效样式 · puppeteer 真实渲染"
+							/>
 							{/* 一个框装四张卡:2×2 四宫格。固定高度(参考选项卡片满展开时的观感取值,不跟随它),
 							    四格 grid-rows-2 等分该高度,卡片 object-contain 缩放填格。 */}
 							<div className="flex h-180 flex-col rounded-bn-card border border-bn-border p-4">
@@ -1473,7 +1460,7 @@ export default function Cards() {
 											(isGlobalScope ? gByKind : puByKind)[toStyleKind(fk)] !== undefined;
 										return (
 											<div key={fk} className="flex min-h-0 flex-col gap-1">
-												<div className="flex items-center gap-1 text-[11px] font-bold text-bn-text-tertiary">
+												<div className="flex items-center gap-1 text-bn-xs font-bold text-bn-text-tertiary">
 													<FkIcon size={11} />
 													{KIND_LABELS[fk].label}
 													{overridden ? (
@@ -1483,7 +1470,7 @@ export default function Cards() {
 													) : null}
 												</div>
 												<div className="flex min-h-0 flex-1 items-center justify-center overflow-hidden">
-													<CardPreview
+													<PreviewImage
 														kind={fk}
 														style={style}
 														content={fcontent}
@@ -1497,7 +1484,7 @@ export default function Cards() {
 									})}
 								</div>
 							</div>
-							<div className="rounded-md border border-bn-border-subtle bg-bn-surface/60 px-3 py-2 text-[11px] italic text-bn-text-secondary">
+							<div className="rounded-md border border-bn-border-subtle bg-bn-surface/60 px-3 py-2 text-bn-xs italic text-bn-text-secondary">
 								{isGlobalScope
 									? "全局基准应用到四种卡片;要单独调某张卡,点左侧对应类型标签。"
 									: focusedSub
@@ -1507,16 +1494,16 @@ export default function Cards() {
 						</>
 					) : (
 						<>
-							<div className="flex items-center justify-between text-[13px] text-bn-text-primary">
-								<span className="font-bold">
-									卡片预览 · 实时反映{isGlobalScope ? "全局" : "该 UP"}配置
-								</span>
-								<span className="text-[11px] font-normal text-bn-text-secondary">
-									puppeteer 真实渲染 · 渲染宽度
-									{kind === "sc" ? " 280" : kind === "guard" ? " 430" : " 600"}px
-								</span>
-							</div>
-							<CardPreview
+							<PreviewHead
+								title={<>卡片预览 · 实时反映{isGlobalScope ? "全局" : "该 UP"}配置</>}
+								note={
+									<>
+										puppeteer 真实渲染 · 渲染宽度
+										{kind === "sc" ? " 280" : kind === "guard" ? " 430" : " 600"}px
+									</>
+								}
+							/>
+							<PreviewImage
 								kind={kind}
 								style={effStyle}
 								content={previewContent}
@@ -1525,7 +1512,7 @@ export default function Cards() {
 							/>
 
 							{/* Effective style readout */}
-							<div className="flex flex-wrap gap-3.5 rounded-md border border-bn-border-subtle bg-bn-surface/60 px-3 py-2 font-mono text-[10.5px] text-bn-text-tertiary">
+							<div className="flex flex-wrap gap-3.5 rounded-md border border-bn-border-subtle bg-bn-surface/60 px-3 py-2 font-mono text-bn-2xs text-bn-text-tertiary">
 								<span>
 									cardColorStart: <b className="text-bn-text-primary">{effStyle.cardColorStart}</b>
 								</span>

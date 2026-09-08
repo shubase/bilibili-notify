@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import type { AIScene, CommentaryCallOverride } from "@bilibili-notify/ai";
 import type { BilibiliAPI } from "@bilibili-notify/api";
 import type { ImageRenderer } from "@bilibili-notify/image";
@@ -6,12 +7,12 @@ import type {
 	ForwardImage,
 	Logger,
 	MessageBus,
-	MessageKindLayout,
 	ServiceContext,
 } from "@bilibili-notify/internal";
-import { interpolate, planMessageGroups, withLock } from "@bilibili-notify/internal";
+import { DEFAULT_MESSAGE_LAYOUT, interpolate, planMessageGroups } from "@bilibili-notify/internal";
 import { CronJob } from "cron";
 import { DateTime } from "luxon";
+import { resolveDynamicColorOptions } from "./card-style";
 import { DynamicFilterReason, filterDynamic } from "./dynamic-filter";
 import type {
 	PickCardBackground,
@@ -47,7 +48,7 @@ const DETECTOR_RESTART_BACKOFF_MS = 5 * 60_000;
  * videoTemplate 时使用(真实 adapter 都会从 globals.defaults.templates 填充)。
  * 与 `@bilibili-notify/internal` 的 `DEFAULT_TEMPLATES.dynamic/.dynamicVideo`
  * 保持一致。变量仅 `{name}`(UP 名);链接是消息版式的独立部件,不再进模板
- * (旧存档残留的 `{url}` 由 renderDynamicText 在版式路径按 url='' 剥离)。
+ * 链接不是模板变量,由消息版式的 link 部件提供。
  */
 const DEFAULT_DYNAMIC_TEXT = {
 	dynamic: "{name}发布了一条动态",
@@ -55,13 +56,11 @@ const DEFAULT_DYNAMIC_TEXT = {
 } as const;
 
 /**
- * 渲染动态推送文本:`{name}` / `{url}` 插值 + `\n` 展开。`url` 为空(未启用 URL)
- * 时连同 `{url}` 的前导分隔符一起去掉,避免行尾残留孤立的「：」。两个推送分支
- * (有图 / 无图)都走此函数 → 文字内容一致。
+ * 渲染动态推送文本:`{name}` 插值 + `\n` 展开。链接是版式的独立部件,模板里没有链接变量
+ * (2026-09 起不再替旧模板剥 `{url}`:写了就原样出现,请从模板里删掉)。
  */
-function renderDynamicText(template: string, name: string, url: string): string {
-	const tmpl = url ? template : template.replace(/\s*[：:]?\s*\{url\}/g, "");
-	return interpolate(tmpl, { name, url }).replaceAll("\\n", "\n");
+function renderDynamicText(template: string, name: string): string {
+	return interpolate(template, { name }).replaceAll("\\n", "\n");
 }
 
 function parseUid(raw: unknown): string | undefined {
@@ -130,11 +129,9 @@ function getDynamicPostTime(author: Dynamic["modules"]["module_author"]): number
 }
 
 /**
- * Runtime configuration for {@link DynamicEngine}. Mirrors the platform-neutral
- * subset of `BilibiliNotifyDynamicConfig`; the koishi shell maps its schema
- * fields onto this struct, the standalone runtime fills it from its own config
- * store. The `logLevel` field is intentionally dropped — adapter sets logger
- * level externally via {@link ServiceContext}.
+ * Runtime configuration for {@link DynamicEngine}. The standalone runtime fills it
+ * from its config store. The `logLevel` field is intentionally dropped — the host
+ * sets logger level externally via {@link ServiceContext}.
  */
 export interface DynamicEngineConfig {
 	/** 轮询动态的 cron 表达式。 */
@@ -142,14 +139,13 @@ export interface DynamicEngineConfig {
 	/** 视频动态时是否将 URL 替换为 BV 号。 */
 	dynamicVideoUrlToBV: boolean;
 	/**
-	 * 非视频动态的推送文本模板。变量 `{name}`(UP 名) / `{url}`(动态链接)。
-	 * 要不要带链接由模板里有没有 `{url}` 决定(per-UP / 全局模板可编辑);`{url}` 在
-	 * url 为空(如视频转 BV 无匹配)时,引擎会顺带去掉相邻分隔符。缺省时回退到内建文案。
-	 * Adapter 通常用 `globals.defaults.templates.dynamic` 填充。
+	 * 非视频动态的推送文本模板,变量只有 `{name}`(UP 名)。链接不是模板变量:它是消息版式的
+	 * 独立部件,要不要带、放在哪由版式决定。缺省时回退到内建文案。Adapter 通常用
+	 * `globals.defaults.templates.dynamic` 填充。
 	 */
 	dynamicTemplate?: string;
 	/**
-	 * 视频投稿的推送文本模板。变量 `{name}` / `{url}`(视频链接或 BV)。
+	 * 视频投稿的推送文本模板,变量同上(链接部件给的是视频链接,或按 dynamicVideoUrlToBV 换成 BV)。
 	 * 缺省时回退到内建文案。Adapter 通常用 `globals.defaults.templates.dynamicVideo` 填充。
 	 */
 	videoTemplate?: string;
@@ -176,12 +172,11 @@ export interface DynamicEngineConfig {
 	 */
 	aiEnabled?: boolean;
 	/**
-	 * 引擎级消息版式(动态切片)。per-UP `SubItemView.messageLayout` 缺失时兜底 ——
-	 * koishi 端用 `defaultMessageKindLayout("dynamic", { link: 开关 })` 填充(无版式
-	 * 编辑 UI,仅开关链接);独立端 per-UP 恒有值,不落到这里。两级都缺 = 旧路径
-	 * (链接内嵌模板 {url})。
+	 * 点评时允不允许联网搜索。缺省 false —— 搜索按次付费,自动路径必须主人亲手
+	 * 点亮。Adapter 用 `globals.defaults.ai.search.engines.dynamic` 填充;引擎只把
+	 * 它翻成 override.webSearch,执行器在不在是生成器的事。
 	 */
-	messageLayout?: MessageKindLayout;
+	aiWebSearch?: boolean;
 	/**
 	 * 全局默认卡片背景图廊(`defaults.cardStyle.backgroundImages`)。该 UP 无 per-UP
 	 * 背景覆盖时,`pickDynamicColorOptions` 拿它做「每次推送轮换」的兜底列表 ——
@@ -208,10 +203,10 @@ export interface DynamicEngineOptions {
 	 */
 	getSubs: () => SubscriptionsView | null;
 	/**
-	 * 可选注入：背景图轮换选择器。某 UP 的动态卡配 >1 张背景图时「每次推送轮换」;
-	 * 缺省(如 koishi)则不轮换,沿用首图。
+	 * 背景图轮换选择器。某 UP 的动态卡配 >1 张背景图时「每次推送轮换」;宿主注入
+	 * (独立端 fs 持久化游标)。返回 undefined = 本次不换,沿用首图。
 	 */
-	pickCardBackground?: PickCardBackground;
+	pickCardBackground: PickCardBackground;
 }
 
 /** 从动态数据中提取图片 URL，用于多模态 AI 点评（最多 4 张） */
@@ -276,9 +271,8 @@ function extractDynamicText(item: Dynamic): string {
 /**
  * 平台中立的动态轮询/过滤/渲染核心。
  *
- * - 不依赖 koishi runtime；adapter 提供 ServiceContext / MessageBus / PushLike。
- * - image / ai 通过 **构造期注入**（不在 detect 循环内做服务查找），缺失时降级。
- * - 时间线、过滤、API 错误处理逻辑与原 koishi 版 BilibiliNotifyDynamic 一致。
+ * - 不依赖任何宿主框架;宿主(独立端 runtime)提供 ServiceContext / MessageBus / PushLike。
+ * - image / ai 通过 **构造期注入**(不在 detect 循环内做服务查找),缺失时降级。
  */
 export class DynamicEngine {
 	private readonly serviceCtx: ServiceContext;
@@ -289,7 +283,7 @@ export class DynamicEngine {
 	private ai?: CommentaryClient;
 	private readonly logger: Logger;
 	private readonly getSubs: () => SubscriptionsView | null;
-	private readonly pickCardBackground: PickCardBackground | undefined;
+	private readonly pickCardBackground: PickCardBackground;
 
 	private config: DynamicEngineConfig;
 	private dynamicJob?: CronJob;
@@ -301,6 +295,17 @@ export class DynamicEngine {
 	 * 退避重试热路径反复刷 error(Q1)。
 	 */
 	private riskControlled = false;
+	/**
+	 * 瞬时错误(-509 / 瞬时 -403 / 4101132 之类未知码)的边沿标记,存着当前故障的
+	 * 错误码。作用与 {@link riskControlled} 对称:
+	 *
+	 * 1. **不重复打扰** —— 同一个码连续失败只告警一次。退避周期是 300s,持续故障
+	 *    一小时就是十几条私聊,而每条的信息量和第一条一模一样。换了码 = 换了故障,
+	 *    重新告警。
+	 * 2. **知道该不该报喜** —— 成功拉取时靠它判断「此前真的坏过」,否则每个 cron
+	 *    tick 都会报一次"已恢复"。
+	 */
+	private transientErrorCode: number | null = null;
 	/**
 	 * 登录已失效,等 `auth-restored`。两个作用:
 	 *
@@ -321,6 +326,14 @@ export class DynamicEngine {
 	/** 连续图片渲染失败计数，达到阈值时仅通知一次但不停 cron */
 	private imageFailureStreak = 0;
 	private imageFailureNotified = false;
+	/**
+	 * 上次**成功**拉到动态列表的时刻。`undefined` = 起来以后一次都没成功过。
+	 *
+	 * 只记成功、不记尝试:独立端的 `/status` 拿它回答「还在跑吗」,而连着失败三小时
+	 * 的系统若报「1 分钟前抓过」,这一项就从答案变成了骗局 —— 那恰好是主人掏出手机
+	 * 问状态的场合。
+	 */
+	private lastSuccessfulFetchAt?: number;
 	private readonly busHandles: Disposable[] = [];
 
 	constructor(opts: DynamicEngineOptions) {
@@ -352,8 +365,8 @@ export class DynamicEngine {
 		}
 
 		// `subscription-changed` 是无负载事件（参见 internal/platform.ts BiliEvents）。
-		// adapter 收到 koishi 端的 ops 后，应当先调用 engine.applyOps(ops) 再 emit
-		// MessageBus 事件用于其他下游；engine 自身只需在 auth-restored 时重建快照。
+		// 宿主应当先调用 engine.applyOps(ops) 再 emit MessageBus 事件用于其他下游;
+		// engine 自身只需在 auth-restored 时重建快照。
 		this.busHandles.push(
 			this.bus.on("auth-restored", () => {
 				this.authLost = false;
@@ -388,6 +401,9 @@ export class DynamicEngine {
 		this.riskControlled = false;
 		// 同理:登录失效的抑制标记也只在一个 lifecycle 内有效。
 		this.authLost = false;
+		// 瞬时错误边沿同理 —— 留着的话下次 start 后第一次成功拉取会报一句
+		// 上个 lifecycle 的「已恢复」。
+		this.transientErrorCode = null;
 		this.detectorRestartTimer?.dispose();
 		this.detectorRestartTimer = undefined;
 		if (this.dynamicJob) {
@@ -395,6 +411,7 @@ export class DynamicEngine {
 			this.dynamicJob = undefined;
 			this.logger.info("[stop] 动态检测任务已停止");
 		}
+		this.releaseDetectLock();
 		while (this.busHandles.length > 0) {
 			const h = this.busHandles.pop();
 			h?.dispose();
@@ -402,7 +419,7 @@ export class DynamicEngine {
 	}
 
 	/**
-	 * 替换运行时配置(adapter 在 koishi config / dashboard 编辑后调用)。
+	 * 替换运行时配置(宿主在 dashboard 编辑后调用)。
 	 * `dynamicCron` 变化时会自动停掉旧 CronJob 并按新表达式重新 schedule —— 否则
 	 * 配置已经写进 this.config,但 node-cron 句柄还在跑旧节奏,纯粹的字段更新
 	 * 是看不见的 bug。
@@ -422,24 +439,28 @@ export class DynamicEngine {
 	 * 热替换 CommentaryClient 实例。adapter 在用户运行时打开 / 关闭 / 更换 AI
 	 * 配置后调用,引擎随后的动态点评会立即用新实例 (或回退到纯文字) ,无需重启 server。
 	 */
+	/**
+	 * 上次成功拉到动态列表的时刻(epoch ms),`undefined` = 一次都还没成功。
+	 * 独立端的 `/status` 用它回答「还在跑吗」。
+	 */
+	lastFetchAt(): number | undefined {
+		return this.lastSuccessfulFetchAt;
+	}
+
 	setAi(ai: CommentaryClient | undefined): void {
 		this.ai = ai;
 	}
 
 	/**
-	 * 热替换 ImageRenderer 实例。与 setAi 对称:adapter 在 image 服务上下线时
-	 * 调用,引擎随后的卡片渲染会立即用新实例 (或回退到纯文字) ,无需重启 server。
-	 *
-	 * 主要给 koishi adapter 用 —— sibling service (-image) 启停时通过 ctx.inject
-	 * 后置注入。独立端 imageRenderer 是 engine 同进程一次性 wire,不会动态消失,
-	 * 不需要调用本方法 (cardStyle 热更走 imageRenderer.updateConfig)。
+	 * 热替换 ImageRenderer 实例。与 setAi 对称:宿主在渲染器上下线(空闲关浏览器 /
+	 * 卡片渲染开关)时调用,引擎随后的卡片渲染会立即用新实例(或回退到纯文字),无需重启。
 	 */
 	setImage(image: ImageRenderer | undefined): void {
 		this.image = image;
 	}
 
 	get isActive(): boolean {
-		return this.dynamicJob?.running ?? false;
+		return this.dynamicJob?.isActive ?? false;
 	}
 
 	/** 用最新订阅快照重启动态检测；保留已有 UID 的时间戳避免重推旧动态。 */
@@ -488,28 +509,19 @@ export class DynamicEngine {
 	}
 
 	/**
-	 * 解析动态卡 colorOptions。背景图「每次推送轮换」:优先该 UP 自带的
-	 * `backgroundImages`;没有覆盖(样式自带列表为空)→ 落回引擎级
-	 * `defaultBackgroundImages`(全局默认图廊)—— 否则无覆盖的 UP 会一直渲染
-	 * 渲染器内部缓存的静态首图,图廊配再多张也不轮换(回归 bug)。列表 >1 张且
-	 * 注入了选择器 → 选下一张覆盖 backgroundImage(游标键 `uid:dynamic`)并强制
-	 * enable:true,其余字段留空,靠调用点逐字段回退渲染器全局配置;否则原样
-	 * 返回(enable=false → undefined,走渲染器全局兜底)。每次渲染调一次 =
-	 * 每推送轮换一张。
+	 * 解析动态卡 colorOptions(规则见 {@link resolveDynamicColorOptions}):该 UP 自带
+	 * 图廊 ?? 引擎级默认图廊,游标键 `uid:dynamic`。每次渲染调一次 = 每推送轮换一张。
 	 */
 	private pickDynamicColorOptions(
 		uid: string,
 		style: SubItemView["customCardStyle"],
 	): SubItemView["customCardStyle"] | undefined {
-		const images =
-			style?.backgroundImages && style.backgroundImages.length > 0
-				? style.backgroundImages
-				: this.config.defaultBackgroundImages;
-		if (images && images.length > 1 && this.pickCardBackground) {
-			const picked = this.pickCardBackground(`${uid}:dynamic`, images);
-			if (picked !== undefined) return { ...style, enable: true, backgroundImage: picked };
-		}
-		return style?.enable ? style : undefined;
+		return resolveDynamicColorOptions({
+			style,
+			defaultBackgroundImages: this.config.defaultBackgroundImages,
+			pick: this.pickCardBackground,
+			scopeKey: `${uid}:dynamic`,
+		});
 	}
 
 	/** 建「已观测」锚点(缺则以此刻为起点)。每一个订阅都要有,与推送开关无关。 */
@@ -619,16 +631,7 @@ export class DynamicEngine {
 	private startJob(): void {
 		let job: CronJob;
 		try {
-			job = new CronJob(
-				this.config.dynamicCron,
-				withLock(
-					() => this.detectDynamics(),
-					(err) =>
-						this.logger.error(
-							`[detector] 动态检测执行异常：${err instanceof Error ? err.message : String(err)}`,
-						),
-				),
-			);
+			job = new CronJob(this.config.dynamicCron, () => void this.runDetectLocked());
 		} catch (err) {
 			this.logger.error(
 				`[detector] dynamicCron="${this.config.dynamicCron}" 无法解析,动态检测未启动：${err instanceof Error ? err.message : String(err)}`,
@@ -658,16 +661,17 @@ export class DynamicEngine {
 			this.dynamicJob.stop();
 			this.dynamicJob = undefined;
 		}
+		this.releaseDetectLock();
 	}
 
 	private reconcileJob(): void {
 		if (this.dynamicSubManager.size === 0) {
-			if (this.dynamicJob?.running) {
+			if (this.dynamicJob?.isActive) {
 				this.dynamicJob.stop();
 				this.dynamicJob = undefined;
 				this.logger.info("[detector] 订阅清空，动态检测任务已停止");
 			}
-		} else if (!this.dynamicJob?.running && !this.detectorRestartTimer && !this.authLost) {
+		} else if (!this.dynamicJob?.isActive && !this.detectorRestartTimer && !this.authLost) {
 			// 两个「此刻别启动」的理由,少一个都会让 applyOps 把 cron 提前拉起来:
 			//
 			// · detectorRestartTimer 非空 = 正处于 -352/瞬时错误的退避窗口。提前 startJob
@@ -679,6 +683,49 @@ export class DynamicEngine {
 			);
 			this.startJob();
 		}
+	}
+
+	/** 正在跑的那一轮;cron tick 撞上就跳过,`detectNow` 撞上就排在后面。 */
+	private detectInFlight: Promise<void> | null = null;
+
+	/**
+	 * 拆掉检测器时松开锁。这把锁挂在实例上,活得比 cron job 长 —— 一轮要是永远不落定
+	 * (渲染闸堆住之类),它会把之后所有 tick 静默丢掉,而且**重启也救不回来**:登录恢复、
+	 * 改 cron 都只是重建 job,锁还是那一把。此前锁是随 job 一起新建的闭包,重建即重新武装;
+	 * 这里补回那个性质 —— 拆检测器 = 这一轮不再算数。
+	 */
+	private releaseDetectLock(): void {
+		this.detectInFlight = null;
+	}
+
+	/**
+	 * 带锁跑一轮。同一时刻只有一轮在跑(此前是 `withLock`,换成握着 promise 是为了让
+	 * `detectNow` 等得到这一轮结束)。异常记日志、锁必释放 —— 锁卡死的症状是 cron tick
+	 * 全部静默丢弃,动态从此不再推。
+	 */
+	private runDetectLocked(): Promise<void> {
+		if (this.detectInFlight) return this.detectInFlight;
+		const round = this.detectDynamics()
+			.catch((err: unknown) => {
+				this.logger.error(
+					`[detector] 动态检测执行异常：${err instanceof Error ? err.message : String(err)}`,
+				);
+			})
+			.finally(() => {
+				this.detectInFlight = null;
+			});
+		this.detectInFlight = round;
+		return round;
+	}
+
+	/**
+	 * 立刻跑一轮(devtools「现在就跑」)。撞上在跑的那轮就**等它跑完再跑一轮**,不是跳过 ——
+	 * 调用方多半是刚往 feed 里塞了东西才来的,而在跑的那轮拉 feed 在塞之前,跳过等于白塞。
+	 * 回的 promise 在属于这次调用的那一轮结束时落定。
+	 */
+	detectNow(): Promise<void> {
+		const current = this.detectInFlight;
+		return current ? current.then(() => this.runDetectLocked()) : this.runDetectLocked();
 	}
 
 	private async detectDynamics(): Promise<void> {
@@ -700,10 +747,9 @@ export class DynamicEngine {
 			return;
 		}
 
-		if (this.riskControlled) {
-			this.riskControlled = false;
-			this.logger.info("[api] 风控已解除，动态检测恢复正常");
-		}
+		await this.announceRecovery();
+		// 记在这里而不是入口:上面那两个 return(网络抛错 / 接口错误码)都不算抓到。
+		this.lastSuccessfulFetchAt = Date.now();
 		this.logger.debug("[detector] 成功获取动态信息，开始处理");
 
 		// DY1:per-uid 记账 —— 成功处理(含被过滤/开播伪动态/已发)的 pub_ts 进
@@ -822,12 +868,12 @@ export class DynamicEngine {
 
 				// Render card
 				const sub = this.dynamicSubManager.get(uid);
-				// 消息版式:per-UP 折叠值优先,缺失时兜底引擎 config 级(koishi 的默认版式
-				// + 链接开关);两级都缺 = 旧路径。块隐藏的部件直接跳过其生产成本:
+				// 消息版式来自 per-UP 折叠值(宿主恒填);sub 在本轮处理中途被退订时用默认版式
+				// 兜底,发送前还有 stillSubscribed 重校。块隐藏的部件直接跳过其生产成本:
 				// card 不渲染图片、text 不调 AI。
-				const layout = sub?.messageLayout ?? this.config.messageLayout;
+				const layout = sub?.messageLayout ?? DEFAULT_MESSAGE_LAYOUT.dynamic;
 				const wantPart = (t: string): boolean =>
-					!layout || layout.blocks.some((b) => b.visible && b.type === t);
+					layout.blocks.some((b) => b.visible && b.type === t);
 				let buffer: Buffer | undefined;
 				try {
 					if (this.image && this.config.imageEnabled !== false && wantPart("card")) {
@@ -889,9 +935,8 @@ export class DynamicEngine {
 					this.imageFailureNotified = false;
 				}
 
-				// Build bare URL (模板的 {url} 变量,不含任何前缀文案)。链接恒计算 ——
-				// 要不要展示由模板里有没有 {url} 决定。视频转 BV 无匹配等 url 为空的情形,
-				// renderDynamicText 会去掉模板里 {url} 的尾随分隔符。
+				// Build bare URL(链接部件的内容,不含任何前缀文案)。链接恒计算 —— 显隐 / 位置
+				// 由版式的 link 部件决定。
 				const isVideo = item.type === "DYNAMIC_TYPE_AV";
 				let url: string;
 				if (isVideo) {
@@ -922,7 +967,10 @@ export class DynamicEngine {
 								`${name}发布了一条动态，内容如下：\n${dynamicText}`,
 								"dynamic",
 								imageUrls,
-								subForAi?.aiOverride,
+								// 联网搜索是引擎级开关,盖在 per-UP 覆盖之上(per-UP 没有这一项)。
+								this.config.aiWebSearch
+									? { ...subForAi?.aiOverride, webSearch: true }
+									: subForAi?.aiOverride,
 							);
 							this.logger.debug(`[ai] 动态点评生成完毕，长度=${aiComment?.length ?? 0}`);
 						} catch (e) {
@@ -947,60 +995,46 @@ export class DynamicEngine {
 					: (sub?.customDynamicTemplate ??
 						this.config.dynamicTemplate ??
 						DEFAULT_DYNAMIC_TEXT.dynamic);
-				if (!layout) {
-					// 旧路径(koishi 端现状):链接经模板 {url} 内嵌在文本里,卡片+文本合并一条。
-					const text = aiComment ?? renderDynamicText(tmpl, name, url);
-					const segments: PushSegment[] = buffer
-						? [
-								{ type: "image", buffer, mime: "image/jpeg" },
-								...(text ? ([{ type: "text", text }] as PushSegment[]) : []),
-							]
-						: [{ type: "text", text }];
-					await this.push.broadcastDynamic(uid, segments, "dynamic");
-				} else {
-					// 版式路径:文本以 url='' 渲染(renderDynamicText 会把 {url} 连同前导
-					// 分隔符剥掉,旧自定义模板残留 {url} 也不会双链接),链接独立成部件,
-					// 顺序 / 显隐 / 分条全由版式决定;同条内相邻文本类部件以 separator 连接。
-					const text = wantPart("text") ? (aiComment ?? renderDynamicText(tmpl, name, "")) : "";
-					const present = new Set<string>();
-					if (buffer) present.add("card");
-					if (text) present.add("text");
-					if (url) present.add("link");
-					const groups = planMessageGroups(layout.blocks, present);
-					const messages: PushSegment[][] = groups.map((group) => {
-						const segs: PushSegment[] = [];
-						let texts: string[] = [];
-						const flushText = (): void => {
-							if (texts.length > 0) {
-								segs.push({ type: "text", text: texts.join(layout.separator) });
-								texts = [];
-							}
-						};
-						for (const part of group) {
-							if (part === "card" && buffer) {
-								flushText();
-								segs.push({ type: "image", buffer, mime: "image/jpeg" });
-							} else if (part === "text") {
-								texts.push(text);
-							} else if (part === "link") {
-								texts.push(url);
-							}
+				// 链接独立成部件,顺序 / 显隐 / 分条全由版式决定;同条内相邻文本类部件以 separator 连接。
+				const text = wantPart("text") ? (aiComment ?? renderDynamicText(tmpl, name)) : "";
+				const present = new Set<string>();
+				if (buffer) present.add("card");
+				if (text) present.add("text");
+				if (url) present.add("link");
+				const groups = planMessageGroups(layout.blocks, present);
+				const messages: PushSegment[][] = groups.map((group) => {
+					const segs: PushSegment[] = [];
+					let texts: string[] = [];
+					const flushText = (): void => {
+						if (texts.length > 0) {
+							segs.push({ type: "text", text: texts.join(layout.separator) });
+							texts = [];
 						}
-						flushText();
-						return segs;
-					});
-					if (messages.length === 0) {
-						this.logger.debug(`[push] UID=${uid} 消息版式所有部件隐藏/缺失,本条不推送`);
-					} else if (messages.length === 1) {
-						await this.push.broadcastDynamic(uid, messages[0] as PushSegment[], "dynamic");
-					} else if (this.push.broadcastDynamicSequence) {
-						await this.push.broadcastDynamicSequence(uid, messages, "dynamic");
-					} else {
-						// 防御兜底(现实不可达:填 messageLayout 的 adapter 必实现 sequence)。
-						// 合并回一条而非逐条 broadcast —— 逐条会让 @全体 每条重复一次。
-						this.logger.warn("[push] adapter 未实现 broadcastDynamicSequence,分条已合并为单条");
-						await this.push.broadcastDynamic(uid, messages.flat(), "dynamic");
+					};
+					for (const part of group) {
+						if (part === "card" && buffer) {
+							flushText();
+							segs.push({ type: "image", buffer, mime: "image/jpeg" });
+						} else if (part === "text") {
+							texts.push(text);
+						} else if (part === "link") {
+							texts.push(url);
+						}
 					}
+					flushText();
+					return segs;
+				});
+				// 这一条动态 = 一次推送:主卡(可能分条)与后面的图集共用一个 pushId,宿主的
+				// 历史落同一行、图集是追加上去的附加项。
+				const pushId = randomUUID();
+				if (messages.length === 0) {
+					this.logger.debug(`[push] UID=${uid} 消息版式所有部件隐藏/缺失,本条不推送`);
+				} else if (messages.length === 1) {
+					await this.push.broadcastDynamic(uid, messages[0] as PushSegment[], "dynamic", {
+						pushId,
+					});
+				} else {
+					await this.push.broadcastDynamicSequence(uid, messages, "dynamic", { pushId });
 				}
 
 				// Push extra images from draw dynamics. DYNAMIC_TYPE_DRAW 的原图在
@@ -1047,6 +1081,7 @@ export class DynamicEngine {
 									},
 								],
 								"dynamic-images",
+								{ pushId },
 							);
 						} catch (e) {
 							this.logger.warn(
@@ -1112,6 +1147,9 @@ export class DynamicEngine {
 				// 清掉风控边沿:恢复后若再遇 -352 是全新 episode,必须重新告警
 				// (否则跨 auth-loss 的新风控会被陈旧 flag 静默 —— 审计发现的缺口)。
 				this.riskControlled = false;
+				// 瞬时错误边沿同理清掉。登录恢复后的第一次成功拉取属于 auth-restored
+				// 那条线(上层自己会通知),不该由这里拿着跨 episode 的陈旧错误码报喜。
+				this.transientErrorCode = null;
 				break;
 			}
 			case -352: {
@@ -1122,7 +1160,7 @@ export class DynamicEngine {
 				if (!this.riskControlled) {
 					this.riskControlled = true;
 					this.logger.error("[api] 账号被风控，动态检测暂停，将退避后自动重试");
-					await this.push.sendPrivateMsg("账号被风控，请使用 `bili cap` 指令解除风控");
+					await this.tellMaster("账号被风控，请使用 `bili cap` 指令解除风控");
 					this.bus.emit("engine-error", LOG_TAG, "账号被风控");
 				} else {
 					this.logger.debug("[api] 仍处于风控态，退避后继续重探(不重复告警)");
@@ -1133,12 +1171,58 @@ export class DynamicEngine {
 			default: {
 				// 瞬时错误(-509 限流 / 瞬时 -403 / 未知码):不可永久停 cron。
 				// 退避后自动重试,瞬时抖动自愈,无需人工重启进程 → Q3 warn 不冒充事故。
-				this.logger.warn(`[api] 获取动态信息失败，错误码：${code}，${message}，将退避后自动重试`);
-				await this.push.sendPrivateMsg(`获取动态信息失败，错误码：${code}`);
-				this.bus.emit("engine-error", LOG_TAG, `获取动态失败，错误码：${code}`);
+				// 边沿去重同 -352:同一个码连续失败只告警一次,换了码才当新故障重报。
+				if (this.transientErrorCode !== code) {
+					this.transientErrorCode = code;
+					this.logger.warn(`[api] 获取动态信息失败，错误码：${code}，${message}，将退避后自动重试`);
+					await this.tellMaster(`获取动态信息失败，错误码：${code}`);
+					this.bus.emit("engine-error", LOG_TAG, `获取动态失败，错误码：${code}`);
+				} else {
+					this.logger.debug(`[api] 仍是错误码 ${code}，退避后继续重试(不重复告警)`);
+				}
 				this.scheduleDetectorRestart(`错误码 ${code}`);
 			}
 		}
+	}
+
+	/**
+	 * 私聊通知主人,发不出去只记一句 warn。
+	 *
+	 * 调用方全在关键控制流上:告警之后还要 `scheduleDetectorRestart` 排退避重启,
+	 * 报喜之后还要接着处理这一轮的动态。裸 `await` 的话,私聊通道自己坏掉(master
+	 * 不可达 / 适配器抛错)就会把后面的活儿一起带走 —— 尤其告警那条,`handleApiError`
+	 * 开头已经 stop 了 job,退避重启再排不上,动态检测就**再也不会自己起来**了。
+	 */
+	private async tellMaster(text: string): Promise<void> {
+		try {
+			await this.push.sendPrivateMsg(text);
+		} catch (e) {
+			this.logger.warn(`[push] 通知主人失败：${e instanceof Error ? e.message : String(e)}`);
+		}
+	}
+
+	/**
+	 * 成功拉取后的「好了」通知 —— 只在此前真的报过故障时说一次。
+	 *
+	 * 报错走私聊,恢复也得走私聊。否则主人手里只剩一条报错:退避重启、任务已启动
+	 * 这些都只进日志,IM 里再无下文,分不清是自愈了还是还坏着只是不再吭声。
+	 *
+	 * 说的时机是**这一次真的拉成功了**,不是「重启了检测任务」—— 重启只是把 cron
+	 * 挂回去,故障还在的话下一轮照样失败,那会儿报喜就是骗人。
+	 *
+	 * 只私聊、不发 `engine-error`:那个事件在独立端会点亮 AlertShell 的红色告警面板,
+	 * 拿它报喜语义是反的。
+	 */
+	private async announceRecovery(): Promise<void> {
+		const parts: string[] = [];
+		if (this.riskControlled) parts.push("风控已解除");
+		if (this.transientErrorCode !== null) parts.push(`此前错误码：${this.transientErrorCode}`);
+		if (parts.length === 0) return;
+		this.riskControlled = false;
+		this.transientErrorCode = null;
+		const detail = parts.join("，");
+		this.logger.info(`[api] ${detail}，动态检测恢复正常`);
+		await this.tellMaster(`动态检测已恢复正常（${detail}）`);
 	}
 
 	/**

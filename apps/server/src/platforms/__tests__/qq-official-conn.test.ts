@@ -4,6 +4,7 @@ import type { Disposable, Logger, ServiceContext } from "@bilibili-notify/intern
 import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 import { type WebSocket, WebSocketServer } from "ws";
 import { createQQGatewayConn, QQ_OPCODE, type QQDiscoveredSession } from "../qq-official";
+import type { InboundGroupMessage, InboundPrivateMessage } from "../types.js";
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 async function waitFor(cond: () => boolean, timeoutMs = 3000): Promise<void> {
@@ -162,6 +163,157 @@ describe("createQQGatewayConn — openid 捞取", () => {
 		gw.dispatch("C2C_MESSAGE_CREATE", { author: { user_openid: "U_OPENID" } });
 		await waitFor(() => onDiscovered.mock.calls.length > 0);
 		expect(onDiscovered).toHaveBeenCalledWith({ scope: "private", openid: "U_OPENID" });
+	});
+});
+
+describe("createQQGatewayConn — C2C 私聊正文(审批指令的入口)", () => {
+	it("C2C_MESSAGE_CREATE → onInboundPrivate(openid 当 userId + 正文)", async () => {
+		const gw = await startFakeGateway();
+		const onInboundPrivate = vi.fn();
+		const conn = createQQGatewayConn(connOpts(gw, { onInboundPrivate }));
+		cleanups.push(() => conn.close());
+		await waitFor(() => lastIdentify(gw) !== undefined);
+		gw.dispatch("C2C_MESSAGE_CREATE", {
+			author: { user_openid: "U_OPENID" },
+			content: "y",
+			id: "M1",
+		});
+		await waitFor(() => onInboundPrivate.mock.calls.length > 0);
+		expect(onInboundPrivate).toHaveBeenCalledWith({ userId: "U_OPENID", text: "y" });
+	});
+
+	it("群消息不进 onInboundPrivate —— 群里打个 y 不该发出待审的周报", async () => {
+		const gw = await startFakeGateway();
+		const onInboundPrivate = vi.fn();
+		const onDiscovered = vi.fn();
+		const conn = createQQGatewayConn(connOpts(gw, { onInboundPrivate, onDiscovered }));
+		cleanups.push(() => conn.close());
+		await waitFor(() => lastIdentify(gw) !== undefined);
+		gw.dispatch("GROUP_AT_MESSAGE_CREATE", { group_openid: "G1", content: "y" });
+		// 用 onDiscovered 当节拍器:它一定会被这帧触发,到了就说明这帧处理完了。
+		await waitFor(() => onDiscovered.mock.calls.length > 0);
+		expect(onInboundPrivate).not.toHaveBeenCalled();
+	});
+
+	it("onInboundPrivate 抛错不能带崩连接 —— 它还担着推送", async () => {
+		const gw = await startFakeGateway();
+		const onInboundPrivate = vi.fn((_msg: InboundPrivateMessage) => {
+			throw new Error("指令处理炸了");
+		});
+		const conn = createQQGatewayConn(connOpts(gw, { onInboundPrivate }));
+		cleanups.push(() => conn.close());
+		await waitFor(() => lastIdentify(gw) !== undefined);
+		gw.dispatch("C2C_MESSAGE_CREATE", { author: { user_openid: "U1" }, content: "y" });
+		await waitFor(() => onInboundPrivate.mock.calls.length > 0);
+		// 还活着的直接证据:再来一帧照样派发到。
+		gw.dispatch("C2C_MESSAGE_CREATE", { author: { user_openid: "U1" }, content: "n" });
+		await waitFor(() => onInboundPrivate.mock.calls.length > 1);
+		expect(onInboundPrivate.mock.calls[1]?.[0]).toEqual({ userId: "U1", text: "n" });
+	});
+});
+
+describe("createQQGatewayConn — 群消息正文(链接解析的入口)", () => {
+	// 群主把机器人的消息范围放到「获取群内全部消息」后,不 @ 的群消息以 GROUP_MESSAGE_CREATE
+	// 下发;@ 了机器人的照旧是 GROUP_AT_MESSAGE_CREATE。两种都得交出去 —— 三档范围是 QQ 那边
+	// 的设置,我们这边收到什么解析什么。
+	it("GROUP_MESSAGE_CREATE → onInboundGroup(群 openid + 发言者 + 正文)", async () => {
+		const gw = await startFakeGateway();
+		const onInboundGroup = vi.fn();
+		const conn = createQQGatewayConn(connOpts(gw, { onInboundGroup }));
+		cleanups.push(() => conn.close());
+		await waitFor(() => lastIdentify(gw) !== undefined);
+		gw.dispatch("GROUP_MESSAGE_CREATE", {
+			group_openid: "G1",
+			author: { member_openid: "M1", id: "M1" },
+			content: "看这个 https://www.bilibili.com/video/BV1zMtU6uEEb/",
+			id: "MSG1",
+			timestamp: "2026-09-02T12:00:00+08:00",
+		});
+		await waitFor(() => onInboundGroup.mock.calls.length > 0);
+		expect(onInboundGroup).toHaveBeenCalledWith({
+			groupId: "G1",
+			userId: "M1",
+			text: "看这个 https://www.bilibili.com/video/BV1zMtU6uEEb/",
+			cardLinks: [],
+		} satisfies InboundGroupMessage);
+	});
+
+	it("GROUP_AT_MESSAGE_CREATE 同样进 onInboundGroup;C2C 不进", async () => {
+		const gw = await startFakeGateway();
+		const onInboundGroup = vi.fn();
+		const onDiscovered = vi.fn();
+		const conn = createQQGatewayConn(connOpts(gw, { onInboundGroup, onDiscovered }));
+		cleanups.push(() => conn.close());
+		await waitFor(() => lastIdentify(gw) !== undefined);
+		gw.dispatch("GROUP_AT_MESSAGE_CREATE", {
+			group_openid: "G1",
+			author: { member_openid: "M1" },
+			content: " https://b23.tv/abc",
+		});
+		await waitFor(() => onInboundGroup.mock.calls.length > 0);
+		expect(onInboundGroup).toHaveBeenCalledWith({
+			groupId: "G1",
+			userId: "M1",
+			text: " https://b23.tv/abc",
+			cardLinks: [],
+		});
+		gw.dispatch("C2C_MESSAGE_CREATE", {
+			author: { user_openid: "U1" },
+			content: "https://b23.tv/x",
+		});
+		await waitFor(() => onDiscovered.mock.calls.length > 1);
+		expect(onInboundGroup).toHaveBeenCalledTimes(1);
+	});
+
+	// 「全部消息」档下 GROUP_MESSAGE_CREATE 是群里每一句话。它进发现表的话,面板那份
+	// 「最近优先」的列表会随人说话不停重排;入群与被 @ 两条路已经够让一个群露面。
+	it("GROUP_MESSAGE_CREATE 不进发现表 —— 普通群聊不该搅动面板的会话列表", async () => {
+		const gw = await startFakeGateway();
+		const onDiscovered = vi.fn();
+		const onInboundGroup = vi.fn();
+		const conn = createQQGatewayConn(connOpts(gw, { onDiscovered, onInboundGroup }));
+		cleanups.push(() => conn.close());
+		await waitFor(() => lastIdentify(gw) !== undefined);
+		gw.dispatch("GROUP_MESSAGE_CREATE", {
+			group_openid: "G2",
+			author: { member_openid: "M" },
+			content: "hi",
+		});
+		// 用 onInboundGroup 当节拍器:这帧一定会到它那儿,到了就说明发现表那步也过去了。
+		await waitFor(() => onInboundGroup.mock.calls.length > 0);
+		expect(onDiscovered).not.toHaveBeenCalled();
+		// 被 @ 的那条照旧进发现表。
+		gw.dispatch("GROUP_AT_MESSAGE_CREATE", { group_openid: "G2", content: "@bot hi" });
+		await waitFor(() => onDiscovered.mock.calls.length > 0);
+		expect(onDiscovered).toHaveBeenCalledWith({ scope: "group", openid: "G2" });
+	});
+
+	it("onInboundGroup 抛错不能带崩连接", async () => {
+		const gw = await startFakeGateway();
+		const onInboundGroup = vi.fn((_msg: InboundGroupMessage) => {
+			throw new Error("解析炸了");
+		});
+		const conn = createQQGatewayConn(connOpts(gw, { onInboundGroup }));
+		cleanups.push(() => conn.close());
+		await waitFor(() => lastIdentify(gw) !== undefined);
+		gw.dispatch("GROUP_MESSAGE_CREATE", {
+			group_openid: "G1",
+			author: { member_openid: "M" },
+			content: "a",
+		});
+		await waitFor(() => onInboundGroup.mock.calls.length > 0);
+		gw.dispatch("GROUP_MESSAGE_CREATE", {
+			group_openid: "G1",
+			author: { member_openid: "M" },
+			content: "b",
+		});
+		await waitFor(() => onInboundGroup.mock.calls.length > 1);
+		expect(onInboundGroup.mock.calls[1]?.[0]).toEqual({
+			groupId: "G1",
+			userId: "M",
+			text: "b",
+			cardLinks: [],
+		});
 	});
 });
 

@@ -1,11 +1,5 @@
 import { describe, expect, it } from "vite-plus/test";
-import {
-	AstrBotAdapterSchema,
-	AstrBotPushTargetSchema,
-	OnebotAdapterConfigSchema,
-	PushAdapterSchema,
-	PushTargetSchema,
-} from "./targets";
+import { OnebotAdapterConfigSchema, PushAdapterSchema, PushTargetSchema } from "./targets";
 
 const UUID_A = "11111111-1111-4111-8111-111111111111";
 const UUID_B = "22222222-2222-4222-8222-222222222222";
@@ -84,52 +78,6 @@ describe("PushAdapterSchema (discriminated by platform)", () => {
 		expect(r.success).toBe(false);
 	});
 
-	it("accepts a valid koishi-bot adapter", () => {
-		const r = PushAdapterSchema.safeParse({
-			id: UUID_A,
-			name: "onebot",
-			platform: "koishi-bot",
-			enabled: true,
-			config: { botPlatform: "onebot" },
-		});
-		expect(r.success).toBe(true);
-	});
-
-	it("rejects koishi-bot adapter without botPlatform", () => {
-		const r = PushAdapterSchema.safeParse({
-			id: UUID_A,
-			name: "bad",
-			platform: "koishi-bot",
-			enabled: true,
-			config: {},
-		});
-		expect(r.success).toBe(false);
-	});
-
-	it("accepts a valid astrbot adapter with empty config", () => {
-		const adapter = {
-			id: UUID_A,
-			name: "AstrBot",
-			platform: "astrbot",
-			enabled: true,
-			config: {},
-		};
-		expect(AstrBotAdapterSchema.safeParse(adapter).success).toBe(true);
-		expect(PushAdapterSchema.safeParse(adapter).success).toBe(true);
-	});
-
-	it("rejects astrbot adapter connection config", () => {
-		const adapter = {
-			id: UUID_A,
-			name: "bad",
-			platform: "astrbot",
-			enabled: true,
-			config: { token: "secret" },
-		};
-		expect(AstrBotAdapterSchema.safeParse(adapter).success).toBe(false);
-		expect(PushAdapterSchema.safeParse(adapter).success).toBe(false);
-	});
-
 	it("rejects unknown platform", () => {
 		const r = PushAdapterSchema.safeParse({
 			id: UUID_A,
@@ -185,6 +133,50 @@ describe("OnebotAdapterConfigSchema (transport discriminatedUnion)", () => {
 			expect(r.data.retryTimes).toBe(0);
 			expect(r.data.retryIntervalMs).toBe(1_000);
 		}
+	});
+
+	// --- 超时下限(带图 / 合并转发) ---
+	it("超时下限:缺省补 default(带图 30s / 合并转发 60s),三种 transport 共用", () => {
+		const http = OnebotAdapterConfigSchema.safeParse({ baseUrl: "http://localhost:5700" });
+		expect(http.success).toBe(true);
+		if (http.success && http.data.transport === "http") {
+			expect(http.data.imageMinTimeoutMs).toBe(30_000);
+			expect(http.data.forwardMinTimeoutMs).toBe(60_000);
+		}
+		const rev = OnebotAdapterConfigSchema.safeParse({ transport: "ws-reverse", port: 6700 });
+		expect(rev.success).toBe(true);
+		if (rev.success && rev.data.transport === "ws-reverse") {
+			expect(rev.data.imageMinTimeoutMs).toBe(30_000);
+			expect(rev.data.forwardMinTimeoutMs).toBe(60_000);
+		}
+	});
+
+	it("超时下限:显式 0 合法 —— 想「严格按我配的超时走」得关得掉", () => {
+		const r = OnebotAdapterConfigSchema.safeParse({
+			baseUrl: "http://localhost:5700",
+			imageMinTimeoutMs: 0,
+			forwardMinTimeoutMs: 0,
+		});
+		expect(r.success).toBe(true);
+		if (r.success && r.data.transport === "http") {
+			expect(r.data.imageMinTimeoutMs).toBe(0);
+			expect(r.data.forwardMinTimeoutMs).toBe(0);
+		}
+	});
+
+	it("超时下限:负数拒绝", () => {
+		expect(
+			OnebotAdapterConfigSchema.safeParse({
+				baseUrl: "http://localhost:5700",
+				imageMinTimeoutMs: -1,
+			}).success,
+		).toBe(false);
+		expect(
+			OnebotAdapterConfigSchema.safeParse({
+				baseUrl: "http://localhost:5700",
+				forwardMinTimeoutMs: -1,
+			}).success,
+		).toBe(false);
 	});
 
 	// --- http branch ---
@@ -391,67 +383,6 @@ describe("PushTargetSchema (discriminated by platform)", () => {
 			session: {},
 		});
 		expect(r.success).toBe(false);
-	});
-
-	it("accepts a koishi-bot target with channelId", () => {
-		const r = PushTargetSchema.safeParse({
-			id: UUID_B,
-			name: "ob:111",
-			adapterId: UUID_A,
-			platform: "koishi-bot",
-			scope: "group",
-			enabled: true,
-			session: { channelId: "111" },
-		});
-		expect(r.success).toBe(true);
-	});
-
-	it("accepts an astrbot target with unified_msg_origin", () => {
-		const target = {
-			id: UUID_B,
-			name: "AstrBot 群聊",
-			adapterId: UUID_A,
-			platform: "astrbot",
-			scope: "group",
-			enabled: true,
-			session: {
-				unified_msg_origin: "aiocqhttp:GroupMessage:123456",
-				platform: "aiocqhttp",
-				messageType: "group",
-				sessionId: "123456",
-				sessionName: "测试群",
-			},
-		};
-		expect(AstrBotPushTargetSchema.safeParse(target).success).toBe(true);
-		expect(PushTargetSchema.safeParse(target).success).toBe(true);
-	});
-
-	it("rejects astrbot target without unified_msg_origin", () => {
-		const target = {
-			id: UUID_B,
-			name: "bad",
-			adapterId: UUID_A,
-			platform: "astrbot",
-			scope: "group",
-			enabled: true,
-			session: { platform: "aiocqhttp" },
-		};
-		expect(AstrBotPushTargetSchema.safeParse(target).success).toBe(false);
-		expect(PushTargetSchema.safeParse(target).success).toBe(false);
-	});
-
-	it("rejects astrbot target with unknown session keys", () => {
-		const target = {
-			id: UUID_B,
-			name: "bad",
-			adapterId: UUID_A,
-			platform: "astrbot",
-			scope: "group",
-			enabled: true,
-			session: { unified_msg_origin: "aiocqhttp:GroupMessage:123456", token: "secret" },
-		};
-		expect(AstrBotPushTargetSchema.safeParse(target).success).toBe(false);
-		expect(PushTargetSchema.safeParse(target).success).toBe(false);
 	});
 
 	it("rejects onebot target missing adapterId", () => {

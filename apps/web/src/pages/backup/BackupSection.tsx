@@ -1,9 +1,7 @@
+import { Btn, ConfirmDialog, ErrorNote, GlassBox, Icon } from "@bilibili-notify/ui";
 import { useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
-import { Btn } from "../../components/atoms";
-import { ConfirmDialog } from "../../components/dialog";
-import { GlassBox } from "../../components/glass-box";
-import { Icon } from "../../components/icons";
+import { SECTION_ACCENT } from "../../config/section-accents";
 import { ApiError, api } from "../../services/api";
 import { BackupExportDialog } from "./BackupExportDialog";
 import { BackupImportDialog } from "./BackupImportDialog";
@@ -128,11 +126,11 @@ export function BackupSection() {
 		<GlassBox
 			title="备份与恢复 · backup"
 			subtitle="一键导出订阅 / 目标 / 适配器 / 全局设置 · 完整备份另含 B 站登录与密钥"
-			accent="#8b5cf6"
+			accent={SECTION_ACCENT.system}
 			icon={<Icon.download size={14} />}
 			badge="导出 / 导入"
 		>
-			<div className="text-[12px] leading-relaxed text-bn-text-secondary">
+			<div className="text-bn-sm leading-relaxed text-bn-text-secondary">
 				<span className="font-semibold text-bn-text-primary">完整备份</span>
 				：含机密（B 站 Cookie、AI Key、适配器凭据），用 6 位 PIN 加密，用于换机 / 灾备还原。
 				<br />
@@ -140,13 +138,9 @@ export function BackupSection() {
 				：机密位置留空，纯明文 JSON，可存档、可分享给别人抄配置。
 			</div>
 
-			{error ? (
-				<div className="mt-3 rounded border border-bn-danger-border bg-bn-danger-soft p-2.5 text-xs text-bn-danger-text">
-					{error}
-				</div>
-			) : null}
+			{error ? <ErrorNote className="mt-3">{error}</ErrorNote> : null}
 			{notice ? (
-				<div className="mt-3 rounded border border-bn-border bg-bn-surface/60 p-2.5 text-xs text-bn-text-secondary">
+				<div className="mt-3 rounded-sm border border-bn-border bg-bn-surface/60 p-2.5 text-bn-sm text-bn-text-secondary">
 					{notice}
 				</div>
 			) : null}

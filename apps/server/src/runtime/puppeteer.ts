@@ -15,14 +15,14 @@ import type {
 	BoundingBox,
 	ElementHandleLike,
 	PageLike,
+	PageOptions,
 	PuppeteerLike,
 	ScreenshotOptions,
 	SetContentOptions,
 	WaitForFunctionOptions,
 } from "@bilibili-notify/image";
-import type { Logger } from "@bilibili-notify/internal";
+import { createSerialGate, type Logger } from "@bilibili-notify/internal";
 import puppeteer from "puppeteer-core";
-import { createSerialGate } from "./serial-gate.js";
 
 export interface ResolveChromePathOptions {
 	/** 路径存在性判定,默认 `fs.existsSync`;注入以便单测。 */
@@ -151,6 +151,16 @@ export interface PuppeteerAdapterOptions {
 
 export interface StandalonePuppeteer extends PuppeteerLike {
 	dispose(): Promise<void>;
+	/**
+	 * 把空闲关闭提前到现在(devtools「Chrome 空闲计时器提前到期」)。有活跃页或压根没
+	 * 浏览器在跑就不动、回 false;关了回 true。下次渲染照常重启。
+	 */
+	closeIdleNow(): Promise<boolean>;
+	/**
+	 * 还在排队等渲染的数量。`/status` 拿它回答「是不是卡住了」——
+	 * 所有渲染都串行经过同一把闸,这个数持续不为 0 就是推送在堆积。
+	 */
+	renderQueueDepth(): number;
 }
 
 export function createPuppeteerAdapter(opts: PuppeteerAdapterOptions): StandalonePuppeteer {
@@ -162,8 +172,8 @@ export function createPuppeteerAdapter(opts: PuppeteerAdapterOptions): Standalon
 	let activePages = 0;
 	let idleTimer: NodeJS.Timeout | null = null;
 	// 串行闸:所有渲染(预览 screenshotHtml + 推送 ImageRenderer)经同一浏览器,冷启动
-	// 窗口期并发截图会触发 CDP 竞态把卡片平铺成 2×2(见 serial-gate.ts)。串起来即根除。
-	const acquire = createSerialGate();
+	// 窗口期并发截图会触发 CDP 竞态把卡片平铺成 2×2(见 internal 的 serial-gate)。串起来即根除。
+	const renderGate = createSerialGate();
 
 	function cancelIdleTimer(): void {
 		if (idleTimer) {
@@ -265,9 +275,27 @@ export function createPuppeteerAdapter(opts: PuppeteerAdapterOptions): Standalon
 	}
 
 	return {
-		async page(): Promise<PageLike> {
-			// 进闸:等上一个渲染(页面 close)后才继续,保证全程并发度为 1。
-			const release = await acquire();
+		renderQueueDepth: () => renderGate.waiting(),
+		async closeIdleNow(): Promise<boolean> {
+			if (activePages > 0 || !browser) return false;
+			// 光看 `activePages` 不够:它是在 `await b.newPage()` **之后**才 +1 的,渲染的开场
+			// 那一段(进闸 → ensure → newPage)里它还是 0。卡在那一段里关掉浏览器,那次渲染
+			// 会以 Target closed 失败 —— 一张该发的卡就没了。进闸再关:闸保证同一时刻只有一个
+			// 临界区,拿到闸就说明没有哪次渲染正在开场。
+			const release = await renderGate.acquire();
+			try {
+				if (activePages > 0 || !browser) return false;
+				cancelIdleTimer();
+				await closeIdleBrowser();
+				return true;
+			} finally {
+				release();
+			}
+		},
+		async page(options?: PageOptions): Promise<PageLike> {
+			// 进闸:等上一个渲染(页面 close)后才继续,保证全程并发度为 1。低优先级
+			// (链接卡)在正常车道排空之前不放行。
+			const release = await renderGate.acquire({ priority: options?.priority });
 			cancelIdleTimer();
 			try {
 				const b = await ensure();

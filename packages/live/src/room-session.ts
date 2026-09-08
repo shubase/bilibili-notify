@@ -1,14 +1,14 @@
-import type { Disposable } from "@bilibili-notify/internal";
 import {
 	GuardLevel,
-	type Message,
-	type MsgHandler,
-	type UserActionMsg,
-} from "blive-message-listener";
+	type LiveEvent,
+	type LiveUser,
+	type UserActionType,
+} from "@bilibili-notify/blive";
+import type { Disposable } from "@bilibili-notify/internal";
 import { DateTime } from "luxon";
 import { LivePushType } from "./push-like";
 import { GUARD_LEVEL_IMG } from "./room-context";
-import { LiveRoomAccessDeniedError } from "./room-helpers";
+import { LiveRoomAccessDeniedError, LiveRoomPreflightBlockedError } from "./room-helpers";
 import { LIVE_EVENT_COOLDOWN, RoomSessionBase } from "./room-session-base";
 import { buildRoomLink } from "./template-renderer";
 import { LiveType } from "./types";
@@ -17,14 +17,14 @@ import { LiveType } from "./types";
  * One {@link RoomSession} per UID/room actively being monitored.
  *
  * Extends {@link RoomSessionBase} (state + lifecycle + transitions) with the
- * {@link MsgHandler} factory and the per-event handlers (`onLiveStart`,
- * `onIncomeDanmu`, `onIncomeSuperChat`, `onGuardBuy`, `onLiveEnd`, `onError`,
- * `onWatchedChange`, `onLikedChange`, `onUserAction`).
+ * single-callback event funnel (`buildEventHandler`) and the per-event handlers
+ * (`onLiveStart`, `onIncomeDanmu`, `onIncomeSuperChat`, `onGuardBuy`,
+ * `onLiveEnd`, `onError`, `onUserAction`).
  *
  * Each handler reads / mutates the protected state defined on the base.
  * `bootstrap()` (defined on the base) opens the WS connection and arms the
  * periodic timer if the room is already live; subsequent state transitions
- * are driven by the events routed through these handlers.
+ * are driven by the events routed through the funnel.
  */
 /** Dashboard 端期望的"实时观看人数"采样间隔。B 站每几秒推一帧 WATCHED_CHANGE,
  * 这里 per-UID 门控成 2s 最多一次,够人眼感知,WS 不会刷屏。 */
@@ -36,15 +36,23 @@ const VIEWERS_EMIT_THROTTLE_MS = 2000;
  */
 const RECONNECT_BACKOFF_MS = [1000, 2000, 4000, 8000, 16000] as const;
 
+/**
+ * 预检被 -352 风控拦截时的**长尾**退避(单位 ms),末项封顶循环、永不放弃。
+ * 与上面那条秒级梯子分开:WS 是直播状态唯一信号源(没有 HTTP 轮询兜底),
+ * 风控一持续就是几十分钟,拿 31 秒的梯子去顶会把好房间全停光;而无 token
+ * 直连的旧回退(blive 库时代)只能收匿名残缺数据,已随自实现一并退役。
+ */
+const PREFLIGHT_BLOCKED_BACKOFF_MS = [60_000, 300_000, 900_000, 1_800_000] as const;
+
 /** B 站 live WS 静默自愈:每分钟检查一次,3 分钟无 heartbeat/消息即主动重连。 */
 const LIVE_WS_WATCHDOG_INTERVAL_MS = 60_000;
 export const LIVE_WS_STALE_MS = 180_000;
 
-type ReconnectReason = "error" | "close" | "watchdog";
+type ReconnectReason = "error" | "close" | "watchdog" | "preflight";
 type LiveWsActivityReason =
 	| "connected"
 	| "open"
-	| "start-listen"
+	| "auth-ok"
 	| "heartbeat"
 	| "danmu"
 	| "superchat"
@@ -54,6 +62,8 @@ type LiveWsActivityReason =
 	| "live-start"
 	| "live-end"
 	| "interact"
+	| "raw"
+	| "other"
 	| "close";
 
 export class RoomSession extends RoomSessionBase {
@@ -75,6 +85,8 @@ export class RoomSession extends RoomSessionBase {
 	private lastLiveWsActivityReason: LiveWsActivityReason = "connected";
 	private watchdogTimer?: Disposable;
 	private watchdogReconnectCount = 0;
+	/** 漂移观测:degraded raw 的 per-cmd 累计,只增不清(见 noteDegradedRaw)。 */
+	private readonly degradedRawCounts = new Map<string, number>();
 
 	/** 外层主动停止 listener 时调用,阻止 onError/onClose/watchdog 触发重连。 */
 	cancel(): void {
@@ -154,62 +166,108 @@ export class RoomSession extends RoomSessionBase {
 		);
 	}
 
-	// ── MsgHandler factory ────────────────────────────────────────────────────
+	// ── Event funnel ──────────────────────────────────────────────────────────
 
-	protected buildHandler(): MsgHandler {
-		const base: MsgHandler = {
-			onOpen: () => this.markLiveWsActivity("open"),
-			onStartListen: () => this.markLiveWsActivity("start-listen"),
-			onClose: () => {
-				if (this.cancelled || this.ctx.isDisposed()) return;
-				if (this.ctx.consumeIntentionalClose(this.sub.roomId)) return;
-				this.markLiveWsActivity("close");
-				void this.reconnect("close");
-			},
-			onError: () => this.onError(),
-			onAttentionChange: () => this.markLiveWsActivity("heartbeat"),
-			onIncomeDanmu: ({ body }) => {
-				this.markLiveWsActivity("danmu");
-				this.onIncomeDanmu(body);
-			},
-			onIncomeSuperChat: ({ body }) => {
-				this.markLiveWsActivity("superchat");
-				return this.onIncomeSuperChat(body);
-			},
-			onWatchedChange: ({ body }) => {
-				this.markLiveWsActivity("watched");
-				this.liveData.watchedNum = body.text_small;
-				const now = Date.now();
-				if (now - this.lastViewersEmitMs >= VIEWERS_EMIT_THROTTLE_MS) {
-					this.lastViewersEmitMs = now;
-					this.ctx.emitViewers(this.sub.uid, body.text_small);
+	/**
+	 * 单回调漏斗:连接生命周期与业务消息都从这一个口进来,switch 一次接完。
+	 * 活跃度标记因此天然只有这一处(旧 handler 对象时代要在 13 个槽位里各撒一次)。
+	 *
+	 * 主动关闭的 close 回声不会出现在这里 —— 客户端 close() 之后保证静默,
+	 * 旧的 consumeIntentionalClose 对暗号已随之退役。
+	 */
+	protected buildEventHandler(): (ev: LiveEvent) => void | Promise<void> {
+		// 返回值透传底下 handler 的 Promise:客户端不消费它,但测试靠 await 它
+		// 才能等事件真正跑完再断言(与旧 MsgHandler 的返回语义一致)。
+		return (ev) => {
+			switch (ev.kind) {
+				case "open":
+					this.markLiveWsActivity("open");
+					return;
+				case "auth-ok":
+					this.markLiveWsActivity("auth-ok");
+					return;
+				case "auth-failed":
+					// token 可能过期/失配。走重连梯子:每轮都重新预检拿新 token。
+					this.ctx.logger.warn(`[conn] 直播间 [${this.sub.roomId}] 弹幕认证失败 code=${ev.code}`);
+					void this.reconnect("error", `认证失败 code=${ev.code}`);
+					return;
+				case "heartbeat":
+					this.markLiveWsActivity("heartbeat");
+					return;
+				case "closed":
+					if (this.cancelled || this.ctx.isDisposed()) return;
+					this.markLiveWsActivity("close");
+					void this.reconnect("close");
+					return;
+				case "error":
+					return this.onError();
+				case "danmu":
+					this.markLiveWsActivity("danmu");
+					this.onIncomeDanmu(ev);
+					return;
+				case "superchat":
+					this.markLiveWsActivity("superchat");
+					return this.onIncomeSuperChat(ev);
+				case "watched": {
+					this.markLiveWsActivity("watched");
+					this.liveData.watchedNum = ev.textSmall;
+					const now = Date.now();
+					if (now - this.lastViewersEmitMs >= VIEWERS_EMIT_THROTTLE_MS) {
+						this.lastViewersEmitMs = now;
+						this.ctx.emitViewers(this.sub.uid, ev.textSmall);
+					}
+					return;
 				}
-			},
-			onLikedChange: ({ body }) => {
-				this.markLiveWsActivity("liked");
-				this.liveData.likedNum = body.count;
-			},
-			onGuardBuy: ({ body }) => {
-				this.markLiveWsActivity("guard");
-				return this.onGuardBuy(body);
-			},
-			onLiveStart: () => {
-				this.markLiveWsActivity("live-start");
-				return this.onLiveStart();
-			},
-			onLiveEnd: () => {
-				this.markLiveWsActivity("live-end");
-				return this.onLiveEnd();
-			},
+				case "liked":
+					this.markLiveWsActivity("liked");
+					this.liveData.likedNum = ev.count;
+					return;
+				case "guard-buy":
+					this.markLiveWsActivity("guard");
+					return this.onGuardBuy({
+						guard_level: ev.guardLevel,
+						gift_name: ev.giftName,
+						user: ev.user,
+					});
+				case "live-start":
+					this.markLiveWsActivity("live-start");
+					return this.onLiveStart();
+				case "live-end":
+					this.markLiveWsActivity("live-end");
+					return this.onLiveEnd();
+				case "user-action":
+					if (!this.sub.customSpecialUsersEnterTheRoom.enable) return;
+					this.markLiveWsActivity("interact");
+					return this.onUserAction(ev);
+				case "raw":
+					// 未解析命令也是活的流量 —— watchdog 只关心连接死没死
+					this.markLiveWsActivity("raw");
+					// degraded = 已知命令解析失败(B 站可能改了字段形状),是协议
+					// 漂移信号,要报出来;plain raw 是刻意不解析的命令,属正常流量
+					if (ev.degraded) this.noteDegradedRaw(ev.cmd);
+					return;
+				default:
+					// 已解析但业务不消费的 kind(gift / room-change / 抽奖组等,
+					// 2026-08 定案「只打协议层地基」)—— 与 raw 同理,只标活跃度
+					this.markLiveWsActivity("other");
+					return;
+			}
 		};
-		if (!this.sub.customSpecialUsersEnterTheRoom.enable) return base;
-		return {
-			...base,
-			onUserAction: (msg) => {
-				this.markLiveWsActivity("interact");
-				return this.onUserAction(msg);
-			},
-		};
+	}
+
+	/**
+	 * 漂移报警限流:同 cmd 首条立即 warn,之后每满 100 条再报一次累计 ——
+	 * 漂移一旦发生是每帧都漂,逐帧 warn 会刷爆日志。计数随 session 生命周期,
+	 * 不随重连清零(漂移不会因为重连而消失)。
+	 */
+	private noteDegradedRaw(cmd: string): void {
+		const count = (this.degradedRawCounts.get(cmd) ?? 0) + 1;
+		this.degradedRawCounts.set(cmd, count);
+		if (count === 1 || count % 100 === 0) {
+			this.ctx.logger.warn(
+				`[proto] 直播间 [${this.sub.roomId}] 已知命令 ${cmd} 解析降级(累计 ${count} 次)—— B 站可能调整了字段形状,请检查更新`,
+			);
+		}
 	}
 
 	// ── Event handlers ────────────────────────────────────────────────────────
@@ -224,6 +282,14 @@ export class RoomSession extends RoomSessionBase {
 		this.reconnecting = true;
 		try {
 			await this.reconnectLoop(reason, detail);
+		} catch (e) {
+			// 总兜底:reconnect 的 promise 被 watchdog / auth-failed / closed /
+			// preflight 四个入口以 void 丢弃 —— 这里再抛就是 unhandledRejection
+			// (Node 默认崩进程)。已知失败模式都在 loop 内消化,这层只接漏网的
+			// (如补跑推卡时渲染/推送 reject)。
+			const msg = `直播间 [${this.sub.roomId}] 重连流程内部异常:${(e as Error).message}`;
+			this.ctx.logger.error(`[conn] ${msg}`);
+			this.ctx.emitEngineError(msg);
 		} finally {
 			this.reconnecting = false;
 		}
@@ -238,7 +304,12 @@ export class RoomSession extends RoomSessionBase {
 		// 「是**我们**把在播状态翻下去的」—— 只有这种情况才需要在重连成功后核对回来。
 		// 判「当前不在播」是不够的:本来就没在播的房间会被拖去做一次没意义的网络核对。
 		let weTurnedLiveOff = false;
-		while (this.reconnectAttempts < RECONNECT_BACKOFF_MS.length) {
+		// 上一次尝试是否被预检 -352 拦下。真 → 下一次 sleep 走长尾梯子且不消耗
+		// 秒级梯子的次数(不放弃);假 → 一切同旧。bootstrap 期被拦(reason=preflight)
+		// 从第一轮就按长尾等。
+		let preflightBlocked = reason === "preflight";
+		let preflightBlockedAttempts = 0;
+		while (true) {
 			if (this.cancelled || this.ctx.isDisposed()) return;
 			if (reason === "error") {
 				if (this.liveStatus) weTurnedLiveOff = true;
@@ -247,24 +318,38 @@ export class RoomSession extends RoomSessionBase {
 			}
 			this.ctx.closeListener(this.sub.roomId);
 
-			const delay = RECONNECT_BACKOFF_MS[this.reconnectAttempts];
-			this.reconnectAttempts++;
+			let delay: number;
 			const reasonText = this.describeReconnectReason(reason, detail);
-			this.ctx.logger.warn(
-				`[conn] 直播间 [${this.sub.roomId}] ${reasonText},${delay / 1000}s 后重连(第 ${this.reconnectAttempts}/${RECONNECT_BACKOFF_MS.length} 次)`,
-			);
+			if (preflightBlocked) {
+				const idx = Math.min(preflightBlockedAttempts, PREFLIGHT_BLOCKED_BACKOFF_MS.length - 1);
+				delay = PREFLIGHT_BLOCKED_BACKOFF_MS[idx] as number;
+				preflightBlockedAttempts++;
+				// 预检被拦说明服务在响应(是风控不是连接故障)—— 复位秒级计数,
+				// 否则风控波中拦截与普通失败交替时,5 个普通轮凑齐就 break 放弃。
+				this.reconnectAttempts = 0;
+				this.ctx.logger.warn(
+					`[conn] 直播间 [${this.sub.roomId}] ${reasonText},${Math.round(delay / 1000)}s 后重试预检(长尾第 ${preflightBlockedAttempts} 次,不放弃)`,
+				);
+			} else {
+				if (this.reconnectAttempts >= RECONNECT_BACKOFF_MS.length) break;
+				delay = RECONNECT_BACKOFF_MS[this.reconnectAttempts] as number;
+				this.reconnectAttempts++;
+				this.ctx.logger.warn(
+					`[conn] 直播间 [${this.sub.roomId}] ${reasonText},${delay / 1000}s 后重连(第 ${this.reconnectAttempts}/${RECONNECT_BACKOFF_MS.length} 次)`,
+				);
+			}
 			await this.sleepReconnect(delay);
 			if (this.cancelled || this.ctx.isDisposed()) return;
 
 			// L4:startLiveRoomListener 现返回是否真有 listener(新建,或退避窗口
-			// 内已被别处恢复)。throw(blive 库内部异常等)与 false 一并视为本轮
-			// 失败,继续退避(while 续链,无递归、无丢弃定时器)。只有真成功才
-			// 复位 backoff。
+			// 内已被别处恢复)。throw 与 false 一并视为本轮失败,继续退避(while
+			// 续链,无递归、无丢弃定时器)。只有真成功才复位 backoff。
 			let ok = false;
+			preflightBlocked = false;
 			try {
 				ok = await this.ctx.startLiveRoomListener(
 					this.sub.roomId,
-					this.buildHandler(),
+					this.buildEventHandler(),
 					() => this.cancelled,
 				);
 			} catch (e) {
@@ -275,6 +360,11 @@ export class RoomSession extends RoomSessionBase {
 					this.cancel();
 					this.ctx.stopMonitoring(e.message, this.sub.roomId);
 					return;
+				}
+				if (e instanceof LiveRoomPreflightBlockedError) {
+					// 风控还没散,回长尾继续等;计数不清零,间隔继续爬到封顶。
+					preflightBlocked = true;
+					continue;
 				}
 				this.ctx.logger.warn(
 					`[conn] 直播间 [${this.sub.roomId}] 重连发起异常:${(e as Error).message}`,
@@ -291,6 +381,33 @@ export class RoomSession extends RoomSessionBase {
 				this.onListenerStarted();
 				this.ctx.logger.info(`[conn] 直播间 [${this.sub.roomId}] 重连成功`);
 				this.reconnectAttempts = 0;
+				// 预检被风控挡在 bootstrap 门外的房间,从没跑过 bootstrapRoomState ——
+				// 房间信息 / 已在播检测 / restartPush 都还欠着,这里补跑(同款
+				// 「翻成在播」窗口包裹)。与 weTurnedLiveOff 天然互斥:没 bootstrap
+				// 过的房间 liveStatus 恒为 false,不可能是我们翻下去的。
+				if (!this.bootstrapped) {
+					if (this.bootstrapInFlight) {
+						// bootstrap 窗口内断线:首跑还在途,新 listener 已就位,房态
+						// 由首跑收尾 —— 不并发第二份(双开会重复推「正在直播」卡、
+						// 交错 transition 窗口)。
+						return;
+					}
+					this.beginLiveTransition();
+					let stateReady = false;
+					try {
+						stateReady = await this.bootstrapRoomState();
+					} finally {
+						this.finishLiveTransition();
+					}
+					if (stateReady) return;
+					// 熬过风控刚连上,初始信息拉取又失败 —— 多半泡在同一场风控余波里。
+					// 回长尾继续等,不 cancel:一次瞬时 HTTP 失败不该毙掉「永不放弃」的房间。
+					this.ctx.logger.warn(
+						`[conn] 直播间 [${this.sub.roomId}] 重连后初始房态拉取失败,回长尾退避重试`,
+					);
+					preflightBlocked = true;
+					continue;
+				}
 				// 上面 `reason === "error"` 的分支把状态翻成了下播并停了周期复推。
 				// 那是保守处置(连接断了,我们确实不知道房间还在不在播),但**必须
 				// 在重连成功后核对回来** —— 否则几小时后真正的下播事件会撞上
@@ -359,9 +476,15 @@ export class RoomSession extends RoomSessionBase {
 	}
 
 	private describeReconnectReason(reason: ReconnectReason, detail?: string): string {
-		if (reason === "error") return "连接错误";
+		if (reason === "error") return detail ? `连接错误(${detail})` : "连接错误";
 		if (reason === "close") return "连接关闭";
+		if (reason === "preflight") return "弹幕预检被风控拦截";
 		return detail ? `连接静默(${detail})` : "连接静默";
+	}
+
+	/** bootstrap 期预检被 -352 拦截 → 直接进长尾重试(不占用秒级梯子、不放弃房间)。 */
+	protected override onPreflightBlocked(): void {
+		void this.reconnect("preflight");
 	}
 
 	/**
@@ -381,15 +504,12 @@ export class RoomSession extends RoomSessionBase {
 	}
 
 	private onIncomeDanmu(body: { content: string; user: { uname: string; uid: number } }): void {
-		if (
-			this.ctx.isSubscribed(this.sub, "wordcloud") ||
-			this.ctx.isSubscribed(this.sub, "liveSummary")
-		) {
+		if (this.ctx.collectsDanmaku(this.sub)) {
 			this.ctx.danmakuCollector.recordDanmaku(this.sub.roomId, body.content, body.user.uname);
 		}
+		// 不按目标挡:没配目标的推送由推送层记成「无目标」,面板上才看得见。
 		if (
 			this.sub.customSpecialDanmakuUsers.enable &&
-			this.ctx.hasTargets(this.sub, "specialDanmaku") &&
 			this.sub.customSpecialDanmakuUsers.specialDanmakuUsers?.includes(body.user.uid.toString())
 		) {
 			const text = this.ctx.templateRenderer.renderSpecialDanmaku({
@@ -412,9 +532,7 @@ export class RoomSession extends RoomSessionBase {
 		user: { uname: string; uid: number };
 		price: number;
 	}): Promise<void> {
-		const collectsDanmaku =
-			this.ctx.isSubscribed(this.sub, "wordcloud") ||
-			this.ctx.isSubscribed(this.sub, "liveSummary");
+		const collectsDanmaku = this.ctx.collectsDanmaku(this.sub);
 		const pushesSC = this.ctx.isSubscribed(this.sub, "superchat");
 		if (!collectsDanmaku && !pushesSC) return;
 		if (collectsDanmaku) {
@@ -428,10 +546,12 @@ export class RoomSession extends RoomSessionBase {
 		if (data.code !== 0) {
 			const text = `【${this.masterInfo?.username ?? ""}的直播间】${body.user.uname}的SC:${body.content}（${body.price}元）`;
 			if (this.ctx.isDisposed()) return;
-			await this.ctx.push.broadcastToTargets(
-				this.sub.uid,
-				this.ctx.contentBuilder.message([this.ctx.contentBuilder.text(text)]),
-				LivePushType.Superchat,
+			await this.enqueuePush(() =>
+				this.ctx.push.broadcastToTargets(
+					this.sub.uid,
+					this.ctx.contentBuilder.message([this.ctx.contentBuilder.text(text)]),
+					LivePushType.Superchat,
+				),
 			);
 			return;
 		}
@@ -452,10 +572,12 @@ export class RoomSession extends RoomSessionBase {
 					this.sub.cardLayout?.sc,
 				);
 				if (this.ctx.isDisposed()) return;
-				await this.ctx.push.broadcastToTargets(
-					this.sub.uid,
-					this.ctx.contentBuilder.image(buf, "image/jpeg"),
-					LivePushType.Superchat,
+				await this.enqueuePush(() =>
+					this.ctx.push.broadcastToTargets(
+						this.sub.uid,
+						this.ctx.contentBuilder.image(buf, "image/jpeg"),
+						LivePushType.Superchat,
+					),
 				);
 				return;
 			} catch (e) {
@@ -464,10 +586,12 @@ export class RoomSession extends RoomSessionBase {
 		}
 		const fallback = `【${this.masterInfo?.username ?? ""}的直播间】${data.data.uname}的SC:${body.content}（${body.price}元）`;
 		if (this.ctx.isDisposed()) return;
-		await this.ctx.push.broadcastToTargets(
-			this.sub.uid,
-			this.ctx.contentBuilder.message([this.ctx.contentBuilder.text(fallback)]),
-			LivePushType.Superchat,
+		await this.enqueuePush(() =>
+			this.ctx.push.broadcastToTargets(
+				this.sub.uid,
+				this.ctx.contentBuilder.message([this.ctx.contentBuilder.text(fallback)]),
+				LivePushType.Superchat,
+			),
 		);
 	}
 
@@ -486,9 +610,9 @@ export class RoomSession extends RoomSessionBase {
 		if (effectiveGuardBuy.enable) {
 			const customGuardImg: Record<GuardLevel, string | undefined> = {
 				[GuardLevel.None]: undefined,
-				[GuardLevel.Jianzhang]: effectiveGuardBuy.captainImgUrl,
-				[GuardLevel.Tidu]: effectiveGuardBuy.supervisorImgUrl,
-				[GuardLevel.Zongdu]: effectiveGuardBuy.governorImgUrl,
+				[GuardLevel.Captain]: effectiveGuardBuy.captainImgUrl,
+				[GuardLevel.Admiral]: effectiveGuardBuy.supervisorImgUrl,
+				[GuardLevel.Governor]: effectiveGuardBuy.governorImgUrl,
 			};
 			const text = this.ctx.templateRenderer.renderGuardBuy({
 				guardBuyConfig: effectiveGuardBuy,
@@ -635,32 +759,35 @@ export class RoomSession extends RoomSessionBase {
 				: this.masterInfo.liveOpenFollowerNum.toString();
 		this.liveData.fansNum = this.masterInfo.liveOpenFollowerNum;
 		const roomLink = buildRoomLink(this.liveRoomInfo);
-		// 消息版式:per-UP 折叠值优先,缺失时兜底引擎 config 级(koishi 的默认版式 +
-		// 链接开关);两级都缺 = 旧路径。版式路径下链接独立成部件,开播模板按 omitLink
-		// 剥掉 {link},由 sendLiveNotifyCard 按块序装配。
-		const messageLayout = this.sub.messageLayout ?? this.ctx.config.messageLayout;
+		// 消息版式来自 per-UP 折叠值(宿主恒填)。链接独立成部件,
+		// 由 sendLiveNotifyCard 按块序装配。
 		const liveStartMsg = this.ctx.templateRenderer.renderLiveStart({
 			sub: this.sub,
 			globalCustom: this.ctx.config.customLiveMsg,
 			master: this.masterInfo,
 			diffTime,
 			followerNum,
-			roomLink,
-			omitLink: messageLayout !== undefined,
 		});
 
-		await this.ctx.sendLiveNotifyCard({
-			liveType: LiveType.StartBroadcasting,
-			liveData: this.liveData,
-			liveRoomInfo: this.liveRoomInfo,
-			master: this.masterInfo,
-			cardStyle: this.resolvedCardStyle("live"),
-			cardLayout: this.sub.cardLayout,
-			uid: this.sub.uid,
-			notifyMsg: liveStartMsg,
-			messageLayout,
-			roomLink,
-		});
+		// 串行闸(enqueuePush):秒级断流重开时,这张开播卡会与上一场还在途的下播卡
+		// 并发 —— 不排队的话谁快谁先送达,用户看到「先开播后下播」的倒序。
+		// 抓成局部变量再入闸:非空收窄进不了闭包,卡片也本就该反映发起时刻的状态。
+		const liveRoomInfo = this.liveRoomInfo;
+		const master = this.masterInfo;
+		await this.enqueuePush(() =>
+			this.ctx.sendLiveNotifyCard({
+				liveType: LiveType.StartBroadcasting,
+				liveData: this.liveData,
+				liveRoomInfo,
+				master,
+				cardStyle: this.resolvedCardStyle("live"),
+				cardLayout: this.sub.cardLayout,
+				uid: this.sub.uid,
+				notifyMsg: liveStartMsg,
+				messageLayout: this.sub.messageLayout,
+				roomLink,
+			}),
+		);
 
 		if (this.ctx.isDisposed()) return;
 		// 跨 useLiveRoomInfo / useMasterInfo / getTimeDifference / sendLiveNotifyCard
@@ -695,35 +822,23 @@ export class RoomSession extends RoomSessionBase {
 	/**
 	 * 特别关注用户进房。
 	 *
-	 * blive 的 `onUserAction` 已解析好 `enter / follow / share / like`,不必再自己
-	 * 订阅原始帧、用 protobuf 解 `data.pb`。旧路径依赖一份仓库里从未存在的 .proto
-	 * schema,`protobuf.load` 必然抛错走降级,该特性实际上从来没生效过。
+	 * 事件源是 `INTERACT_WORD_V2` **一帧独供**(parser 只解它;`ENTRY_EFFECT` /
+	 * v1 `INTERACT_WORD` / `LIKE_INFO_V3_CLICK` 一律走 raw 不进来)。blive 库时代
+	 * `onUserAction` 是四个上游事件的汇流口,ENTRY_EFFECT 被硬编码成 "enter",
+	 * 舰长进房会推两次 —— 那时靠 `msg.type` 对暗号排重;自实现后源头就只有一个,
+	 * 暗号不需要了,但**别把 ENTRY_EFFECT 加回 parser**,不然旧 bug 原样复活。
 	 *
-	 * 但 `onUserAction` 是**四个上游事件的汇流口**:`INTERACT_WORD_V2` /
-	 * `INTERACT_WORD`(v1)/ `ENTRY_EFFECT` / `LIKE_INFO_V3_CLICK`。前三个都会产出
-	 * `action: "enter"` —— 尤其 `ENTRY_EFFECT`(舰长进场特效)在 blive 的 parser 里
-	 * 是**硬编码**成 "enter" 的。只看 `action` 的话,一个舰长身份的特别关注用户进一次
-	 * 房会被推两次(且 ENTRY_EFFECT 的 uname 是从 `copy_writing` 正则抠的,抠不到就是
-	 * 空串)。所以必须用 `type` 锁死到 `INTERACT_WORD_V2` —— 这也正是旧代码原本监听的
-	 * 那一帧。
-	 *
-	 * `body.user.uid` 是 number,而白名单存的是 string,比对前必须转。
+	 * `user.uid` 是 number,而白名单存的是 string,比对前必须转。
 	 */
-	private async onUserAction(msg: Message<UserActionMsg>): Promise<void> {
-		if (msg.type !== "INTERACT_WORD_V2") return;
-		const body = msg.body;
-		if (
-			!this.sub.customSpecialUsersEnterTheRoom.enable ||
-			!this.ctx.hasTargets(this.sub, "specialUserEnter")
-		) {
-			return;
-		}
-		if (body.action !== "enter") return;
-		const uid = String(body.user.uid);
+	private async onUserAction(ev: { action: UserActionType; user: LiveUser }): Promise<void> {
+		// 同特别弹幕:不按目标挡,「无目标」由推送层记账。
+		if (!this.sub.customSpecialUsersEnterTheRoom.enable) return;
+		if (ev.action !== "enter") return;
+		const uid = String(ev.user.uid);
 		if (!this.sub.customSpecialUsersEnterTheRoom.specialUsersEnterTheRoom?.includes(uid)) return;
 		const text = this.ctx.templateRenderer.renderSpecialUserEnter({
 			template: this.sub.customSpecialUsersEnterTheRoom.msgTemplate,
-			uname: body.user.uname,
+			uname: ev.user.uname,
 			master: this.masterInfo,
 		});
 		this.ctx.safeBroadcast(

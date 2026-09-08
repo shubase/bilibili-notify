@@ -5,6 +5,7 @@
  * 到了当天下午仍该是「今天」,而不是因为过了 24 小时就掉进「昨天」。
  */
 
+import type { AiConversationMetaDTO } from "@bilibili-notify/contract";
 import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 import { createSseParser, groupConversations, groupLabel, sendChatMessage } from "../aiChat";
 
@@ -138,6 +139,36 @@ describe("sendChatMessage — 事件分派", () => {
 		const res = await sendChatMessage("c1", "问", { onDelta: () => {} });
 		expect(res.reply.tools).toEqual([{ name: "get_user_info", args: { uid: "1" }, ok: true }]);
 	});
+
+	it("reasoning 帧派给 onReasoning,不混进正文", async () => {
+		stubStream(
+			`event: reasoning\ndata: {"text":"主人问的是"}\n\n`,
+			`event: reasoning\ndata: {"text":"订阅"}\n\n`,
+			`event: delta\ndata: {"text":"晚上好"}\n\n`,
+			doneFrame(),
+		);
+		const think: string[] = [];
+		const text: string[] = [];
+		await sendChatMessage("c1", "问", {
+			onDelta: (t) => text.push(t),
+			onReasoning: (t) => think.push(t),
+		});
+		expect(think).toEqual(["主人问的是", "订阅"]);
+		expect(text).toEqual(["晚上好"]);
+	});
+
+	it("不关心思考时不传 onReasoning 也不炸", async () => {
+		stubStream(`event: reasoning\ndata: {"text":"想想"}\n\n`, doneFrame());
+		await expect(sendChatMessage("c1", "问", { onDelta: () => {} })).resolves.toMatchObject({
+			reply: { content: "答" },
+		});
+	});
+
+	it("done 里回复带的思考原样交出去 —— 交接那一帧要拿它顶上", async () => {
+		stubStream(doneFrame({ reasoning: "想了一下" }));
+		const res = await sendChatMessage("c1", "问", { onDelta: () => {} });
+		expect(res.reply.reasoning).toBe("想了一下");
+	});
 });
 
 describe("groupLabel", () => {
@@ -166,12 +197,14 @@ describe("groupLabel", () => {
 });
 
 describe("groupConversations", () => {
-	const meta = (id: string, updatedAt: string) => ({
+	const meta = (id: string, updatedAt: string): AiConversationMetaDTO => ({
 		id,
 		title: id,
 		createdAt: updatedAt,
 		updatedAt,
 		messageCount: 2,
+		mode: "chat",
+		persona: true,
 	});
 
 	it("按标签成组,组内保持服务端给的倒序", () => {
@@ -191,5 +224,62 @@ describe("groupConversations", () => {
 	it("全在同一组时只有一个标题", () => {
 		const got = groupConversations([meta("a", at(24, 14)), meta("b", at(24, 9))], NOW);
 		expect(got).toHaveLength(1);
+	});
+});
+
+describe("sendChatMessage — 会话级胶囊 flags", () => {
+	/** 最小可用的 SSE 响应:一个 done 事件。 */
+	function doneRes() {
+		const payload = `event: done\ndata: ${JSON.stringify({ user: {}, reply: {}, conversation: { id: "c1" } })}\n\n`;
+		const body = new ReadableStream<Uint8Array>({
+			start(c) {
+				c.enqueue(new TextEncoder().encode(payload));
+				c.close();
+			},
+		});
+		return new Response(body, { status: 200 });
+	}
+
+	it("两颗胶囊点亮 → 请求体带 thinking/search:true", async () => {
+		const fetchMock = vi.fn(async () => doneRes());
+		vi.stubGlobal("fetch", fetchMock);
+		await sendChatMessage("c1", "问", { onDelta: () => {} }, undefined, {
+			thinking: true,
+			search: true,
+		});
+		const body = JSON.parse(
+			((fetchMock.mock.calls[0] as unknown[])[1] as RequestInit).body as string,
+		);
+		expect(body).toMatchObject({ thinking: true, search: true });
+		vi.unstubAllGlobals();
+	});
+
+	it("这条路永远不发 mode —— 模式归会话所有,请求体说了不算", async () => {
+		// 模式曾经按消息走请求体,主人后来定了开局锁定,服务端 ChatRequestSchema 也
+		// 跟着删了这个字段。前端还往请求体里塞的话,读代码的人会以为这里改得动模式
+		// (实际被 zod 原地丢掉),而写能力本就不该由每条消息决定。
+		const fetchMock = vi.fn(async () => doneRes());
+		vi.stubGlobal("fetch", fetchMock);
+		await sendChatMessage("c1", "做套皮肤", { onDelta: () => {} }, undefined, {
+			thinking: true,
+			search: true,
+		});
+		const body = JSON.parse(
+			((fetchMock.mock.calls[0] as unknown[])[1] as RequestInit).body as string,
+		);
+		expect("mode" in body).toBe(false);
+		vi.unstubAllGlobals();
+	});
+
+	it("胶囊全灭 / 不传 flags → 请求体里根本没有这两个键(不带 = 关)", async () => {
+		const fetchMock = vi.fn(async () => doneRes());
+		vi.stubGlobal("fetch", fetchMock);
+		await sendChatMessage("c1", "问", { onDelta: () => {} });
+		const body = JSON.parse(
+			((fetchMock.mock.calls[0] as unknown[])[1] as RequestInit).body as string,
+		);
+		expect("thinking" in body).toBe(false);
+		expect("search" in body).toBe(false);
+		vi.unstubAllGlobals();
 	});
 });

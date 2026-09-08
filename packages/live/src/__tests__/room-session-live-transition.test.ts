@@ -16,8 +16,8 @@
  * 每层自己的单测当时都是绿的,裂缝全在这些跨路径的不变量上,所以在这里逐条钉死。
  */
 
+import type { LiveEvent } from "@bilibili-notify/blive";
 import type { ServiceContext } from "@bilibili-notify/internal";
-import type { MsgHandler } from "blive-message-listener";
 import { beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import type { SubItemView } from "../push-like";
 import type { RoomContext } from "../room-helpers";
@@ -36,8 +36,7 @@ function makeSub(over: Partial<SubItemView> = {}): SubItemView {
 		liveEnd: true,
 		liveGuardBuy: false,
 		superchat: false,
-		wordcloud: false,
-		liveSummary: false,
+		liveEndExtras: { wordcloud: false, liveSummary: false },
 		target: {},
 		customCardStyle: { enable: false },
 		customLiveMsg: { enable: false },
@@ -133,7 +132,6 @@ function makeCtx(over: Partial<Record<string, unknown>> = {}) {
 		},
 		isSubscribed: (_sub: SubItemView, kind: string) => kind === "liveEnd",
 		getMasterInfo: async () => ({ ...MASTER }),
-		consumeIntentionalClose: () => false,
 		emitLiveState: mocks.emitLiveState,
 		emitEngineError: mocks.emitEngineError,
 		sendLiveNotifyCard: mocks.sendLiveNotifyCard,
@@ -153,10 +151,11 @@ const liveEmits = (m: ReturnType<typeof vi.fn>) =>
 	m.mock.calls.filter((c: unknown[]) => c[1] === "live").length;
 
 /**
- * `MsgHandler` 的回调在类型上声明返回 `void`,实际返回的是 Promise —— 测试要等这条
- * 事件真正跑完才能断言,否则断言会跑在事件处理之前。
+ * 事件漏斗在类型上返回 `void | Promise<void>` —— 测试要等这条事件真正跑完才能断言,
+ * 否则断言会跑在事件处理之前。
  */
 const dispatch = (r: unknown): Promise<void> => Promise.resolve(r as Promise<void> | undefined);
+type EventFunnel = (ev: LiveEvent) => void | Promise<void>;
 
 beforeEach(() => {
 	vi.clearAllMocks();
@@ -168,14 +167,14 @@ describe("bootstrap() 期间到达的下播事件", () => {
 		// 的这几秒里 UP 停播了。END 撞上守卫被丢弃,B 站也不会再发第二条;若这里仍
 		// 无条件翻成在播,这个房间就永久停在「直播中」,统计侧每天平白多记 24 小时。
 		const { ctx, mocks } = makeCtx();
-		let handler: MsgHandler | undefined;
+		let handler: EventFunnel | undefined;
 		mocks.startLiveRoomListener.mockImplementation(async (...args: unknown[]) => {
-			handler = args[1] as MsgHandler;
+			handler = args[1] as EventFunnel;
 			return true;
 		});
 		// 在翻状态之前的最后一段 await 里插进这条 END。
 		mocks.getTimeDifference.mockImplementation(async () => {
-			await dispatch(handler?.onLiveEnd?.({} as never));
+			await dispatch(handler?.({ kind: "live-end" }));
 			return "3小时";
 		});
 
@@ -188,13 +187,13 @@ describe("bootstrap() 期间到达的下播事件", () => {
 
 	it("中止时排空弹幕缓冲 —— 否则这几秒的弹幕会混进下一场词云", async () => {
 		const { ctx, mocks } = makeCtx();
-		let handler: MsgHandler | undefined;
+		let handler: EventFunnel | undefined;
 		mocks.startLiveRoomListener.mockImplementation(async (...args: unknown[]) => {
-			handler = args[1] as MsgHandler;
+			handler = args[1] as EventFunnel;
 			return true;
 		});
 		mocks.getTimeDifference.mockImplementation(async () => {
-			await dispatch(handler?.onLiveEnd?.({} as never));
+			await dispatch(handler?.({ kind: "live-end" }));
 			return "3小时";
 		});
 
@@ -209,7 +208,7 @@ describe("bootstrap() 期间到达的下播事件", () => {
 		// (还没开播),紧接着 UP 在这几秒里开播,那条 LIVE 被当成「重复事件」吞掉,
 		// 而 bootstrap 自己也不会翻成在播 —— 房间永久停在「未直播」,和这一组要修的
 		// 「永久停在直播中」正好凑成一对。去重是 onLiveStart 的重入守卫,不归 bootstrap 管。
-		let handler: MsgHandler | undefined;
+		let handler: EventFunnel | undefined;
 		let started: Promise<void> | undefined;
 		// bootstrap 拉主播信息的这一刻 UP 开播了 —— 此时房间快照已是「未开播」,
 		// 而 WS 已经在派发事件。
@@ -217,14 +216,14 @@ describe("bootstrap() 期间到达的下播事件", () => {
 			getMasterInfo: async () => {
 				if (!started) {
 					mocks.getLiveRoomInfo.mockResolvedValue({ ...LIVE_ROOM });
-					started = dispatch(handler?.onLiveStart?.({} as never));
+					started = dispatch(handler?.({ kind: "live-start" }));
 				}
 				return { ...MASTER };
 			},
 		});
 		mocks.getLiveRoomInfo.mockResolvedValue({ ...LIVE_ROOM, live_status: 0 });
 		mocks.startLiveRoomListener.mockImplementation(async (...args: unknown[]) => {
-			handler = args[1] as MsgHandler;
+			handler = args[1] as EventFunnel;
 			return true;
 		});
 
@@ -250,25 +249,25 @@ describe("onLiveStart 准备期间到达的下播事件", () => {
 	async function readySession(sub = makeSub()) {
 		const { ctx, mocks } = makeCtx();
 		mocks.getLiveRoomInfo.mockResolvedValue({ ...LIVE_ROOM, live_status: 0 });
-		let handler: MsgHandler | undefined;
+		let handler: EventFunnel | undefined;
 		mocks.startLiveRoomListener.mockImplementation(async (...args: unknown[]) => {
-			handler = args[1] as MsgHandler;
+			handler = args[1] as EventFunnel;
 			return true;
 		});
 		const session = new RoomSession(ctx, sub) as AnySession;
 		await session.bootstrap();
 		expect(session.isLive).toBe(false);
-		return { session, mocks, handler: handler as MsgHandler };
+		return { session, mocks, handler: handler as EventFunnel };
 	}
 
 	it("刷新房间信息期间收到 END → 不翻成在播", async () => {
 		const { session, mocks, handler } = await readySession();
 		mocks.getLiveRoomInfo.mockImplementation(async () => {
-			await dispatch(handler.onLiveEnd?.({} as never));
+			await dispatch(handler({ kind: "live-end" }));
 			return { ...LIVE_ROOM };
 		});
 
-		await dispatch(handler.onLiveStart?.({} as never));
+		await dispatch(handler({ kind: "live-start" }));
 
 		expect(session.isLive).toBe(false);
 		expect(liveEmits(mocks.emitLiveState)).toBe(0);
@@ -281,11 +280,11 @@ describe("onLiveStart 准备期间到达的下播事件", () => {
 		const { session, mocks, handler } = await readySession();
 		session.lastLiveEnd = Date.now(); // 刚处理过一条 END
 		mocks.getLiveRoomInfo.mockImplementation(async () => {
-			await dispatch(handler.onLiveEnd?.({} as never)); // 冷却期内的第二条
+			await dispatch(handler({ kind: "live-end" })); // 冷却期内的第二条
 			return { ...LIVE_ROOM };
 		});
 
-		await dispatch(handler.onLiveStart?.({} as never));
+		await dispatch(handler({ kind: "live-start" }));
 
 		expect(session.isLive).toBe(false);
 		expect(liveEmits(mocks.emitLiveState)).toBe(0);
@@ -294,11 +293,11 @@ describe("onLiveStart 准备期间到达的下播事件", () => {
 	it("中止时排空弹幕缓冲", async () => {
 		const { session, mocks, handler } = await readySession();
 		mocks.getLiveRoomInfo.mockImplementation(async () => {
-			await dispatch(handler.onLiveEnd?.({} as never));
+			await dispatch(handler({ kind: "live-end" }));
 			return { ...LIVE_ROOM };
 		});
 
-		await dispatch(handler.onLiveStart?.({} as never));
+		await dispatch(handler({ kind: "live-start" }));
 
 		expect(session.isLive).toBe(false);
 		expect(mocks.clear).toHaveBeenCalledWith("r1");
@@ -306,7 +305,7 @@ describe("onLiveStart 准备期间到达的下播事件", () => {
 
 	it("没有 END 时照常开播并推卡", async () => {
 		const { session, mocks, handler } = await readySession();
-		await dispatch(handler.onLiveStart?.({} as never));
+		await dispatch(handler({ kind: "live-start" }));
 
 		expect(session.isLive).toBe(true);
 		expect(liveEmits(mocks.emitLiveState)).toBe(1);
@@ -385,6 +384,52 @@ describe("退避耗尽彻底放弃监听", () => {
 		await giveUp;
 
 		expect(mocks.emitEngineError).toHaveBeenCalledTimes(1);
+		expect(mocks.sendLiveNotifyCard).not.toHaveBeenCalled();
+	});
+});
+
+/**
+ * `tickNow`:把「正在直播」复推提前到现在(devtools「复推计时器提前到期」)。走的就是
+ * 定时器到点调的那个 tick,不是另一条路;没在播就不跑、回 false。
+ */
+describe("RoomSession.tickNow", () => {
+	it("在播且复推开着:立刻跑一次复推 tick(拉房间信息 → 渲染 → 发卡),回 true", async () => {
+		const { ctx, mocks } = makeCtx();
+		const session = new RoomSession(ctx, makeSub({ pushTime: 1 })) as AnySession;
+		await session.bootstrap();
+		expect(session.isLive).toBe(true);
+		mocks.sendLiveNotifyCard.mockClear();
+		mocks.getLiveRoomInfo.mockClear();
+
+		expect(await session.tickNow()).toBe(true);
+
+		expect(mocks.getLiveRoomInfo).toHaveBeenCalledTimes(1);
+		expect(mocks.sendLiveNotifyCard).toHaveBeenCalledTimes(1);
+	});
+
+	it("这个 UP 关了复推(pushTime=0):不跑,回 false —— 排程那条根本没建定时器", async () => {
+		// 提前到期提前的是**那个定时器**。定时器不存在时它没有可提前的东西;照跑就等于
+		// 给一个明确关掉复推的 UP 发了一张它永远不该收到的卡。
+		const { ctx, mocks } = makeCtx();
+		const session = new RoomSession(ctx, makeSub({ pushTime: 0 })) as AnySession;
+		await session.bootstrap();
+		expect(session.isLive).toBe(true);
+		mocks.sendLiveNotifyCard.mockClear();
+
+		expect(await session.tickNow()).toBe(false);
+		expect(mocks.sendLiveNotifyCard).not.toHaveBeenCalled();
+	});
+
+	it("没在播:不跑,回 false", async () => {
+		const { ctx, mocks } = makeCtx({
+			getLiveRoomInfo: async () => ({ ...LIVE_ROOM, live_status: 0 }),
+		});
+		const session = new RoomSession(ctx, makeSub()) as AnySession;
+		await session.bootstrap();
+		expect(session.isLive).toBe(false);
+		mocks.sendLiveNotifyCard.mockClear();
+
+		expect(await session.tickNow()).toBe(false);
 		expect(mocks.sendLiveNotifyCard).not.toHaveBeenCalled();
 	});
 });

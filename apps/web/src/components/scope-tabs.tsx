@@ -7,12 +7,27 @@
  * 计数,从而在同一 Subscription.overrides 上各管各的切片。
  */
 
-import { useEffect, useRef, useState } from "react";
-import { colorFromUid, displayName } from "../pages/up/helpers";
+// 不走 pages/up/helpers —— 组件层反向 import 页面层是圈套;色板直取 internal 正身。
+import { colorFromUid } from "@bilibili-notify/internal/constants";
+import {
+	ADD_LANGUAGE,
+	Avatar,
+	EmptyNote,
+	Icon,
+	IconButton,
+	MenuItem,
+	Pill,
+	PopoverShell,
+	SELECTED_LANGUAGE,
+	TAB_ACTIVE_LANGUAGE,
+	TAB_IDLE_LANGUAGE,
+	TabBarShell,
+	TabButton,
+	useDismiss,
+} from "@bilibili-notify/ui";
+import { useRef, useState } from "react";
 import type { Subscription } from "../types/domain";
-import { Avatar, Pill } from "./atoms";
-import { Icon } from "./icons";
-import { TabBarShell, TabButton } from "./tab-bar";
+import { displayName } from "../utils/up-display";
 
 /** "__global" = 全局默认;其余 = subscription.id。 */
 export type Scope = "__global" | string;
@@ -44,15 +59,7 @@ export function ScopeTabs({
 	const [adding, setAdding] = useState(false);
 	const dropdownRef = useRef<HTMLDivElement | null>(null);
 
-	useEffect(() => {
-		if (!adding) return;
-		function handleDocClick(e: MouseEvent) {
-			if (!dropdownRef.current) return;
-			if (!dropdownRef.current.contains(e.target as Node)) setAdding(false);
-		}
-		document.addEventListener("mousedown", handleDocClick);
-		return () => document.removeEventListener("mousedown", handleDocClick);
-	}, [adding]);
+	useDismiss(dropdownRef, () => setAdding(false), { enabled: adding });
 
 	const isGlobal = scope === "__global";
 
@@ -68,7 +75,7 @@ export function ScopeTabs({
 				全局 / 全部 UP
 			</TabButton>
 
-			{tabSubs.length > 0 ? <span className="mx-0.5 h-5.5 w-px bg-black/10" /> : null}
+			{tabSubs.length > 0 ? <span className="mx-0.5 h-5.5 w-px bg-bn-border" /> : null}
 
 			{/* per-UP tabs (仅显示已定制 + 客户端临时添加的) */}
 			{tabSubs.map((sub) => {
@@ -78,10 +85,14 @@ export function ScopeTabs({
 				return (
 					<div
 						key={sub.id}
-						className={`flex items-center gap-1.5 rounded-lg border py-1.5 pl-3 pr-1.5 text-[12.5px] font-bold transition ${
-							active
-								? "border-bn-pink/25 bg-bn-surface text-bn-pink shadow-[0_2px_8px_rgba(0,0,0,0.08)]"
-								: "border-transparent text-bn-text-tertiary hover:text-bn-text-primary"
+						// 挂点与同条 tab 条上的 TabButton 同口径(tab 家族,曾是 btn)——此前
+						// 「全局 / 全部 UP」有挂点、紧挨着的 per-UP tab 一个都没有,皮肤改样式
+						// 时一条 tab 里第一颗变了、后面几颗没变,并排摆着。观感也整句吃
+						// TAB_*_LANGUAGE —— 曾自配「白卡 + 粉描边」,与「全局」的实心块在同
+						// 一条 tab 上摆着两种选中态(左右内距不对称留着:右侧装移除钮)。
+						data-bn={active ? "tab tab-active" : "tab"}
+						className={`flex items-center gap-1.5 rounded-lg py-1.5 pl-3 pr-1.5 text-bn-sm font-bold transition ${
+							active ? TAB_ACTIVE_LANGUAGE : TAB_IDLE_LANGUAGE
 						}`}
 					>
 						<button
@@ -99,67 +110,73 @@ export function ScopeTabs({
 								{displayName(sub)}
 							</span>
 							{count > 0 ? (
-								<Pill color={active ? "#FB7299" : "#888"} subtle size="sm">
+								// 选中态换 on-solid:实心粉底上的粉徽章读不出来;白纱 + 白字与
+								// 旁边标签同等可读(同 TabButton 小码那段对比度账的结论)。
+								<Pill
+									color={active ? "var(--color-bn-on-solid)" : "var(--color-bn-inactive)"}
+									subtle
+									size="sm"
+								>
 									{count}
 								</Pill>
 							) : null}
 						</button>
-						<button
-							type="button"
+						{/* 曾是站里最后一颗手写的图标钮(收编 23 处后的漏网)。选中 tab 是实心
+						    粉块 —— 常规 tone 的 tertiary 灰字压上去读不出来,走 scrim 档(压在
+						    强底/图片上的那一档,连静态字色一起换 on-solid);闲置 tab 回常规
+						    neutral:平时安静、hover 才出反馈,IconButton 的既定哲学。 */}
+						<IconButton
+							icon={<Icon.close size={11} />}
+							label={`移除 ${displayName(sub)} 的个性化配置`}
+							size="xs"
+							tone="neutral"
+							surface={active ? "scrim" : undefined}
 							onClick={(e) => {
 								e.stopPropagation();
 								onRemoveSub(sub.id);
 							}}
-							title={`移除 ${displayName(sub)} 的个性化配置`}
-							className={`grid h-4.5 w-4.5 place-items-center rounded ${
-								active
-									? "text-bn-pink/80 hover:bg-bn-pink/10"
-									: "text-bn-text-tertiary/70 hover:bg-bn-hover-muted"
-							}`}
-						>
-							<Icon.close size={11} />
-						</button>
+						/>
 					</div>
 				);
 			})}
 
-			{/* 添加 UP 按钮 + 下拉 */}
+			{/* 添加 UP 按钮 + 下拉。虚线=空位语汇,挂专词 `add-slot` 而非 `btn`(皮肤的
+			    按钮实底会把「还能再加一个」画成真按钮);闲置观感整句吃 ADD_LANGUAGE ——
+			    此前 hover 只加深文字,与家族的「粉描边+粉纱」不是一路(2026-08-30 主人
+			    点名统一);展开态说全站统一的选中语汇 —— 曾是自配的 pink/40 + /6 纱。 */}
 			<div className="relative" ref={dropdownRef}>
 				<button
 					type="button"
 					onClick={() => setAdding((v) => !v)}
 					title="从订阅列表添加 UP 主的个性化配置"
-					className={`flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-[12.5px] font-semibold transition ${
-						adding
-							? "border-bn-pink/40 bg-bn-pink/6 text-bn-pink"
-							: "border-dashed border-black/15 text-bn-text-tertiary hover:text-bn-text-primary"
+					data-bn="add-slot"
+					className={`flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-bn-sm font-semibold ${
+						adding ? `${SELECTED_LANGUAGE} transition` : ADD_LANGUAGE
 					}`}
 				>
 					<Icon.plus size={13} />
 					添加 UP
 				</button>
 				{adding ? (
-					<div className="absolute left-0 top-[calc(100%+6px)] z-30 min-w-60 overflow-hidden rounded-[10px] border border-black/8 bg-bn-surface shadow-[0_8px_24px_rgba(0,0,0,0.12)]">
-						<div className="border-b border-bn-border-subtle px-3 pb-1.5 pt-2 text-[11px] font-bold uppercase tracking-wider text-bn-text-tertiary">
+					<PopoverShell layer="nav" variant="flush" className="min-w-60">
+						<div className="border-b border-bn-border-subtle px-3 pb-1.5 pt-2 text-bn-xs font-bold uppercase tracking-wider text-bn-text-tertiary">
 							选择要单独定制的 UP 主
 						</div>
 						{availableSubs.length === 0 ? (
-							<div className="px-3 py-4 text-center text-[12px] text-bn-text-tertiary">
+							<EmptyNote size="sm" className="m-2">
 								所有已订阅的 UP 主都已添加
-							</div>
+							</EmptyNote>
 						) : (
 							<div className="max-h-72 overflow-y-auto py-1">
 								{availableSubs.map((sub) => {
 									const color = colorFromUid(sub.uid);
 									return (
-										<button
-											type="button"
+										<MenuItem
 											key={sub.id}
 											onClick={() => {
 												onAddSub(sub.id);
 												setAdding(false);
 											}}
-											className="flex w-full items-center gap-2.5 px-3 py-2 text-left transition hover:bg-bn-pink/5"
 										>
 											<Avatar
 												name={displayName(sub)}
@@ -168,17 +185,19 @@ export function ScopeTabs({
 												url={sub.cachedProfile?.avatar}
 											/>
 											<div className="min-w-0 flex-1">
-												<div className="truncate text-[12.5px] font-bold text-bn-text-primary">
+												<div className="truncate text-bn-sm font-bold text-bn-text-primary">
 													{displayName(sub)}
 												</div>
-												<div className="text-[10.5px] text-bn-text-tertiary">UID {sub.uid}</div>
+												<div className="text-bn-2xs text-bn-text-tertiary tabular-nums">
+													UID {sub.uid}
+												</div>
 											</div>
 											{sub.state.liveStatus === "live" ? (
-												<Pill color="#FB7299" subtle size="sm">
+												<Pill color="var(--color-bn-pink)" subtle size="sm">
 													播
 												</Pill>
 											) : null}
-										</button>
+										</MenuItem>
 									);
 								})}
 							</div>
@@ -186,16 +205,16 @@ export function ScopeTabs({
 						<button
 							type="button"
 							onClick={() => setAdding(false)}
-							className="block w-full border-t border-bn-border-subtle py-2 text-center text-[11px] text-bn-text-tertiary hover:text-bn-text-primary"
+							className="block w-full border-t border-bn-border-subtle py-2 text-center text-bn-xs text-bn-text-tertiary hover:text-bn-text-primary"
 						>
 							取消
 						</button>
-					</div>
+					</PopoverShell>
 				) : null}
 			</div>
 
 			<div className="flex-1" />
-			<div className="px-2 text-[11px] text-bn-text-tertiary">
+			<div className="px-2 text-bn-xs text-bn-text-tertiary">
 				{isGlobal ? (
 					(globalHint ?? "此处为全部 UP 默认设置")
 				) : perUpHint ? (

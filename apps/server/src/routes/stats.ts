@@ -1,17 +1,15 @@
-import { CommentaryGenerator } from "@bilibili-notify/ai";
 import type {
 	StatsOverviewResponse,
 	StatsRoastPushResponse,
 	StatsRoastResponse,
+	StatsRoastRunNowResponse,
 	StatsSoloRoastResponse,
 	UpStatsRow,
 } from "@bilibili-notify/contract";
-import type { RoastCardUp } from "@bilibili-notify/image";
-import type { NotificationPayload } from "@bilibili-notify/internal";
-import { colorFromUid } from "@bilibili-notify/internal";
-import { Hono } from "hono";
+import { ROAST_MAX_DAYS, ROAST_MIN_DAYS } from "@bilibili-notify/internal";
+import { type Context, Hono } from "hono";
 import { z } from "zod";
-import { resolveAiOverride } from "../runtime/engines.js";
+import type { RoastRunOutcome } from "../runtime/roast-scheduler.js";
 import {
 	countDynamics,
 	dailyActivityCounts,
@@ -20,14 +18,13 @@ import {
 	summarizeLiveSessions,
 	windowSinceIso,
 } from "../stats/aggregate.js";
+import { deliverRoast } from "../stats/roast-deliver.js";
 import {
-	buildRoastPrompt,
-	buildSoloRoastPrompt,
-	parseRoastReply,
-	parseSoloRoastReply,
-	type RoastInput,
-} from "../stats/roast.js";
-import { toGeneratorConfig } from "./ai.js";
+	generateBoardRoast,
+	generateSoloRoast,
+	roastGenErrorStatus,
+	roastGenErrorText,
+} from "../stats/roast-generate.js";
 import type { RouteDeps } from "./types.js";
 
 /**
@@ -41,8 +38,10 @@ import type { RouteDeps } from "./types.js";
  * 每多一天就多扫一天的 fans 采样。
  */
 
-const MIN_DAYS = 1;
-const MAX_DAYS = 90;
+// 单一来源:定时锐评的 schema 校验用的是同一对边界(见 internal 的 constants),
+// 在这儿另立一份的话,两条路对「90 天」的理解迟早会漂开。
+const MIN_DAYS = ROAST_MIN_DAYS;
+const MAX_DAYS = ROAST_MAX_DAYS;
 /**
  * overview 结果的短 TTL 缓存。fans 采样每 ~2min 才动一次,而单次 overview 要
  * 逐 UP 流式扫 N 天的 jsonl(30 天 × 2min × 10 个 UP ≈ 20 万行),不缓存的话
@@ -55,7 +54,7 @@ const CACHE_TTL_MS = 30_000;
  *
  * 键是 `days:tz`,而 days ∈ 1..90、tz ∈ ±840,组合空间约 15 万种,每份都装着
  * 全部 UP 的整段序列。只靠 TTL 不设上限的话,换着参数刷就能在 30s 内把它们
- * 全塞进来 —— 独立端 Docker 镜像的堆上限只有 384MB,顶得爆。
+ * 全塞进来 —— 独立端 Docker 镜像的堆上限只有 512MB,顶得爆。
  *
  * 正常用法(一个时区 × 三个档位)只占个位数,32 已经宽裕得多。
  */
@@ -131,10 +130,19 @@ async function fetchOverview(
 	}
 }
 
-/** 取数失败时给用户的话。两处锐评同一套措辞。 */
-const OVERVIEW_FAILED = "统计数据读取失败,请稍后重试";
+export interface StatsRouteOptions {
+	/**
+	 * 立刻跑一轮 —— 面板上的「试一次」按它。带 uid 跑那位 UP 的单人锐评,
+	 * 不带则跑全局那条榜单周报。
+	 *
+	 * 由 `index.ts` late-bind 进来(调度器建得比路由晚):没传就等于「还没就绪」,
+	 * 端点回 503 而不是假装成功。**它调的就是 cron 到点调的那个函数** —— 另写一条
+	 * 「测试专用」的路径,测出来的就不是真到点时会发生的事。
+	 */
+	runRoastNow?: (uid?: string) => Promise<RoastRunOutcome>;
+}
 
-export function createStatsRoute(deps: RouteDeps): Hono {
+export function createStatsRoute(deps: RouteDeps, options: StatsRouteOptions = {}): Hono {
 	const app = new Hono();
 	const cache = new Map<string, CacheEntry>();
 
@@ -327,71 +335,20 @@ export function createStatsRoute(deps: RouteDeps): Hono {
 	 * 调人格,而是在用配好的女仆干活,草稿会让结果不可复现。
 	 */
 	app.post("/roast", async (c) => {
-		const engines = deps.runtime.engines;
-		if (!engines) {
-			return c.json<StatsRoastResponse>({ ok: false, err: "服务尚未就绪,请稍后重试" }, 503);
-		}
-		const aiSettings = deps.store.getGlobals().defaults.ai;
-		if (!aiSettings.enabled) {
-			return c.json<StatsRoastResponse>({ ok: false, err: "智能女仆尚未启用" }, 400);
-		}
-
-		const days = clampDays(c.req.query("days"));
-		const overview = await fetchOverview(app, days, parseTz(c.req.query("tz")));
-		if (!overview) {
-			return c.json<StatsRoastResponse>({ ok: false, err: OVERVIEW_FAILED }, 500);
-		}
-
-		// 名称在 SubRuntimeStore(cachedProfile 是外置运行时数据,不在配置里),
-		// 与 `/api/subs` 的 join 同源。
-		const nameByUid = new Map(
-			deps.store
-				.getSubscriptions()
-				.map((s) => [
-					s.uid,
-					deps.runtime.subRuntimeStore.get(s.id)?.cachedProfile?.name?.trim() || `UID ${s.uid}`,
-				]),
-		);
-		const ups: RoastInput[] = overview.rows.map((r) => ({
-			uid: r.uid,
-			name: nameByUid.get(r.uid) ?? `UID ${r.uid}`,
-			net7d: r.net7d,
-			netWindow: r.netWindow,
-			archives: r.archives,
-			dynamics: r.dynamics,
-			liveSessions: r.liveSessions,
-			liveHours: r.liveHours,
-			lastActivityAt: r.lastActivityAt,
-		}));
-		if (ups.length < 2) {
-			return c.json<StatsRoastResponse>(
-				{ ok: false, err: "至少要订阅 2 位 UP 主才评得出鸽王" },
-				400,
-			);
-		}
-
-		const generator = new CommentaryGenerator({
-			serviceCtx: deps.runtime.serviceCtx,
-			api: engines.api,
-			config: toGeneratorConfig(aiSettings),
+		// 生成本体在 `../stats/roast-generate.ts` —— 定时推送要走同一份实现,
+		// 否则页面上看到的和到点自动发出去的迟早不是一回事。
+		const gen = await generateBoardRoast(deps, {
+			days: clampDays(c.req.query("days")),
+			tz: parseTz(c.req.query("tz")),
+			fetchOverview: (d, t) => fetchOverview(app, d, t),
 		});
-		let reply: string;
-		try {
-			// `comment()` 而不是 `chat()` —— 见文件末尾 ROAST_CALL 注释。
-			reply = await generator.comment(buildRoastPrompt(ups, days));
-		} catch (err) {
+		if (!gen.ok) {
 			return c.json<StatsRoastResponse>(
-				{ ok: false, err: err instanceof Error ? err.message : String(err) },
-				500,
+				{ ok: false, err: roastGenErrorText(gen) },
+				roastGenErrorStatus(gen),
 			);
 		}
-
-		const result = parseRoastReply(reply, ups);
-		if (!result) {
-			// 解析不出来就直说,不把半截结构渲染成一张看着像模像样的卡。
-			return c.json<StatsRoastResponse>({ ok: false, err: "女仆的回复解析失败,请重试" }, 502);
-		}
-		return c.json<StatsRoastResponse>({ ok: true, result });
+		return c.json<StatsRoastResponse>({ ok: true, result: gen.result });
 	});
 
 	/**
@@ -425,58 +382,60 @@ export function createStatsRoute(deps: RouteDeps): Hono {
 			return c.json<StatsRoastPushResponse>({ ok: false, err: "推送目标不存在" }, 404);
 		}
 
-		// uid → 名称 / 头像 / 配色。配色走 colorFromUid,与 dashboard 上同一位 UP 一致。
-		const subByUid = new Map(deps.store.getSubscriptions().map((s) => [s.uid, s]));
-		const upMeta = (uid: string): RoastCardUp => {
-			const sub = subByUid.get(uid);
-			const profile = sub ? deps.runtime.subRuntimeStore.get(sub.id)?.cachedProfile : undefined;
-			return {
-				name: profile?.name?.trim() || `UID ${uid}`,
-				avatar: profile?.avatar || undefined,
-				color: colorFromUid(uid),
-			};
-		};
-
-		const text = roastPushText(kind, result, days, upMeta);
-		const renderer = engines.imageRenderer;
-		const imageWanted = renderer !== null && deps.store.getGlobals().defaults.cardStyle.enabled;
-
-		let payload: NotificationPayload = { kind: "text", text };
-		let mode: "image" | "text" = "text";
-		if (imageWanted && renderer) {
-			try {
-				const buffer =
-					kind === "board"
-						? await renderer.generateRoastBoardCard({
-								days,
-								pigeon: { ...upMeta(result.pigeon.uid), reason: result.pigeon.reason },
-								diligent: { ...upMeta(result.diligent.uid), reason: result.diligent.reason },
-								roast: result.roast.map((r) => ({ ...upMeta(r.uid), comment: r.comment })),
-								scores: result.scores.map((s) => ({ ...upMeta(s.uid), score: s.score })),
-							})
-						: await renderer.generateRoastSoloCard({
-								days,
-								up: upMeta(result.uid),
-								verdict: result.verdict,
-								score: result.score,
-								highlights: result.highlights,
-							});
-				// caption 不是装饰:图挂了 / 客户端不展图时,那段文字是唯一还读得到的东西。
-				payload = { kind: "image", image: { buffer, mime: "image/jpeg" }, caption: text };
-				mode = "image";
-			} catch (err) {
-				deps.runtime.serviceCtx.logger.warn(
-					`[stats] 锐评卡片渲染失败，降级为文字推送: ${err instanceof Error ? err.message : String(err)}`,
-				);
-			}
+		// 渲染与投递的本体在 `../stats/roast-deliver.ts` —— 定时推送走同一份,
+		// 免得「渲染挂了降级成文字」这类行为将来只剩一条路上还留着。
+		const out = await deliverRoast(deps, { kind, result, days, targetIds: [target.id] });
+		// 停用的目标投递层会跳过(与周报同一条判定)。单目标手动推送遇到它得明说,不能是一句
+		// 含糊的「推送失败」—— 那会让人去查网络。
+		if (out.skipped.length > 0) {
+			return c.json<StatsRoastPushResponse>({ ok: false, err: "推送目标已停用" }, 409);
 		}
-
-		const delivery = await engines.push.sendToTarget(target.id, payload);
-		if (!delivery.ok) {
-			return c.json<StatsRoastPushResponse>({ ok: false, err: delivery.err ?? "推送失败" }, 502);
+		if (out.sent.length === 0) {
+			return c.json<StatsRoastPushResponse>(
+				{ ok: false, err: out.failed[0]?.err ?? "推送失败" },
+				502,
+			);
 		}
+		const mode = out.mode;
 		return c.json<StatsRoastPushResponse>({ ok: true, mode });
 	});
+	/**
+	 * `POST /api/stats/roast/run-now` —— 立刻跑一轮定时周报(面板上的「试一次」)。
+	 *
+	 * **必须注册在 `/roast/:uid` 之前**,理由同 `/roast/push`:Hono 按注册序匹配,
+	 * 反过来 `run-now` 会被当成一个 uid 吃掉。
+	 *
+	 * 三件要紧事:
+	 * - 走的是**和 cron 完全同一个函数**。另写一条「测试专用」的轻量路径,验的就
+	 *   不是真到点时会发生的事 —— 那样的按钮绿了也不能说明什么。
+	 * - 因此审批关着时它会**真的发进群里**。前端负责在点之前把这话讲清楚。
+	 * - 读的是**已保存**的配置,不吃页面草稿(同 `/roast` 那条的理由:这里不是在调
+	 *   参数,是在验一条已经配好的流水线)。
+	 *
+	 * 业务性失败(生成不出来、没配目标)一律 **200 + 结构化结局**,不用 4xx ——
+	 * 前端的 error 分支只拿得到一句 HTTP 错误,原因就丢了(锐评卡踩过这个坑)。
+	 */
+	async function runNow(c: Context, uid?: string): Promise<Response> {
+		if (!options.runRoastNow) {
+			return c.json<StatsRoastRunNowResponse>({ ok: false, err: "服务尚未就绪,请稍后重试" }, 503);
+		}
+		try {
+			return c.json<StatsRoastRunNowResponse>({
+				ok: true,
+				outcome: await options.runRoastNow(uid),
+			});
+		} catch (err) {
+			// 这一轮里任何一步炸了都收在这儿:端点是给人点的,不能把异常漏出去。
+			const why = err instanceof Error ? err.message : String(err);
+			deps.runtime.serviceCtx.logger.warn(`[stats] 手动跑锐评失败: ${why}`);
+			return c.json<StatsRoastRunNowResponse>({ ok: false, err: why }, 502);
+		}
+	}
+
+	app.post("/roast/run-now", (c) => runNow(c));
+	/** 带 uid = 跑这位 UP 的单人锐评。漏掉它就会发出一份全站榜单,完全不是主人要试的东西。 */
+	app.post("/roast/run-now/:uid", (c) => runNow(c, c.req.param("uid")));
+
 	/**
 	 * `POST /api/stats/roast/:uid` —— 单 UP 锐评。
 	 *
@@ -484,77 +443,19 @@ export function createStatsRoute(deps: RouteDeps): Hono {
 	 * 榜单特有的(评鸽王需要对照组),单人只就他自己的数据说话。
 	 */
 	app.post("/roast/:uid", async (c) => {
-		const uid = c.req.param("uid");
-		const engines = deps.runtime.engines;
-		if (!engines) {
-			return c.json<StatsSoloRoastResponse>({ ok: false, err: "服务尚未就绪,请稍后重试" }, 503);
-		}
-
-		// 先确认这个 uid 真的订阅着。不校验的话,任何人构造一个 uid 就能让我们
-		// 拿着一份空数据去请求模型 —— 白烧 token,还会渲染出一张查无此人的卡。
-		const sub = deps.store.getSubscriptions().find((s) => s.uid === uid);
-		if (!sub) {
-			return c.json<StatsSoloRoastResponse>({ ok: false, err: "该 UP 主不在订阅列表里" }, 404);
-		}
-
-		const aiSettings = deps.store.getGlobals().defaults.ai;
-		if (!aiSettings.enabled) {
-			return c.json<StatsSoloRoastResponse>({ ok: false, err: "智能女仆尚未启用" }, 400);
-		}
-
-		const days = clampDays(c.req.query("days"));
-		const overview = await fetchOverview(app, days, parseTz(c.req.query("tz")));
-		if (!overview) {
-			return c.json<StatsSoloRoastResponse>({ ok: false, err: OVERVIEW_FAILED }, 500);
-		}
-		const row = overview.rows.find((r) => r.uid === uid);
-		if (!row) {
-			return c.json<StatsSoloRoastResponse>({ ok: false, err: "该 UP 主暂无统计数据" }, 404);
-		}
-
-		const up: RoastInput = {
-			uid: row.uid,
-			name:
-				deps.runtime.subRuntimeStore.get(sub.id)?.cachedProfile?.name?.trim() || `UID ${row.uid}`,
-			net7d: row.net7d,
-			netWindow: row.netWindow,
-			archives: row.archives,
-			dynamics: row.dynamics,
-			liveSessions: row.liveSessions,
-			liveHours: row.liveHours,
-			lastActivityAt: row.lastActivityAt,
-		};
-
-		const generator = new CommentaryGenerator({
-			serviceCtx: deps.runtime.serviceCtx,
-			api: engines.api,
-			config: toGeneratorConfig(aiSettings),
+		const gen = await generateSoloRoast(deps, {
+			uid: c.req.param("uid"),
+			days: clampDays(c.req.query("days")),
+			tz: parseTz(c.req.query("tz")),
+			fetchOverview: (d, t) => fetchOverview(app, d, t),
 		});
-		// per-UP 人格:与动态点评 / 下播总结同源(见 ROAST_CALL 注释末段)。评的就是
-		// 这一位 UP,主人给他单配的人格没有理由不算数。
-		const aiOverride = resolveAiOverride(sub, deps.store.getGlobals().defaults);
-		let reply: string;
-		try {
-			// 同上:一次性调用,不留会话历史 —— 否则评完 A 再评 B,B 的上下文里坐着 A。
-			// scene / imageUrls 留空:锐评既不属于 dynamic 也不属于 liveSummary,更没有图。
-			reply = await generator.comment(
-				buildSoloRoastPrompt(up, days),
-				undefined,
-				undefined,
-				aiOverride,
-			);
-		} catch (err) {
+		if (!gen.ok) {
 			return c.json<StatsSoloRoastResponse>(
-				{ ok: false, err: err instanceof Error ? err.message : String(err) },
-				500,
+				{ ok: false, err: roastGenErrorText(gen) },
+				roastGenErrorStatus(gen),
 			);
 		}
-
-		const result = parseSoloRoastReply(reply, up);
-		if (!result) {
-			return c.json<StatsSoloRoastResponse>({ ok: false, err: "女仆的回复解析失败,请重试" }, 502);
-		}
-		return c.json<StatsSoloRoastResponse>({ ok: true, result });
+		return c.json<StatsSoloRoastResponse>({ ok: true, result: gen.result });
 	});
 
 	return app;
@@ -585,35 +486,6 @@ const RoastPushSchema = z.intersection(
 		z.object({ kind: z.literal("solo"), result: SoloResultSchema }),
 	]),
 );
-
-type BoardResult = z.infer<typeof BoardResultSchema>;
-type SoloResult = z.infer<typeof SoloResultSchema>;
-
-/**
- * 要发出去的那段文字 —— 图片推送时当图说明,没有图时就是正文。
- *
- * 模型可能压根没给 `pushText`(schema 里它有 `.default("")`),那时用结构化数据
- * 拼一段兜底:宁可发一句干巴巴的「鸽王是谁」,也不能推一条空消息出去。兜底一律
- * 写**名称**,群友不认识 uid。
- */
-function roastPushText(
-	kind: "board" | "solo",
-	result: BoardResult | SoloResult,
-	days: number,
-	upMeta: (uid: string) => RoastCardUp,
-): string {
-	if (result.pushText.trim()) return result.pushText;
-	if (kind === "board") {
-		const r = result as BoardResult;
-		return [
-			`📊 UP 主周报（近 ${days} 天）`,
-			`🕊️ 本期鸽王：${upMeta(r.pigeon.uid).name} —— ${r.pigeon.reason}`,
-			`🏆 勤奋 UP：${upMeta(r.diligent.uid).name} —— ${r.diligent.reason}`,
-		].join("\n");
-	}
-	const s = result as SoloResult;
-	return `📊 ${upMeta(s.uid).name}（近 ${days} 天）：${s.verdict}`;
-}
 
 /**
  * ROAST_CALL —— 为什么两处锐评都走 `comment()` 而不是 `chat()`。

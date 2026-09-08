@@ -1,15 +1,29 @@
+import {
+	AddCard,
+	Btn,
+	ConfirmDialog,
+	EmptyNote,
+	ErrorNote,
+	Icon,
+	Input,
+	LoadingBlock,
+	ModalShell,
+	Pill,
+	SELECTED_LANGUAGE,
+	SELECTED_TINT_BG,
+	TOAST_DURATION_MS,
+	Toast,
+} from "@bilibili-notify/ui";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useMemo, useState } from "react";
-import { Btn, Input } from "../components/atoms";
-import { ConfirmDialog, ModalShell } from "../components/dialog";
-import { Icon } from "../components/icons";
+import { useSearchParams } from "react-router-dom";
 import { ApiError, api } from "../services/api";
 import { makeEmptySubscription, type PushTarget, type Subscription } from "../types/domain";
 import { copyToClipboard } from "../utils/clipboard";
 import { GroupEditDialog } from "./up/GroupEditDialog";
 import { displayName } from "./up/helpers";
 import { computeMenuPosition } from "./up/menu-position";
-import { UpCard } from "./up/UpCard";
+import { UP_CARD_MIN_H, UpCard } from "./up/UpCard";
 import { UpCardMenu } from "./up/UpCardMenu";
 import { UpDialog } from "./up/UpDialog";
 
@@ -51,17 +65,30 @@ function GroupChip({
 	onClick: () => void;
 	muted?: boolean;
 }) {
+	// 圆角走皮肤的 pill 轴,别写死 rounded-full —— 像素风皮肤把 radius.pill 调到 0
+	// 求一身硬直角,写死的话唯独这排胶囊还是圆的。
+	// 底一律**不透明**:这排直接坐在页面背景上,bg-bn-pink/10 那类纱靠白页垫底才
+	// 好看,壁纸皮肤把页面换掉后选中态与未分组当场隐形(2026-08-30 主人真机指出
+	// 「正常状态反而看不太清」)。粉调用 color-mix 落在 surface 上出,默认装等值。
 	const base =
-		"inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-[11.5px] font-semibold transition";
+		"inline-flex items-center gap-1.5 rounded-bn-pill px-2.5 py-1 text-bn-xs font-semibold transition";
+	// 未分组(muted)= 普通档 + 虚线,**只差线型这一个类**(2026-08-30 主人定案:
+	// hover 同样要粉描边,不是只加深文字)。测试用类差集钉着这条,别再各配各的。
+	// 选中配方从这里定案后升进了 ui 库 —— 全站选中态说的都是这一句。
 	const cls = active
-		? "border border-bn-pink bg-bn-pink/10 text-bn-pink"
-		: muted
-			? "border border-dashed border-bn-border bg-bn-surface/60 text-bn-text-tertiary hover:text-bn-text-primary"
-			: "border border-bn-border bg-bn-surface text-bn-text-secondary hover:border-bn-pink/60 hover:text-bn-text-primary";
+		? SELECTED_LANGUAGE
+		: `border ${muted ? "border-dashed " : ""}border-bn-border bg-bn-surface text-bn-text-secondary hover:border-bn-pink/60 hover:text-bn-text-primary`;
 	return (
-		<button type="button" onClick={onClick} className={`${base} ${cls}`}>
+		// 页面里手写的控件不在 packages/ui 那份 skin-hooks 测试的射程内,漏挂了皮肤
+		// 就静默够不到它 —— 这一类在本仓库已犯过两回。分组筛选改的是值,挂 chip。
+		<button
+			type="button"
+			onClick={onClick}
+			data-bn={active ? "chip chip-active" : "chip"}
+			className={`${base} ${cls}`}
+		>
 			<span className="max-w-35 truncate">{label}</span>
-			<span className="font-mono text-[10.5px] opacity-70">{count}</span>
+			<span className="tabular-nums text-bn-2xs opacity-70">{count}</span>
 		</button>
 	);
 }
@@ -172,12 +199,15 @@ function NewSubDialog({
 		: 1;
 
 	return (
-		<ModalShell onCancel={onCancel} width={420} bodyClassName="p-5">
-			<div className="mb-1 text-base font-bold text-bn-text-primary">添加 UP 主</div>
-			<div className="mb-4 text-[12px] text-bn-text-secondary">
-				输入纯数字走 UID 精确查询; 输入名字走搜索,选定后进入配置表单
-			</div>
-			<div className="flex gap-2">
+		<ModalShell
+			onCancel={onCancel}
+			width={420}
+			bodyClassName="p-5"
+			title="添加 UP 主"
+			description="输入纯数字走 UID 精确查询; 输入名字走搜索,选定后进入配置表单"
+		>
+			{/* data-tour:「带我做」导览的高亮挂点(TourCompanion) */}
+			<div className="flex gap-2" data-tour="subs-search">
 				<Input
 					full
 					value={input}
@@ -190,15 +220,11 @@ function NewSubDialog({
 				</Btn>
 			</div>
 			{duplicate ? (
-				<div className="mt-3 rounded border border-bn-warning-border bg-bn-warning-soft p-2 text-xs text-bn-warning-text">
+				<div className="mt-3 rounded-sm border border-bn-warning-border bg-bn-warning-soft p-2 text-bn-sm text-bn-warning-text">
 					该 UID 已经在订阅列表中,无需重复添加
 				</div>
 			) : null}
-			{opErr ? (
-				<div className="mt-3 rounded border border-bn-danger-border bg-bn-danger-soft p-2 text-xs text-bn-danger-text">
-					{opErr}
-				</div>
-			) : null}
+			{opErr ? <ErrorNote className="mt-3">{opErr}</ErrorNote> : null}
 			{profile ? (
 				<ProfilePreview profile={profile} subscribed={existingUids.has(profile.uid)} />
 			) : null}
@@ -214,11 +240,7 @@ function NewSubDialog({
 					onNext={() => gotoPage(page + 1)}
 				/>
 			) : null}
-			{error ? (
-				<div className="mt-3 rounded border border-bn-danger-border bg-bn-danger-soft p-2 text-xs text-bn-danger-text">
-					{error}
-				</div>
-			) : null}
+			{error ? <ErrorNote className="mt-3">{error}</ErrorNote> : null}
 			<div className="mt-4 flex justify-end gap-2">
 				<Btn variant="outline" size="sm" onClick={onCancel} disabled={pending}>
 					{searchData ? "关闭" : "取消"}
@@ -238,6 +260,52 @@ function NewSubDialog({
 	);
 }
 
+/**
+ * UP 资料的「头像 + 名字/UID/已订阅」身份行 —— UID 预览卡与搜索结果行共用这一份。
+ * 收编前两处各抄一遍,连「已订阅」灰标都逐字符相同;第二行内容(粉丝 / 签名的
+ * 排法)两处确实不同,走 children。外层容器(卡片 / 可点行)由调用方出。
+ */
+function UpProfileSummary({
+	profile,
+	subscribed,
+	size,
+	children,
+}: {
+	profile: UpProfileLookup;
+	subscribed: boolean;
+	/** `md` 给预览卡(48px 头像),`sm` 给搜索结果行(40px)。 */
+	size: "sm" | "md";
+	children: React.ReactNode;
+}) {
+	return (
+		<>
+			<img
+				src={profile.avatar}
+				alt={profile.name}
+				data-bn="avatar"
+				className={`${size === "md" ? "h-12 w-12" : "h-10 w-10"} shrink-0 rounded-full bg-bn-surface object-cover`}
+				referrerPolicy="no-referrer"
+			/>
+			<div className="min-w-0 flex-1">
+				<div className="flex items-center gap-2">
+					<span
+						className={`truncate font-bold text-bn-text-primary ${size === "md" ? "text-bn-base" : "text-bn-sm"}`}
+					>
+						{profile.name}
+					</span>
+					<span className="text-bn-2xs tabular-nums text-bn-text-tertiary">UID {profile.uid}</span>
+					{subscribed ? (
+						<Pill size="sm" subtle color="var(--color-bn-text-tertiary)">
+							已订阅
+						</Pill>
+					) : null}
+				</div>
+				{children}
+			</div>
+		</>
+	);
+}
+
 function ProfilePreview({
 	profile,
 	subscribed,
@@ -247,31 +315,14 @@ function ProfilePreview({
 }) {
 	return (
 		<div className="mt-4 flex items-center gap-3 rounded-lg border border-bn-border bg-bn-surface-muted p-3">
-			<img
-				src={profile.avatar}
-				alt={profile.name}
-				className="h-12 w-12 shrink-0 rounded-full bg-bn-surface object-cover"
-				referrerPolicy="no-referrer"
-			/>
-			<div className="min-w-0 flex-1">
-				<div className="flex items-center gap-2">
-					<span className="truncate text-[13px] font-bold text-bn-text-primary">
-						{profile.name}
-					</span>
-					<span className="font-mono text-[10.5px] text-bn-text-tertiary">UID {profile.uid}</span>
-					{subscribed ? (
-						<span className="rounded bg-bn-surface-muted px-1.5 py-0.5 text-[10px] font-semibold text-bn-text-tertiary">
-							已订阅
-						</span>
-					) : null}
-				</div>
-				<div className="mt-0.5 text-[11px] text-bn-text-secondary">{fansLabel(profile.fans)}</div>
+			<UpProfileSummary profile={profile} subscribed={subscribed} size="md">
+				<div className="mt-0.5 text-bn-xs text-bn-text-secondary">{fansLabel(profile.fans)}</div>
 				{profile.sign ? (
-					<div className="mt-1 line-clamp-2 text-[11px] text-bn-text-tertiary" title={profile.sign}>
+					<div className="mt-1 line-clamp-2 text-bn-xs text-bn-text-tertiary" title={profile.sign}>
 						{profile.sign}
 					</div>
 				) : null}
-			</div>
+			</UpProfileSummary>
 		</div>
 	);
 }
@@ -298,9 +349,7 @@ function SearchResultList({
 	return (
 		<div className="mt-4 flex flex-col gap-1.5">
 			{data.results.length === 0 ? (
-				<div className="rounded border border-bn-border bg-bn-surface-muted p-4 text-center text-[12px] text-bn-text-tertiary">
-					没有匹配的 UP 主
-				</div>
+				<EmptyNote>没有匹配的 UP 主</EmptyNote>
 			) : (
 				data.results.map((r) => {
 					const subscribed = existingUids.has(r.uid);
@@ -311,31 +360,17 @@ function SearchResultList({
 							type="button"
 							onClick={() => !disabled && onPick(r)}
 							disabled={disabled}
+							// 候选行。**不挂 option-active** —— 这一列没有「选中的那一个」,
+							// 灰掉的那些是「已经订阅过、挑不了」,不是选中态。
+							data-bn="option"
 							className={`flex items-center gap-3 rounded-lg border p-2.5 text-left transition ${
 								subscribed
 									? "cursor-not-allowed border-bn-border bg-bn-surface-muted opacity-60"
 									: "border-bn-border bg-bn-surface hover:border-bn-pink/60 hover:bg-bn-pink/5"
 							}`}
 						>
-							<img
-								src={r.avatar}
-								alt={r.name}
-								className="h-10 w-10 shrink-0 rounded-full bg-bn-surface object-cover"
-								referrerPolicy="no-referrer"
-							/>
-							<div className="min-w-0 flex-1">
-								<div className="flex items-center gap-1.5">
-									<span className="truncate text-[12.5px] font-bold text-bn-text-primary">
-										{r.name}
-									</span>
-									<span className="font-mono text-[10.5px] text-bn-text-tertiary">UID {r.uid}</span>
-									{subscribed ? (
-										<span className="rounded bg-bn-surface-muted px-1.5 py-0.5 text-[10px] font-semibold text-bn-text-tertiary">
-											已订阅
-										</span>
-									) : null}
-								</div>
-								<div className="mt-0.5 text-[10.5px] text-bn-text-secondary">
+							<UpProfileSummary profile={r} subscribed={subscribed} size="sm">
+								<div className="mt-0.5 text-bn-2xs text-bn-text-secondary">
 									{fansLabel(r.fans)}
 									{r.sign ? (
 										<span className="ml-2 text-bn-text-tertiary" title={r.sign}>
@@ -343,12 +378,12 @@ function SearchResultList({
 										</span>
 									) : null}
 								</div>
-							</div>
+							</UpProfileSummary>
 						</button>
 					);
 				})
 			)}
-			<div className="mt-1 flex items-center justify-between text-[11px] text-bn-text-tertiary">
+			<div className="mt-1 flex items-center justify-between text-bn-xs text-bn-text-tertiary">
 				<span>
 					第 {data.page} 页 / 共 {totalPages} 页 · 总 {data.total} 条
 				</span>
@@ -408,6 +443,26 @@ export default function Subs() {
 	const [groupFilter, setGroupFilter] = useState<string | null>(null);
 	const [selection, setSelection] = useState<Set<string>>(new Set());
 	const [drawerSubId, setDrawerSubId] = useState<string | null>(null);
+	/** 抽屉打开时滚到哪一节;只有 `?open=` 直达(无目标小卡的「去配置」)会要求滚到推送目标。 */
+	const [drawerFocus, setDrawerFocus] = useState<"targets" | undefined>(undefined);
+	const [searchParams, setSearchParams] = useSearchParams();
+	const openParam = searchParams.get("open");
+	// `/subs?open=<订阅 id>`:订阅列表到手后打开那位 UP 的抽屉并滚到推送目标;悬空 id 忽略。
+	// 参数用完即清(replace,不留历史),刷新不会再弹一次。
+	useEffect(() => {
+		if (!openParam || !subsQuery.data) return;
+		if (subsQuery.data.some((s) => s.id === openParam)) {
+			setDrawerSubId(openParam);
+			setDrawerFocus("targets");
+		}
+		setSearchParams(
+			(prev) => {
+				prev.delete("open");
+				return prev;
+			},
+			{ replace: true },
+		);
+	}, [openParam, subsQuery.data, setSearchParams]);
 	/** 右键 / 长按打开的快捷菜单:目标订阅 + 触发点坐标。 */
 	const [menuAt, setMenuAt] = useState<{ subId: string; x: number; y: number } | null>(null);
 	/** 待二次确认的删除(单个来自右键 / 抽屉,多个来自批量)。 */
@@ -419,7 +474,7 @@ export default function Subs() {
 
 	useEffect(() => {
 		if (!copyMsg) return;
-		const t = window.setTimeout(() => setCopyMsg(null), 2000);
+		const t = window.setTimeout(() => setCopyMsg(null), TOAST_DURATION_MS);
 		return () => window.clearTimeout(t);
 	}, [copyMsg]);
 	const [showNewDialog, setShowNewDialog] = useState(false);
@@ -597,7 +652,7 @@ export default function Subs() {
 	}
 
 	return (
-		<div className="bn-anim-fade-in space-y-4">
+		<div className="bn-anim-page-in space-y-4">
 			<div className="flex flex-wrap items-center gap-2.5">
 				<Input
 					value={q}
@@ -613,7 +668,8 @@ export default function Subs() {
 								type="button"
 								key={f.id}
 								onClick={() => setFilterId(f.id)}
-								className={`flex items-center gap-1.5 rounded px-2.5 py-1 text-xs font-semibold transition ${
+								data-bn={active ? "chip chip-active" : "chip"}
+								className={`flex items-center gap-1.5 rounded-sm px-2.5 py-1 text-bn-sm font-semibold transition ${
 									active
 										? "bg-bn-surface text-bn-pink shadow-sm"
 										: "text-bn-text-tertiary hover:text-bn-text-primary"
@@ -621,7 +677,7 @@ export default function Subs() {
 							>
 								{f.label}
 								<span
-									className={`text-[10px] font-bold ${
+									className={`text-bn-2xs font-bold ${
 										active ? "text-bn-pink" : "text-bn-text-secondary"
 									}`}
 								>
@@ -633,7 +689,11 @@ export default function Subs() {
 				</div>
 				<div className="flex-1" />
 				{selection.size > 0 ? (
-					<div className="flex items-center gap-2 rounded-md bg-bn-pink/12 px-2.5 py-1 text-xs font-semibold text-bn-pink">
+					// 状态条不是「选中的某一项」,不吃整句选中语汇 —— 只吃那块不透明粉底
+					// (旧 bg-bn-pink/12 的纱在壁纸皮肤下会隐形,同分组胶囊踩过的雷)。
+					<div
+						className={`flex items-center gap-2 rounded-md ${SELECTED_TINT_BG} px-2.5 py-1 text-bn-sm font-semibold text-bn-pink`}
+					>
 						已选 {selection.size} 项
 						<Btn size="sm" variant="ghost" onClick={() => void bulkSetEnabled(true)}>
 							批量启用
@@ -650,7 +710,10 @@ export default function Subs() {
 						</Btn>
 					</div>
 				) : null}
+				{/* 导览「订阅第一个 UP」的页面级灯位 —— 搜索框(subs-search)住在弹窗里,
+				    弹窗没开时导览得有个恒在的目标可指;开了弹窗聚光灯自动让位 */}
 				<Btn
+					data-tour="subs-add"
 					variant="primary"
 					size="sm"
 					icon={<Icon.plus size={12} />}
@@ -662,7 +725,10 @@ export default function Subs() {
 
 			{groupNames.length > 0 || groupCounts.ungrouped > 0 ? (
 				<div className="flex flex-wrap items-center gap-1.5">
-					<span className="text-[11px] font-semibold text-bn-text-tertiary">分组</span>
+					{/* 这个标题**直接坐在页面背景上**,没有任何底。壁纸皮肤下 tertiary 那一档
+					    只剩 2.1~2.7:1(旁边的胶囊看着清楚,是因为它们挂了 btn、拿到了皮肤给的
+					    实底),secondary 在壁纸深处也才 3.3:1 —— 无底的文字只有 primary 稳。 */}
+					<span className="text-bn-xs font-semibold text-bn-text-primary">分组</span>
 					<GroupChip
 						label="全部"
 						count={subs.length}
@@ -690,25 +756,21 @@ export default function Subs() {
 				</div>
 			) : null}
 
-			{error ? (
-				<div className="rounded border border-bn-danger-border bg-bn-danger-soft p-2 text-xs text-bn-danger-text">
-					{error}
-				</div>
-			) : null}
+			{error ? <ErrorNote>{error}</ErrorNote> : null}
 
-			{subsQuery.isLoading ? <div className="text-sm text-bn-text-secondary">加载中…</div> : null}
+			{subsQuery.isLoading ? (
+				<LoadingBlock label="正在读取订阅列表" hint="女仆正在点名,看看主人都关注了谁 (｡･ω･｡)ﾉ" />
+			) : null}
 			{subsQuery.error ? (
-				<div className="rounded border border-bn-danger-border bg-bn-danger-soft p-3 text-xs text-bn-danger-text">
-					加载失败：{String((subsQuery.error as Error).message)}
-				</div>
+				<ErrorNote>加载失败：{String((subsQuery.error as Error).message)}</ErrorNote>
 			) : null}
 			{subsQuery.data &&
 			filtered.length === 0 &&
 			(q.trim() || filterId !== "all" || groupFilter) ? (
-				<div className="rounded-bn-card border border-dashed border-bn-border bg-bn-surface/60 p-10 text-center">
-					<div className="mb-1 text-sm font-bold text-bn-text-primary">没有匹配的订阅</div>
-					<div className="text-[12px] text-bn-text-secondary">试试换个关键词或筛选条件</div>
-				</div>
+				<EmptyNote>
+					<div className="mb-1 text-bn-base font-bold text-bn-text-primary">没有匹配的订阅</div>
+					<div>试试换个关键词或筛选条件</div>
+				</EmptyNote>
 			) : null}
 
 			<div
@@ -730,18 +792,20 @@ export default function Subs() {
 				{/* 在 grid 末尾追加「+ 添加 UP 主」预选卡。仅在没有任何搜索 / 过滤时
 				    显示 —— 过滤视图下加这张卡会让人误以为它本来就在过滤集合里。点击
 				    等价右上「添加」Btn,打开 NewDialog。视觉走 Targets 的 AddCard 风
-				    格(1px dashed + 实色白底 + unicode 加号),保留 UpCard 的圆角 +
-				    min-h 让它在 grid 里跟其他卡视觉等高。 */}
+				    格(1px dashed + 实色白底 + unicode 加号),圆角与最小高度跟 UpCard
+				    对齐,在 grid 里视觉等高。
+
+				    最小高度**必须与 UpCard 引同一个常量**:grid 同行的高度取最高那张卡,
+				    这个值从前只写在这儿,于是它一被筛掉,整排 UP 卡就矮一截(真机 220→199)。 */}
 				{!q.trim() && filterId === "all" && !groupFilter ? (
-					<button
-						type="button"
+					// data-tour 与右上「添加」同名 —— 同名实例是等价入口,导览聚光灯一起亮
+					<AddCard
+						data-tour="subs-add"
+						label="添加 UP 主"
+						hint="UID / 名称搜索"
+						className={`${UP_CARD_MIN_H} focus:outline-none focus-visible:ring-2 focus-visible:ring-bn-pink`}
 						onClick={() => setShowNewDialog(true)}
-						className="flex min-h-55 flex-col items-center justify-center rounded-xl border border-dashed border-bn-border px-4 py-5 text-center transition hover:border-bn-pink focus:outline-none focus-visible:ring-2 focus-visible:ring-bn-pink"
-					>
-						<span className="text-[28px] leading-none text-bn-text-tertiary">＋</span>
-						<span className="mt-2 text-[13px] font-semibold text-bn-text-primary">添加 UP 主</span>
-						<span className="mt-0.5 text-[11px] text-bn-text-tertiary">UID / 名称搜索</span>
-					</button>
+					/>
 				) : null}
 			</div>
 
@@ -765,11 +829,18 @@ export default function Subs() {
 				<UpDialog
 					sub={drawerSub}
 					targets={targets}
-					onClose={() => setDrawerSubId(null)}
+					focusSection={drawerFocus}
+					onClose={() => {
+						setDrawerSubId(null);
+						setDrawerFocus(undefined);
+					}}
 					saving={upsert.isPending}
 					onSave={(next: Subscription) => {
 						upsert.mutate(next, {
-							onSuccess: () => setDrawerSubId(null),
+							onSuccess: () => {
+								setDrawerSubId(null);
+								setDrawerFocus(undefined);
+							},
 						});
 					}}
 					onDelete={() => setPendingDelete({ ids: [drawerSub.id] })}
@@ -837,11 +908,7 @@ export default function Subs() {
 				/>
 			) : null}
 
-			{copyMsg ? (
-				<div className="fixed bottom-5 left-1/2 z-80 -translate-x-1/2 rounded-md bg-bn-surface-strong px-3 py-1.5 text-[12px] font-medium text-bn-text-primary shadow-bn-elev">
-					{copyMsg}
-				</div>
-			) : null}
+			{copyMsg ? <Toast>{copyMsg}</Toast> : null}
 		</div>
 	);
 }

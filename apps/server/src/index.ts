@@ -2,7 +2,10 @@ import { constants } from "node:fs";
 import { access } from "node:fs/promises";
 import type { Server as HttpServer } from "node:http";
 import { join } from "node:path";
+import type { StatsOverviewResponse } from "@bilibili-notify/contract";
+import { groupSessionFor, type NotificationPayload } from "@bilibili-notify/internal";
 import { type ServerType, serve } from "@hono/node-server";
+import type { Hono } from "hono";
 import { createApp } from "./app.js";
 import { shouldRefuseBareAuth } from "./auth/bare-auth-policy.js";
 import { type AuthSystem, createAuthSystem } from "./auth/index.js";
@@ -12,23 +15,50 @@ import { createBackupService } from "./backup/service.js";
 import { createBiliOnebotCommandHandler } from "./commands/bili-onebot.js";
 import { loadBootstrapConfig, resolveConfigPath } from "./config/loader.js";
 import { type ChromeSource, persistChromeSource } from "./config/persist.js";
+import { type ResolveWebDistDirInput, resolveWebDistDir } from "./config/web-dist.js";
+import { createDevtools } from "./devtools/index.js";
 import { startHistoryRetention } from "./history/retention.js";
 import { startLogRetention } from "./logs/retention.js";
 import { createLogSink } from "./logs/sink.js";
 import { createOnebotAdapter } from "./platforms/onebot.js";
 import { createQQOfficialAdapter, createQQSessionRegistry } from "./platforms/qq-official.js";
+import type { InboundGroupMessage, InboundMeta, InboundPrivateMessage } from "./platforms/types.js";
 import { createWebhookAdapter } from "./platforms/webhook.js";
+import { APP_VERSION, STARTED_AT } from "./routes/health.js";
 import { type AppRuntime, createAppRuntime } from "./runtime/bootstrap.js";
+import {
+	type CommandSpec,
+	command,
+	createCommandDispatcher,
+	effectiveAliases,
+} from "./runtime/command-dispatcher.js";
+import { renderHelp } from "./runtime/command-help.js";
 import { createEngines } from "./runtime/engines.js";
 import { isEntrypoint } from "./runtime/entrypoint.js";
 import { startFansPoller } from "./runtime/fans-poller.js";
+import { createLinkParser, type LinkSourcePlatform } from "./runtime/link-parser.js";
+import { createLoginCommand } from "./runtime/login-command.js";
+import { resolveProbeInterval, startMemoryProbe } from "./runtime/memory-probe.js";
+import { createMuteCommand } from "./runtime/mute-command.js";
+import { resolveExpectedParent, startParentWatch } from "./runtime/parent-watch.js";
 import { createPuppeteerAdapter, type StandalonePuppeteer } from "./runtime/puppeteer.js";
+import { createReportCommand } from "./runtime/report-command.js";
+import { createRoastCommandHandler } from "./runtime/roast-command.js";
+import { createRoastDraftStore } from "./runtime/roast-draft-store.js";
+import { createRoastScheduler } from "./runtime/roast-scheduler.js";
+import { createStatusCommand } from "./runtime/status-command.js";
 import { bindSubscriptionStore } from "./runtime/subscription-store.js";
+import { createUpdateService } from "./update/service.js";
+import {
+	RELEASES_PAGE_URL,
+	TRUSTED_UPDATE_KEYS,
+	UPDATE_MANIFEST_URLS,
+} from "./update/trusted-keys.js";
+import { versionsRootIn } from "./update/versions-root.js";
 import { createWsServer } from "./ws/server.js";
 import type { LogEntry } from "./ws/types.js";
 
 const DEFAULT_SHUTDOWN_TIMEOUT_MS = 10_000;
-const DEFAULT_WEB_DIST_DIR = "/app/web-dist";
 
 export interface StandaloneServerHandle {
 	readonly host: string;
@@ -42,7 +72,11 @@ export interface StartStandaloneServerOptions {
 	env?: NodeJS.ProcessEnv;
 	installProcessHandlers?: boolean;
 	shutdownTimeoutMs?: number;
-	defaultWebDistDir?: string;
+	/**
+	 * 当前这份载荷的入口 URL,dashboard 静态资源按它就近解析
+	 * (见 `config/web-dist.ts`)。只有测试需要传 —— 真实运行永远是本模块自己。
+	 */
+	bundleUrl?: string;
 }
 
 export async function startStandaloneServer(
@@ -195,22 +229,114 @@ export async function startStandaloneServer(
 		// longer exists (deleted while the server was down). FansPoller's
 		// subscription-changed listener handles deletions made while running.
 		await runtime.subRuntimeStore.prune(subBinding.store.list().map((s) => s.id));
-		const adapters = [
+		// 入站的转发口。指令处理器要等 engines / 调度器建好才有,所以这里先留两个
+		// 可后填的引用 —— adapter 建得比它们早。
+		//
+		// 两个 adapter 都在自己那层把帧归一化成平台中立的形状,汇合点是同一个。
+		let onInboundPrivate: ((msg: InboundPrivateMessage, meta: InboundMeta) => void) | undefined;
+		let onInboundGroup:
+			| ((platform: LinkSourcePlatform, msg: InboundGroupMessage, meta: InboundMeta) => void)
+			| undefined;
+		// 当前跑的这份载荷的版本 —— 启动时算过一次的那个常量,别再向上找一遍 package.json。
+		const payloadVersion = APP_VERSION;
+		const updateService = createUpdateService({
+			currentVersion: payloadVersion,
+			// boot.mjs 在加载这份载荷之前摆进来的(见 src/boot.ts)。直接跑
+			// index.mjs 时(dev / 老镜像)拿不到 —— 那就当自己就是地板,
+			// 「没得退」,而不是瞎猜一个版本号。
+			imageVersion: normalizeOptionalEnv(env.BN_IMAGE_VERSION) ?? payloadVersion,
+			// 和 boot.mjs 那侧(update/versions-root.ts)算的是同一个目录 —— 这段路径
+			// 只写一处,写岔了两边都不报错,症状是「升完了重启还是旧版本」。
+			versionsRoot: versionsRootIn(bootstrap.dataDir),
+			nodeMajor: Number.parseInt(process.versions.node.split(".")[0] ?? "0", 10),
+			trustedKeys: TRUSTED_UPDATE_KEYS,
+			manifestUrls: UPDATE_MANIFEST_URLS,
+			releasesPageUrl: RELEASES_PAGE_URL,
+			// 每次现读:用户在面板上改完渠道 / 加速前缀,下一次检查就该按新的来。
+			readSettings: () => runtime.configStore.getGlobals().update,
+		});
+		const rawAdapters = [
 			createOnebotAdapter({
 				logger: log,
 				serviceCtx: runtime.serviceCtx,
 				onInboundEvent: createBiliOnebotCommandHandler(runtime),
+				onInboundPrivate: (msg, meta) => onInboundPrivate?.(msg, meta),
+				onInboundGroup: (msg, meta) => onInboundGroup?.("onebot", msg, meta),
 			}),
 			createQQOfficialAdapter({
 				logger: log,
 				serviceCtx: runtime.serviceCtx,
 				registry: qqSessionRegistry,
+				onInboundPrivate: (msg, meta) => onInboundPrivate?.(msg, meta),
+				onInboundGroup: (msg, meta) => onInboundGroup?.("qq-official", msg, meta),
 			}),
 			createWebhookAdapter({ logger: log }),
 		];
+		// 每个平台的「谁」长得不一样:onebot 是 user_id,qq-official 是 C2C 的
+		// userOpenid。**绝不能跨平台比对** —— 两个命名空间里的字符串撞上就等于
+		// 认错人。取不到(没配 / 群目标没有 userOpenid / 平台还没接入站)就返回
+		// undefined,于是谁都不认。
+		//
+		// 审批与指令分发共用同一个来源:各写一份迟早有一边判得不一样。
+		const masterUserId = () => {
+			const id = runtime.configStore.getGlobals().master.targetId;
+			if (!id) return undefined;
+			const t = runtime.configStore.getTargets().find((x) => x.id === id);
+			if (t?.platform === "onebot") return t.session.userId;
+			if (t?.platform === "qq-official") return t.session.userOpenid;
+			return undefined;
+		};
+
+		// devtools:门是载荷版本号(开发版才给,alpha 也不给)。给的话往下传的都是装饰过的:
+		// 更新路由拿到的能被注入假状态,adapter 拿到的包着截流闸,api 套着 Proxy —— 真服务 /
+		// 真 adapter / 真 api 一行不动。
+		// `subBinding` 是个会在关停时清掉的 let,闭包里收不窄;先把 store 取出来。
+		const subStore = subBinding.store;
+		const devtools = createDevtools({
+			payloadVersion,
+			// 构建产物的入口恒为 `.mjs`;只有 tsx 直跑源码时才是 `.ts`。见 createDevtools 那道门。
+			sourceRun: import.meta.url.endsWith(".ts"),
+			updateService,
+			adapters: rawAdapters,
+			historyStore: runtime.historyStore,
+			api: authSystem.api,
+			// 场景挑订阅:配置里的订阅 + 运行时解析出的房号(与 room-session 拿的是同一份)。
+			subs: () =>
+				subStore.list().map((sub) => ({
+					id: sub.id,
+					uid: sub.uid,
+					name: sub.name ?? runtime.subRuntimeStore.get(sub.id)?.cachedProfile?.name ?? sub.uid,
+					enabled: sub.enabled,
+					roomId: runtime.subRuntimeStore.get(sub.id)?.roomId,
+					specialUsers: sub.specialUsers.map((u) => u.uid),
+					avatar: runtime.subRuntimeStore.get(sub.id)?.cachedProfile?.avatar,
+				})),
+			// 下面几样都是引擎建好之后才有的,现取 —— devtools 建得比引擎早。
+			dynamic: () => engines?.dynamic,
+			inbound: () => ({ private: onInboundPrivate, group: onInboundGroup }),
+			commands: () => ({
+				prefix: runtime.configStore.getGlobals().commands.prefix,
+				masterUserId: masterUserId(),
+			}),
+			adapterConfigs: () => runtime.configStore.getAdapters(),
+			targets: () => runtime.configStore.getTargets(),
+			bus: runtime.bus,
+			authSystem,
+			puppeteer: () => puppeteer,
+			live: () => engines?.live,
+			mute: () => engines?.muteState,
+			fansPoller: () => runtime.fansPoller ?? undefined,
+			// `authSystem` 是个会在关停时清掉的 let;这一刻它一定在(上面刚建的)。
+			loginFlow: () => authSystem?.flow,
+		});
+		if (devtools) log.info("devtools enabled (dev build): /api/dev is mounted");
+		const adapters = devtools?.adapters ?? rawAdapters;
 		engines = createEngines({
 			serviceCtx: runtime.serviceCtx,
-			api: authSystem.api,
+			// 全进程唯一那个字体读取口 —— 预览路由经 RouteDeps.runtime 取的是同一个。
+			loadFontFace: runtime.loadFontFace,
+			api: devtools?.api ?? authSystem.api,
+			quietHoursNow: devtools?.quietHoursNow,
 			loginFlow: authSystem.flow,
 			configStore: runtime.configStore,
 			historyStore: runtime.historyStore,
@@ -221,6 +347,38 @@ export async function startStandaloneServer(
 			puppeteer,
 		});
 		runtime.attachEngines(engines);
+
+		// 内存自检:默认 10 分钟一条,`BN_MEMORY_PROBE_SECONDS=0` 关掉。
+		// 挂在 engines 之后,好把弹幕收集器的规模一起报出来 —— 那是引擎里唯一
+		// 一处随「弹幕量 × 在播时长」无界增长的结构,堆涨时第一个该看它。
+		startMemoryProbe({
+			serviceCtx: runtime.serviceCtx,
+			intervalSeconds: resolveProbeInterval(process.env.BN_MEMORY_PROBE_SECONDS),
+			probes: [
+				() => {
+					const s = engines?.live.danmakuStats();
+					return s ? `弹幕 ${s.rooms} 房/${s.words} 词/${s.senders} 人` : "";
+				},
+			],
+		});
+
+		// 孤儿自检:只有桌面版 launcher 会传 BN_PARENT_PID,Docker / 直接跑都不受影响。
+		// launcher 被强杀时不会带走我们,不自己盯着就会变成占着数据目录的孤儿。
+		const expectedParent = resolveExpectedParent(process.env.BN_PARENT_PID);
+		if (expectedParent !== null) {
+			startParentWatch({
+				expectedParent,
+				onOrphaned: () => {
+					log.warn("launcher 进程已消失,sidecar 主动退出,避免变成孤儿占住数据目录");
+					// 走 SIGTERM 而不是直接 exit —— 复用已装好的优雅关停路径,
+					// 别在这里另起一条收尾逻辑。
+					process.kill(process.pid, "SIGTERM");
+				},
+				schedule: (fn, ms) => {
+					runtime.serviceCtx.setInterval(fn, ms);
+				},
+			});
+		}
 
 		// Daily retention pass for history jsonl files.
 		startHistoryRetention({
@@ -251,23 +409,246 @@ export async function startStandaloneServer(
 		runtime.attachFansPoller(fansPoller);
 		runtime.serviceCtx.onDispose(() => fansPoller.dispose());
 
+		// ── 定时锐评 ──────────────────────────────────────────────────────────
+		// 草稿库 → 调度器 → 审批指令,按依赖顺序建;取数与主人私聊两个口子是回填的
+		// (statsRoute 要等 createApp,engines 上面刚建好)。
+		const roastDrafts = createRoastDraftStore({ dataDir: bootstrap.dataDir, logger: log });
+		await roastDrafts.load();
+
+		let statsRoute: Hono | null = null;
+		/** 私聊主人。发不出去由调用方各自兜住(调度器与指令处理器都不让它拖垮流程)。 */
+		const tellMaster = async (text: string): Promise<void> => {
+			await engines?.push.sendPrivateMsg(text);
+		};
+		// 审批预览要发的是渲染好的那一份(出图就发图),所以走 payload 版而不是
+		// sendPrivateMsg —— 后者只收字符串。
+		const tellMasterPayload = async (payload: NotificationPayload): Promise<void> => {
+			await engines?.push.sendToMaster(payload);
+		};
+
+		const roastScheduler = createRoastScheduler({
+			deps: { runtime, store: runtime.configStore },
+			drafts: roastDrafts,
+			logger: log,
+			// 与手动锐评**同一条路径**:内部代理一次 stats 子路由的 /overview。
+			// 子路由上没有鉴权中间件(鉴权在父 app 的 /api/*),而调度器与 route
+			// handler 同属鉴权边界内的进程内代码 —— 走父 app 反而会被自己 401。
+			fetchOverview: async (days, tz) => {
+				if (!statsRoute) return null;
+				const res = await statsRoute.request(`/overview?days=${days}&tz=${tz}`);
+				if (!res.ok) return null;
+				try {
+					return (await res.json()) as StatsOverviewResponse;
+				} catch {
+					return null;
+				}
+			},
+			tellMaster,
+			tellMasterPayload,
+		});
+
+		// 主人在他那条私聊通道上的身份 —— 只有这个 id 敲的指令算数。
+		//
+		const roastCommands = createRoastCommandHandler({
+			drafts: roastDrafts,
+			logger: log,
+			masterUserId,
+			deliver: (draft) => roastScheduler.deliverApproved(draft),
+			reply: tellMaster,
+		});
+
+		// 自引用:帮助要列出「包括它自己在内」的全部指令,所以先建表再往里塞。
+		//
+		// **所有 push 必须排在下面 createCommandDispatcher 之前** —— 它在构造时就把
+		// 指令表编译好(解析签名、排触发词)。之后再 push 的指令会出现在帮助里,
+		// 却永远不响应,而帮助里看得见恰恰让人不往这上面想。
+		const commands: CommandSpec[] = [];
+		commands.push(
+			command({
+				name: "help",
+				aliases: ["帮助", "?"],
+				signature: "[name:string|指令名]",
+				description: "看看能敲哪些指令",
+				example: "mute",
+				// values.name 由签名推出来,是 string | undefined —— 不用断言、不用 typeof。
+				// 报错里显示的是「指令名」那个显示名,不是 name。
+				run: async (values) => {
+					// 前缀与别名都**现读**:主人改完前缀,帮助恰恰是他第一个会看的东西,
+					// 而列出一批已经被他改掉的别名等于教他敲没反应的词。
+					const cfg = runtime.configStore.getGlobals().commands;
+					const entries = commands.map((c) => ({
+						...c,
+						aliases: effectiveAliases(c, cfg.aliases),
+					}));
+					await tellMaster(renderHelp(entries, cfg.prefix, values.name));
+				},
+			}),
+		);
+		// 静音的闸装在 push 里(见 engines.ts),这里只是改状态的入口。
+		commands.push(createMuteCommand({ muteState: engines.muteState, reply: tellMaster }));
+		commands.push(
+			createStatusCommand({
+				reply: tellMaster,
+				probe: () => ({
+					// 登录态直接用 LoginFlow 那句人话(「已登录」/「账号登录已失效…」)——
+					// 在这儿把 status 码再翻译一遍,就是第二份会跟它跑偏的文案。
+					login: authSystem?.status().msg ?? "还没起来",
+					lastFetchAt: engines?.dynamic.lastFetchAt(),
+					// 没装 Chrome 就没有渲染队列。
+					renderQueue: puppeteer?.renderQueueDepth() ?? 0,
+					adapters: runtime.configStore
+						.getAdapters()
+						.filter((a) => a.enabled)
+						// **没探测过 ≠ 断了**。webhook 这类平台压根不支持探测,testStatus
+						// 永远是 undefined;当成断线的话主人会永远看见一条假报警。
+						.map((a) => ({ name: a.name, ok: a.testStatus?.ok ?? true })),
+					mutedUntil: engines?.muteState.mutedUntil() ?? 0,
+				}),
+			}),
+		);
+		commands.push(
+			createReportCommand({
+				logger: log,
+				reply: tellMaster,
+				// 审批开着时,草稿连同「回复 y <id>」由调度器自己私聊出去,指令层不再补一句。
+				run: (days) => roastScheduler.runBoardOnce(days),
+			}),
+		);
+		commands.push(
+			createLoginCommand({
+				logger: log,
+				reply: tellMaster,
+				begin: () => authSystem?.beginLogin() ?? Promise.resolve(),
+				snapshot: () => authSystem?.status() ?? { status: 0, msg: "登录系统还没起来" },
+				// **走 sendToMaster 而不是普通推送**:它强制私聊,onebot adapter 在拿不到
+				// userId 时直接报错而不会回落到群。二维码进群等于公开征集「谁来当我的
+				// B 站账号」。这里还要把「没送到」如实带回去 —— 见 login-command.ts。
+				sendQr: async (buffer) => {
+					// LoginFlow 的 renderQr 走 qrcode 包的 toDataURL,产物恒为 PNG。
+					const r = await engines?.push.sendToMaster({
+						kind: "image",
+						image: { buffer, mime: "image/png" },
+					});
+					return r?.ok === true;
+				},
+			}),
+		);
+
+		const commandDispatcher = createCommandDispatcher({
+			logger: log,
+			masterUserId,
+			reply: tellMaster,
+			config: () => runtime.configStore.getGlobals().commands,
+			commands,
+			// 审批的 y/n 作为第二道门 —— 有待审草稿时才认,没有时它只是个普通字母。
+			confirmation: roastCommands.confirmation,
+		});
+
+		// 群里贴视频链接 → 回一张卡。回到来源群不走推送目标表:用收到这条消息的那个
+		// adapter 直接发,群不必配成推送目标(主人定的:机器人在的所有群都算)。
+		// OneBot 的 groupId 是群号,官机的是群 openid —— 临时目标按平台各造各的。
+		// `engines` 是个会被热重载赋值的 let,闭包里 TS 收不窄;这一刻它一定在(上面刚建的)。
+		const runtimeEngines = engines;
+		// 回到来源群用的是收到那一帧的适配器:配置里那条 + 它所属平台的实现,两者都在才发得出。
+		const replyRoute = (platform: LinkSourcePlatform, adapterId: string) => {
+			const adapter = runtime.configStore.getAdapters().find((a) => a.id === adapterId);
+			const platformAdapter = adapters.find((a) => a.platforms.includes(platform));
+			return adapter && platformAdapter ? { adapter, platformAdapter } : null;
+		};
+		const linkParser = createLinkParser({
+			logger: log,
+			// 开关与呈现都从引擎拿:随 config-changed 刷新的快照,呈现规则与推送的动态卡同源。
+			config: () => runtimeEngines.linkParsing(),
+			policyFor: (key) => runtimeEngines.linkPolicyFor(key),
+			api: runtimeEngines.api,
+			renderer: () => runtimeEngines.imageRenderer,
+			presentation: () => runtimeEngines.linkCardPresentation(),
+			// 能力走 sink 那条适配器寻址(健康探测与 /api/adapters/capabilities 用的是同一份),
+			// 别在接线层再手写一条 —— 两条路会各自漂。
+			capabilities: ({ adapterId }) => runtimeEngines.adapterCapabilities(adapterId),
+			probeCapabilities: ({ adapterId }) => runtimeEngines.probeAdapterCapabilities(adapterId),
+			send: async ({ platform, adapterId, groupId }, payload) => {
+				const route = replyRoute(platform, adapterId);
+				if (!route) {
+					return { ok: false, latencyMs: 0, err: `adapter not found: adapterId=${adapterId}` };
+				}
+				const { adapter, platformAdapter } = route;
+				const common = {
+					id: `link-reply:${groupId}`,
+					name: "链接解析回复",
+					adapterId,
+					scope: "group" as const,
+					enabled: true,
+				};
+				return platformAdapter.send(
+					adapter,
+					platform === "onebot"
+						? { ...common, platform: "onebot", session: groupSessionFor("onebot", groupId) }
+						: {
+								...common,
+								platform: "qq-official",
+								session: groupSessionFor("qq-official", groupId),
+							},
+					payload,
+				);
+			},
+		});
+
+		// 两个 adapter 交出来的是同一个形状:私聊进指令分发,群进链接解析。哪个平台来的
+		// 只有链接解析关心(回到来源群要按平台造目标),所以在这儿补上。
+		onInboundPrivate = (msg) => void commandDispatcher.handleMessage(msg);
+		onInboundGroup = (platform, msg, meta) =>
+			void linkParser.handleMessage({ platform, adapterId: meta.adapterId, ...msg });
+
+		roastScheduler.start();
+		runtime.bus.on("config-changed", (scope) => {
+			// 全局那条(roastSchedule)与 per-UP 那些(subscriptions)各自都可能增删改。
+			if (scope === "globals" || scope === "subscriptions") roastScheduler.reconcile();
+			// 别名进了触发词表,得重建;前缀与总开关是现读的,不用管。
+			// reconcile 自己吞异常 —— 这里是总线回调,抛出去会被 unhandledRejection
+			// 处理器变成一次进程退出。
+			if (scope === "globals") commandDispatcher.reconcile();
+		});
+		runtime.serviceCtx.onDispose(() => roastScheduler.stop());
+
+		// 过期草稿:每小时清一轮,清掉的**告诉主人一声**。悄悄消失的话他只会以为
+		// 这期又没发 —— 那正是这个功能要消除的沉默。
+		runtime.serviceCtx.setInterval(
+			() => {
+				void roastDrafts
+					.sweep()
+					.then(async (dead) => {
+						for (const d of dead) {
+							await tellMaster(`编号 ${d.id} 的锐评超过 48 小时没有回复，已经作废了～`);
+						}
+					})
+					.catch((err) => {
+						log.warn(
+							`[roast-draft] 过期清理失败: ${err instanceof Error ? err.message : String(err)}`,
+						);
+					});
+			},
+			60 * 60 * 1000,
+		);
+
 		const webDist = await resolveEffectiveWebDistDir({
 			configured: bootstrap.webDistDir,
 			envValue: normalizeOptionalEnv(env.BN_WEB_DIST),
-			defaultDir: options.defaultWebDistDir ?? DEFAULT_WEB_DIST_DIR,
+			bundleUrl: options.bundleUrl ?? import.meta.url,
 		});
 		const effectiveWebDistDir = webDist.dir;
-		if (webDist.source === "env") {
+		// 两条告警都只对 B 模型(容器)说 —— 桌面壳是拿 `--web-dist` 指着自己安装目录
+		// 里那份资源起 sidecar 的,那是设计,不是配错,不该每次启动都被念一遍。
+		const isBootstrapFileModel = Boolean(normalizeOptionalEnv(env.BN_CONFIG));
+		if (webDist.source === "explicit" && isBootstrapFileModel) {
+			// 钉死一个绝对路径 = 前端不再跟着载荷走。在线升级之后这里仍指着旧那份,
+			// 症状是「升完了界面没变 / 某个新功能点了没反应」,而且服务端一声不吭。
 			log.warn(
-				`bootstrap config missing webDistDir, using BN_WEB_DIST=${webDist.dir}. 请把 webDistDir: ${webDist.dir} 写入 /config/bn.config.yaml,或删除旧配置让容器重新生成。`,
+				`webDistDir is pinned to ${webDist.dir}; dashboard assets will NOT follow in-app updates. 想让它跟着升级走,就把 webDistDir(或 BN_WEB_DIST)删掉。`,
 			);
-		} else if (webDist.source === "default") {
+		} else if (webDist.source === "disabled" && isBootstrapFileModel) {
 			log.warn(
-				`bootstrap config missing webDistDir and BN_WEB_DIST is empty; found ${webDist.defaultDir}/index.html, using ${webDist.defaultDir}. 请把 webDistDir: ${webDist.defaultDir} 写入 /config/bn.config.yaml,或删除旧配置让容器重新生成。`,
-			);
-		} else if (webDist.source === "disabled" && normalizeOptionalEnv(env.BN_CONFIG)) {
-			log.warn(
-				`dashboard static assets disabled: bootstrap config missing webDistDir, BN_WEB_DIST is empty, and ${webDist.defaultDir}/index.html was not found. Dashboard GET / will return 404; 请把 webDistDir 写入 /config/bn.config.yaml,或删除旧配置让容器重新生成。`,
+				`dashboard static assets disabled: ${webDist.payloadDir}/index.html was not found. Dashboard GET / will return 404;载荷似乎不完整,建议重拉镜像或重装。`,
 			);
 		}
 		if (effectiveWebDistDir) {
@@ -303,7 +684,11 @@ export async function startStandaloneServer(
 			: undefined;
 
 		const app = createApp(runtime, {
-			authSystem,
+			// devtools 给的话是套了 Proxy 的那份:`status()` 可注入假登录态,别的原样。
+			authSystem: devtools?.authSystem ?? authSystem,
+			// 显式给一份:`authSystem.api` 是数据属性,取出来的是没装饰过的那个,卡片预览
+			// 就会绕过 devtools 的 api 覆盖(假直播时预览渲染的还是真房间)。
+			api: devtools?.api ?? authSystem.api,
 			backupService,
 			basicAuthCredentials,
 			sessionCodec,
@@ -322,6 +707,35 @@ export async function startStandaloneServer(
 			allowedOrigins,
 			desktopToken,
 			qqSessionRegistry,
+			// 注册表交给路由:别名冲突检查与 `GET /api/commands` 都照它来,
+			// 面板上那张指令卡片不必再手写一份清单。
+			commands,
+			onStatsRoute: (route) => {
+				statsRoute = route;
+			},
+			// 面板上的「试一次」—— 调的就是 cron 到点调的那两个函数,不是模拟。
+			runRoastNow: (uid) => (uid ? roastScheduler.runSoloOnce(uid) : roastScheduler.runBoardOnce()),
+			devtools: devtools?.route,
+			update: {
+				service: devtools?.updateService ?? updateService,
+				// 与 /api/health 报的是同一个值:面板靠「startedAt 变了」认新进程。
+				startedAt: STARTED_AT,
+				// 应用 = 优雅停机 + 退 0,由进程管理器把新版本拉起来。**退出码必须是 0**:
+				// 非 0 会被编排系统当成崩溃,退避重启甚至进 CrashLoopBackOff。
+				applyUpdate: async () => {
+					try {
+						await close("update apply");
+					} catch (err) {
+						// close() 是 rethrow 的。停机里某一处 dispose 抛了也得退 0:这时进程
+						// 反正要没了,非 0 只会让编排系统当成崩溃去退避重启。
+						log.error(
+							`update apply: graceful close failed, exiting anyway: ${err instanceof Error ? err.message : String(err)}`,
+						);
+					} finally {
+						process.exit(0);
+					}
+				},
+			},
 		});
 		await new Promise<void>((resolveServe) => {
 			server = serve(
@@ -346,7 +760,6 @@ export async function startStandaloneServer(
 		wsServer = createWsServer({
 			httpServer,
 			bus: runtime.bus,
-			store: runtime.configStore,
 			serviceCtx: runtime.serviceCtx,
 			authRequired: !!basicAuthCredentials,
 			wsTicketStore,
@@ -381,23 +794,22 @@ export async function startStandaloneServer(
 	}
 }
 
-type WebDistDirSource = "config" | "env" | "default" | "disabled";
-
-async function resolveEffectiveWebDistDir(options: {
-	configured: string | undefined;
-	envValue: string | undefined;
-	defaultDir: string;
-}): Promise<{ dir?: string; source: WebDistDirSource; defaultDir: string }> {
-	if (options.configured) {
-		return { dir: options.configured, source: "config", defaultDir: options.defaultDir };
-	}
-	if (options.envValue) {
-		return { dir: options.envValue, source: "env", defaultDir: options.defaultDir };
-	}
-	if (await hasReadableIndexHtml(options.defaultDir)) {
-		return { dir: options.defaultDir, source: "default", defaultDir: options.defaultDir };
-	}
-	return { source: "disabled", defaultDir: options.defaultDir };
+/**
+ * {@link resolveWebDistDir} 之上再加一道存在性探测。
+ *
+ * 分两种来源区别对待:**用户点名的目录照单全收**(空着也是他的决定,我们不替他改主意);
+ * **跟着载荷算出来的那个只是推断**,里面没有 `index.html` 就说明这份载荷根本没带前端 ——
+ * 与其挂一个空壳目录让所有请求撞进 404,不如干脆不挂,日志里说清楚。
+ */
+async function resolveEffectiveWebDistDir(input: ResolveWebDistDirInput): Promise<
+	| { dir: string; source: "explicit" | "payload" }
+	// 只有这一档要说出「我们本来打算挂哪个目录」——而走到这里时它就是上面算出来的那个:
+	// 用户点名的目录已经在上一行 return 了。
+	| { dir?: undefined; source: "disabled"; payloadDir: string }
+> {
+	const { dir, source } = resolveWebDistDir(input);
+	if (source === "explicit" || (await hasReadableIndexHtml(dir))) return { dir, source };
+	return { source: "disabled", payloadDir: dir };
 }
 
 async function hasReadableIndexHtml(dir: string): Promise<boolean> {

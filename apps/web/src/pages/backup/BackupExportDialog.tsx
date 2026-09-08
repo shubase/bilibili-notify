@@ -1,8 +1,7 @@
+import { Btn, CheckRow, ErrorNote, Icon, ModalShell } from "@bilibili-notify/ui";
 import { useState } from "react";
-import { Btn } from "../../components/atoms";
-import { ModalShell } from "../../components/dialog";
-import { Icon } from "../../components/icons";
 import { type BackupKind, type BackupSectionSelection, isValidPin } from "./backup-file";
+import { ChoiceCard, PinField } from "./dialog-bits";
 
 export interface BackupExportDialogProps {
 	onCancel: () => void;
@@ -42,17 +41,15 @@ export function BackupExportDialog({ onCancel, onExport, busy }: BackupExportDia
 	}
 
 	return (
-		<ModalShell onCancel={onCancel} width={400} bodyClassName="p-5">
-			<div className="mb-3 text-base font-bold text-bn-text-primary">导出备份</div>
-
+		<ModalShell onCancel={onCancel} width={400} bodyClassName="p-5" title="导出备份">
 			<div className="mb-4 grid grid-cols-2 gap-2">
-				<KindCard
+				<ChoiceCard
 					active={kind === "full"}
 					title="完整备份"
 					sub="含机密 · 用于灾备还原"
 					onClick={() => setKind("full")}
 				/>
-				<KindCard
+				<ChoiceCard
 					active={kind === "sanitized"}
 					title="脱敏导出"
 					sub="无机密 · 可存档/分享"
@@ -61,64 +58,23 @@ export function BackupExportDialog({ onCancel, onExport, busy }: BackupExportDia
 			</div>
 
 			{kind === "full" ? (
-				<div className="mb-4 flex items-start gap-1.5 rounded-lg border border-bn-danger-border bg-bn-danger-soft px-3 py-2.5 text-[12px] leading-relaxed text-bn-danger-text">
-					<Icon.warning size={14} className="mt-0.5 shrink-0" />
-					<span>
-						此文件 = 你的 B 站账号与面板密码，请妥善保管、切勿外发；6 位 PIN
-						仅防手滑，真正的安全靠保管好文件本身。
-					</span>
-				</div>
+				<ErrorNote icon={<Icon.warning size={14} />} className="mb-4">
+					此文件 = 你的 B 站账号与面板密码，请妥善保管、切勿外发；6 位 PIN
+					仅防手滑，真正的安全靠保管好文件本身。
+				</ErrorNote>
 			) : null}
 
 			{kind === "full" ? (
-				<label className="mb-4 block">
-					<span className="mb-1 block text-[12px] font-semibold text-bn-text-secondary">
-						备份 PIN（6 位数字）
-					</span>
-					<input
-						type="password"
-						inputMode="numeric"
-						maxLength={6}
-						value={pin}
-						onChange={(e) => setPin(e.target.value.replace(/\D/g, "").slice(0, 6))}
-						placeholder="设置 6 位数字 PIN"
-						className="w-full rounded-md border border-bn-border bg-bn-surface px-3 py-2 text-[13px] tracking-[0.4em] text-bn-text-primary outline-none focus:border-bn-pink"
-					/>
-				</label>
+				<PinField className="mb-4" value={pin} onChange={setPin} placeholder="设置 6 位数字 PIN" />
 			) : null}
 
-			<div className="mb-1 text-[12px] font-semibold text-bn-text-secondary">备份内容</div>
+			<div className="mb-1 text-bn-sm font-semibold text-bn-text-secondary">备份内容</div>
 			<div className="flex flex-col gap-1.5">
-				{SECTIONS.map(({ key, label }) => {
-					const checked = sections[key];
-					return (
-						<label
-							key={key}
-							className={`flex cursor-pointer items-center gap-2.5 rounded-lg border px-2.5 py-2 text-[13px] transition ${
-								checked
-									? "border-bn-pink/60 bg-bn-pink/10 font-semibold text-bn-text-primary"
-									: "border-bn-border bg-bn-surface text-bn-text-secondary hover:border-bn-pink/40"
-							}`}
-						>
-							<input
-								type="checkbox"
-								checked={checked}
-								onChange={() => toggle(key)}
-								className="sr-only"
-							/>
-							<span
-								className={`flex h-4 w-4 shrink-0 items-center justify-center rounded border transition ${
-									checked
-										? "border-bn-pink bg-bn-pink text-white"
-										: "border-bn-border bg-bn-surface"
-								}`}
-							>
-								{checked ? <Icon.check size={11} /> : null}
-							</span>
-							<span className="truncate">{label}</span>
-						</label>
-					);
-				})}
+				{SECTIONS.map(({ key, label }) => (
+					<CheckRow key={key} checked={sections[key]} onChange={() => toggle(key)}>
+						{label}
+					</CheckRow>
+				))}
 			</div>
 
 			<div className="mt-4 flex justify-end gap-2">
@@ -130,22 +86,5 @@ export function BackupExportDialog({ onCancel, onExport, busy }: BackupExportDia
 				</Btn>
 			</div>
 		</ModalShell>
-	);
-}
-
-function KindCard(props: { active: boolean; title: string; sub: string; onClick: () => void }) {
-	return (
-		<button
-			type="button"
-			onClick={props.onClick}
-			className={`rounded-lg border px-3 py-2.5 text-left transition ${
-				props.active
-					? "border-bn-pink/60 bg-bn-pink/10"
-					: "border-bn-border bg-bn-surface hover:border-bn-pink/40"
-			}`}
-		>
-			<div className="text-[13px] font-bold text-bn-text-primary">{props.title}</div>
-			<div className="text-[11px] text-bn-text-tertiary">{props.sub}</div>
-		</button>
 	);
 }

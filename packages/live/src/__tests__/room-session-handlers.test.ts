@@ -15,11 +15,12 @@
  * handleLiveEnd/armPeriodicTimer 用 `(s as any).x = vi.fn()` 就地打桩。
  */
 
+import { GuardLevel } from "@bilibili-notify/blive";
 import type { ServiceContext } from "@bilibili-notify/internal";
-import { GuardLevel } from "blive-message-listener";
+import { defaultMessageKindLayout } from "@bilibili-notify/internal";
 import { beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import type { SubItemView } from "../push-like";
-import { LivePushType } from "../push-like";
+import { LivePushType, wantsLiveEndExtras } from "../push-like";
 import { RoomContext } from "../room-helpers";
 import { RoomSession } from "../room-session";
 import { LiveType } from "../types";
@@ -37,8 +38,7 @@ function makeSub(over: Partial<SubItemView> = {}): SubItemView {
 		liveEnd: true,
 		liveGuardBuy: false,
 		superchat: false,
-		wordcloud: false,
-		liveSummary: false,
+		liveEndExtras: { wordcloud: false, liveSummary: false },
 		target: {},
 		customCardStyle: { enable: false },
 		customLiveMsg: { enable: false },
@@ -50,6 +50,8 @@ function makeSub(over: Partial<SubItemView> = {}): SubItemView {
 		minGuardLevel: 3,
 		pushTime: 0,
 		restartPush: false,
+		// 宿主恒填版式;用例按需覆盖。
+		messageLayout: defaultMessageKindLayout("live"),
 		...over,
 	} as SubItemView;
 }
@@ -70,7 +72,7 @@ interface CtxMocks {
 	getTimeDifference: ReturnType<typeof vi.fn>;
 	emitLiveState: ReturnType<typeof vi.fn>;
 	isSubscribed: ReturnType<typeof vi.fn>;
-	hasTargets: ReturnType<typeof vi.fn>;
+	collectsDanmaku: ReturnType<typeof vi.fn>;
 	safeBroadcast: ReturnType<typeof vi.fn>;
 }
 
@@ -97,7 +99,7 @@ function makeCtx(opts?: { customGuardBuyEnabled?: boolean }): { ctx: RoomContext
 		getTimeDifference: vi.fn(async () => "1小时"),
 		emitLiveState: vi.fn(),
 		isSubscribed: vi.fn(() => false),
-		hasTargets: vi.fn(() => false),
+		collectsDanmaku: vi.fn((sub: SubItemView) => wantsLiveEndExtras(sub)),
 		safeBroadcast: vi.fn(),
 	};
 	const ctx = {
@@ -129,7 +131,7 @@ function makeCtx(opts?: { customGuardBuyEnabled?: boolean }): { ctx: RoomContext
 		},
 		danmakuCollector: { recordDanmaku: m.recordDanmaku, clear: vi.fn(), registerRoom: vi.fn() },
 		isSubscribed: m.isSubscribed,
-		hasTargets: m.hasTargets,
+		collectsDanmaku: m.collectsDanmaku,
 		safeBroadcast: m.safeBroadcast,
 		sendLiveNotifyCard: m.sendLiveNotifyCard,
 		stopMonitoring: m.stopMonitoring,
@@ -163,10 +165,12 @@ describe("RoomSession.onIncomeSuperChat", () => {
 		expect(m.broadcastToTargets).not.toHaveBeenCalled();
 	});
 
-	it("仅收集弹幕(wordcloud 订阅)不推 SC → recordDanmaku 调用但不广播", async () => {
+	it("仅收集弹幕(下播开着、词云开着)不推 SC → recordDanmaku 调用但不广播", async () => {
 		const { ctx, m } = makeCtx();
-		m.isSubscribed.mockImplementation((_s: unknown, feat: string) => feat === "wordcloud");
-		const s = new RoomSession(ctx, makeSub({ wordcloud: true })) as AnySession;
+		const s = new RoomSession(
+			ctx,
+			makeSub({ liveEnd: true, liveEndExtras: { wordcloud: true, liveSummary: false } }),
+		) as AnySession;
 		await s.onIncomeSuperChat(scBody);
 		expect(m.recordDanmaku).toHaveBeenCalledTimes(1);
 		expect(m.broadcastToTargets).not.toHaveBeenCalled();
@@ -323,7 +327,7 @@ describe("RoomSession.onIncomeSuperChat", () => {
 
 describe("RoomSession.onGuardBuy", () => {
 	const guardBody = {
-		guard_level: GuardLevel.Jianzhang,
+		guard_level: GuardLevel.Captain,
 		gift_name: "舰长",
 		user: { uname: "船员", uid: 7 },
 	};
@@ -337,7 +341,7 @@ describe("RoomSession.onGuardBuy", () => {
 	});
 
 	it("guard_level 高于阈值(等级不够)→ 不推", async () => {
-		// sub.minGuardLevel=1(总督);Jianzhang(3) > 1 → return
+		// sub.minGuardLevel=1(总督);Captain(3) > 1 → return
 		const { ctx, m } = makeCtx();
 		m.isSubscribed.mockImplementation((_s: unknown, feat: string) => feat === "liveGuardBuy");
 		const s = new RoomSession(ctx, makeSub({ liveGuardBuy: true, minGuardLevel: 1 })) as AnySession;
@@ -518,7 +522,7 @@ describe("RoomSession.onLiveStart", () => {
 		expect(s.armPeriodicTimer).not.toHaveBeenCalled();
 	});
 
-	it("sub 带 messageLayout → renderLiveStart 走 omitLink,sendLiveNotifyCard 收到版式与房间链接", async () => {
+	it("sub 带 messageLayout → sendLiveNotifyCard 收到版式与房间链接", async () => {
 		const { ctx, m } = makeCtx();
 		const layout = {
 			blocks: [{ id: "card", type: "card", visible: true }],
@@ -541,67 +545,10 @@ describe("RoomSession.onLiveStart", () => {
 		});
 		s.armPeriodicTimer = vi.fn();
 		await s.onLiveStart();
-		expect(m.renderLiveStart.mock.calls[0]?.[0]?.omitLink).toBe(true);
 		const params = m.sendLiveNotifyCard.mock.calls[0]?.[0];
 		expect(params?.messageLayout).toEqual(layout);
 		expect(params?.roomLink).toBe("https://live.bilibili.com/12345");
 	});
-
-	it("sub 无版式但 ctx.config 有(koishi 默认版式+链接开关)→ 同走版式路径", async () => {
-		const { ctx, m } = makeCtx();
-		const cfgLayout = {
-			blocks: [
-				{ id: "card", type: "card", visible: true },
-				{ id: "text", type: "text", visible: true },
-				{ id: "link", type: "link", visible: false },
-			],
-			separator: "\n",
-		};
-		(ctx as unknown as { config: Record<string, unknown> }).config.messageLayout = cfgLayout;
-		const s = new RoomSession(ctx, makeSub()) as AnySession;
-		s.useLiveRoomInfo = vi.fn(async () => {
-			s.liveRoomInfo = {
-				live_time: "2026-01-01 00:00:00",
-				short_id: 0,
-				room_id: 12345,
-				title: "标题",
-				user_cover: "",
-			};
-			return true;
-		});
-		s.useMasterInfo = vi.fn(async () => {
-			s.masterInfo = { username: "主播", userface: "", roomId: "r1", liveOpenFollowerNum: 100 };
-			return true;
-		});
-		s.armPeriodicTimer = vi.fn();
-		await s.onLiveStart();
-		expect(m.renderLiveStart.mock.calls[0]?.[0]?.omitLink).toBe(true);
-		expect(m.sendLiveNotifyCard.mock.calls[0]?.[0]?.messageLayout).toEqual(cfgLayout);
-	});
-
-	it("sub 无 messageLayout → renderLiveStart 不 omitLink(旧文案不变)", async () => {
-		const { ctx, m } = makeCtx();
-		const s = new RoomSession(ctx, makeSub()) as AnySession;
-		s.useLiveRoomInfo = vi.fn(async () => {
-			s.liveRoomInfo = {
-				live_time: "2026-01-01 00:00:00",
-				short_id: 0,
-				room_id: 12345,
-				title: "标题",
-				user_cover: "",
-			};
-			return true;
-		});
-		s.useMasterInfo = vi.fn(async () => {
-			s.masterInfo = { username: "主播", userface: "", roomId: "r1", liveOpenFollowerNum: 100 };
-			return true;
-		});
-		s.armPeriodicTimer = vi.fn();
-		await s.onLiveStart();
-		expect(m.renderLiveStart.mock.calls[0]?.[0]?.omitLink).toBeFalsy();
-		expect(m.sendLiveNotifyCard.mock.calls[0]?.[0]?.messageLayout).toBeUndefined();
-	});
-
 	it("拉直播间信息失败(useLiveRoomInfo=false)→ stopMonitoring,不推卡", async () => {
 		const { ctx, m } = makeCtx();
 		const s = new RoomSession(ctx, makeSub()) as AnySession;
@@ -642,8 +589,7 @@ describe("RoomSession.onLiveEnd", () => {
 // 回归:消息版式此前误实现成「仅作用于开播」,直播中 / 下播的默认模板又同批移除
 // 了 {link} 变量,两者叠加导致这两类推送的房间链接彻底丢失且无替代机制。现在
 // messageLayout 覆盖开播 / 直播中 / 下播三类,以下钉住 tickPushAtTime / handleLiveEnd
-// 与 onLiveStart 同款接线(sub.messageLayout ?? ctx.config.messageLayout,omitLink,
-// roomLink 透传)。
+// 与 onLiveStart 同款接线(sub.messageLayout,roomLink 透传)。
 // ---------------------------------------------------------------------------
 
 describe("RoomSession.tickPushAtTime — 消息版式", () => {
@@ -665,36 +611,15 @@ describe("RoomSession.tickPushAtTime — 消息版式", () => {
 		});
 	}
 
-	it("sub 带 messageLayout → renderLiveOngoing 走 omitLink,sendLiveNotifyCard 收到版式与房间链接", async () => {
+	it("sub 带 messageLayout → renderLiveOngoing 后 sendLiveNotifyCard 收到版式与房间链接", async () => {
 		const { ctx, m } = makeCtx();
 		const layout = { blocks: [{ id: "card", type: "card", visible: true }], separator: "\n" };
 		const s = new RoomSession(ctx, makeSub({ messageLayout: layout })) as AnySession;
 		primeLiveRoom(s);
 		await s.tickPushAtTime();
-		expect(m.renderLiveOngoing.mock.calls[0]?.[0]?.omitLink).toBe(true);
 		const params = m.sendLiveNotifyCard.mock.calls[0]?.[0];
 		expect(params?.messageLayout).toEqual(layout);
 		expect(params?.roomLink).toBe("https://live.bilibili.com/12345");
-	});
-
-	it("sub 无版式但 ctx.config 有(koishi 默认版式)→ 同走版式路径", async () => {
-		const { ctx, m } = makeCtx();
-		const cfgLayout = { blocks: [{ id: "text", type: "text", visible: true }], separator: "\n" };
-		(ctx as unknown as { config: Record<string, unknown> }).config.messageLayout = cfgLayout;
-		const s = new RoomSession(ctx, makeSub()) as AnySession;
-		primeLiveRoom(s);
-		await s.tickPushAtTime();
-		expect(m.renderLiveOngoing.mock.calls[0]?.[0]?.omitLink).toBe(true);
-		expect(m.sendLiveNotifyCard.mock.calls[0]?.[0]?.messageLayout).toEqual(cfgLayout);
-	});
-
-	it("sub 无 messageLayout → renderLiveOngoing 不 omitLink(旧文案不变,链接仍内嵌)", async () => {
-		const { ctx, m } = makeCtx();
-		const s = new RoomSession(ctx, makeSub()) as AnySession;
-		primeLiveRoom(s);
-		await s.tickPushAtTime();
-		expect(m.renderLiveOngoing.mock.calls[0]?.[0]?.omitLink).toBeFalsy();
-		expect(m.sendLiveNotifyCard.mock.calls[0]?.[0]?.messageLayout).toBeUndefined();
 	});
 });
 
@@ -725,36 +650,25 @@ describe("RoomSession.handleLiveEnd — 消息版式", () => {
 		s.dispatchWordCloudAndSummary = vi.fn(async () => {});
 	}
 
-	it("sub 带 messageLayout → renderLiveEnd 走 omitLink,sendLiveNotifyCard 收到版式与房间链接", async () => {
+	it("sub 带 messageLayout → renderLiveEnd 后 sendLiveNotifyCard 收到版式与房间链接", async () => {
 		const { ctx, m } = makeCtx();
 		m.isSubscribed.mockReturnValue(true);
 		const layout = { blocks: [{ id: "text", type: "text", visible: true }], separator: "\n" };
 		const s = new RoomSession(ctx, makeSub({ messageLayout: layout })) as AnySession;
 		primeStopBroadcast(s);
 		await s.handleLiveEnd("ws");
-		expect(m.renderLiveEnd.mock.calls[0]?.[0]?.omitLink).toBe(true);
 		const params = m.sendLiveNotifyCard.mock.calls[0]?.[0];
 		expect(params?.messageLayout).toEqual(layout);
 		expect(params?.roomLink).toBe("https://live.bilibili.com/12345");
-	});
-
-	it("sub 无 messageLayout → renderLiveEnd 不 omitLink(旧文案不变,链接仍内嵌)", async () => {
-		const { ctx, m } = makeCtx();
-		m.isSubscribed.mockReturnValue(true);
-		const s = new RoomSession(ctx, makeSub()) as AnySession;
-		primeStopBroadcast(s);
-		await s.handleLiveEnd("ws");
-		expect(m.renderLiveEnd.mock.calls[0]?.[0]?.omitLink).toBeFalsy();
-		expect(m.sendLiveNotifyCard.mock.calls[0]?.[0]?.messageLayout).toBeUndefined();
 	});
 });
 
 // ---------------------------------------------------------------------------
 // onUserAction —— 特别关注用户进房
 //
-// 数据源是 blive 的 onUserAction(action: enter/follow/share/like),不再是
-// INTERACT_WORD_V2 原始帧 + protobuf 解码:后者依赖一份仓库里从未存在的
-// .proto schema,`protobuf.load` 必然抛错降级,该特性实际上从来没生效过。
+// 数据源是 @bilibili-notify/blive 解析出的 user-action 事件({action, user}),
+// 且只由 INTERACT_WORD_V2 一帧独供 —— ENTRY_EFFECT / v1 INTERACT_WORD 在 parser
+// 层就走 raw,不会产出 user-action(舰长进房重复推的旧 bug 由 parser 测试钉住)。
 // ---------------------------------------------------------------------------
 
 function makeSpecialUserSub() {
@@ -768,31 +682,17 @@ function makeSpecialUserSub() {
 	});
 }
 
-/**
- * blive 把 **四个**上游事件全部汇流进同一个 `onUserAction` 回调:
- * `INTERACT_WORD_V2` / `INTERACT_WORD`(v1) / `ENTRY_EFFECT` / `LIKE_INFO_V3_CLICK`。
- * 其中前三个都会产出 `action: "enter"`(ENTRY_EFFECT 是舰长进场特效,parser 里硬编码
- * 成 "enter"),所以只看 `action` 会让一个舰长身份的特别关注用户进一次房被推两次。
- * `type` 是唯一能把它们区分开的字段——测试必须建模它,否则这个 bug 测不出来。
- */
-function enterMsg(uid: number, uname = "特别用户", type = "INTERACT_WORD_V2") {
-	return {
-		type,
-		body: { user: { uid, uname }, action: "enter" as const, timestamp: 1_700_000_000_000 },
-	};
+function enterEvent(uid: number, uname = "特别用户") {
+	return { action: "enter" as const, user: { uid, uname } };
 }
 
 describe("RoomSession.onUserAction", () => {
-	it("特别关注用户进房 → 用 internal feature key specialUserEnter 检查目标并推送", async () => {
+	it("特别关注用户进房 → 渲染并推送(UserActions)", async () => {
 		const { ctx, m } = makeCtx();
-		m.hasTargets.mockImplementation(
-			(_sub: unknown, feature: string) => feature === "specialUserEnter",
-		);
 		const s = new RoomSession(ctx, makeSpecialUserSub()) as AnySession;
 
-		await s.onUserAction(enterMsg(42));
+		await s.onUserAction(enterEvent(42));
 
-		expect(m.hasTargets).toHaveBeenCalledWith(expect.anything(), "specialUserEnter");
 		expect(m.renderSpecialUserEnter).toHaveBeenCalledTimes(1);
 		expect(m.renderSpecialUserEnter.mock.calls[0]?.[0]?.uname).toBe("特别用户");
 		expect(m.safeBroadcast).toHaveBeenCalledTimes(1);
@@ -801,69 +701,63 @@ describe("RoomSession.onUserAction", () => {
 
 	it("uid 是数字 → 与字符串白名单比对时不因类型不符而漏推", async () => {
 		const { ctx, m } = makeCtx();
-		m.hasTargets.mockReturnValue(true);
 		const s = new RoomSession(ctx, makeSpecialUserSub()) as AnySession;
 
-		await s.onUserAction(enterMsg(42));
+		await s.onUserAction(enterEvent(42));
 
 		expect(m.safeBroadcast).toHaveBeenCalledTimes(1);
 	});
 
-	it("非进房动作(关注 / 点赞 / 分享)→ 不推送", async () => {
+	it("非进房动作(关注 / 分享 / 未知)→ 不推送", async () => {
 		const { ctx, m } = makeCtx();
-		m.hasTargets.mockReturnValue(true);
 		const s = new RoomSession(ctx, makeSpecialUserSub()) as AnySession;
 
-		for (const action of ["follow", "like", "share", "unknown"] as const) {
-			const msg = enterMsg(42);
-			await s.onUserAction({ ...msg, body: { ...msg.body, action } });
+		for (const action of ["follow", "share", "unknown"] as const) {
+			await s.onUserAction({ ...enterEvent(42), action });
 		}
-
-		expect(m.safeBroadcast).not.toHaveBeenCalled();
-	});
-
-	it("舰长进场特效(ENTRY_EFFECT)→ 不推送,避免与 INTERACT_WORD_V2 对同一次进房重复推", async () => {
-		const { ctx, m } = makeCtx();
-		m.hasTargets.mockReturnValue(true);
-		const s = new RoomSession(ctx, makeSpecialUserSub()) as AnySession;
-
-		// 同一个舰长进一次房,B 站会同时下发 INTERACT_WORD_V2 与 ENTRY_EFFECT,
-		// 两帧都被 blive 解析成 action: "enter" 塞进 onUserAction。
-		await s.onUserAction(enterMsg(42));
-		await s.onUserAction(enterMsg(42, "", "ENTRY_EFFECT"));
-
-		expect(m.safeBroadcast).toHaveBeenCalledTimes(1);
-	});
-
-	it("旧版进房帧(INTERACT_WORD v1)→ 不推送", async () => {
-		const { ctx, m } = makeCtx();
-		m.hasTargets.mockReturnValue(true);
-		const s = new RoomSession(ctx, makeSpecialUserSub()) as AnySession;
-
-		await s.onUserAction(enterMsg(42, "特别用户", "INTERACT_WORD"));
 
 		expect(m.safeBroadcast).not.toHaveBeenCalled();
 	});
 
 	it("非特别关注的用户进房 → 不推送", async () => {
 		const { ctx, m } = makeCtx();
-		m.hasTargets.mockReturnValue(true);
 		const s = new RoomSession(ctx, makeSpecialUserSub()) as AnySession;
 
-		await s.onUserAction(enterMsg(999, "路人"));
+		await s.onUserAction(enterEvent(999, "路人"));
 
 		expect(m.safeBroadcast).not.toHaveBeenCalled();
 	});
 
-	it("没有 specialUserEnter 推送目标 → 不渲染也不推送", async () => {
+	it("没配 specialUserEnter 的推送目标 → 照样渲染并广播,「无目标」由推送层记账", async () => {
 		const { ctx, m } = makeCtx();
-		m.hasTargets.mockReturnValue(false);
-		const s = new RoomSession(ctx, makeSpecialUserSub()) as AnySession;
+		const sub = makeSpecialUserSub();
+		sub.target = {};
+		const s = new RoomSession(ctx, sub) as AnySession;
 
-		await s.onUserAction(enterMsg(42));
+		await s.onUserAction(enterEvent(42));
 
-		expect(m.renderSpecialUserEnter).not.toHaveBeenCalled();
-		expect(m.safeBroadcast).not.toHaveBeenCalled();
+		expect(m.renderSpecialUserEnter).toHaveBeenCalledTimes(1);
+		expect(m.safeBroadcast).toHaveBeenCalledTimes(1);
+	});
+});
+
+describe("RoomSession.onIncomeDanmu — 特别关注用户的弹幕", () => {
+	it("没配 specialDanmaku 的推送目标 → 照样广播(UserDanmakuMsg),不在引擎里按目标挡", () => {
+		const { ctx, m } = makeCtx();
+		const sub = makeSub({
+			customSpecialDanmakuUsers: {
+				enable: true,
+				specialDanmakuUsers: ["42"],
+				msgTemplate: "弹幕模板",
+			},
+			target: {},
+		});
+		const s = new RoomSession(ctx, sub) as AnySession;
+
+		s.onIncomeDanmu({ content: "你好", user: { uname: "特别用户", uid: 42 } });
+
+		expect(m.safeBroadcast).toHaveBeenCalledTimes(1);
+		expect(m.safeBroadcast.mock.calls[0]?.[2]).toBe(LivePushType.UserDanmakuMsg);
 	});
 });
 
@@ -904,7 +798,11 @@ describe("RoomContext.sendLiveNotifyCard — LiveType → LivePushType 映射", 
 			serviceCtx: fakeServiceCtx,
 			// 其余依赖在 sendLiveNotifyCard 路径上不触达,给最小 stub。
 			api: {} as never,
-			push: { broadcastToTargets, sendPrivateMsg: vi.fn(async () => {}) },
+			push: {
+				broadcastToTargets,
+				broadcastSequenceToTargets: vi.fn(async () => {}),
+				sendPrivateMsg: vi.fn(async () => {}),
+			},
 			contentBuilder: {
 				text: (t: string) => ({ kind: "text", text: t }) as never,
 				image: () => ({ kind: "image" }) as never,
@@ -915,7 +813,7 @@ describe("RoomContext.sendLiveNotifyCard — LiveType → LivePushType 映射", 
 			wordcloudGenerator: {} as never,
 			liveSummaryRequester: {} as never,
 			danmakuCollector: {} as never,
-			// imageRenderer=null → 走文字降级分支(buffer undefined),依旧调
+			// imageRenderer=null → 没有 card 部件(buffer undefined),版式路径只剩文本,依旧调
 			// push.broadcastToTargets(uid, msg, pushType),pushType 即被测的映射结果。
 			getImageRenderer: () => null,
 			config: {
@@ -924,6 +822,10 @@ describe("RoomContext.sendLiveNotifyCard — LiveType → LivePushType 映射", 
 				liveSummaryDefault: "",
 			},
 			emitEngineError: vi.fn(),
+			emitLiveState: vi.fn(),
+			emitViewers: vi.fn(),
+			pickCardBackground: () => undefined,
+			onRoomIdResolved: vi.fn(),
 		});
 		return { ctx, broadcastToTargets };
 	}
@@ -955,6 +857,7 @@ describe("RoomContext.sendLiveNotifyCard — LiveType → LivePushType 映射", 
 			cardStyle: { enable: false },
 			uid: "u1",
 			notifyMsg: "msg",
+			messageLayout: defaultMessageKindLayout("live"),
 		});
 		expect(broadcastToTargets).toHaveBeenCalledTimes(1);
 		return broadcastToTargets.mock.calls[0]?.[2] as LivePushType;

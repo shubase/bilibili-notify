@@ -1,3 +1,4 @@
+import { Btn, Icon, MenuItem, PopoverShell, StatusDot, useDismiss } from "@bilibili-notify/ui";
 import {
 	closestCenter,
 	DndContext,
@@ -15,8 +16,8 @@ import {
 } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
-import { NavLink } from "react-router-dom";
+import { type ReactNode, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { NavLink, useLocation } from "react-router-dom";
 import { canHideNav, NAV_ITEMS, type NavItem, orderedNav, resolveNav } from "../config/nav";
 import { useBackendReachable } from "../hooks/useBackendReachable";
 import { api } from "../services/api";
@@ -24,11 +25,11 @@ import { submitLogout } from "../services/session";
 import { useAuthStore } from "../store/auth";
 import { useNavStore } from "../store/nav";
 import { useSessionStore } from "../store/session";
+import { useSkinStore, useSkinText } from "../store/skin";
 import { type ThemePreference, useThemeStore } from "../store/theme";
 import { BiliLoginStatus } from "../types/auth";
 import type { PushTarget, Subscription } from "../types/domain";
-import { Btn } from "./atoms";
-import { Icon } from "./icons";
+import { DragHandle } from "./drag-handle";
 
 interface UserCardData {
 	card?: {
@@ -55,19 +56,14 @@ function NavEditorRow({ item, shown, locked }: { item: NavItem; shown: boolean; 
 			style={{ transform: CSS.Transform.toString(transform), transition }}
 			className="flex items-center gap-1.5 rounded-md px-1 py-1 hover:bg-bn-surface-muted"
 		>
-			<button
-				type="button"
-				ref={setActivatorNodeRef}
-				{...attributes}
-				{...listeners}
-				title="拖动排序"
-				aria-label={`拖动排序 ${item.label}`}
-				className="cursor-grab touch-none select-none px-0.5 text-[14px] leading-none text-bn-text-tertiary active:cursor-grabbing"
-			>
-				⠿
-			</button>
+			<DragHandle
+				attributes={attributes}
+				listeners={listeners}
+				setActivatorNodeRef={setActivatorNodeRef}
+				label={item.label}
+			/>
 			<label
-				className={`flex flex-1 items-center gap-2 text-[12.5px] ${
+				className={`flex flex-1 items-center gap-2 text-bn-sm ${
 					locked
 						? "cursor-not-allowed text-bn-text-tertiary"
 						: "cursor-pointer text-bn-text-primary"
@@ -114,13 +110,7 @@ function NavEditor({ onClose }: { onClose: () => void }) {
 	);
 
 	// 点外面就收起来。面板本身不拦点击 —— 勾完一项还想勾下一项,不该每次都重新展开。
-	useEffect(() => {
-		function onDocPointerDown(e: PointerEvent): void {
-			if (!ref.current?.contains(e.target as Node)) onClose();
-		}
-		document.addEventListener("pointerdown", onDocPointerDown);
-		return () => document.removeEventListener("pointerdown", onDocPointerDown);
-	}, [onClose]);
+	useDismiss(ref, onClose, { event: "pointerdown" });
 
 	const rows = orderedNav(NAV_ITEMS, order);
 
@@ -131,12 +121,16 @@ function NavEditor({ onClose }: { onClose: () => void }) {
 	}
 
 	return (
-		<div
+		<PopoverShell
 			ref={ref}
-			className="bn-glass absolute right-0 top-full z-30 mt-1 w-60 rounded-bn-card p-2 shadow-bn-card"
+			align="right"
+			variant="panel"
+			layer="nav"
+			surface="glass"
+			className="w-60"
 		>
 			<div className="flex items-center justify-between gap-1 px-1 py-1">
-				<span className="text-[11.5px] font-bold text-bn-text-secondary">标签显示与排序</span>
+				<span className="text-bn-xs font-bold text-bn-text-secondary">标签显示与排序</span>
 				<div className="flex items-center gap-0.5">
 					<Btn variant="ghost" size="sm" onClick={showAll}>
 						全部显示
@@ -161,7 +155,7 @@ function NavEditor({ onClose }: { onClose: () => void }) {
 					})}
 				</SortableContext>
 			</DndContext>
-		</div>
+		</PopoverShell>
 	);
 }
 
@@ -180,6 +174,7 @@ function AccountChip() {
 						alt={name}
 						src={face}
 						referrerPolicy="no-referrer"
+						data-bn="avatar"
 						className="ml-2 inline-block h-5 w-5 rounded-full"
 					/>
 				) : null}
@@ -197,7 +192,7 @@ function AccountChip() {
 const THEME_OPTIONS: ReadonlyArray<{ value: ThemePreference; label: string; hint: string }> = [
 	{ value: "system", label: "跟随系统", hint: "自动跟随系统外观" },
 	{ value: "light", label: "浅色", hint: "固定使用亮色主题" },
-	{ value: "dark", label: "深色", hint: "固定使用暗色主题" },
+	{ value: "dark", label: "深色", hint: "固定使用深色主题" },
 ];
 
 function themeLabel(value: ThemePreference): string {
@@ -208,20 +203,35 @@ function ThemeSwitcher() {
 	const preference = useThemeStore((s) => s.preference);
 	const resolved = useThemeStore((s) => s.resolved);
 	const setPreference = useThemeStore((s) => s.setPreference);
+	// 锁模式时切换无效,按钮置灰说明原因,而不是让用户点了没反应。
+	// (已启用的皮肤按深浅槽各自生效,不锁 —— 锁只发生在试穿与编辑器里。)
+	const lockedTheme = useSkinStore((s) => s.lockedTheme);
+	// 两种锁法要说两句话:试穿是「这皮肤只有一套」,编辑器是「你正在编这一套」。
+	// 编辑器抽屉里没有「应用/取消试穿」那两颗钮,照搬那句会让主人去找一个不存在的东西。
+	const editing = useSkinStore((s) => s.editing);
 	const [open, setOpen] = useState(false);
 	const containerRef = useRef<HTMLDivElement | null>(null);
 	const current = themeLabel(preference);
 
 	// 点击下拉外部时关闭(与 Rules/draft-island 的下拉一致),仅在展开时挂监听。
-	useEffect(() => {
-		if (!open) return;
-		function handleDocClick(e: MouseEvent) {
-			if (!containerRef.current) return;
-			if (!containerRef.current.contains(e.target as Node)) setOpen(false);
-		}
-		document.addEventListener("mousedown", handleDocClick);
-		return () => document.removeEventListener("mousedown", handleDocClick);
-	}, [open]);
+	useDismiss(containerRef, () => setOpen(false), { enabled: open });
+
+	if (lockedTheme) {
+		return (
+			<Btn
+				variant="outline"
+				size="sm"
+				disabled
+				title={
+					editing
+						? `正在编辑这套皮肤的${themeLabel(lockedTheme)},抽屉顶部换一套即可切换`
+						: `试穿中的皮肤只有${themeLabel(lockedTheme)}一套,应用或取消试穿即可切换`
+				}
+			>
+				主题：{themeLabel(lockedTheme)}({editing ? "编辑中" : "试穿锁定"})
+			</Btn>
+		);
+	}
 
 	return (
 		<div className="relative" ref={containerRef}>
@@ -236,32 +246,31 @@ function ThemeSwitcher() {
 				主题：{current}
 			</Btn>
 			{open ? (
-				<div className="absolute right-0 top-full z-20 mt-2 w-42 rounded-lg border border-bn-border bg-bn-surface-strong p-1.5 shadow-bn-elev">
+				<PopoverShell align="right" className="w-42">
 					{THEME_OPTIONS.map((o) => {
 						const active = o.value === preference;
 						return (
-							<button
-								type="button"
+							<MenuItem
 								key={o.value}
-								aria-label={o.label}
+								ariaLabel={o.label}
+								active={active}
 								onClick={() => {
 									setPreference(o.value);
 									setOpen(false);
 								}}
-								className={`block w-full rounded-md px-2.5 py-1.5 text-left text-[12px] transition ${
-									active
-										? "bg-bn-pink/12 font-bold text-bn-pink"
-										: "text-bn-text-primary hover:bg-bn-hover-muted"
-								}`}
 							>
-								<span className="block">{o.label}</span>
-								<span className="block text-[10.5px] font-normal text-bn-text-secondary">
-									{o.hint}
+								{/* MenuItem 本体是横向 flex,两个兄弟 span 会被摆成左右两列互相挤 ——
+								    标签和小字必须包进同一个块里才是上下两行。 */}
+								<span className="block min-w-0">
+									<span className="block">{o.label}</span>
+									<span className="block text-bn-2xs font-normal text-bn-text-secondary">
+										{o.hint}
+									</span>
 								</span>
-							</button>
+							</MenuItem>
 						);
 					})}
-				</div>
+				</PopoverShell>
 			) : null}
 		</div>
 	);
@@ -326,9 +335,47 @@ function LogoutButton() {
 	);
 }
 
+/**
+ * 那枚「服务器通不通」的徽章。两个分支此前各写一遍,共用一串 60 字符的类名 ——
+ * 谁改了其中一边的内边距,页面就会在后端掉线的瞬间换个形状,而那正是最难复现的
+ * 时刻。收成一处,两态就只剩 tone 一个差异。
+ *
+ * 不走库里的 `Pill`:那个是 `rounded-sm` 的实底/淡底徽章,这枚是带前导圆点的
+ * 圆头状态条。也不走 `StatusDot` 当圆点:它是 2×2 的**写死 hex**,换过去等于把
+ * 这里的 `bg-bn-success` / `bg-bn-danger` token 降级成不跟主题走的颜色。
+ */
+function ReachBadge({
+	tone,
+	title,
+	children,
+}: {
+	tone: "success" | "danger";
+	title?: string;
+	children: ReactNode;
+}) {
+	const box =
+		tone === "success"
+			? "bg-bn-success-soft text-bn-success-text"
+			: "bg-bn-danger-soft text-bn-danger-text";
+	return (
+		<span
+			data-bn="badge"
+			className={`inline-flex items-center gap-1.5 rounded-bn-pill px-2.5 py-1 text-bn-xs font-semibold ${box}`}
+			title={title}
+		>
+			{/* 那颗点用库里的 —— 尺寸阶梯与档位色都归 StatusDot 管,手画一颗就等着
+			    它哪天改了阶梯而这里原地不动。 */}
+			<StatusDot size="sm" kind={tone === "success" ? "ok" : "err"} />
+			{children}
+		</span>
+	);
+}
+
 export function GlassHeader() {
 	const qc = useQueryClient();
 	const reachable = useBackendReachable();
+	// 皮肤文案槽:皮肤没给就用产品默认标题。
+	const headerTitle = useSkinText("headerTitle") ?? "Bilibili Notify · 女仆值班室";
 	const subs = useQuery({
 		queryKey: ["subscriptions"],
 		queryFn: () => api.get<Subscription[]>("/api/subs"),
@@ -342,6 +389,26 @@ export function GlassHeader() {
 		targets: targets.data?.length ?? 0,
 	};
 
+	// 一级导航的选中态判定(见下方 navActive)。
+	const { pathname } = useLocation();
+	/**
+	 * 刚点下的那一格 —— **不等路由**。
+	 *
+	 * `data-bn` 是静态属性,选中态由 pathname 手算;而路由切换有一段缝(真机量到
+	 * ~58ms)。松手那一刻 `:active` 已经失效、`tab-active` 还没挂上,于是像素风皮肤
+	 * 那种「按下位移 3px」的装会弹起来再按回去 —— 主人看到的是点一下抖一下
+	 * (2026-08-24 真机:「按下,松手又弹起又按下」)。
+	 *
+	 * 皮肤修不了这个:CSS 选择器管不到「刚刚被点过」,那一帧元素身上既没有 `:active`
+	 * 也没有 `tab-active`。
+	 *
+	 * 连**点它时的 pathname** 一起记下 —— 于是「路由追上来了没有」是当场比出来的,
+	 * 不必再用一个 effect 去清它。乐观值是**派生**的,存成一份需要同步的状态就得
+	 * 回答「谁负责清、什么时候清」,而那两个答案都会漂。
+	 */
+	const [pressed, setPressed] = useState<{ to: string; at: string } | null>(null);
+	// `at !== pathname` = 路由已经动了,这条乐观值当场作废。
+	const optimistic = pressed?.at === pathname ? pressed.to : null;
 	// 导航条显哪几项、按什么顺序 —— 纯本地偏好,见 config/nav.ts。
 	const hiddenNav = useNavStore((s) => s.hidden);
 	const navOrder = useNavStore((s) => s.order);
@@ -376,17 +443,24 @@ export function GlassHeader() {
 	}, []);
 
 	return (
-		<header ref={headerRef} className="bn-glass-strong sticky top-0 z-10">
+		<header
+			ref={headerRef}
+			data-bn="header"
+			// z-bn-header:卡在**页面内容**(最高 z-bn-nav,TabBarShell 给「添加 UP」下拉留的)之上、
+			// **覆盖层**(z-bn-scrim 起:AI 抽屉/弹窗/toast/灵动岛)之下。原先是 z-bn-raised,比页面
+			// 内容还低 —— 往下滚,tab 条整条画在吸顶顶栏之上,把主导航切掉一截。
+			className="bn-glass-strong sticky top-0 z-bn-header shadow-bn-card"
+		>
 			<div className="flex items-center justify-between gap-4 px-7 pt-4">
 				<div className="flex min-w-0 items-center gap-3">
 					<div className="flex h-13 items-center px-1">
 						<img alt="Bilibili Notify" src="/logo.png" className="h-13 w-auto object-contain" />
 					</div>
 					<div className="min-w-0">
-						<div className="text-[17px] font-bold tracking-tight text-bn-text-primary">
-							Bilibili Notify · 女仆值班室
+						<div className="text-bn-lg font-bold tracking-tight text-bn-text-primary">
+							{headerTitle}
 						</div>
-						<div className="mt-0.5 truncate text-[11.5px] text-bn-text-secondary">
+						<div className="mt-0.5 truncate text-bn-xs text-bn-text-secondary">
 							<AccountChip />
 						</div>
 					</div>
@@ -398,18 +472,14 @@ export function GlassHeader() {
 					 * 是每位 UP 各自的 features,跟这里毫无关系。措辞必须落在「服务器」上。
 					 */}
 					{reachable ? (
-						<span
-							className="inline-flex items-center gap-1.5 rounded-full bg-bn-success-soft px-2.5 py-1 text-[11.5px] font-semibold text-bn-success-text"
+						<ReachBadge
+							tone="success"
 							title="后端服务可访问。与推送开关无关 —— 推送是否启用见各 UP 的规则设置。"
 						>
-							<span className="h-1.5 w-1.5 rounded-full bg-emerald-500" />
 							服务器运行中
-						</span>
+						</ReachBadge>
 					) : (
-						<span className="inline-flex items-center gap-1.5 rounded-full bg-bn-danger-soft px-2.5 py-1 text-[11.5px] font-semibold text-bn-danger-text">
-							<span className="h-1.5 w-1.5 rounded-full bg-red-500" />
-							服务器失联
-						</span>
+						<ReachBadge tone="danger">服务器失联</ReachBadge>
 					)}
 					<ThemeSwitcher />
 					<Btn variant="outline" size="sm" icon={<Icon.refresh size={14} />} onClick={refreshAll}>
@@ -423,43 +493,64 @@ export function GlassHeader() {
 					<LogoutButton />
 				</div>
 			</div>
-			<nav className="relative flex gap-0 px-5 pt-3">
-				{shownNav.map((t) => (
-					<NavLink
-						key={t.to}
-						to={t.to}
-						end
-						className={({ isActive }) =>
-							`relative flex items-center gap-1.5 px-4 py-2.5 text-[13px] transition ${
-								isActive
+			{/* 挂 `nav` 挂点 —— 次级导航(TabBarShell / SectionNav)都挂了,唯独这条
+			    一级导航没挂。皮肤给 nav 画底色/描边时,Rules 的作用域条、Targets 的
+			    分区列表都换装,顶栏这排纹丝不动 —— 两者常常同屏,比"全都不生效"更露馅。 */}
+			<nav data-bn="nav" className="relative flex gap-0 px-5 pt-3">
+				{shownNav.map((t) => {
+					// data-bn 是静态属性,NavLink 的 isActive 回调塞不进去 —— 选中态自己算。
+					// 除精确匹配外把子路径也算给父项(/about/guide/push 亮「关于」);
+					// "/" 排除在前缀判定外,不然它永远全亮。
+					const current = optimistic ?? pathname;
+					const navActive = current === t.to || (t.to !== "/" && current.startsWith(`${t.to}/`));
+					return (
+						<NavLink
+							key={t.to}
+							to={t.to}
+							end
+							// tab 家族挂点(曾挂 btn,皮肤按钮实底把整排一级导航画成一排按钮)。
+							data-bn={navActive ? "tab tab-active" : "tab"}
+							// 新手导览的指路挂点:子步不在目标路由时,聚光灯照到对应页签上
+							// 让用户自己点过去(tour-companion 的 Spotlight 按此选择器解析)。
+							data-tour-nav={t.to}
+							onClick={(e) => {
+								// 带修饰键的点击是「在新标签打开」—— 这一页的路由压根不变,
+								// 乐观值留在那一格上就会一直指错,而且没有下一次 pathname
+								// 变化来清它。
+								if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+								setPressed({ to: t.to, at: pathname });
+							}}
+							className={`relative flex items-center gap-1.5 px-4 py-2.5 text-bn-base transition ${
+								navActive
 									? "font-bold text-bn-pink"
 									: "font-medium text-bn-text-tertiary hover:text-bn-text-primary"
-							}`
-						}
-					>
-						{({ isActive }) => (
-							<>
-								{t.label}
-								{t.countKey ? (
-									<span
-										className={`rounded-lg px-1.5 py-px text-[10px] font-bold ${
-											isActive
-												? "bg-bn-pink/15 text-bn-pink"
-												: "bg-bn-code-bg text-bn-text-secondary"
-										}`}
-									>
-										{counts[t.countKey]}
-									</span>
-								) : null}
+							}`}
+						>
+							{t.label}
+							{t.countKey ? (
+								// 选中态**不自带颜色**,底与字都跟着这一格自己的文字色走。此前写死
+								// `text-bn-pink`,等于假设「选中格的背景仍是页面底色」—— 皮肤把
+								// tab-active 画成实心粉块之后这个假设就破了:粉纱铺在粉块上还是粉,
+								// 粉字落上去正好隐形(2026-08-24 主人真机指出「未选中看得见数字,
+								// 选中就没了」)。跟随之后可读性搭在「选中格的字本来就得看得清」
+								// 这条既有不变量上,皮肤把 tab-active 改成什么色都不会掉队。
+								// 未选中态反过来要自带:那时父色是 tertiary 浅灰,跟着走会糊成一团。
 								<span
-									className={`absolute inset-x-2 -bottom-px h-0.5 rounded-full transition ${
-										isActive ? "bg-bn-pink" : "bg-transparent"
+									className={`rounded-lg px-1.5 py-px text-bn-2xs font-bold ${
+										navActive ? "bg-current/15" : "bg-bn-code-bg text-bn-text-secondary"
 									}`}
-								/>
-							</>
-						)}
-					</NavLink>
-				))}
+								>
+									{counts[t.countKey]}
+								</span>
+							) : null}
+							<span
+								className={`absolute inset-x-2 -bottom-px h-0.5 rounded-full transition ${
+									navActive ? "bg-bn-pink" : "bg-transparent"
+								}`}
+							/>
+						</NavLink>
+					);
+				})}
 				{/* 挑标签的入口。贴在导航条右端 —— 它讲的就是这一条的事,摆在别处得先
 				    让人找。图标按钮而非文字,免得这个「让界面别那么满」的功能自己先占一格。 */}
 				<div className="relative ml-auto self-center">

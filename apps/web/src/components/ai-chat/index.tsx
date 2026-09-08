@@ -1,8 +1,14 @@
-import type { AiConversationDTO } from "@bilibili-notify/contract";
+import {
+	AI_TOOL_CREATE_SKIN,
+	type AiChatMode,
+	type AiConversationDTO,
+} from "@bilibili-notify/contract";
 import type { GlobalConfig } from "@bilibili-notify/internal";
-import { resolveAIProfile } from "@bilibili-notify/internal/constants";
+import { resolveActivePersona, resolveAIProfile } from "@bilibili-notify/internal/constants";
+import { ErrorNote, Icon, TabBar } from "@bilibili-notify/ui";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { type CSSProperties, useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import { useLocation, useNavigate } from "react-router-dom";
 import {
 	chatImageUrl,
 	conversationQueryKey,
@@ -16,26 +22,40 @@ import {
 	uploadChatImage,
 } from "../../services/aiChat";
 import { api } from "../../services/api";
+import {
+	listMaidSkillsSafe,
+	type MaidSkillDTO,
+	maidSkillsQueryKey,
+} from "../../services/maidSkill";
+import { syncActiveSkinToStore } from "../../services/skin-active";
 import { useAiChatStore } from "../../store/aiChat";
 import { useAuthStore } from "../../store/auth";
 import { BiliLoginStatus } from "../../types/auth";
-import { Icon } from "../icons";
 import { Composer, type ComposerAttachment, MAX_ATTACHMENTS } from "./composer";
 import { MessageList, preloadChatMarkdown, type ToolChipData } from "./messages";
 import { resolveChatPersona } from "./persona";
+import { SearchControl } from "./search-control";
 import { ChatSidebar } from "./sidebar";
-import { AI_SKILLS, resolveOutgoing } from "./skills";
+import { resolveOutgoing } from "./skills";
+import { ThinkingControl } from "./thinking-control";
+import { useSessionCapsules } from "./use-session-capsules";
 
 /**
- * 女仆 AI 聊天 —— 右下角一颗胶囊,点开是整页覆盖的对话界面。
+ * 女仆 AI 聊天 —— 一条独立路由(/chat)的整页对话界面,右下角的胶囊
+ * ({@link AiChatDock})是它的全局入口。
  *
  * 取代了旧的「贴底建议条」:那条是**单向**的,按当前路由播一句预置话术,主人
  * 没法回话,读完只能关掉。会话记录落在服务端(见 apps/server 的 ConversationStore),
  * 所以换设备、重启服务都还在;女仆带只读工具,查得到订阅 / 直播状态 / 粉丝数,
  * 但改不动任何东西。
  *
- * 挂在 App 根部而非某个页面里:它是全局的,任何一页都能召唤。
+ * 曾经是盖在当前 tab 上的 overlay(开合态在 store 里)。改成路由之后,开没开由
+ * URL 说了算:刷新留在聊天里、浏览器返回键好使、/chat 也能存成书签直达。
  */
+
+/** 聊天页的路由。App 的 Route 与胶囊的跳转共用这一份,免得两处各写各的字符串。 */
+export const CHAT_PATH = "/chat";
+
 /**
  * 首屏闲下来之后跑一次 `fn`,返回撤销函数。
  *
@@ -56,43 +76,48 @@ function onIdle(fn: () => void): () => void {
 	return () => clearTimeout(id);
 }
 
+/**
+ * 右下角的「女仆 AI」胶囊。挂在 App 根部而非某个页面里:它是全局的,任何一页
+ * 都能召唤;已经在聊天页时不渲染 —— 自己叠在自己的入口上没有意义。
+ */
 export function AiChatDock() {
-	const open = useAiChatStore((s) => s.open);
-	const setOpen = useAiChatStore((s) => s.setOpen);
+	const navigate = useNavigate();
+	const onChatPage = useLocation().pathname === CHAT_PATH;
 
 	// 闲下来就把 Markdown chunk 取回来。这颗胶囊在每一页都挂着,所以这条**总会**跑,
 	// 与聊天开没开无关 —— 目的正是让主人第一次点进去时它已经在了。
 	useEffect(() => onIdle(preloadChatMarkdown), []);
 
-	if (!open) {
-		return (
-			<button
-				type="button"
-				onClick={() => setOpen(true)}
-				// 主人露出「要进来」的意思时就去取 Markdown 那个 chunk(约 153KB)。
-				//
-				// 这颗胶囊是打开聊天的**唯一**入口(`open` 不持久化,store 初值恒为
-				// false),所以在它身上预热就覆盖了全部路径。挪上来 / 聚焦到它,比真正
-				// 点开早几百毫秒 —— 足够取回来,于是进去之后纯文本那条退路根本
-				// 不会露面。
-				//
-				// 三个事件各管一类人:pointerEnter 是鼠标,focus 是键盘 Tab,
-				// pointerDown 是触屏(那儿没有 hover)。预热本身幂等,重复调只是
-				// 拿同一个已解析的 promise。
-				onPointerEnter={preloadChatMarkdown}
-				onPointerDown={preloadChatMarkdown}
-				onFocus={preloadChatMarkdown}
-				title="打开女仆 AI 聊天"
-				className="bn-ai-fab fixed bottom-5 right-5 z-30 flex h-12 cursor-pointer items-center gap-2.25 rounded-[26px] pl-4 pr-5 text-[13.5px] font-bold text-white shadow-[0_10px_28px_rgba(108,92,231,0.42)]"
-			>
-				<Icon.ai size={20} />
-				女仆 AI
-			</button>
-		);
-	}
-	// 拆成两个组件而不是一路 if:关着的时候不该挂那一堆 query 和订阅,
-	// 更不该在后台轮询会话列表。
-	return <ChatOverlay onClose={() => setOpen(false)} />;
+	if (onChatPage) return null;
+	return (
+		<button
+			type="button"
+			onClick={() => navigate(CHAT_PATH)}
+			// 主人露出「要进来」的意思时就去取 Markdown 那个 chunk(约 153KB)。
+			//
+			// 站内进聊天页只有这颗胶囊一个入口,在它身上预热就覆盖了站内全部路径
+			// (直接输 /chat 进来的那条由 ChatPage 挂载时的兜底预热接住)。挪上来 /
+			// 聚焦到它,比真正点开早几百毫秒 —— 足够取回来,于是进去之后纯文本那条
+			// 退路根本不会露面。
+			//
+			// 三个事件各管一类人:pointerEnter 是鼠标,focus 是键盘 Tab,
+			// pointerDown 是触屏(那儿没有 hover)。预热本身幂等,重复调只是
+			// 拿同一个已解析的 promise。
+			onPointerEnter={preloadChatMarkdown}
+			onPointerDown={preloadChatMarkdown}
+			onFocus={preloadChatMarkdown}
+			title="打开女仆 AI 聊天"
+			// 挂皮肤挂点:这颗胶囊全站常驻,却自带一套观感(`.bn-ai-fab` 的渐变 / 玻璃 /
+			// 流光全写死在 styles.css 里)。不挂的话皮肤够不到它 —— 整站换成像素窗口,
+			// 只有右下角还是圆头紫胶囊。皮肤 CSS 是无层 author 样式,压得过 `.bn-ai-fab`
+			// 所在的 `@layer components`,所以挂上就够了,默认装的观感一个像素都不变。
+			data-bn="btn btn-primary"
+			className="bn-ai-fab fixed bottom-5 right-5 z-bn-nav flex h-12 cursor-pointer items-center gap-2.25 rounded-bn-pill pl-4 pr-5 text-bn-base font-bold text-bn-on-solid shadow-bn-ai transition-shadow hover:shadow-bn-ai-lg"
+		>
+			<Icon.ai size={20} />
+			女仆 AI
+		</button>
+	);
 }
 
 /**
@@ -109,17 +134,91 @@ type PendingTool = ToolChipData & { id: string };
  * 那一让步足够 React 把重渲染 flush 掉)。闭包里读到的于是恒为空数组 —— 图能选、
  * 能预览、也照常挂在自己那条消息上,唯独服务端一张都收不到。
  */
-type SendVars = { text: string; attachments: readonly ComposerAttachment[] };
+type SendVars = {
+	text: string;
+	attachments: readonly ComposerAttachment[];
+	/**
+	 * 会话级胶囊在**点发送那一刻**的状态。走 variables 而不是让 mutationFn 从
+	 * 组件闭包里读 —— 见 react-query onMutate 的时序坑:要发的东西必须随载荷走。
+	 */
+	flags: { thinking: boolean; search: boolean; skill?: string };
+	/**
+	 * 这一问发去哪场对话。`null` = 现开一场(空态首发)。同样走 variables:
+	 * mutationFn 从闭包里读 activeId 会读到旧值。
+	 */
+	conversationId: string | null;
+	/** 现开一场时用的面孔。已有对话时它不起作用 —— 面孔开局就锁死了。 */
+	face: ChatFace;
+};
 
-function ChatOverlay({ onClose }: { onClose: () => void }) {
+/** 技能还没拉到时的稳定空表 —— 每次渲染现造一个 `[]` 会让 Composer 白白重渲。 */
+const EMPTY_SKILLS: readonly MaidSkillDTO[] = [];
+
+/** 一场对话的面孔:模式 + 带不带人格。开局定死,见 contract 的 AiChatMode。 */
+type ChatFace = { mode: AiChatMode; persona: boolean };
+
+const DEFAULT_FACE: ChatFace = { mode: "chat", persona: true };
+/** 工坊那副面孔。**不带人格** —— 那条路整段顶掉 system,人格本来就不在场。 */
+const SKIN_FACE: ChatFace = { mode: "skin", persona: false };
+
+/**
+ * 人格那一档的两段 —— **只在空态摆一次**。
+ *
+ * 模式那个切换器已经撤了(改由侧栏两个入口决定),这个位置留给人格:女仆气质是
+ * 这个项目的底色,但主人也有「就正经问点事」的时候。同样开局锁定 —— 聊到一半
+ * 换人格,前半段的语气和后半段对不上,读起来像换了个人。
+ */
+const PERSONA_TABS = [
+	{ id: "on" as const, label: "有人格", icon: <Icon.ai size={14} /> },
+	{ id: "off" as const, label: "无人格", icon: <Icon.chat size={14} /> },
+];
+
+/** /chat 路由页。除了「返回控制台」的去向,不感知路由 —— 其余全是聊天自己的事。 */
+/**
+ * 聊天页顶层的玻璃浮钮 —— 展开侧栏 / 返回控制台两颗共用的观感皮(sheen + soft +
+ * lift + 玻璃底 + hover 强化),此前那串 class 各抄一份。形状(方格 / 药丸)与
+ * 摆位由 className 给。玻璃件走 glass 挂点语义,刻意不挂 `data-bn="btn"`
+ * (coverage 豁免名单里记着这条)。
+ */
+function FloatGlassButton({
+	title,
+	ariaLabel,
+	onClick,
+	className,
+	children,
+}: {
+	title?: string;
+	ariaLabel?: string;
+	onClick: () => void;
+	className: string;
+	children: React.ReactNode;
+}) {
+	return (
+		<button
+			type="button"
+			title={title}
+			aria-label={ariaLabel}
+			onClick={onClick}
+			className={`bn-glass-sheen bn-glass-soft bn-glass-lift bn-glass absolute top-4 z-bn-raised cursor-pointer text-bn-text-tertiary shadow-bn-card hover:bg-(--bn-glass-strong-bg) hover:shadow-bn-elev ${className}`}
+		>
+			{children}
+		</button>
+	);
+}
+
+export function ChatPage() {
+	const navigate = useNavigate();
+	const location = useLocation();
+	// 「返回控制台」回**来路**:从统计页点进来就该回统计页。直接输网址 / 书签进来时
+	// 历史里没有上一页(初始 entry 的 key 恒为 "default"),navigate(-1) 要么退出站点
+	// 要么原地不动 —— 这种时候显式回首页。
+	const onClose = () => {
+		if (location.key === "default") navigate("/", { replace: true });
+		else navigate(-1);
+	};
+
 	const rail = useAiChatStore((s) => s.rail);
 	const setRail = useAiChatStore((s) => s.setRail);
-	const theme = useAiChatStore((s) => s.theme);
-	const setTheme = useAiChatStore((s) => s.setTheme);
-	const glassOpacity = useAiChatStore((s) => s.glassOpacity);
-	const setGlassOpacity = useAiChatStore((s) => s.setGlassOpacity);
-	const glassClear = useAiChatStore((s) => s.glassClear);
-	const setGlassClear = useAiChatStore((s) => s.setGlassClear);
 	const activeId = useAiChatStore((s) => s.activeId);
 	const setActiveId = useAiChatStore((s) => s.setActiveId);
 
@@ -135,8 +234,10 @@ function ChatOverlay({ onClose }: { onClose: () => void }) {
 	// 模型名在当前生效的那个服务商桶里(各家一套配置)。
 	const ai = globalsQuery.data?.defaults.ai;
 	const modelName = ai ? resolveAIProfile(ai).model : undefined;
-	// 名字 / 自称 / 对主人的称呼一律跟「智能女仆」页配的人格走,界面上不写死。
-	const persona = resolveChatPersona(globalsQuery.data?.defaults.ai.persona);
+	// 名字 / 自称 / 对主人的称呼一律跟**当前选中的那份人格**走(`activePreset` 指的
+	// 那份),界面上不写死。直读 `ai.persona` 的话主人换了人格这里也不动 —— 那个字段
+	// 自人格指针上线就没有界面入口、永远冻在老值上,而她开口自称的是新那位。
+	const persona = resolveChatPersona(ai ? resolveActivePersona(ai).persona : undefined);
 
 	const snapshot = useAuthStore((s) => s.snapshot);
 	const card =
@@ -146,6 +247,16 @@ function ChatOverlay({ onClose }: { onClose: () => void }) {
 	// 没登录 / 还没拿到账号时,用人格里那个称呼顶上 —— 傲娇预设下就是「笨蛋」,
 	// 比硬写「主人」更贴合主人自己配的那套口吻。
 	const userName = card?.name?.trim() || persona.user;
+
+	/**
+	 * 斜杠菜单那份技能清单。拉不到就当没有技能(见 listMaidSkillsSafe)——
+	 * 技能是锦上添花,不该因为它取不回来就让整个聊天挂着一条红字。
+	 */
+	const skills =
+		useQuery({
+			queryKey: maidSkillsQueryKey,
+			queryFn: listMaidSkillsSafe,
+		}).data ?? EMPTY_SKILLS;
 
 	const listQuery = useQuery({
 		queryKey: conversationsQueryKey,
@@ -166,8 +277,9 @@ function ChatOverlay({ onClose }: { onClose: () => void }) {
 		if (activeId && activeQuery.isError) setActiveId(null);
 	}, [activeId, activeQuery.isError, setActiveId]);
 
-	// 面板一打开再取一次 —— 兜底。正常路径上首屏空闲那次早就取完了(见 AiChatDock),
-	// 这条覆盖的是「页面刚加载完、空闲回调还没排上就直奔胶囊」。预热幂等,白调无害。
+	// 页面一挂载再取一次 —— 兜底。正常路径上首屏空闲那次早就取完了(见 AiChatDock),
+	// 这条覆盖的是「刚加载完、空闲回调还没排上就直奔胶囊」,以及**直接输 /chat 进来**
+	// (根本没经过胶囊)。预热幂等,白调无害。
 	useEffect(() => {
 		preloadChatMarkdown();
 	}, []);
@@ -184,6 +296,8 @@ function ChatOverlay({ onClose }: { onClose: () => void }) {
 		ask: string;
 		draft: string;
 		tools: readonly PendingTool[];
+		/** 思考草稿(思考模型专有),同样逐字长出来。 */
+		think: string;
 		/** 这一问带上去的图(显示地址)。在途期间也得看得见,否则像是没发出去。 */
 		images?: readonly string[];
 	} | null>(null);
@@ -215,6 +329,42 @@ function ChatOverlay({ onClose }: { onClose: () => void }) {
 		setSettled(null);
 	}, [activeId]);
 
+	// 会话级的两颗胶囊(深度思考 / 联网搜索)与模式。归零策略连同「首发落地新会话
+	// 不算换会话」的豁免都住在 hook 里 —— 见 use-session-capsules.ts。
+	const { thinkingOn, setThinkingOn, searchOn, setSearchOn, adoptConversation } =
+		useSessionCapsules(activeId);
+
+	/**
+	 * 还没落户的那场对话的面孔。只有空态用得上它 —— 一旦会话建起来,面孔就归
+	 * 服务端那份记录所有,这里说了不算。
+	 */
+	const [pendingFace, setPendingFace] = useState<ChatFace>(DEFAULT_FACE);
+	/**
+	 * 当下这场对话的面孔:有会话就读会话的,没有就是待建的那份。
+	 *
+	 * 会话详情还在路上时先从侧栏列表里取 —— 那份早到,而这中间的空窗期如果回落
+	 * 成默认值,工坊会话会闪一下聊天的样子。
+	 */
+	const activeMeta = conversations.find((c) => c.id === activeId);
+	const activeFace: ChatFace = activeId
+		? {
+				mode: activeQuery.data?.mode ?? activeMeta?.mode ?? DEFAULT_FACE.mode,
+				persona: activeQuery.data?.persona ?? activeMeta?.persona ?? DEFAULT_FACE.persona,
+			}
+		: pendingFace;
+	const skinMode = activeFace.mode === "skin";
+	// 空态与会话态两个 Composer 用同一份 —— 各写一遍的话,加第三颗胶囊只改到
+	// 一处,问候屏和聊天里的工具栏就长得不一样了(正是本文件头警告过的分裂态)。
+	//
+	// 两颗胶囊在皮肤工坊里照样摆着:做「某部作品风格」的皮肤要先查得到那部作品的
+	// 配色,搜索是这个模式里唯一保留的外部能力(见服务端 chat-tool.ts 的权衡)。
+	const composerExtras = (
+		<>
+			<ThinkingControl on={thinkingOn} onToggle={setThinkingOn} />
+			<SearchControl on={searchOn} onToggle={setSearchOn} />
+		</>
+	);
+
 	/**
 	 * 起标题。刻意**不**把错误摊给主人:服务端起名失败也回 200 + 当前标题,
 	 * 真到网络层断了也只是标题没变 —— 为一个装饰在刚聊完的界面上弹红字,
@@ -227,36 +377,77 @@ function ChatOverlay({ onClose }: { onClose: () => void }) {
 	});
 
 	const send = useMutation({
-		mutationFn: async ({ text, attachments: outgoingFiles }: SendVars) => {
+		mutationFn: async ({
+			text,
+			attachments: outgoingFiles,
+			flags,
+			conversationId,
+			face,
+		}: SendVars) => {
 			const imageIds = outgoingFiles.map((a) => a.id);
 			// 还没有会话就先开一个 —— 主人在空态直接打字发送时走这条路,
 			// 不必先去点「新对话」。
-			const id = activeId ?? (await createConversation()).id;
-			if (id !== activeId) setActiveId(id);
+			// 这一轮开过的工具:id → 名字。end 事件只带 id 与成败,而「做完皮肤要
+			// 补一拍状态回灌」得先认出它是哪个工具。建在**这一轮**的闭包里,跨轮
+			// 不留残影。
+			const toolNames = new Map<string, string>();
+			// 面孔归会话所有,所以「发去哪一场」是发送方在点下回车那一刻就定好的:
+			// 给了 id 就发去那场,给 null 就照 face 现开一场。
+			const id = conversationId ?? (await createConversation(face)).id;
+			if (id !== activeId) {
+				// 这次 activeId 变化是首发落的户口,不是换会话 —— 别把刚点亮的胶囊打回默认。
+				adoptConversation();
+				setActiveId(id);
+			}
 			return sendChatMessage(
 				id,
 				text,
 				{
 					onDelta: (chunk) => setPending((p) => (p ? { ...p, draft: p.draft + chunk } : p)),
+					// 思考流单独累积,不混进正文 —— 它是要折叠、要用另一副面孔渲染的。
+					onReasoning: (chunk) => setPending((p) => (p ? { ...p, think: p.think + chunk } : p)),
 					// 工具轮不产生正文,所以那几秒原本只有三个跳动的点 —— 跟「模型卡住了」
 					// 长得一模一样。start 就上屏、end 只回填结论:这样「正在查订阅」是在查的
 					// **当时**说的,而不是查完了才补一句。
 					//
 					// 按 id 认人而不是「改最后一条」:一轮里可以同时开好几个工具,end 回来的
 					// 次序不保证跟 start 一致。
-					onTool: (ev) =>
+					onTool: (ev) => {
+						if (ev.phase === "start") toolNames.set(ev.id, ev.name);
+						// 女仆做完一套皮肤(很可能顺手已经替主人换上了)—— 服务端那边
+						// 已经落盘,界面得自己去问一声,否则她说「换好啦」而屏幕不动。
+						// 只认做成了的:白拉一趟没意义,还会把失败演成成功。
+						else if (ev.phase === "end" && ev.ok && toolNames.get(ev.id) === AI_TOOL_CREATE_SKIN) {
+							void syncActiveSkinToStore().catch(() => {
+								// 拉失败就维持现状:皮肤已经在库里了,主人去皮肤页照样看得到。
+							});
+							void qc.invalidateQueries({ queryKey: ["skins"] });
+						}
 						setPending((p) => {
 							if (!p) return p; // 已经切走 / 撤掉了,这一拍没人要
 							if (ev.phase === "start") {
 								return { ...p, tools: [...p.tools, { id: ev.id, name: ev.name, args: ev.args }] };
 							}
+							// 慢工具的进度。只更新数字,状态仍是「在跑」—— 报进度不是收尾。
+							if (ev.phase === "progress") {
+								return {
+									...p,
+									tools: p.tools.map((t) => (t.id === ev.id ? { ...t, progress: ev.chars } : t)),
+								};
+							}
 							return {
 								...p,
-								tools: p.tools.map((t) => (t.id === ev.id ? { ...t, ok: ev.ok } : t)),
+								tools: p.tools.map((t) =>
+									t.id === ev.id
+										? { ...t, ok: ev.ok, ...(ev.sources ? { sources: ev.sources } : {}) }
+										: t,
+								),
 							};
-						}),
+						});
+					},
 				},
 				imageIds,
+				flags,
 			);
 		},
 		onMutate: ({ text, attachments: outgoingFiles }: SendVars) => {
@@ -264,7 +455,13 @@ function ChatOverlay({ onClose }: { onClose: () => void }) {
 			// 输入框,出现在对话里。图也一样跟着走。
 			setInput("");
 			setError(null);
-			setPending({ ask: text, draft: "", tools: [], images: outgoingFiles.map((a) => a.url) });
+			setPending({
+				ask: text,
+				draft: "",
+				tools: [],
+				think: "",
+				images: outgoingFiles.map((a) => a.url),
+			});
 			setAttachments([]);
 		},
 		onSuccess: (res, _vars) => {
@@ -339,41 +536,80 @@ function ChatOverlay({ onClose }: { onClose: () => void }) {
 	 * 跟着进到新对话的空白页里。它的 onSuccess 认的是服务端返回的会话 id,
 	 * 所以照样会正确落到原来那个会话上。
 	 */
-	const startNew = () => {
+	const startNew = (mode: AiChatMode = "chat") => {
 		setActiveId(null);
 		setInput("");
 		setError(null);
 		setPending(null);
+		// 侧栏那两颗按钮**就是**选面孔的动作 —— 会话还没落户,先记在待建的这份上。
+		setPendingFace(mode === "skin" ? SKIN_FACE : DEFAULT_FACE);
 	};
 
 	const busy = send.isPending;
 	// 一有在途消息就离开空态 —— 主人发了话,问候页就该让位给对话。
 	const empty = messages.length === 0 && pending === null;
 
+	/**
+	 * 人格那一档 —— **只在空态摆**,而且只给日常聊天。
+	 *
+	 * 皮肤工坊那条路整段顶掉 system,人格本来就不在场;在那儿摆个开关是承诺一件
+	 * 做不到的事。会话一旦开口就撤掉:面孔锁定,留着一个点不动的切换器更让人困惑。
+	 */
+	const personaPicker =
+		empty && !skinMode ? (
+			<div className="mx-auto mb-2.5 w-fit">
+				<TabBar
+					items={PERSONA_TABS}
+					value={pendingFace.persona ? "on" : "off"}
+					onChange={(v) => setPendingFace((f) => ({ ...f, persona: v === "on" }))}
+				/>
+			</div>
+		) : null;
+
 	// 内容一长就贴底。依赖里带上 `pending.draft.length` 是要紧的:流式回复是逐字
 	// 长出来的,只盯消息数的话,整段生成过程中视图纹丝不动,新字全长在视野之外。
+	// 思考流同理 —— 它先于正文长出来,不跟着它滚,思考阶段就全长在视野之外。
 	// biome-ignore lint/correctness/useExhaustiveDependencies: 这几个值只作触发条件,不在函数体内读
 	useEffect(() => {
 		const el = scrollRef.current;
 		if (el) el.scrollTop = el.scrollHeight;
-	}, [busy, messages.length, pending?.draft.length]);
+	}, [busy, messages.length, pending?.draft.length, pending?.think.length]);
 
 	const submit = (text?: string) => {
-		const outgoing = resolveOutgoing(text ?? input);
+		const raw = text ?? input;
+		// 斜杠命令在这里拆成「点名了哪条技能」+「主人这一问」。正文一个字都不经过
+		// 浏览器 —— 服务端拿名字去库里取,落盘的用户消息就是他真打的那几个字。
+		const outgoing = resolveOutgoing(raw, skills);
 		// 只有图、一个字没打也算数 —— 图本身就是问题。
-		if ((!outgoing && attachments.length === 0) || busy) return;
+		if ((!outgoing.text && attachments.length === 0) || busy) return;
+		// 技能不再点名面孔(它声明不了模式,见 ADR-0001 决策 11),所以这一问永远
+		// 发去当下这场;进皮肤工坊的唯一入口是侧栏那颗「新建皮肤工坊」。
+		const reuse = activeId !== null;
+		const outgoingFace: ChatFace =
+			activeFace.mode === "skin" ? SKIN_FACE : { ...pendingFace, mode: "chat" };
 		// 附件快照必须在**这里**取。`mutationFn` 是在 `onMutate` 之后才跑的
 		// (onMutate 的返回值被 await,那一让步足够 React 把重渲染 flush 掉),
 		// 那时 `setAttachments([])` 已经生效 —— 从 mutationFn 的闭包里读
 		// `attachments` 只能读到空数组,于是服务端一张图也收不到。
-		send.mutate({ text: outgoing, attachments });
+		// 两颗胶囊同理随载荷走。
+		send.mutate({
+			text: outgoing.text,
+			attachments,
+			flags: {
+				thinking: thinkingOn,
+				search: searchOn,
+				...(outgoing.skill ? { skill: outgoing.skill } : {}),
+			},
+			conversationId: reuse ? activeId : null,
+			face: outgoingFace,
+		});
 	};
 
 	/** 挑了图就立刻传,传完塞进待发送列表。格式 / 大小不对当场报,不等到点发送。 */
-	const pickFiles = async (files: FileList) => {
+	const pickFiles = async (files: readonly File[]) => {
 		setError(null);
 		const room = MAX_ATTACHMENTS - attachments.length;
-		for (const file of Array.from(files).slice(0, room)) {
+		for (const file of files.slice(0, room)) {
 			try {
 				const id = await uploadChatImage(file);
 				setAttachments((prev) => [...prev, { id, url: chatImageUrl(id) }]);
@@ -383,33 +619,19 @@ function ChatOverlay({ onClose }: { onClose: () => void }) {
 		}
 	};
 
-	/** 玻璃片实际生效的透明度。完全透明优先,压过滑块拉到哪一档。 */
-	const glass = glassClear ? 0 : glassOpacity;
-
 	return (
-		<div
-			data-chat-theme={theme}
-			className="bn-anim-chat-in fixed inset-0 z-40 flex"
-			// 玻璃片的三个值,算法照搬推送卡片的卡片内容层:
-			//     glass = 完全透明 ? 0 : 设置值      blur = 完全透明 ? 0 : 基线
-			// 「完全透明」就是这些值一起归零,不是另一套规则 —— 那边一直这么写。
-			// blur 送的是**倍率**而不是像素:各玻璃件的基线半径不一样(面板 32px、
-			// 胶囊 20px),送倍率才不用把那张表复制一份到 JS 里来。
-			//
-			// saturate 是推送卡片没有的那一项(那边只有 blur),但它必须跟着透明度
-			// 一起退:backdrop-filter 加工的是**背后**的像素,底色一透,它还在那儿
-			// 把背后的主题辉光按倍数放大 —— 表现就是「玻璃拉到最低,显出来的背景
-			// 反而比背景本身还鲜艳」。1 = 原样不动;默认档落在 1.82,与这功能之前
-			// 写死的 1.8 基本同观感。
-			style={
-				{
-					background: "var(--bn-chat-bg)",
-					"--bn-chat-glass": glass,
-					"--bn-chat-blur": glassClear ? 0 : 1,
-					"--bn-chat-saturate": 1 + glass,
-				} as CSSProperties
-			}
-			role="dialog"
+		<section
+			// 四色预设已砍,不再有 data-chat-theme:默认主题样式定义在 styles.css 的
+			// :root 上,皮肤注入的 root 内联变量天然顶掉它;换观感一律走皮肤包。
+			// 玻璃质感同理不再有 chat 专属参数 —— 玻璃族直接吃 --bn-glass-* token,
+			// 调玻璃去皮肤编辑器。data-bn-chat-root 给 chat 专属壁纸寻址。
+			data-bn-chat-root=""
+			className="bn-anim-chat-in fixed inset-0 z-bn-scrim flex"
+			style={{ background: "var(--bn-chat-bg)" }}
+			// overlay 时代这里是 div + role="dialog"。成了路由页之后它不再是「盖在
+			// 页面上的对话框」,对屏幕阅读器自称 dialog 会让人找「关闭」而不是「返回」。
+			// 带名字的 <section> 暴露出来就是 region 地标;不用 <main> —— App 壳里
+			// 已经有一个 <main>,页面里嵌第二个是违规的。
 			aria-label="女仆 AI 聊天"
 		>
 			{rail ? (
@@ -423,40 +645,32 @@ function ChatOverlay({ onClose }: { onClose: () => void }) {
 					onNew={startNew}
 					onDelete={(id) => removeConv.mutate(id)}
 					onCollapse={() => setRail(false)}
-					theme={theme}
-					onThemeChange={setTheme}
 					modelName={modelName}
 					userName={userName}
 					userFace={card?.face}
 					aiName={persona.name}
-					glassOpacity={glassOpacity}
-					onGlassOpacityChange={setGlassOpacity}
-					glassClear={glassClear}
-					onGlassClearChange={setGlassClear}
 				/>
 			) : null}
 
 			<div className="relative flex min-w-0 flex-1 flex-col">
 				{!rail ? (
-					<button
-						type="button"
+					<FloatGlassButton
 						title="打开侧栏"
-						aria-label="打开侧栏"
+						ariaLabel="打开侧栏"
 						onClick={() => setRail(true)}
-						className="bn-glass-sheen bn-glass-soft bn-glass-lift bn-glass-chip absolute left-4 top-4 z-10 grid h-8.5 w-8.5 cursor-pointer place-items-center rounded-[9px] text-bn-text-tertiary shadow-[0_6px_18px_rgba(42,30,72,0.14)]"
+						className="left-4 grid h-8.5 w-8.5 place-items-center rounded-bn-sm"
 					>
 						<Icon.panelExpand size={18} />
-					</button>
+					</FloatGlassButton>
 				) : null}
 
-				<button
-					type="button"
+				<FloatGlassButton
 					onClick={onClose}
-					className="bn-glass-sheen bn-glass-soft bn-glass-lift bn-glass-chip absolute right-4 top-4 z-10 flex h-9.5 cursor-pointer items-center gap-1.75 rounded-[19px] px-4 text-[12.5px] font-semibold text-bn-text-tertiary shadow-[0_6px_18px_rgba(42,30,72,0.14)]"
+					className="right-4 flex h-9.5 items-center gap-1.75 rounded-bn-lg px-4 text-bn-sm font-semibold"
 				>
 					<Icon.arrowLeft size={15} />
 					返回控制台
-				</button>
+				</FloatGlassButton>
 
 				{empty ? (
 					<div className="relative flex flex-1 flex-col justify-center overflow-y-auto p-6">
@@ -467,16 +681,19 @@ function ChatOverlay({ onClose }: { onClose: () => void }) {
 						/>
 						<div className="relative mx-auto w-full max-w-180">
 							<div className="bn-anim-fade-up mb-7.5 text-center">
-								<h1 className="mb-1.5 text-[32px] font-bold leading-tight tracking-tight text-bn-text-primary">
+								<h1 className="mb-1.5 text-bn-hero font-bold leading-tight tracking-tight text-bn-text-primary">
 									{greeting()}
 									<span className="bn-chat-accent-grad-x bg-clip-text text-transparent">
 										{userName}
 									</span>
 								</h1>
-								<div className="text-[15.5px] text-bn-text-secondary">
-									今天想让{persona.self}帮{persona.user}做点什么呢?
+								<div className="text-bn-md text-bn-text-secondary">
+									{skinMode
+										? "说说想要什么样的界面皮肤吧 —— 氛围、主色、深浅都可以聊;想要壁纸就把图发过来,她自己找不了图"
+										: `今天想让${persona.self}帮${persona.user}做点什么呢?`}
 								</div>
 							</div>
+							{personaPicker}
 							<Composer
 								value={input}
 								onChange={setInput}
@@ -487,33 +704,26 @@ function ChatOverlay({ onClose }: { onClose: () => void }) {
 								onRemoveAttachment={(id) => setAttachments((p) => p.filter((a) => a.id !== id))}
 								autoFocus
 								aiName={persona.name}
+								extras={composerExtras}
+								skills={skinMode ? EMPTY_SKILLS : skills}
 							/>
 							{error ? (
-								<div
-									role="alert"
-									className="mx-auto mt-3 max-w-180 rounded-xl border border-bn-danger-border bg-bn-danger-soft px-4 py-3 text-[13px] leading-relaxed text-bn-danger-text"
-								>
+								<ErrorNote size="lg" className="mx-auto mt-3 max-w-180">
 									呜…{persona.self}出错了:{error}
+								</ErrorNote>
+							) : null}
+							{/* 技能胶囊那一排整个拆了(ADR-0001 决策 10):技能改成主人自己写的
+							    之后,预置几枚胶囊就成了「我们替他挑的那五条」;而斜杠菜单本身
+							    就是完整目录,打一个 `/` 全在那儿。留一句引导语指路即可。 */}
+							{!skinMode && skills.length > 0 ? (
+								<div className="bn-anim-fade-up mt-4 text-center text-bn-sm text-bn-text-tertiary">
+									打一个&nbsp;
+									<span className="bn-chat-accent rounded-bn-xs bg-bn-code-bg px-1.5 py-px font-mono font-semibold">
+										/
+									</span>
+									&nbsp;看看{persona.self}会做的事
 								</div>
 							) : null}
-							<div className="bn-anim-fade-up mt-4 flex flex-wrap justify-center gap-2">
-								{AI_SKILLS.map((s) => {
-									const Glyph = Icon[s.icon];
-									return (
-										<button
-											key={s.cmd}
-											type="button"
-											onClick={() => submit(s.prompt)}
-											className="bn-glass-lift bn-nohl bn-glass-chip flex cursor-pointer items-center gap-1.75 rounded-[20px] px-3.75 py-2 text-[12.5px] font-semibold text-bn-text-tertiary shadow-[0_6px_18px_rgba(42,30,72,0.12)]"
-										>
-											<span className="bn-chat-accent flex">
-												<Glyph size={14} />
-											</span>
-											{s.desc}
-										</button>
-									);
-								})}
-							</div>
 						</div>
 					</div>
 				) : (
@@ -539,15 +749,17 @@ function ChatOverlay({ onClose }: { onClose: () => void }) {
 								onRemoveAttachment={(id) => setAttachments((p) => p.filter((a) => a.id !== id))}
 								autoFocus
 								aiName={persona.name}
+								extras={composerExtras}
+								skills={skinMode ? EMPTY_SKILLS : skills}
 							/>
-							<div className="mt-2 text-center text-[11px] text-bn-text-secondary">
+							<div className="mt-2 text-center text-bn-xs text-bn-text-secondary">
 								{persona.name}可能会出错,请核对重要信息
 							</div>
 						</div>
 					</>
 				)}
 			</div>
-		</div>
+		</section>
 	);
 }
 

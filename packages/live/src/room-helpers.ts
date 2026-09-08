@@ -1,8 +1,13 @@
-import type { LiveRoomInfo, MasterInfoData, MySelfInfoData } from "@bilibili-notify/api";
+import {
+	type LiveRoomInfo,
+	type MasterInfoData,
+	type MySelfInfoData,
+	RiskControlError,
+} from "@bilibili-notify/api";
+import { connectLiveRoom, type DanmuHost, type LiveEvent } from "@bilibili-notify/blive";
 import { type MessageKindLayout, planMessageGroups } from "@bilibili-notify/internal";
-import { type MsgHandler, startListen } from "blive-message-listener";
 import { DateTime } from "luxon";
-import { LivePushType, type SubItemView } from "./push-like";
+import { type LiveBroadcastOptions, LivePushType, type SubItemView } from "./push-like";
 import { RoomContextBase } from "./room-context";
 import { type LiveData, LiveType, type MasterInfo } from "./types";
 
@@ -21,6 +26,20 @@ export class LiveRoomAccessDeniedError extends Error {
 	constructor(readonly reason: string) {
 		super(`弹幕连接不可用：${reason}，可能是加密/付费/测试房或当前账号无权限访问`);
 		this.name = "LiveRoomAccessDeniedError";
+	}
+}
+
+/**
+ * 预检 getDanmuInfo 被 -352 风控拦截。瞬时风控不是永久拒绝:调用方应走**长尾**
+ * 退避重试预检(分钟级,不放弃房间),而不是消耗 WS 错误那条秒级重连梯子。
+ *
+ * 旧路径(blive 库时代)是「回退直连,让库用自己的指纹再试」;自实现后 HTTP 只有
+ * 我们这一套指纹,没 token 连不上,回退直连已无意义。
+ */
+export class LiveRoomPreflightBlockedError extends Error {
+	constructor(readonly reason: string) {
+		super(`弹幕连接预检被风控拦截：${reason}`);
+		this.name = "LiveRoomPreflightBlockedError";
 	}
 }
 
@@ -58,17 +77,26 @@ export function describeLiveRoomDanmuAccessDenied(info: LiveRoomDanmuInfo): stri
  */
 export class RoomContext extends RoomContextBase {
 	/**
+	 * Per-room 建连轮次计数,用于 host_list 轮转:首个 host 从用户网络不可达时,
+	 * 重连换下一个 host 而不是永远钉死首项烧光梯子。**特意不在 closeListener 清**
+	 * —— 重连循环每轮顶部都会 close,清了就等于永远连同一个 host。
+	 */
+	private readonly hostRotation = new Map<string, number>();
+
+	/**
 	 * Bring up the WebSocket listener for `roomId`.
 	 *
 	 * L4: returns `true` iff there is an active listener for the room *after*
 	 * this call — either freshly created OR already present (the latter lets a
 	 * reconnect that races with a backoff-window restore treat the room as
 	 * recovered). 可重试的 setup 失败返回 `false`;B 站明确拒绝弹幕连接时抛
-	 * {@link LiveRoomAccessDeniedError},让调用方停止监测,不要把受限房当瞬时抖动重连。
+	 * {@link LiveRoomAccessDeniedError},让调用方停止监测,不要把受限房当瞬时抖动重连;
+	 * 预检被 -352 风控拦截时抛 {@link LiveRoomPreflightBlockedError},调用方走长尾
+	 * 退避重试预检(每次重试都会重新拿 token,顺带修掉旧库复用过期 token 的暗雷)。
 	 */
 	async startLiveRoomListener(
 		roomId: string,
-		handler: MsgHandler,
+		onEvent: (ev: LiveEvent) => void,
 		shouldAbort?: () => boolean,
 	): Promise<boolean> {
 		// ②6:per-session 取消探针。此方法只认 engine 级 isDisposed(),感知不到
@@ -87,25 +115,35 @@ export class RoomContext extends RoomContextBase {
 			this.logger.warn(`[conn] 直播间 [${roomId}] 连接已存在，跳过创建`);
 			return true;
 		}
-		this.consumeIntentionalClose(roomId);
 
 		let danmuInfo: LiveRoomDanmuInfo;
 		try {
 			danmuInfo = await this.api.getLiveRoomInfoStreamKey(roomId);
 		} catch (e) {
+			// 持续 -352 经 wbiGet 以 RiskControlError **异常**到达(它绝不把 -352 body
+			// 返回给调用方)—— 必须映射成预检拦截交给长尾退避;吞成 return false 会让
+			// 「-352 永不放弃」整条不可达,房间被当普通失败在秒级梯子内放弃。
+			if (e instanceof RiskControlError) {
+				throw new LiveRoomPreflightBlockedError(e.message);
+			}
 			const message = e instanceof Error ? e.message : String(e);
 			this.logger.warn(`[conn] 获取弹幕连接信息异常，房间 [${roomId}]：${message}`);
 			return false;
 		}
 		const fallbackReason = describeLiveRoomDanmuPreflightFallback(danmuInfo);
 		if (fallbackReason) {
-			this.logger.warn(
-				`[conn] 直播间 [${roomId}] 弹幕连接预检被风控拦截：${fallbackReason}，回退到直接建连`,
-			);
+			throw new LiveRoomPreflightBlockedError(fallbackReason);
 		}
 		const deniedReason = describeLiveRoomDanmuAccessDenied(danmuInfo);
 		if (deniedReason) {
 			throw new LiveRoomAccessDeniedError(deniedReason);
+		}
+		// describeLiveRoomDanmuAccessDenied 已保证 token / host_list 非空
+		const token = this.readDanmuToken(danmuInfo);
+		const hostList = this.readDanmuHosts(danmuInfo);
+		if (!token || hostList.length === 0) {
+			this.logger.warn(`[conn] 直播间 [${roomId}] 弹幕连接信息不完整,视为本轮失败`);
+			return false;
 		}
 		if (aborted()) return false;
 
@@ -128,10 +166,27 @@ export class RoomContext extends RoomContextBase {
 			this.emitEngineError(`[${roomId}] 获取个人信息失败 code=${mySelfInfo.code}`);
 			return false;
 		}
+		// 真 buvid3(设备指纹)进认证包;cookie 罐里那条是占位假值。失败返回空串,
+		// 认证包缺 buvid 仍可尝试。
+		const buvid = await this.api.getBuvid3();
 		if (aborted()) return false;
 
-		const listener = startListen(roomIdNum, handler, {
-			ws: { headers: { Cookie: cookiesStr }, uid: mySelfInfo.data.mid },
+		// host_list 轮转:client 是哑管道恒取首项,这里按建连轮次旋转列表次序。
+		const attempt = this.hostRotation.get(roomId) ?? 0;
+		this.hostRotation.set(roomId, attempt + 1);
+		const offset = attempt % hostList.length;
+		const rotatedHosts = [...hostList.slice(offset), ...hostList.slice(0, offset)];
+
+		const listener = connectLiveRoom({
+			// sub.roomId 来自主播信息解析,已是真实长房号(短号在这里连预检都过不了)
+			roomId: roomIdNum,
+			uid: mySelfInfo.data.mid,
+			token,
+			buvid,
+			hostList: rotatedHosts,
+			cookieHeader: cookiesStr,
+			userAgent: this.api.getUserAgent(),
+			onEvent,
 		});
 		if (aborted()) {
 			listener.close();
@@ -141,6 +196,23 @@ export class RoomContext extends RoomContextBase {
 		this.logger.info(`[conn] 直播间 [${roomId}] 连接已建立`);
 		this.logSideEffectState(`listener:created room=${roomId}`);
 		return true;
+	}
+
+	private readDanmuToken(info: LiveRoomDanmuInfo): string {
+		const token = info.data?.token;
+		return typeof token === "string" ? token.trim() : "";
+	}
+
+	private readDanmuHosts(info: LiveRoomDanmuInfo): DanmuHost[] {
+		const raw = Array.isArray(info.data?.host_list) ? info.data.host_list : [];
+		const hosts: DanmuHost[] = [];
+		for (const entry of raw) {
+			const h = entry as { host?: unknown; wss_port?: unknown };
+			if (typeof h.host === "string" && h.host && typeof h.wss_port === "number") {
+				hosts.push({ host: h.host, wssPort: h.wss_port });
+			}
+		}
+		return hosts;
 	}
 
 	/** Fetch live-room info; on failure, notifies admin + tears down this room. */
@@ -206,10 +278,9 @@ export class RoomContext extends RoomContextBase {
 	 * an image via {@link ImageRenderer.generateLiveCard} when available; falls
 	 * back to plain text on failure.
 	 *
-	 * 消息版式(`messageLayout`)覆盖开播 / 直播中 / 下播三类(调用方按各自 liveType
-	 * 传参,未传即走旧路径不受影响):卡片 / 文本(各自模板,调用方已按 omitLink 剥掉
-	 * {link})/ 链接(roomLink)按块序装配,分条符切多条经 `broadcastSequenceToTargets`。
-	 * SC / 上舰不经此方法,始终维持现状。
+	 * 消息版式(`messageLayout`)覆盖开播 / 直播中 / 下播三类(调用方按各自 liveType 传参):
+	 * 卡片 / 文本(各自模板,模板里没有链接变量)/ 链接(roomLink)按块序装配,分条符切多条经
+	 * `broadcastSequenceToTargets`。SC / 上舰不经此方法。
 	 */
 	async sendLiveNotifyCard(params: {
 		liveType: LiveType;
@@ -220,14 +291,16 @@ export class RoomContext extends RoomContextBase {
 		cardLayout?: SubItemView["cardLayout"];
 		uid: string;
 		notifyMsg: string;
-		messageLayout?: MessageKindLayout;
+		messageLayout: MessageKindLayout;
 		roomLink?: string;
+		/** 见 {@link LiveBroadcastOptions.pushId}:下播卡传它,词云 / 总结才能追加到同一行。 */
+		pushId?: string;
 	}): Promise<void> {
 		const { liveType, liveData, liveRoomInfo, master, cardStyle, cardLayout, uid, notifyMsg } =
 			params;
 		const layout = params.messageLayout;
 		// 版式里 card 块隐藏 → 连图片渲染都跳过(白渲染更亏)。
-		const wantCard = !layout || layout.blocks.some((b) => b.visible && b.type === "card");
+		const wantCard = layout.blocks.some((b) => b.visible && b.type === "card");
 
 		let buffer: Buffer | undefined;
 		if (this.imageRenderer?.generateLiveCard && wantCard) {
@@ -254,37 +327,20 @@ export class RoomContext extends RoomContextBase {
 					? LivePushType.LiveEnd
 					: LivePushType.Live;
 
-		if (layout) {
-			await this.broadcastWithMessageLayout({
-				layout,
-				buffer,
-				notifyMsg,
-				uid,
-				pushType,
-				roomLink: params.roomLink ?? "",
-			});
-			return;
-		}
-
-		if (!buffer) {
-			this.logger.debug(`[push] [${master.username}] 无图片，降级为文字推送`);
-			const fallbackMsg = this.contentBuilder.message([
-				this.contentBuilder.text(notifyMsg || `直播通知 - ${master.username}`),
-			]);
-			await this.push.broadcastToTargets(uid, fallbackMsg, pushType);
-			return;
-		}
-		const msg = this.contentBuilder.message([
-			this.contentBuilder.image(buffer, "image/jpeg"),
-			this.contentBuilder.text(notifyMsg || ""),
-		]);
-		await this.push.broadcastToTargets(uid, msg, pushType);
+		await this.broadcastWithMessageLayout({
+			layout,
+			buffer,
+			notifyMsg,
+			uid,
+			pushType,
+			roomLink: params.roomLink ?? "",
+			pushId: params.pushId,
+		});
 	}
 
 	/**
 	 * 版式路径的装配与投递:按块序分组(分条符切组),同条内相邻文本类部件以
-	 * separator 连接;多条走 `broadcastSequenceToTargets`,adapter 未实现时合并
-	 * 回一条兜底(逐条 broadcast 会让 @全体 每条重复)。
+	 * separator 连接;多条走 `broadcastSequenceToTargets`。
 	 */
 	private async broadcastWithMessageLayout(args: {
 		layout: MessageKindLayout;
@@ -293,8 +349,10 @@ export class RoomContext extends RoomContextBase {
 		roomLink: string;
 		uid: string;
 		pushType: LivePushType;
+		pushId?: string;
 	}): Promise<void> {
 		const { layout, buffer, notifyMsg, roomLink, uid, pushType } = args;
+		const opts: LiveBroadcastOptions = { pushId: args.pushId };
 		const text = layout.blocks.some((b) => b.visible && b.type === "text") ? notifyMsg : "";
 		const present = new Set<string>();
 		if (buffer) present.add("card");
@@ -328,15 +386,10 @@ export class RoomContext extends RoomContextBase {
 			return;
 		}
 		if (groups.length === 1) {
-			await this.push.broadcastToTargets(uid, buildContent(groups[0] ?? []), pushType);
+			await this.push.broadcastToTargets(uid, buildContent(groups[0] ?? []), pushType, opts);
 			return;
 		}
-		if (this.push.broadcastSequenceToTargets) {
-			await this.push.broadcastSequenceToTargets(uid, groups.map(buildContent), pushType);
-			return;
-		}
-		this.logger.warn("[push] adapter 未实现 broadcastSequenceToTargets,分条已合并为单条");
-		await this.push.broadcastToTargets(uid, buildContent(groups.flat()), pushType);
+		await this.push.broadcastSequenceToTargets(uid, groups.map(buildContent), pushType, opts);
 	}
 
 	/** Format `dateString` (yyyy-MM-dd HH:mm:ss UTC+8) as elapsed-time text. */

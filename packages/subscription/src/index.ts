@@ -22,8 +22,8 @@ function sameSubscription(a: Subscription, b: Subscription): boolean {
 
 /**
  * In-memory subscription collection with diff + emit.
- * Persistence is the caller's concern: koishi seeds from koishi config,
- * standalone seeds from ConfigStore. Both call replaceAll() on load.
+ * Persistence is the caller's concern: the standalone runtime seeds from ConfigStore
+ * and calls replaceAll() on load.
  */
 export interface SubscriptionStore {
 	/** Return a snapshot of all subscriptions (shallow copy). */
@@ -118,24 +118,3 @@ export function createSubscriptionStore(bus: MessageBus): SubscriptionStore {
 
 // Re-export types callers need from this package
 export type { Subscription, SubscriptionOp };
-
-/**
- * Legacy flat config item shape used by the koishi basic sub configuration UI.
- * Preserved here so koishi/src/config/subscriptions.ts can reference it without touching push.
- */
-export interface FlatSubConfigItem {
-	name: string;
-	uid: string;
-	platform: string;
-	/** Comma-separated channel IDs */
-	target: string;
-	dynamic: boolean;
-	dynamicAtAll: boolean;
-	live: boolean;
-	liveAtAll: boolean;
-	liveEnd: boolean;
-	liveGuardBuy: boolean;
-	superchat: boolean;
-	wordcloud: boolean;
-	liveSummary: boolean;
-}

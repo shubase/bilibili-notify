@@ -11,7 +11,6 @@
 
 import type {
 	DeliveryResult,
-	Logger,
 	NotificationSink,
 	PushTarget,
 	ServiceContext,
@@ -19,17 +18,12 @@ import type {
 import type { SubscriptionStore } from "@bilibili-notify/subscription";
 import { describe, expect, it, vi } from "vite-plus/test";
 import { BilibiliPush } from "../bilibili-push";
-
-const silentLogger: Logger = {
-	debug: () => {},
-	info: () => {},
-	warn: () => {},
-	error: () => {},
-};
+import { pushBase, silentLogger } from "./helpers";
 
 function makeUnreachableSink(): NotificationSink {
 	return {
 		isAvailable: () => false, // 永远不可达 → sendToTarget 进入 sleep retry 循环
+		isEnabled: () => true,
 		send: async (): Promise<DeliveryResult> => ({ ok: false, latencyMs: 0, err: "unreachable" }),
 		sendPrivate: async (): Promise<DeliveryResult> => ({
 			ok: false,
@@ -77,6 +71,7 @@ describe("BilibiliPush.stop() — P1-B 短期-a sleepWakers 唤醒", () => {
 		};
 
 		const push = new BilibiliPush({
+			...pushBase(),
 			sink: makeUnreachableSink(),
 			store: emptyStore,
 			logger: silentLogger,
@@ -133,12 +128,14 @@ describe("BilibiliPush.stop() — P1-B 短期-a sleepWakers 唤醒", () => {
 		);
 		const sink: NotificationSink = {
 			isAvailable: () => available,
+			isEnabled: () => true,
 			send,
 			sendPrivate: async (): Promise<DeliveryResult> => ({ ok: false, latencyMs: 0 }),
 			resolve: (id) => ({ id, name: id, platform: "test" }) as unknown as PushTarget,
 		};
 
 		const push = new BilibiliPush({
+			...pushBase(),
 			sink,
 			store: emptyStore,
 			logger: silentLogger,
@@ -177,12 +174,14 @@ describe("BilibiliPush.stop() — P1-B 短期-a sleepWakers 唤醒", () => {
 		});
 		const sink: NotificationSink = {
 			isAvailable: () => true,
+			isEnabled: () => true,
 			send: (id) => send(id),
 			sendPrivate: async (): Promise<DeliveryResult> => ({ ok: false, latencyMs: 0 }),
 			resolve: (id) => ({ id, name: id, platform: "test" }) as unknown as PushTarget,
 		};
 		const onSend = vi.fn();
 		push = new BilibiliPush({
+			...pushBase(),
 			sink,
 			store: permissiveStore("u1", ["a", "b"]),
 			logger: silentLogger,
@@ -193,10 +192,7 @@ describe("BilibiliPush.stop() — P1-B 短期-a sleepWakers 唤醒", () => {
 		const results = await push.sendBatch(
 			["a", "b"],
 			{ kind: "text", text: "x" },
-			{
-				uid: "u1",
-				feature: "live",
-			},
+			{ uid: "u1", feature: "live", kind: "live", pushId: "p1", role: "main" },
 		);
 
 		// 仅 "a" 触达 sink;generation 1→2 后 "b" 被放弃,不跨生命周期拆发。
@@ -206,12 +202,13 @@ describe("BilibiliPush.stop() — P1-B 短期-a sleepWakers 唤醒", () => {
 		expect(results).toEqual([]);
 	});
 
-	it("不传 serviceCtx(退化路径)也能被 stop() 唤醒", async () => {
+	// 上一条用的是永不 fire 的假时钟;这条用 pushBase() 的真时钟,验 stop() 抢在 backoff 到期前唤醒。
+	it("真时钟 serviceCtx 下 stop() 也能立即唤醒 backoff 中的重试", async () => {
 		const push = new BilibiliPush({
+			...pushBase(),
 			sink: makeUnreachableSink(),
 			store: emptyStore,
 			logger: silentLogger,
-			// 故意不传 serviceCtx,走 sleep 内裸 setTimeout 路径
 		});
 		push.start();
 

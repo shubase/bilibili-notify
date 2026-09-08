@@ -1,21 +1,20 @@
 import { z } from "zod";
+import {
+	ONEBOT_FORWARD_MIN_TIMEOUT_MS,
+	ONEBOT_IMAGE_MIN_TIMEOUT_MS,
+	PUSH_TARGET_PLATFORMS,
+} from "../constants.js";
 
 /**
- * Push 目标平台。Adapter 矩阵按 platform 分发：
- * - `onebot`：独立端 OneBot v11 HTTP adapter
- * - `webhook`：任意 HTTP POST JSON
- * - `koishi-bot`：仅 koishi 薄壳侧实现，通过 `ctx.bots[botPlatform]` 调 koishi bot
- *   `sendMessage`；独立端不注册该 platform adapter
- * - `astrbot`：仅 AstrBot 插件侧实现，通过 Python 壳按 `unified_msg_origin` 投递
- * - `qq-official`：独立端 QQ 官方机器人(q.qq.com)WS 网关 adapter,频道/群/C2C
+ * Push 目标平台。Adapter 矩阵按 platform 分发(server 侧 `apps/server/src/platforms/`
+ * 一平台一实现)—— 这条 union 就是将来薄插件把 Koishi / AstrBot 桥接进来时的接入点:
+ * 往 constants 的 `PUSH_TARGET_PLATFORMS` 加一个平台名 + 一套 adapter/session schema +
+ * 一个 server adapter。词表住零依赖的 constants 是为了前端也拿得到(平台能力判断在那边)。
+ * - `onebot`:OneBot v11 HTTP adapter
+ * - `webhook`:任意 HTTP POST JSON
+ * - `qq-official`:QQ 官方机器人(q.qq.com)WS 网关 adapter,频道/群/C2C
  */
-export const PushTargetPlatformSchema = z.union([
-	z.literal("onebot"),
-	z.literal("webhook"),
-	z.literal("koishi-bot"),
-	z.literal("astrbot"),
-	z.literal("qq-official"),
-]);
+export const PushTargetPlatformSchema = z.enum(PUSH_TARGET_PLATFORMS);
 export type PushTargetPlatform = z.infer<typeof PushTargetPlatformSchema>;
 
 export const PushTargetScopeSchema = z.enum(["group", "private", "channel"]);
@@ -35,6 +34,14 @@ const onebotCommonConfigShape = {
 	protocolVersion: z.literal("v11").default("v11"),
 	/** 单次操作总超时（毫秒）。HTTP = 请求超时；WS = 等 echo 响应超时。 */
 	timeoutMs: z.number().int().positive().default(15_000),
+	/**
+	 * 带图普通消息的超时**下限**（毫秒）。协议端要先把图传到 QQ 图床才回响应，实测
+	 * 常超 15s，所以取 `max(timeoutMs, 此值)` 单独放宽。`0` = 关闭放宽，严格按
+	 * `timeoutMs` 走（想让挂掉的 bot 快速失败、别拖住串行发送的后续目标时用）。
+	 */
+	imageMinTimeoutMs: z.number().int().min(0).default(ONEBOT_IMAGE_MIN_TIMEOUT_MS),
+	/** 合并转发（`send_*_forward_msg`）的超时下限（毫秒）。语义同上，`0` = 关闭放宽。 */
+	forwardMinTimeoutMs: z.number().int().min(0).default(ONEBOT_FORWARD_MIN_TIMEOUT_MS),
 	/** 失败时的重试次数（不含首次）。 */
 	retryTimes: z.number().int().min(0).default(0),
 	/** 两次重试之间的等待（毫秒）。 */
@@ -106,18 +113,6 @@ export const WebhookAdapterConfigSchema = z.object({
 });
 export type WebhookAdapterConfig = z.infer<typeof WebhookAdapterConfigSchema>;
 
-export const KoishiBotAdapterConfigSchema = z.object({
-	/** koishi 内部 bot.platform，例如 'onebot' / 'discord' / 'telegram'。 */
-	botPlatform: z.string().min(1),
-	/** 同 platform 多 bot 时挑 bot。 */
-	selfId: z.string().optional(),
-});
-export type KoishiBotAdapterConfig = z.infer<typeof KoishiBotAdapterConfigSchema>;
-
-// AstrBot 由宿主 Python 壳完成实际投递；连接级配置固定为空对象。
-export const AstrBotAdapterConfigSchema = z.object({}).strict();
-export type AstrBotAdapterConfig = z.infer<typeof AstrBotAdapterConfigSchema>;
-
 /**
  * QQ 官方机器人公域/私域类型。私域可发原生 markdown,公域只能发模板 markdown ——
  * 决定 adapter 的 markdown 能力门控(私域默认开、公域默认关)。
@@ -162,7 +157,7 @@ export type PushAdapterTestStatus = z.infer<typeof PushAdapterTestStatusSchema>;
 /**
  * Push adapter — 平台级的"连接实例"。
  *
- * 类比 Koishi bot 实例：一份 baseUrl/accessToken 一次配置，被多个 PushTarget
+ * 类比一个 bot 实例:一份 baseUrl/accessToken 一次配置,被多个 PushTarget
  * (实际的群/私聊/dashboard 会话) 复用。
  */
 const PushAdapterCommonShape = {
@@ -184,19 +179,6 @@ const WebhookAdapterSchema = z.object({
 	config: WebhookAdapterConfigSchema,
 });
 
-const KoishiBotAdapterSchema = z.object({
-	...PushAdapterCommonShape,
-	platform: z.literal("koishi-bot"),
-	config: KoishiBotAdapterConfigSchema,
-});
-
-export const AstrBotAdapterSchema = z.object({
-	...PushAdapterCommonShape,
-	platform: z.literal("astrbot"),
-	config: AstrBotAdapterConfigSchema,
-});
-export type AstrBotAdapter = z.infer<typeof AstrBotAdapterSchema>;
-
 const QQOfficialAdapterSchema = z.object({
 	...PushAdapterCommonShape,
 	platform: z.literal("qq-official"),
@@ -206,8 +188,6 @@ const QQOfficialAdapterSchema = z.object({
 export const PushAdapterSchema = z.discriminatedUnion("platform", [
 	OnebotAdapterSchema,
 	WebhookAdapterSchema,
-	KoishiBotAdapterSchema,
-	AstrBotAdapterSchema,
 	QQOfficialAdapterSchema,
 ]);
 export type PushAdapter = z.infer<typeof PushAdapterSchema>;
@@ -231,31 +211,6 @@ export type OnebotSession = z.infer<typeof OnebotSessionSchema>;
 
 export const WebhookSessionSchema = z.object({}).strict();
 export type WebhookSession = z.infer<typeof WebhookSessionSchema>;
-
-export const KoishiBotSessionSchema = z
-	.object({
-		channelId: z.string().optional(),
-		guildId: z.string().optional(),
-		userId: z.string().optional(),
-	})
-	.strict();
-export type KoishiBotSession = z.infer<typeof KoishiBotSessionSchema>;
-
-export const AstrBotSessionSchema = z
-	.object({
-		/** AstrBot 会话稳定定位符，来自 `event.unified_msg_origin`。 */
-		unified_msg_origin: z.string().min(1),
-		/** 展示用宿主平台摘要，例如 aiocqhttp / telegram。 */
-		platform: z.string().optional(),
-		/** 展示用消息类型摘要，例如 group / private / channel。 */
-		messageType: z.string().optional(),
-		/** 展示用会话 ID 摘要；投递仍以 unified_msg_origin 为准。 */
-		sessionId: z.string().optional(),
-		/** 展示用会话名摘要。 */
-		sessionName: z.string().optional(),
-	})
-	.strict();
-export type AstrBotSession = z.infer<typeof AstrBotSessionSchema>;
 
 /**
  * QQ 官方机器人会话。按 target.scope 用不同字段(发送时运行期校验,缺失即拒)。
@@ -301,19 +256,6 @@ const WebhookPushTargetSchema = z.object({
 	session: WebhookSessionSchema,
 });
 
-const KoishiBotPushTargetSchema = z.object({
-	...PushTargetCommonShape,
-	platform: z.literal("koishi-bot"),
-	session: KoishiBotSessionSchema,
-});
-
-export const AstrBotPushTargetSchema = z.object({
-	...PushTargetCommonShape,
-	platform: z.literal("astrbot"),
-	session: AstrBotSessionSchema,
-});
-export type AstrBotPushTarget = z.infer<typeof AstrBotPushTargetSchema>;
-
 const QQOfficialPushTargetSchema = z.object({
 	...PushTargetCommonShape,
 	platform: z.literal("qq-official"),
@@ -324,8 +266,6 @@ export const PushTargetSchema = z
 	.discriminatedUnion("platform", [
 		OnebotPushTargetSchema,
 		WebhookPushTargetSchema,
-		KoishiBotPushTargetSchema,
-		AstrBotPushTargetSchema,
 		QQOfficialPushTargetSchema,
 	])
 	.superRefine((target, ctx) => {
@@ -338,3 +278,35 @@ export const PushTargetSchema = z
 		}
 	});
 export type PushTarget = z.infer<typeof PushTargetSchema>;
+
+/**
+ * 群目标的「群地址」—— 与入站帧里的 `groupId` 是同一个值(OneBot 是群号,官机是群
+ * openid)。没有入站的平台(webhook)没有地址。
+ *
+ * 和 {@link groupSessionFor} 是一对反函数,都住在 session 形状声明的地方:各处自己
+ * 按平台写一个 switch 的话,以后接进来的新平台会在一处落进 default、另一处被列出来,
+ * 群配了却永远匹配不上,还不报错。
+ */
+export function groupAddressOf(target: PushTarget): string | undefined {
+	switch (target.platform) {
+		case "onebot":
+			return target.session.groupId;
+		case "qq-official":
+			return target.session.groupOpenid;
+		default:
+			return undefined;
+	}
+}
+
+/** 群地址 → 该平台的 session。给「回到来源群」造临时目标用(见 groupAddressOf)。 */
+export function groupSessionFor(
+	platform: "onebot",
+	groupId: string,
+): z.infer<typeof OnebotSessionSchema>;
+export function groupSessionFor(
+	platform: "qq-official",
+	groupId: string,
+): z.infer<typeof QQOfficialSessionSchema>;
+export function groupSessionFor(platform: "onebot" | "qq-official", groupId: string) {
+	return platform === "onebot" ? { groupId } : { groupOpenid: groupId };
+}

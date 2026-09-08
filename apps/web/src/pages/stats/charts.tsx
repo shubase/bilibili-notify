@@ -23,7 +23,8 @@ import type { RadarAxis } from "./radar.js";
  * (color-token-conformance)只管 utility class,管不到 SVG 属性。
  */
 
-const AXIS_TEXT = "var(--color-bn-text-secondary)";
+/** 坐标轴刻度 —— 元信息,走辅助档,别和正文抢分量。 */
+const AXIS_TEXT = "var(--color-bn-text-tertiary)";
 const GRID = "var(--color-bn-border-subtle)";
 const GRID_ZERO = "var(--color-bn-border)";
 const POS = "var(--color-bn-success-text)";
@@ -33,8 +34,12 @@ const NEG = "var(--color-bn-danger-text)";
  *
  * 必须与涨绿跌红拉开到一眼可辨:灰色是这套图里唯一「这段是猜的」的信号,和它
  * 撞色就等于把推断值伪装成实测值。见 gaps.ts。
+ *
+ * 走**辅助档**(tertiary)不走正文档:推断值是附属信息。此前吃 secondary,而亮色
+ * 默认装当时把 secondary 配成了全站最淡一档(#999,2.85:1),「淡=这段是猜的」
+ * 看着成立、其实是搭了配错顺序的顺风车;顺序理顺后灰柱当场变重,顺风车没了。
  */
-const ESTIMATED = "var(--color-bn-text-secondary)";
+const ESTIMATED = "var(--color-bn-text-tertiary)";
 
 /** 自适宽容器:测出像素宽再把它交给 render(w),避免 SVG 用百分比宽导致文字被拉伸。 */
 export function ResponsiveChart({
@@ -68,7 +73,7 @@ export function ResponsiveChart({
 /** 空数据占位 —— 与「有数据但全是 0」严格区分,文案要说清是没记录。 */
 export function ChartEmpty({ hint }: { hint: string }) {
 	return (
-		<div className="flex h-full min-h-24 items-center justify-center px-4 text-center text-xs text-bn-text-secondary">
+		<div className="flex h-full min-h-24 items-center justify-center px-4 text-center text-bn-sm text-bn-text-secondary">
 			{hint}
 		</div>
 	);
@@ -77,14 +82,14 @@ export function ChartEmpty({ hint }: { hint: string }) {
 export function DeltaTag({ v, size = 12 }: { v: number | null; size?: number }) {
 	if (v === null) {
 		return (
-			<span className="font-mono text-bn-text-secondary" style={{ fontSize: size }}>
+			<span className="tabular-nums text-bn-text-secondary" style={{ fontSize: size }}>
 				—
 			</span>
 		);
 	}
 	const up = v >= 0;
 	return (
-		<span className="font-mono font-bold" style={{ fontSize: size, color: up ? POS : NEG }}>
+		<span className="tabular-nums font-bold" style={{ fontSize: size, color: up ? POS : NEG }}>
 			{up ? "▲" : "▼"} {formatSignedWan(v)}
 		</span>
 	);
@@ -218,7 +223,7 @@ export function TrendChart({
 						textAnchor="end"
 						fontSize="9.5"
 						fill={AXIS_TEXT}
-						className="font-mono"
+						className="tabular-nums"
 					>
 						{fmt(Math.round(tv))}
 					</text>
@@ -354,7 +359,7 @@ export function NetBars({
 						textAnchor="end"
 						fontSize="9.5"
 						fill={AXIS_TEXT}
-						className="font-mono"
+						className="tabular-nums"
 					>
 						{formatSignedWan(Math.round(tv))}
 					</text>
@@ -490,7 +495,7 @@ export function RadarChart({
 							fontSize="9.5"
 							fill={missing ? GRID_ZERO : color}
 							fontWeight={missing ? "400" : "700"}
-							className="font-mono"
+							className="tabular-nums"
 						>
 							{a.display}
 						</text>
@@ -543,7 +548,7 @@ export function Heatmap({
 				>
 					<div className="flex w-20 shrink-0 items-center gap-1.5">
 						<span className="h-2 w-2 shrink-0 rounded-full" style={{ background: r.color }} />
-						<span className="truncate text-xs font-semibold text-bn-text-primary">{r.name}</span>
+						<span className="truncate text-bn-sm font-semibold text-bn-text-primary">{r.name}</span>
 					</div>
 					<div className="flex flex-1" style={{ gap }}>
 						{r.cells.map((v, i) => (
@@ -561,7 +566,7 @@ export function Heatmap({
 			{/* 底部时间刻度 —— 没有它就看不出热力图横轴跨了多久。 */}
 			<div className="mt-2.5 flex shrink-0">
 				<div className="w-20 shrink-0" />
-				<div className="flex flex-1 justify-between font-mono text-[9.5px] text-bn-text-secondary">
+				<div className="flex flex-1 justify-between tabular-nums text-bn-micro text-bn-text-secondary">
 					{heatAxisLabels(days.length).map((label, i) => (
 						// biome-ignore lint/suspicious/noArrayIndexKey: 固定 4 个刻度,位置即身份
 						<span key={i}>{label}</span>

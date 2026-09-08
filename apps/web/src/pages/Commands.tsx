@@ -1,23 +1,21 @@
 import { buildPatch } from "@bilibili-notify/internal/patch";
+import { GlassBox, Icon, Toggle } from "@bilibili-notify/ui";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useState } from "react";
-import { Toggle } from "../components/atoms";
 import { Field, TInput } from "../components/forms";
-import { GlassBox } from "../components/glass-box";
-import { Icon } from "../components/icons";
 import { useDirtyDraft } from "../hooks/useDirtyDraft";
 import { api } from "../services/api";
 import type {
-	CommandAliases,
-	CommandConfig,
 	GlobalConfig,
 	GlobalConfigPatch,
+	GroupCommandAliases,
+	GroupCommandConfig,
 } from "../types/globals";
 
 const DEFAULT_PREFIX = "bili";
 const DEFAULT_OWNER_QQ = "1319870047";
 const DEFAULT_VIDEO_PARSE = { enabled: true };
-const DEFAULT_ALIASES: CommandAliases = {
+const DEFAULT_ALIASES: GroupCommandAliases = {
 	help: "帮助",
 	add: "订阅",
 	del: "取消",
@@ -27,7 +25,7 @@ const DEFAULT_ALIASES: CommandAliases = {
 	delallall: "清空全部",
 	member: "权限",
 };
-const LEGACY_ALIASES: CommandAliases = {
+const LEGACY_ALIASES: GroupCommandAliases = {
 	help: "help",
 	add: "add",
 	del: "del",
@@ -38,7 +36,7 @@ const LEGACY_ALIASES: CommandAliases = {
 	member: "member",
 };
 
-type AliasKey = keyof CommandAliases;
+type AliasKey = keyof GroupCommandAliases;
 
 const COMMAND_ROWS: ReadonlyArray<{
 	key: AliasKey;
@@ -82,8 +80,8 @@ function deepMerge<T>(base: T, patch: GlobalConfigPatch): T {
 	return out as T;
 }
 
-function editableCommands(draft: GlobalConfig): CommandConfig {
-	const commands = draft.commands ?? ({} as CommandConfig);
+function editableCommands(draft: GlobalConfig): GroupCommandConfig {
+	const commands = draft.groupCommands ?? ({} as GroupCommandConfig);
 	const aliases = isLegacyDefaultAliases(commands.aliases) ? undefined : commands.aliases;
 	return {
 		enabled: commands.enabled ?? true,
@@ -100,9 +98,9 @@ function editableCommands(draft: GlobalConfig): CommandConfig {
 	};
 }
 
-function isLegacyDefaultAliases(aliases: Partial<CommandAliases> | undefined): boolean {
+function isLegacyDefaultAliases(aliases: Partial<GroupCommandAliases> | undefined): boolean {
 	if (!aliases) return false;
-	return (Object.keys(LEGACY_ALIASES) as Array<keyof CommandAliases>).every(
+	return (Object.keys(LEGACY_ALIASES) as Array<keyof GroupCommandAliases>).every(
 		(key) => aliases[key] === LEGACY_ALIASES[key],
 	);
 }
@@ -112,13 +110,13 @@ function previewToken(value: string | undefined, fallback: string): string {
 	return token && !/\s/.test(token) ? token : fallback;
 }
 
-function commandPreview(commands: CommandConfig, key: AliasKey, arg?: string): string {
+function commandPreview(commands: GroupCommandConfig, key: AliasKey, arg?: string): string {
 	const prefix = previewToken(commands.prefix, DEFAULT_PREFIX);
 	const alias = previewToken(commands.aliases[key], DEFAULT_ALIASES[key]);
 	return `${prefix}${alias}${arg ?? ""}`;
 }
 
-function duplicateAliases(aliases: CommandAliases): Set<AliasKey> {
+function duplicateAliases(aliases: GroupCommandAliases): Set<AliasKey> {
 	const seen = new Map<string, AliasKey>();
 	const duplicated = new Set<AliasKey>();
 	for (const key of Object.keys(aliases) as AliasKey[]) {
@@ -152,8 +150,8 @@ export default function Commands() {
 		setDraft((d) => (d ? deepMerge(d, delta) : d));
 	}
 
-	function patchCommands(delta: NonNullable<GlobalConfigPatch["commands"]>): void {
-		patchDraft({ commands: delta });
+	function patchCommands(delta: NonNullable<GlobalConfigPatch["groupCommands"]>): void {
+		patchDraft({ groupCommands: delta });
 	}
 
 	const save = useMutation({
@@ -161,7 +159,7 @@ export default function Commands() {
 			const base = globalsQuery.data;
 			await api.patch<GlobalConfig>(
 				"/api/globals",
-				buildPatch({ commands: next.commands }, { commands: base?.commands }),
+				buildPatch({ groupCommands: next.groupCommands }, { groupCommands: base?.groupCommands }),
 			);
 		},
 		onSuccess: () => qc.invalidateQueries({ queryKey: ["globals"] }),
@@ -169,7 +167,7 @@ export default function Commands() {
 
 	useDirtyDraft<GlobalConfig>({
 		pageKey: "commands",
-		pageLabel: "指令功能",
+		pageLabel: "群聊指令",
 		draft,
 		baseline: globalsQuery.data ?? null,
 		onSave: async () => {
@@ -200,16 +198,16 @@ export default function Commands() {
 		<div className="bn-anim-fade-in space-y-5">
 			<GlassBox
 				title="指令功能"
-				subtitle="OneBot 群聊订阅管理 · globals.commands"
+				subtitle="OneBot 群聊订阅管理 · globals.groupCommands"
 				accent="#00AEEC"
 				icon={<Icon.chat size={14} />}
 				badge={commands.enabled ? "已启用" : "已停用"}
 			>
-				<Field code="commands.enabled">
+				<Field code="groupCommands.enabled">
 					<Toggle value={commands.enabled} onChange={(v) => patchCommands({ enabled: v })} />
 				</Field>
 
-				<Field code="commands.prefix">
+				<Field code="groupCommands.prefix">
 					<TInput
 						value={commands.prefix}
 						onChange={(v) => patchCommands({ prefix: v })}
@@ -223,7 +221,7 @@ export default function Commands() {
 					</div>
 				) : null}
 
-				<Field code="commands.ownerQq">
+				<Field code="groupCommands.ownerQq">
 					<TInput
 						value={commands.ownerQq ?? ""}
 						onChange={(v) => patchCommands({ ownerQq: v.replace(/\D/g, "") || null })}
@@ -243,7 +241,7 @@ export default function Commands() {
 				icon={<Icon.eye size={14} />}
 				badge={commands.videoParse.enabled ? "已启用" : "已停用"}
 			>
-				<Field code="commands.videoParse.enabled">
+				<Field code="groupCommands.videoParse.enabled">
 					<Toggle
 						value={commands.videoParse.enabled}
 						onChange={(v) => patchCommands({ videoParse: { enabled: v } })}
@@ -262,14 +260,16 @@ export default function Commands() {
 					{COMMAND_ROWS.map((row) => {
 						const duplicate = duplicated.has(row.key);
 						return (
-							<Field code={`commands.aliases.${row.key}`} key={row.key}>
+							<Field code={`groupCommands.aliases.${row.key}`} key={row.key}>
 								<div className="flex w-full flex-col gap-1.5">
 									<div className="flex flex-col gap-1 sm:flex-row sm:items-center">
 										<TInput
 											value={commands.aliases[row.key]}
 											onChange={(v) =>
 												patchCommands({
-													aliases: { [row.key]: v } as Partial<CommandAliases>,
+													aliases: {
+														[row.key]: v,
+													} as Partial<GroupCommandAliases>,
 												})
 											}
 											placeholder={DEFAULT_ALIASES[row.key]}

@@ -104,6 +104,8 @@ function makeOnebotAdapter(overrides: Partial<Extract<PushAdapter, { platform: "
 			protocolVersion: "v11" as const,
 			headers: {},
 			timeoutMs: 15_000,
+			imageMinTimeoutMs: 30_000,
+			forwardMinTimeoutMs: 60_000,
 			retryTimes: 0,
 			retryIntervalMs: 1_000,
 		},
@@ -236,6 +238,32 @@ describe("ConfigStore", () => {
 		});
 		await store2.load();
 		expect(store2.getGlobals().defaults.messageLayout.live).toEqual(customLive);
+	});
+
+	/**
+	 * 换人格只改一个指针字符串,是最容易被中间某层吃掉的那种改动 —— 而症状恰好
+	 * 就是主人报的「怎么选都切不过去」。这里把整条落盘链钉住:合并 → schema
+	 * (`migratePersonaPointer` 会重算指针,它必须认账而不是按 `ai.persona` 把选择
+	 * 拨回去)→ 落盘 → 冷重启再读。
+	 */
+	it("换全局人格:activePreset 存得住,冷重启后不被 ai.persona 拨回去", async () => {
+		// 默认配置的 persona 就是「温柔女仆」那份,指针也指着它 —— 换成傲娇毒舌之后,
+		// persona 与指针刻意不一致,正是迁移最容易判错的形状。
+		expect(store.getGlobals().defaults.ai.activePreset).toBe("gentle-maid");
+
+		const next = await store.patchGlobals({ defaults: { ai: { activePreset: "tsundere" } } });
+		expect(next.defaults.ai.activePreset).toBe("tsundere");
+		// 指针不改写 persona —— 主人手写的那份原封不动。
+		expect(next.defaults.ai.persona.name).toBe("小绫");
+
+		const bus2 = makeFakeBus();
+		const store2 = createConfigStore({
+			bootstrap: makeBootstrap(dataDir),
+			bus: bus2,
+			serviceCtx: makeFakeServiceCtx(),
+		});
+		await store2.load();
+		expect(store2.getGlobals().defaults.ai.activePreset).toBe("tsundere");
 	});
 
 	it("setGlobals rejects malformed input with ConfigValidationError", async () => {
@@ -488,29 +516,36 @@ describe("ConfigStore", () => {
 		await rm(dir2, { recursive: true, force: true });
 	});
 
-	it("load() 静默丢弃存量 web-dashboard adapter 与 target(平台已移除)", async () => {
-		const dir2 = await mkdtemp(join(tmpdir(), "bn-config-drop-webdash-"));
+	// 已撤下的平台(web-dashboard 早先、koishi-bot / astrbot 随宿主一起)留下的存量条目:
+	// 当年的 schema 是收它们的(dashboard 不给建,但直调 API / 旧备份都能留下)。loader 一律
+	// 静默丢弃 —— safeParse 一失败就是启动期 throw,没有面板可以进去改,boot 三振回落也救不回来。
+	it.each([
+		{ platform: "web-dashboard", config: {}, session: {} },
+		{ platform: "koishi-bot", config: { botPlatform: "onebot" }, session: { channelId: "1" } },
+		{ platform: "astrbot", config: {}, session: {} },
+	])("load() 静默丢弃已撤下平台 $platform 的存量 adapter 与 target", async (stale) => {
+		const dir2 = await mkdtemp(join(tmpdir(), "bn-config-drop-removed-"));
 		const state2 = join(dir2, "state");
 		await mkdir(state2, { recursive: true });
 		const webhook = makeWebhookAdapter();
-		const webDash = {
+		const adapter = {
 			id: randomUUID(),
-			name: "Dashboard 通知中心",
-			platform: "web-dashboard",
+			name: stale.platform,
+			platform: stale.platform,
 			enabled: true,
-			config: {},
+			config: stale.config,
 		};
-		const webDashTarget = {
+		const target = {
 			id: randomUUID(),
-			name: "dash",
-			adapterId: webDash.id,
-			platform: "web-dashboard",
-			scope: "channel",
+			name: "stale",
+			adapterId: adapter.id,
+			platform: stale.platform,
+			scope: "group",
 			enabled: true,
-			session: {},
+			session: stale.session,
 		};
-		await writeFile(join(state2, "adapters.json"), JSON.stringify([webhook, webDash]), "utf8");
-		await writeFile(join(state2, "targets.json"), JSON.stringify([webDashTarget]), "utf8");
+		await writeFile(join(state2, "adapters.json"), JSON.stringify([adapter, webhook]), "utf8");
+		await writeFile(join(state2, "targets.json"), JSON.stringify([target]), "utf8");
 
 		const store2 = createConfigStore({
 			bootstrap: makeBootstrap(dir2),
@@ -518,10 +553,8 @@ describe("ConfigStore", () => {
 			serviceCtx: makeFakeServiceCtx(),
 		});
 		await store2.load(); // 不应抛错
-		const adapters = store2.getAdapters();
-		expect(adapters).toHaveLength(1);
-		expect(adapters[0]?.platform).toBe("webhook");
-		// web-dashboard target 被丢弃;只剩 webhook 自动托管 target
+		expect(store2.getAdapters().map((a) => a.platform)).toEqual(["webhook"]);
+		// 撤下平台的 target 被丢弃;只剩 webhook 自动托管 target
 		expect(store2.getTargets().every((t) => t.platform === "webhook")).toBe(true);
 		await rm(dir2, { recursive: true, force: true });
 	});

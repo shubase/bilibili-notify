@@ -1,4 +1,4 @@
-import type { ReactNode } from "react";
+import { memo, type ReactNode } from "react";
 import ReactMarkdown, { type Components } from "react-markdown";
 import remarkBreaks from "remark-breaks";
 import remarkGfm from "remark-gfm";
@@ -116,7 +116,7 @@ const COMPONENTS: Components = {
 	// pre 负责滚动与底色,code 只管字体。
 	code: ({ children, className }) => (
 		<code
-			className={`rounded-[5px] bg-bn-code-bg px-[0.35em] py-[0.1em] font-mono text-[0.88em] ${className ?? ""}`}
+			className={`rounded-bn-xs bg-bn-code-bg px-[0.35em] py-[0.1em] font-mono text-[0.88em] ${className ?? ""}`}
 		>
 			{children}
 		</code>
@@ -124,7 +124,7 @@ const COMPONENTS: Components = {
 	// 代码块:横向滚动而不是换行 —— 一行长命令折成五行比滚动更难读。
 	// 里头那个 code 的底色和内边距要压掉,否则块里再套一层浅底。
 	pre: ({ children }) => (
-		<pre className="my-[0.6em] overflow-x-auto rounded-lg bg-bn-code-bg p-3 text-[13px] leading-[1.6] first:mt-0 last:mb-0 [&>code]:bg-transparent [&>code]:p-0 [&>code]:text-[13px]">
+		<pre className="my-[0.6em] overflow-x-auto rounded-lg bg-bn-code-bg p-3 text-bn-base leading-[1.6] first:mt-0 last:mb-0 [&>code]:bg-transparent [&>code]:p-0 [&>code]:text-bn-base">
 			{children}
 		</pre>
 	),
@@ -132,7 +132,7 @@ const COMPONENTS: Components = {
 	// 表格自己会撑宽,套一层滚动容器把它关住 —— 否则整页跟着横向滚。
 	table: ({ children }) => (
 		<div className="my-[0.6em] overflow-x-auto first:mt-0 last:mb-0">
-			<table className="w-full border-collapse text-[13px]">{children}</table>
+			<table className="w-full border-collapse text-bn-base">{children}</table>
 		</div>
 	),
 	th: ({ children }) => (
@@ -159,10 +159,18 @@ function headingsAsBoldLine(): Components {
  */
 const PLUGINS = [remarkGfm, remarkBreaks];
 
-export function ChatMarkdown({ text }: { text: string }) {
+/**
+ * `memo` 不是锦上添花 —— 流式回复每来一个分片就 `setPending` 一次,整个 `MessageList`
+ * 跟着重渲,于是**每一条早已落盘的助手消息**都被 react-markdown 从头解析一遍
+ * (它自己没有记忆化,每次都要走一整趟 remark 的 mdast→hast→元素构建)。
+ * 一场几十条的对话、每秒十几片,就是每秒几百次产出与上一帧逐字节相同的完整解析。
+ *
+ * 唯一的 prop 是字符串,默认浅比较就够。
+ */
+export const ChatMarkdown = memo(function ChatMarkdown({ text }: { text: string }) {
 	return (
 		<ReactMarkdown remarkPlugins={PLUGINS} components={COMPONENTS}>
 			{text}
 		</ReactMarkdown>
 	);
-}
+});

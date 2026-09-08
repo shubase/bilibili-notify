@@ -8,6 +8,7 @@
  * 正常。拖拽手柄只绑在 ⠿ 上 —— 开关 / 边距输入 / 删除按钮仍可正常点击。
  */
 
+import { AddButton, Icon, IconButton, Toggle } from "@bilibili-notify/ui";
 import {
 	closestCenter,
 	DndContext,
@@ -20,12 +21,9 @@ import {
 import {
 	SortableContext,
 	sortableKeyboardCoordinates,
-	useSortable,
 	verticalListSortingStrategy,
 } from "@dnd-kit/sortable";
-import { CSS } from "@dnd-kit/utilities";
-import { Toggle } from "../../components/atoms";
-import { Icon } from "../../components/icons";
+import { SortableRow, SortableRowEnd, sortableLabelTone } from "../../components/sortable-row";
 import type { CardBlockFull } from "../../types/domain";
 import { DIVIDER_LABEL } from "./block-labels";
 import {
@@ -64,13 +62,13 @@ function MarginInput({
 }) {
 	if (locked) {
 		return (
-			<span className="text-[10px] text-bn-text-tertiary" title="第一个模块的上边距由卡片框架固定">
+			<span className="text-bn-2xs text-bn-text-tertiary" title="第一个模块的上边距由卡片框架固定">
 				上边距 固定
 			</span>
 		);
 	}
 	return (
-		<label className="flex items-center gap-0.5 text-[10px] text-bn-text-tertiary">
+		<label className="flex items-center gap-0.5 text-bn-2xs text-bn-text-tertiary">
 			上边距
 			<input
 				type="number"
@@ -79,15 +77,16 @@ function MarginInput({
 					const n = Number.parseInt(e.target.value, 10);
 					onChange(Number.isFinite(n) && n !== 0 ? n : undefined);
 				}}
-				className="w-9 rounded border border-bn-border-subtle bg-bn-surface px-1 py-0.5 text-center text-[11px] text-bn-text-primary"
+				data-bn="input"
+				className="w-9 rounded-sm border border-bn-border-subtle bg-bn-field px-1 py-0.5 text-center text-bn-xs text-bn-text-primary"
 			/>
 			px
 		</label>
 	);
 }
 
-/** 单个可排序行 —— useSortable 必须 per-item,故抽成组件。拖拽手柄仅 ⠿。 */
-function SortableRow({
+/** 单个可排序行 —— 壳子(useSortable/拖拽态/手柄)在 components/sortable-row,这里只摆内容。 */
+function BlockRow({
 	block,
 	locked,
 	labels,
@@ -104,46 +103,11 @@ function SortableRow({
 	onRemove: (id: string) => void;
 	onMargin: (id: string, v: number | undefined) => void;
 }) {
-	const {
-		attributes,
-		listeners,
-		setNodeRef,
-		setActivatorNodeRef,
-		transform,
-		transition,
-		isDragging,
-	} = useSortable({ id: block.id });
 	const isDivider = block.type === DIVIDER_TYPE;
-	const style = { transform: CSS.Transform.toString(transform), transition };
 	return (
-		<li
-			ref={setNodeRef}
-			style={style}
-			className={`relative flex items-center gap-2 rounded-lg border px-2.5 py-2 ${
-				isDragging
-					? "z-10 border-bn-pink/60 bg-bn-surface opacity-90 shadow-lg"
-					: "border-bn-border-subtle bg-bn-surface/60"
-			}`}
-		>
-			<button
-				type="button"
-				ref={setActivatorNodeRef}
-				{...attributes}
-				{...listeners}
-				title="拖动排序"
-				aria-label="拖动排序"
-				className="cursor-grab touch-none select-none text-[15px] leading-none text-bn-text-tertiary active:cursor-grabbing"
-			>
-				⠿
-			</button>
+		<SortableRow id={block.id}>
 			<span
-				className={`flex-1 text-[13px] font-medium ${
-					isDivider
-						? "italic text-bn-text-tertiary"
-						: block.visible
-							? "text-bn-text-primary"
-							: "text-bn-text-tertiary line-through"
-				}`}
+				className={`flex-1 text-bn-base font-medium ${sortableLabelTone(isDivider, block.visible)}`}
 			>
 				{isDivider ? DIVIDER_LABEL : (labels[block.type] ?? block.type)}
 			</span>
@@ -154,22 +118,19 @@ function SortableRow({
 					onChange={(v) => onMargin(block.id, v)}
 				/>
 			)}
-			{/* 固定宽度槽位 —— 让删除按钮与 Toggle 占同宽,上下行的边距输入对齐。 */}
-			<div className="flex w-7 shrink-0 justify-end">
+			<SortableRowEnd>
 				{isDivider ? (
-					<button
-						type="button"
-						title="删除分割线"
+					<IconButton
+						icon={<Icon.close size={13} />}
+						label="删除分割线"
+						tone="danger"
 						onClick={() => onRemove(block.id)}
-						className="grid h-5 w-5 place-items-center rounded text-bn-text-tertiary transition hover:bg-bn-danger-soft hover:text-bn-danger-text"
-					>
-						<Icon.close size={13} />
-					</button>
+					/>
 				) : (
 					<Toggle value={block.visible} size="sm" onChange={() => onToggle(block.id)} />
 				)}
-			</div>
-		</li>
+			</SortableRowEnd>
+		</SortableRow>
 	);
 }
 
@@ -200,7 +161,7 @@ export function BlockListEditor({
 				<SortableContext items={blocks.map((b) => b.id)} strategy={verticalListSortingStrategy}>
 					<ul className="flex flex-col gap-1.5">
 						{blocks.map((b, i) => (
-							<SortableRow
+							<BlockRow
 								key={b.id}
 								block={b}
 								locked={i === 0}
@@ -214,14 +175,10 @@ export function BlockListEditor({
 					</ul>
 				</SortableContext>
 			</DndContext>
-			<button
-				type="button"
-				onClick={() => onChange(addDivider(blocks))}
-				className="flex items-center justify-center gap-1 rounded-lg border border-dashed border-bn-border-subtle py-1.5 text-[12px] font-medium text-bn-text-tertiary transition hover:border-bn-pink/60 hover:text-bn-text-primary"
-			>
+			<AddButton block onClick={() => onChange(addDivider(blocks))}>
 				<Icon.plus size={13} />
 				添加分割线
-			</button>
+			</AddButton>
 		</div>
 	);
 }

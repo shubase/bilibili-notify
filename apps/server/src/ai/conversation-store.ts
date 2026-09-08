@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { mkdir, readdir, readFile, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { AI_TOOL_CREATE_SKIN, type AiChatMode } from "@bilibili-notify/contract";
 import type { Logger } from "@bilibili-notify/internal";
 
 /**
@@ -42,6 +43,11 @@ export interface StoredMessage {
 	/** 助手消息专有,见 {@link StoredToolTrace}。没调过工具就整个字段缺席。 */
 	tools?: StoredToolTrace[];
 	/**
+	 * 助手消息专有:答这一句之前的思考过程(思考模型的那段草稿)。
+	 * 只作展示,**永不**回传给模型当上下文。没思考就整个字段缺席。
+	 */
+	reasoning?: string;
+	/**
 	 * 用户消息专有:这一问带的图片资产 id(见 `runtime/chat-assets`)。
 	 *
 	 * 存 id 而**不是** base64:会话文件是整份读进内存的,把图塞进去之后,往后
@@ -55,6 +61,7 @@ export interface NewMessage {
 	role: ConversationRole;
 	content: string;
 	tools?: readonly StoredToolTrace[];
+	reasoning?: string;
 	images?: readonly string[];
 }
 
@@ -64,6 +71,16 @@ export interface Conversation {
 	createdAt: string;
 	updatedAt: string;
 	messages: StoredMessage[];
+	/**
+	 * 这场对话的面孔,开局定下、整场锁定(见 {@link AiChatMode})。
+	 *
+	 * 读的时候**一律补默认**,不让 undefined 流出去:上线前的会话文件里没有这个
+	 * 字段,而下游(路由挑 system、侧栏画 label)每一处都得自己想一遍「没有算什么」
+	 * 的话,迟早有一处想反 —— 那就是老会话集体变成皮肤工坊。
+	 */
+	mode: AiChatMode;
+	/** 带不带女仆人格;同样读时补默认(老会话 = true)。 */
+	persona: boolean;
 	/**
 	 * 标题是否已由 AI 起过。缺失(旧文件)按 false 算。
 	 *
@@ -81,6 +98,10 @@ export interface ConversationMeta {
 	createdAt: string;
 	updatedAt: string;
 	messageCount: number;
+	/** 见 {@link Conversation.mode}。侧栏那一行的 label 指着它。 */
+	mode: AiChatMode;
+	/** 见 {@link Conversation.persona}。 */
+	persona: boolean;
 	/** 见 {@link Conversation.autoTitled}。前端拿它决定要不要去要一个标题。 */
 	autoTitled?: boolean;
 }
@@ -90,8 +111,13 @@ export interface ConversationStore {
 	list(): Promise<ConversationMeta[]>;
 	/** 读一整个会话(含消息);不存在返回 null。 */
 	get(id: string): Promise<Conversation | null>;
-	/** 新建一个空会话。会话总数超上限时顺手删掉最旧的。 */
-	create(): Promise<Conversation>;
+	/**
+	 * 新建一个空会话。会话总数超上限时顺手删掉最旧的。
+	 *
+	 * 面孔在这一刻定死,之后没有任何接口能改它 —— 「锁定」不是界面上藏个按钮,
+	 * 是**根本没有那条路**。
+	 */
+	create(init?: { mode?: AiChatMode; persona?: boolean }): Promise<Conversation>;
 	/**
 	 * 追加消息并回写。返回更新后的会话;会话不存在返回 null(**不**凭空造一个 ——
 	 * 那会让「删掉的会话又冒出来」这种幽灵行为看着像正常功能)。
@@ -106,6 +132,18 @@ export interface ConversationStore {
 	setTitle(id: string, title: string): Promise<Conversation | null>;
 	/** 删除一个会话。返回它此前是否存在。 */
 	remove(id: string): Promise<boolean>;
+	/**
+	 * 标记这一场**正有一轮在跑**,返回收工时该调的那个函数。
+	 *
+	 * 为什么需要它:消息是「拿到回复之后才落盘」的(routes/ai.ts 那条既有决定 ——
+	 * 先写用户消息的话,AI 一失败盘上就留下一个没人回答的问题),所以一轮生成期间
+	 * 盘上仍是零消息;而 {@link list} 会把零消息的当空壳藏起来。皮肤生成要几分钟,
+	 * 主人正聊着的那一场就这么从侧栏消失了。
+	 *
+	 * 计数而非布尔:同一场可能同时有两轮在跑,先收工的那次不该把还在跑的也放出去。
+	 * 返回的函数**可以重复调**(只销自己那一笔),catch 与 finally 都调不会串账。
+	 */
+	markBusy(id: string): () => void;
 }
 
 export interface ConversationStoreOptions {
@@ -115,6 +153,20 @@ export interface ConversationStoreOptions {
 	maxMessages?: number;
 	/** 保留的最大会话数,超出在 create 时删最旧的。默认 50。 */
 	maxConversations?: number;
+}
+
+/**
+ * 老会话(文件里没有 `mode`)的面孔 —— 从工具痕迹里认。
+ *
+ * 上线前的会话一律按「聊天」读的话,主人一屋子做过皮肤的老会话在侧栏里一块牌都
+ * 不挂,看不出哪场是工坊的。而 `create_skin` 的痕迹是**结论级**的证据,不是猜。
+ *
+ * 只在读的时候认,**不回写盘**:推断幂等,而改主人的存档不是。显式值永远优先 ——
+ * 这一层只补「文件里没写」的那种情况。
+ */
+function inferMode(conv: Conversation): AiChatMode {
+	const workshop = conv.messages.some((m) => m.tools?.some((t) => t.name === AI_TOOL_CREATE_SKIN));
+	return workshop ? "skin" : "chat";
 }
 
 /** 新会话的占位标题。首条用户消息落下来之前一直显示它。 */
@@ -158,7 +210,14 @@ export function createConversationStore(opts: ConversationStoreOptions): Convers
 			if (!parsed || typeof parsed.id !== "string" || !Array.isArray(parsed.messages)) {
 				throw new Error("shape mismatch");
 			}
-			return parsed;
+			// 面孔在**读的这一处**补默认,一次补齐、下游全都拿到实值。上线前的
+			// 会话文件里没这两个字段,让 undefined 流出去的话,每一个下游都得自己
+			// 想一遍「没有算什么」—— 想反一处,主人的老会话就集体变了面孔。
+			return {
+				...parsed,
+				mode: parsed.mode ?? inferMode(parsed),
+				persona: parsed.persona ?? true,
+			};
 		} catch (err) {
 			// 一条脏记录不该让侧栏整个空掉:跳过它,别的照常列出来。
 			logger.warn(`[ai-chat] 跳过损坏的会话文件 ${file}: ${String(err)}`);
@@ -170,6 +229,18 @@ export function createConversationStore(opts: ConversationStoreOptions): Convers
 		await mkdir(dir, { recursive: true });
 		await writeFile(fileOf(conv.id), JSON.stringify(conv), "utf8");
 	}
+
+	/**
+	 * 空会话过多久算「凉透」。取得宽是因为一轮对话可以很长 —— 皮肤生成一趟几分钟,
+	 * 加上主人打字与读回复,半小时是个谁都不冤枉的界。
+	 */
+	const EMPTY_CONVERSATION_TTL_MS = 30 * 60 * 1000;
+
+	/**
+	 * 正在跑的轮次计数(会话 id → 几轮)。只活在内存里 —— 进程一重启,「在途」这件事
+	 * 本来就不存在了(那些 SSE 全断了),陈旧的标记反而会把死壳永久钉在侧栏上。
+	 */
+	const busy = new Map<string, number>();
 
 	async function listAll(): Promise<Conversation[]> {
 		let names: string[];
@@ -200,20 +271,34 @@ export function createConversationStore(opts: ConversationStoreOptions): Convers
 	return {
 		async list() {
 			const all = await listAll();
-			return all.map((c) => ({
-				id: c.id,
-				title: c.title,
-				createdAt: c.createdAt,
-				updatedAt: c.updatedAt,
-				messageCount: c.messages.length,
-			}));
+			// 零消息的不露面。会话是在**发送之前**就建好的(前端要先拿到 id 才能
+			// 开那条 SSE),而整轮失败时服务端一个字都不落盘 —— 壳却留下了。主人
+			// 看到的是侧栏冒出一条点进去空空如也的「对话」,删又不知道该不该删。
+			//
+			// 只过滤不删:判它是垃圾要等到它凉透(见 create 里的清理),列表这一层
+			// 只管别让它碍眼。
+			//
+			// **在途的那一场例外**:它盘上同样是零消息(消息拿到回复才落盘),可它
+			// 恰恰是主人此刻正看着的那一场 —— 藏掉它,侧栏里就没有「我正在聊的那条」。
+			// 见 markBusy。
+			return all
+				.filter((c) => c.messages.length > 0 || busy.has(c.id))
+				.map((c) => ({
+					id: c.id,
+					title: c.title,
+					createdAt: c.createdAt,
+					updatedAt: c.updatedAt,
+					messageCount: c.messages.length,
+					mode: c.mode,
+					persona: c.persona,
+				}));
 		},
 
 		async get(id) {
 			return readOne(fileOf(id));
 		},
 
-		create() {
+		create(init) {
 			return serial(async () => {
 				const now = new Date().toISOString();
 				const conv: Conversation = {
@@ -222,6 +307,8 @@ export function createConversationStore(opts: ConversationStoreOptions): Convers
 					createdAt: now,
 					updatedAt: now,
 					messages: [],
+					mode: init?.mode ?? "chat",
+					persona: init?.persona ?? true,
 				};
 				await writeOne(conv);
 
@@ -231,7 +318,37 @@ export function createConversationStore(opts: ConversationStoreOptions): Convers
 				// **刚建的这个必须先排除在候选之外。**它的 updatedAt 与同毫秒里
 				// 别人的完全相同,靠排序保不住;真被挑中就是「点了新对话,对话没了」。
 				const others = (await listAll()).filter((c) => c.id !== conv.id);
-				for (const stale of others.slice(Math.max(0, maxConversations - 1))) {
+
+				// **先回收凉透的空壳**,再按数量修剪。壳不进列表(见 list),可它照样
+				// 占着名额;而修剪按 updatedAt 挑人下手,壳只要比某条真会话新,被挤
+				// 下去的就是主人真聊过的那一条。
+				//
+				// 「凉透」这个条件不能省:此刻正在发送的那一轮,盘上也是零消息 ——
+				// 皮肤生成一趟就要几分钟,中途另开一个对话把它清掉,主人回来会发现
+				// 刚才那轮凭空没了。
+				//
+				// 而光有时间还不够 —— **在途的一律不动**,跑多久都一样。TTL 是给
+				// 「没人用的壳」估的一个宽界,不是在途轮次的死线:工坊一次结构化调用
+				// 就 300s,还要重试、嵌套生成、最多八轮工具,真能跑过半小时。列表那头
+				// (见 list)早就认了 busy 这本账,回收这头也得认,否则删掉的是主人正
+				// 等着的那一场,几分钟的生成连同文件一起没。
+				const cutoff = Date.now() - EMPTY_CONVERSATION_TTL_MS;
+				const alive: Conversation[] = [];
+				for (const c of others) {
+					if (c.messages.length === 0 && !busy.has(c.id) && Date.parse(c.createdAt) < cutoff) {
+						await unlink(fileOf(c.id)).catch(() => {});
+						logger.debug(`[ai-chat] 回收没发出去的空会话 ${c.id}`);
+						continue;
+					}
+					alive.push(c);
+				}
+
+				// 数量修剪也得认同一本账。在途的那场跑得够久,主人又在别处开过几个
+				// 对话,它的 updatedAt 就沉到底部 —— 被当成「最旧」删掉,跟上面那条
+				// 是同一个事故换了个入口。宁可暂时多留一条:它一收工,下次 create
+				// 就照常把它算进去。
+				for (const stale of alive.slice(Math.max(0, maxConversations - 1))) {
+					if (busy.has(stale.id)) continue;
 					await unlink(fileOf(stale.id)).catch(() => {});
 					logger.debug(`[ai-chat] 会话数超上限,删除最旧的 ${stale.id}`);
 				}
@@ -252,8 +369,9 @@ export function createConversationStore(opts: ConversationStoreOptions): Convers
 						content: m.content,
 						ts: now,
 						// 没调过工具就**不写**这个字段:绝大多数消息都没调,一条一个空
-						// 数组等于给每个会话文件白加一份噪音。图片同理。
+						// 数组等于给每个会话文件白加一份噪音。思考与图片同理。
 						...(m.tools?.length ? { tools: [...m.tools] } : {}),
+						...(m.reasoning ? { reasoning: m.reasoning } : {}),
 						...(m.images?.length ? { images: [...m.images] } : {}),
 					});
 				}
@@ -286,6 +404,19 @@ export function createConversationStore(opts: ConversationStoreOptions): Convers
 				await writeOne(conv);
 				return conv;
 			});
+		},
+
+		markBusy(id) {
+			busy.set(id, (busy.get(id) ?? 0) + 1);
+			let released = false;
+			return () => {
+				// 幂等:调用方的 catch 与 finally 都调一次也不会把别人那一笔销掉。
+				if (released) return;
+				released = true;
+				const left = (busy.get(id) ?? 1) - 1;
+				if (left > 0) busy.set(id, left);
+				else busy.delete(id);
+			};
 		},
 
 		remove(id) {

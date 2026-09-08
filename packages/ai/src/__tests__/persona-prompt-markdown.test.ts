@@ -30,11 +30,15 @@ describe("buildSystemPrompt — allowMarkdown", () => {
 	});
 
 	it("allowMarkdown 只摘掉那一条,人格与工具铁律一个字不动", () => {
-		const plain = buildSystemPrompt({ preset: "assistant" });
-		const md = buildSystemPrompt({ preset: "assistant", allowMarkdown: true });
+		// 两边都带 withTools —— 工具铁律现在按调用方分档(挂了工具才发,见
+		// persona-prompt-tools.test.ts),这一条要验的是**在同一档里**
+		// allowMarkdown 只摘纯文本那一行,所以两边的档位必须对齐才比得出来。
+		const opts = { preset: "assistant" as const, withTools: true };
+		const plain = buildSystemPrompt(opts);
+		const md = buildSystemPrompt({ ...opts, allowMarkdown: true });
 		// 「必须调用工具才能声称操作成功」那条铁律绝不能被顺手带走。
 		expect(md).toContain("必须调用对应工具");
-		expect(md).toContain("严禁在未调用工具的情况下声称操作已完成");
+		expect(md).toContain("严禁在未调用工具的情况下编造或猜测结果");
 		// 两者之差**只有**那一行。
 		const removed = plain
 			.split("\n")
@@ -44,6 +48,16 @@ describe("buildSystemPrompt — allowMarkdown", () => {
 		expect(removed[0]).toContain(PLAIN_TEXT_RULE);
 	});
 
+	it("不带工具那一档也一样 —— allowMarkdown 同样只摘那一行", () => {
+		const plain = buildSystemPrompt({ preset: "assistant" });
+		const md = buildSystemPrompt({ preset: "assistant", allowMarkdown: true });
+		const removed = plain.split("\n").filter((l) => !md.split("\n").includes(l));
+		expect(removed).toHaveLength(1);
+		expect(removed[0]).toContain(PLAIN_TEXT_RULE);
+		// 「本次任务范围」那条在两边都在,不会被 allowMarkdown 带走。
+		expect(md).toContain("就眼前给到的内容直接作答");
+	});
+
 	it("那条约束留在**原来的位置** —— 推送侧的提示词顺序不许变", () => {
 		// 摘除做法很容易顺手写成「拼在整段末尾」,那样推送侧看到的顺序就变了。
 		// 收件人是主人的群,「行为不变」得是字面意义上的不变。
@@ -51,11 +65,13 @@ describe("buildSystemPrompt — allowMarkdown", () => {
 		const lines = plain.split("\n");
 		const ruleAt = lines.findIndex((l) => l.includes(PLAIN_TEXT_RULE));
 		const dutyAt = lines.findIndex((l) => l.includes("这是你最重要的职责"));
-		const toolLawAt = lines.findIndex((l) => l.includes("【重要规则】"));
+		// 规则块的抬头按档位不同:挂了工具是【重要规则】,没挂是【本次任务】。这条要守的
+		// 是**位置**(纯文本那句夹在职责句与规则块之间),所以两种抬头都认。
+		const ruleBlockAt = lines.findIndex((l) => /^【(重要规则|本次任务)】/.test(l));
 		expect(dutyAt).toBeGreaterThanOrEqual(0);
-		expect(toolLawAt).toBeGreaterThanOrEqual(0);
+		expect(ruleBlockAt).toBeGreaterThanOrEqual(0);
 		expect(ruleAt).toBeGreaterThan(dutyAt);
-		expect(ruleAt).toBeLessThan(toolLawAt);
+		expect(ruleAt).toBeLessThan(ruleBlockAt);
 	});
 
 	it("custom 预设下同样管用 —— 自定义人格也吃这段共用开头", () => {

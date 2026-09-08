@@ -35,6 +35,7 @@ import {
 	LiveCard,
 	type LiveCardProps,
 	renderCard,
+	USER_FONT_FAMILY,
 } from "@bilibili-notify/image";
 import {
 	type CardBlock,
@@ -53,16 +54,26 @@ import {
 	firstExistingCardBg,
 	isValidCardBgId,
 	listCardBg,
+	MAX_CARD_BG_BYTES,
 	readCardBg,
 	readCardBgDataUrl,
 	saveCardBg,
 } from "../runtime/card-assets.js";
+import {
+	deleteFontAsset,
+	isValidFontAssetId,
+	listFontAssets,
+	MAX_FONT_ASSET_BYTES,
+	readFontAsset,
+	saveFontAsset,
+} from "../runtime/font-assets.js";
 import {
 	createPuppeteerAdapter,
 	resolveChromePath,
 	type StandalonePuppeteer,
 } from "../runtime/puppeteer.js";
 import type { RouteDeps } from "./types.js";
+import { uploadBodyLimit } from "./upload-limit.js";
 
 export interface CardsRouteOptions {
 	deps: RouteDeps;
@@ -107,6 +118,8 @@ const StyleSchema = z.object({
 	cardColorStart: z.string(),
 	cardColorEnd: z.string(),
 	font: z.string().optional(),
+	/** 主人自带字体的资产 id;设了优先于 `font`(预览与出图必须用同一款,否则「预览好看、推出去变样」)。 */
+	fontAsset: z.string().optional(),
 	showPopularity: z.boolean().optional(),
 	showArea: z.boolean().optional(),
 	showFans: z.boolean().optional(),
@@ -207,6 +220,28 @@ function cardBgReferences(globals: GlobalConfig, subs: Subscription[], id: strin
 	const inByKind = (
 		byKind?: Record<string, { backgroundImages?: string[]; liveCoverImages?: string[] }>,
 	): boolean => (byKind ? Object.values(byKind).some(inStyle) : false);
+
+	const refs: string[] = [];
+	if (inStyle(globals.defaults.cardStyle) || inByKind(globals.defaults.cardStyleByKind)) {
+		refs.push("全局默认");
+	}
+	for (const s of subs) {
+		if (inStyle(s.overrides.cardStyle) || inByKind(s.overrides.cardStyleByKind)) {
+			refs.push(`UP ${s.uid}`);
+		}
+	}
+	return refs;
+}
+
+/**
+ * 哪些地方还选着这款字体 —— 与 {@link cardBgReferences} 同一套四层扫描
+ * (全局基准 / 全局 per-kind / UP 基准 / UP per-kind)。**四层都得查**:漏掉哪一层,
+ * 那一层的配置删完就成了悬空引用,出图静静落回兜底字体,而设置页还显示着它的名字。
+ */
+function fontAssetReferences(globals: GlobalConfig, subs: Subscription[], id: string): string[] {
+	const inStyle = (style?: { fontAsset?: string }): boolean => style?.fontAsset === id;
+	const inByKind = (byKind?: Record<string, { fontAsset?: string }>): boolean =>
+		byKind ? Object.values(byKind).some(inStyle) : false;
 
 	const refs: string[] = [];
 	if (inStyle(globals.defaults.cardStyle) || inByKind(globals.defaults.cardStyleByKind)) {
@@ -339,7 +374,8 @@ export function createCardsRoute(opts: CardsRouteOptions): Hono {
 	});
 
 	// 背景图上传 → 落盘 `<dataDir>/assets/card-bg/<id>`,返回资产 id 写进 cardStyle.backgroundImage。
-	app.post("/asset", async (c) => {
+	// 闸在 parseBody 之前:超大的当场回绝,别先整份读进那 512MB 的堆里。见 upload-limit.ts。
+	app.post("/asset", uploadBodyLimit(MAX_CARD_BG_BYTES, "图片"), async (c) => {
 		const body = await c.req.parseBody().catch(() => null);
 		const file = body?.file;
 		if (!(file instanceof File)) return c.json({ ok: false, err: "缺少图片文件" }, 400);
@@ -389,12 +425,89 @@ export function createCardsRoute(opts: CardsRouteOptions): Hono {
 		return c.json({ ok: removed });
 	});
 
+	// ---- 字体图廊 -----------------------------------------------------------
+	//
+	// 与上面背景图那四个端点同形(落盘 + id 引用 + 定向读取 + 删除前查引用)。字体单独
+	// 一套目录与一套端点,不与背景图混:两者的合法后缀、体积上限、以及「列表里显示什么」
+	// 都不一样(字体没有缩略图可看,列表得带原始文件名)。
+
+	// 字体上传 → 落盘 `<dataDir>/assets/font/<id>`,返回资产 id 写进 cardStyle.fontAsset。
+	// 后缀取自**原始文件名**而不是 mime —— 浏览器给字体的 mime 一塌糊涂(同一个 .ttf 可能
+	// 是 font/ttf、application/x-font-ttf、application/octet-stream 甚至空串)。
+	app.post("/font-asset", uploadBodyLimit(MAX_FONT_ASSET_BYTES, "字体文件"), async (c) => {
+		const body = await c.req.parseBody().catch(() => null);
+		const file = body?.file;
+		if (!(file instanceof File)) return c.json({ ok: false, err: "缺少字体文件" }, 400);
+		try {
+			const bytes = new Uint8Array(await file.arrayBuffer());
+			const id = await saveFontAsset(opts.deps.store.bootstrap.dataDir, bytes, file.name);
+			return c.json({ ok: true, id, name: file.name });
+		} catch (err) {
+			return c.json({ ok: false, err: String((err as Error)?.message ?? err) }, 400);
+		}
+	});
+
+	// 字体图廊列表 —— 带原始文件名,否则设置页上只剩一串 hex,主人认不出哪个是哪个。
+	app.get("/font-assets", async (c) => {
+		const fonts = await listFontAssets(opts.deps.store.bootstrap.dataDir);
+		return c.json({ ok: true, fonts });
+	});
+
+	// 字体文件服务 —— 经 id 正则校验的定向读取(绝不 serveStatic 整个 dataDir,内有 secrets)。
+	// 设置页拿它做预览:同一款字体在页面上和出图里得是同一款。
+	app.get("/font-asset/:id", async (c) => {
+		const res = await readFontAsset(opts.deps.store.bootstrap.dataDir, c.req.param("id"));
+		if (!res) return c.json({ ok: false, err: "not found" }, 404);
+		return new Response(res.bytes, {
+			headers: {
+				"Content-Type": res.mime,
+				"Cache-Control": "private, max-age=31536000, immutable",
+			},
+		});
+	});
+
+	// 字体删除 —— 仍被某处选着的先拦截(409)。直接删掉的话那一处立刻成了悬空引用:
+	// 出图静静回落到兜底字体,而设置页上还显示着这款字体的名字,主人查都没法查。
+	app.delete("/font-asset/:id", async (c) => {
+		const id = c.req.param("id");
+		if (!isValidFontAssetId(id)) return c.json({ ok: false, err: "无效的资产 id" }, 400);
+		const referencedBy = fontAssetReferences(
+			opts.deps.store.getGlobals(),
+			opts.deps.store.getSubscriptions(),
+			id,
+		);
+		if (referencedBy.length > 0) {
+			return c.json(
+				{ ok: false, err: "该字体仍被使用,请先在卡片设置里换掉再删除", referencedBy },
+				409,
+			);
+		}
+		const removed = await deleteFontAsset(opts.deps.store.bootstrap.dataDir, id);
+		return c.json({ ok: removed });
+	});
+
 	// One ImageRenderer reused across requests. Lazy — only constructed when
 	// the first real-fetch / sc / guard path actually runs, so deployments
 	// without BN_CHROME_PATH don't spin one up needlessly.
 	//
 	// 每次请求都 updateConfig 一遍传入的 style — 否则用户在 Cards 页改完颜色后
 	// 第一次 /preview 构造一个 renderer 后,后续改色就不生效(renderer 是 lazy 单例)。
+	// `@font-face` 规则的读取口 —— **本路由只此一份**,mock 路径(live / dyn 走示例数据)
+	// 与 ImageRenderer 都走它。一款中文字库 base64 后二三十兆,而镜像里 V8 堆上限只有
+	// 512MB;各读各的话,一屏几张卡就能把堆顶起来。共用之后两边拿到的是同一个字符串
+	// 引用,内存里始终只有一份。
+	//
+	// 缓存里留的是**拼好的规则**而不是 data URL:规则本身就把 data URL 包在里头,存前者
+	// 就等于让后者可被回收,同一串东西不必占两份。
+	//
+	// 惰性构造:`/enable-rendering`、`/detect-chrome` 这些路由不碰 store,它们的测试
+	// 给的也是不带 store 的最小 deps —— 在这儿直接取 `bootstrap.dataDir` 会让整条路由
+	// 建不起来。真要读字体时再取,那条路径上 store 必然在。
+	const loadFontFace = (id: string): Promise<string> => {
+		if (!id) return Promise.resolve("");
+		return opts.deps.runtime.loadFontFace(id);
+	};
+
 	let imageRenderer: ImageRenderer | null = null;
 	// 缓存绑定的 adapter 快照 —— 热切换(/enable-rendering)会把 currentPuppeteer 换成
 	// 新 adapter 并 dispose 旧的,若不比对直接复用,imageRenderer 会一直攥着已销毁的
@@ -416,6 +529,9 @@ export function createCardsRoute(opts: CardsRouteOptions): Hono {
 				opts.deps.store.bootstrap.dataDir,
 				style.backgroundImages,
 			),
+			// 预览得跟出图用同一款字体,否则「预览好看、推出去变样」。悬空 id 由
+			// resolveFontFace 兜成空串,渲染器据此回落家族名。
+			fontAsset: style.fontAsset,
 		};
 		if (!imageRenderer || imageRendererPuppeteer !== currentPuppeteer) {
 			imageRenderer = new ImageRenderer({
@@ -424,6 +540,8 @@ export function createCardsRoute(opts: CardsRouteOptions): Hono {
 				config,
 				// 背景图 id → data URL(读 <dataDir>/assets/card-bg);sc/guard/真实拉取走 generate* 解析。
 				resolveAsset: (id) => readCardBgDataUrl(opts.deps.store.bootstrap.dataDir, id),
+				// 字体 id → 拼好的 @font-face(读 <dataDir>/assets/font)。
+				resolveFontFace: loadFontFace,
 				// 预览:每来一次请求就热更一次样式,打 info 会刷屏且像"已保存"。真正生效的
 				// INFO 由推送渲染器(runtime/engines.ts)在 config-changed 后打。
 				quietConfigUpdates: true,
@@ -594,8 +712,8 @@ export function createCardsRoute(opts: CardsRouteOptions): Hono {
 		// (不经 ImageRenderer,未登录也能调色)。背景图/直播封面在此解析成 data URL 注入;
 		// 取「第一张盘上存在的图」,跳过悬空引用。
 		const dataDir = opts.deps.store.bootstrap.dataDir;
-		// 背景图与直播封面互不依赖(各自独立的资产解析),并发发起省一次串行 I/O 往返。
-		const [bgDataUrl, coverDataUrl] = await Promise.all([
+		// 背景图、直播封面、自带字体互不依赖(各自独立的资产解析),并发发起省几次串行 I/O。
+		const [bgDataUrl, coverDataUrl, fontFace] = await Promise.all([
 			firstExistingCardBg(dataDir, style.backgroundImages).then((id) =>
 				readCardBgDataUrl(dataDir, id),
 			),
@@ -604,6 +722,7 @@ export function createCardsRoute(opts: CardsRouteOptions): Hono {
 						readCardBgDataUrl(dataDir, id),
 					)
 				: Promise.resolve(""),
+			loadFontFace(style.fontAsset ?? ""),
 		]);
 		const { component, props, title, htmlWidth } = buildPreviewSpec(
 			kind,
@@ -613,9 +732,12 @@ export function createCardsRoute(opts: CardsRouteOptions): Hono {
 			coverDataUrl,
 			commandHelpHintFromGlobals(opts.deps.store.getGlobals()),
 		);
+		// 自带字体优先于家族名(与 ImageRenderer#resolveFont 同一套判断);资产悬空时
+		// fontFace 是空串,静静回落家族名。
 		const html = await renderCard(component, props, {
 			title,
-			font: style.font ?? "PingFang SC, sans-serif",
+			font: fontFace ? USER_FONT_FAMILY : (style.font ?? "PingFang SC, sans-serif"),
+			fontFace: fontFace || undefined,
 			htmlWidth,
 		});
 		const buffer = await screenshotHtml(puppeteer, html);

@@ -1,9 +1,17 @@
 import type { SubscriptionDTO } from "@bilibili-notify/contract";
+import {
+	Avatar,
+	Btn,
+	ErrorNote,
+	GlassPanel,
+	GlassStatCard,
+	Icon,
+	LoadingBlock,
+	MenuItem,
+	PopoverShell,
+} from "@bilibili-notify/ui";
 import { useQuery } from "@tanstack/react-query";
 import { useMemo, useState } from "react";
-import { Avatar, Btn } from "../components/atoms";
-import { GlassPanel, GlassStatCard } from "../components/glass";
-import { Icon } from "../components/icons";
 import { api } from "../services/api";
 import {
 	activityLevel,
@@ -36,22 +44,25 @@ import { buildStatColumns, type StatColumnId } from "./stats/columns";
 import { buildCsv } from "./stats/csv";
 import { netFromCumulative, sumNetPoints } from "./stats/gaps";
 import { RoastCard } from "./stats/RoastCard";
+import { RoastScheduleBox } from "./stats/RoastScheduleBox";
 import { buildRadarAxes } from "./stats/radar";
+import { STATS_RANGES } from "./stats/ranges";
 import { SoloRoastCard } from "./stats/SoloRoastCard";
+import { SoloRoastScheduleBox } from "./stats/SoloRoastScheduleBox";
 import { colorFromUid, displayName } from "./up/helpers";
 
 /**
- * 面板 / KPI 卡的主题色。
+ * 面板 / KPI 卡的主题色 —— 走 token,跟皮肤换装。
  *
- * **必须是十六进制字面量,不能用 `var(--color-bn-*)`**:GlassPanel 与
- * GlassStatCard 会拼 alpha 后缀(`${color}1a`)来造渐变底色和描边,拼上 CSS
- * 变量会得到 `var(--color-bn-pink)1a` 这种非法值 —— 浏览器**静默丢弃整条声明**,
- * 卡片就变成没有底色、没有边框的裸块,而且 typecheck 和 lint 都发现不了。
- * 取值与 styles.css 里的同名 token 一致。
+ * 这里曾经写着「**必须是十六进制字面量**」,理由是 GlassPanel / GlassStatCard
+ * 拼 alpha 后缀(`${color}1a`),拼上 CSS 变量会得到 `var(--color-bn-pink)1a`
+ * 这种非法值、被浏览器静默丢弃。那两个组件现在用 `color-mix()` 造透明度,
+ * 限制没了 —— 而它一直在的代价是:统计页的强调色被钉死在 B 站粉/蓝/紫上,
+ * 装了别的皮肤,整站都换了,只有这几张卡还是原来的配色。
  */
-const PINK = "#fb7299";
-const BLUE = "#00aeec";
-const PURPLE = "#a29bfe";
+const PINK = "var(--color-bn-pink)";
+const BLUE = "var(--color-bn-blue)";
+const PURPLE = "var(--color-bn-purple)";
 /**
  * KPI 行的补充色相。品牌三色(粉/蓝/紫)在色轮上挨得太近,五张卡排一行时
  * 几乎糊成一片,分不出哪张讲的是哪件事。青与琥珀把色相拉开到另外两个象限,
@@ -67,12 +78,6 @@ const NET_TONE_COLOR: Record<SignTone, string> = {
 	negative: RED,
 	unknown: "var(--color-bn-text-secondary)",
 };
-
-const RANGES = [
-	{ days: 7, label: "近7日" },
-	{ days: 30, label: "近30日" },
-	{ days: 90, label: "近90日" },
-] as const;
 
 /** 数值展示统一走这里:`null` 一律显示破折号,绝不用 0 顶替「没有记录」。 */
 function num(v: number | null, fmt: (n: number) => string = formatWan): string {
@@ -140,38 +145,39 @@ function UpPicker({
 			<button
 				type="button"
 				onClick={() => setOpen(!open)}
+				// 它与 TSelect 同语义:显示当前值、点开挑候选 —— 挂 input 不挂 btn,
+				// 与库里下拉触发器的口径一致。
+				data-bn="input"
 				className="flex h-9 min-w-40 items-center gap-2 rounded-bn-card border border-bn-border bg-bn-surface px-2.5 text-left"
 			>
 				{/* 「全部 UP 主」不配头像 —— 汇总视图没有「一个人」可代表,
 				    原来那颗粉蓝渐变圆只是个占位,反而像某位 UP 的头像。 */}
 				{cur ? <Avatar name={cur.name} color={cur.color} size={22} url={cur.avatar} /> : null}
-				<span className="text-xs font-bold text-bn-text-primary">{cur?.name ?? "全部 UP 主"}</span>
-				<span className="ml-auto text-xs text-bn-text-secondary">{open ? "▴" : "▾"}</span>
+				<span className="text-bn-sm font-bold text-bn-text-primary">
+					{cur?.name ?? "全部 UP 主"}
+				</span>
+				<span className="ml-auto text-bn-sm text-bn-text-secondary">{open ? "▴" : "▾"}</span>
 			</button>
 			{open ? (
-				<div className="absolute left-0 top-[calc(100%+6px)] z-50 max-h-80 min-w-56 overflow-y-auto rounded-bn-card border border-bn-border bg-bn-surface shadow-bn-card">
-					<button
-						type="button"
+				<PopoverShell layer="overlay" className="max-h-80 min-w-56 overflow-y-auto">
+					<MenuItem
 						onClick={() => {
 							onChange(null);
 							setOpen(false);
 						}}
-						className="flex w-full items-center gap-2.5 px-3 py-2 text-left hover:bg-bn-hover-muted"
 					>
-						<span className="text-xs font-bold text-bn-text-primary">全部 UP 主</span>
-						<span className="ml-auto text-xs text-bn-text-secondary">汇总</span>
-					</button>
+						<span className="text-bn-sm font-bold text-bn-text-primary">全部 UP 主</span>
+						<span className="ml-auto text-bn-sm text-bn-text-secondary">汇总</span>
+					</MenuItem>
 					{rows.map((r) => {
 						const m = meta.get(r.uid);
 						return (
-							<button
+							<MenuItem
 								key={r.uid}
-								type="button"
 								onClick={() => {
 									onChange(r.uid);
 									setOpen(false);
 								}}
-								className="flex w-full items-center gap-2.5 px-3 py-2 text-left hover:bg-bn-hover-muted"
 							>
 								<Avatar
 									name={m?.name ?? r.uid}
@@ -181,18 +187,18 @@ function UpPicker({
 									status={r.live ? "living" : undefined}
 								/>
 								<span className="min-w-0 flex-1">
-									<span className="block truncate text-xs font-bold text-bn-text-primary">
+									<span className="block truncate text-bn-sm font-bold text-bn-text-primary">
 										{m?.name ?? `UID ${r.uid}`}
 									</span>
-									<span className="block text-[10.5px] text-bn-text-secondary">
+									<span className="block text-bn-2xs text-bn-text-secondary">
 										{num(r.fans)} · {sinceText(r.lastActivityAt)}
 									</span>
 								</span>
 								<DeltaTag v={r.net7d} size={10.5} />
-							</button>
+							</MenuItem>
 						);
 					})}
-				</div>
+				</PopoverShell>
 			) : null}
 		</div>
 	);
@@ -231,22 +237,22 @@ function CompareTable({
 
 	return (
 		<div className="overflow-x-auto">
-			<table className="w-full border-collapse text-xs">
+			<table className="w-full border-collapse text-bn-sm">
 				<thead>
 					<tr className="border-b border-bn-border">
-						<th className="px-2.5 py-2 text-left text-[11px] font-bold text-bn-text-secondary">
+						<th className="px-2.5 py-2 text-left text-bn-xs font-bold text-bn-text-secondary">
 							UP 主
 						</th>
-						<th className="px-2.5 py-2 text-right text-[11px] font-bold text-bn-text-secondary">
+						<th className="px-2.5 py-2 text-right text-bn-xs font-bold text-bn-text-secondary">
 							粉丝数
 						</th>
-						<th className="px-2.5 py-2 text-center text-[11px] font-bold text-bn-text-secondary">
+						<th className="px-2.5 py-2 text-center text-bn-xs font-bold text-bn-text-secondary">
 							近期走势
 						</th>
 						{cols.map((c) => (
 							<th
 								key={c.id}
-								className="whitespace-nowrap px-2.5 py-2 text-right text-[11px] font-bold"
+								className="whitespace-nowrap px-2.5 py-2 text-right text-bn-xs font-bold"
 								style={{ color: sort === c.id ? PINK : "var(--color-bn-text-secondary)" }}
 							>
 								<button type="button" onClick={() => setSort(c.id)}>
@@ -277,17 +283,17 @@ function CompareTable({
 											status={r.live ? "living" : undefined}
 										/>
 										<div className="min-w-0">
-											<div className="truncate text-xs font-bold text-bn-text-primary">
+											<div className="truncate text-bn-sm font-bold text-bn-text-primary">
 												{m?.name ?? `UID ${r.uid}`}
 											</div>
-											<div className="text-[10.5px] text-bn-text-secondary">
+											<div className="text-bn-2xs text-bn-text-secondary">
 												{sinceText(r.lastActivityAt)}
 												{r.live ? " · 直播中" : ""}
 											</div>
 										</div>
 									</div>
 								</td>
-								<td className="px-2.5 py-2 text-right font-mono font-bold text-bn-text-primary">
+								<td className="px-2.5 py-2 text-right tabular-nums font-bold text-bn-text-primary">
 									{num(r.fans)}
 								</td>
 								<td className="px-2.5 py-2 text-center">
@@ -303,7 +309,7 @@ function CompareTable({
 									) : (
 										<td
 											key={c.id}
-											className={`px-2.5 py-2 text-right font-mono font-bold${
+											className={`px-2.5 py-2 text-right tabular-nums font-bold${
 												c.color ? "" : " text-bn-text-tertiary"
 											}`}
 											style={c.color ? { color: c.color } : undefined}
@@ -371,24 +377,24 @@ function ContentMix({
 					color={PURPLE}
 					label={
 						<div className="text-center">
-							<div className="text-xl font-bold text-bn-text-primary">{total}</div>
-							<div className="text-[9.5px] text-bn-text-secondary">总活动</div>
+							<div className="text-bn-xl font-bold text-bn-text-primary">{total}</div>
+							<div className="text-bn-micro text-bn-text-secondary">总活动</div>
 						</div>
 					}
 				/>
 				<div className="flex flex-col gap-1">
-					<div className="text-[11px] text-bn-text-secondary">日均活动</div>
-					<div className="font-mono text-2xl font-bold leading-none" style={{ color: PURPLE }}>
+					<div className="text-bn-xs text-bn-text-secondary">日均活动</div>
+					<div className="tabular-nums text-bn-xl font-bold leading-none" style={{ color: PURPLE }}>
 						{coveredDays > 0 ? (coveredTotal / coveredDays).toFixed(1) : "—"}
 					</div>
-					<div className="text-[10.5px] text-bn-text-secondary">
+					<div className="text-bn-2xs text-bn-text-secondary">
 						次 / 天 · {coveredDays < days ? `已记录${coveredDays}日` : `近${days}日`}
 					</div>
 				</div>
 			</div>
 			<div className="flex flex-col gap-2.5">
 				{parts.map(([label, v, c]) => (
-					<div key={label} className="flex items-center gap-2 text-xs">
+					<div key={label} className="flex items-center gap-2 text-bn-sm">
 						<span className="h-2 w-2 shrink-0 rounded-sm" style={{ background: c }} />
 						<span className="w-8 shrink-0 text-bn-text-tertiary">{label}</span>
 						<div className="h-1.5 flex-1 overflow-hidden rounded-full bg-bn-code-bg">
@@ -397,8 +403,8 @@ function ContentMix({
 								style={{ width: `${(v / total) * 100}%`, background: c }}
 							/>
 						</div>
-						<b className="w-6 text-right font-mono text-bn-text-primary">{v}</b>
-						<span className="w-9 text-right font-mono text-bn-text-secondary">
+						<b className="w-6 text-right tabular-nums text-bn-text-primary">{v}</b>
+						<span className="w-9 text-right tabular-nums text-bn-text-secondary">
 							{Math.round((v / total) * 100)}%
 						</span>
 					</div>
@@ -454,11 +460,21 @@ export default function Stats() {
 		[focused, rows],
 	);
 
+	// 等待/失败态也走页面自己的 p-6 外框 —— 直接裸一行字坐在页面背景上,皮肤壁纸
+	// 一开就是灰字飘在图上,而且切到正常态时整页会跳一下(内外边距对不上)。
 	if (statsQuery.isLoading) {
-		return <div className="p-8 text-sm text-bn-text-secondary">正在读取统计数据…</div>;
+		return (
+			<div className="bn-anim-page-in p-6">
+				<LoadingBlock label="正在读取统计数据" hint="女仆正在翻账本,清点这些天的推送 (｡･ω･｡)ﾉ" />
+			</div>
+		);
 	}
 	if (statsQuery.isError) {
-		return <div className="p-8 text-sm text-bn-danger-text">统计数据加载失败,请稍后重试。</div>;
+		return (
+			<div className="bn-anim-page-in p-6">
+				<ErrorNote>统计数据加载失败,请稍后重试。</ErrorNote>
+			</div>
+		);
 	}
 
 	const heatRows = (focused ? [focused] : rows).map((r) => ({
@@ -469,7 +485,7 @@ export default function Stats() {
 	}));
 
 	return (
-		<div className="flex flex-col gap-3.5 p-6">
+		<div className="bn-anim-page-in flex flex-col gap-3.5 p-6">
 			<div className="flex flex-wrap items-end justify-between gap-3">
 				<div className="flex items-center gap-3">
 					{/* 单 UP 视图给一枚大头像 —— 钻进某个人之后,页头得先回答「现在看的是谁」。 */}
@@ -483,10 +499,10 @@ export default function Stats() {
 						/>
 					) : null}
 					<div>
-						<div className="text-lg font-bold tracking-tight text-bn-text-primary">
+						<div className="text-bn-lg font-bold tracking-tight text-bn-text-primary">
 							{focused ? (focusedMeta?.name ?? `UID ${focused.uid}`) : "数据统计 · 粉丝与动态分析"}
 						</div>
-						<div className="mt-1 text-xs text-bn-text-secondary">
+						<div className="mt-1 text-bn-sm text-bn-text-secondary">
 							{focused ? (
 								// 名字已经在上面的标题里了,这行改说 UID —— 昵称会改,UID 不会,
 								// 主人对着后台核对时要的是这个。
@@ -505,12 +521,13 @@ export default function Stats() {
 				<div className="flex items-center gap-2.5">
 					<UpPicker rows={rows} meta={meta} value={picked} onChange={setPicked} />
 					<div className="flex gap-1 rounded-bn-card border border-bn-border bg-bn-surface p-0.5">
-						{RANGES.map((r) => (
+						{STATS_RANGES.map((r) => (
 							<button
 								key={r.days}
 								type="button"
 								onClick={() => setDays(r.days)}
-								className="rounded-md px-3 py-1.5 text-xs font-semibold"
+								data-bn={days === r.days ? "chip chip-active" : "chip"}
+								className="rounded-md px-3 py-1.5 text-bn-sm font-semibold"
 								style={{
 									background: days === r.days ? "var(--color-bn-surface-muted)" : "transparent",
 									color: days === r.days ? PINK : "var(--color-bn-text-tertiary)",
@@ -534,7 +551,7 @@ export default function Stats() {
 							footer={
 								<>
 									<DeltaTag v={focused.net7d} size={11.5} />
-									<span className="text-[10.5px] text-bn-text-secondary">近7日</span>
+									<span className="text-bn-2xs text-bn-text-secondary">近7日</span>
 									<span className="ml-auto">
 										<Sparkline
 											data={focused.series.slice(-14)}
@@ -557,12 +574,13 @@ export default function Stats() {
 							value={num(focused.netWindow, formatSignedWan)}
 							color={PURPLE}
 						/>
-						<GlassStatCard label="投稿" value={dash(focused.archives)} suffix="个" color={BLUE} />
+						<GlassStatCard label="投稿" value={dash(focused.archives)} suffix="个" color={AMBER} />
+						{/* KPI 行收尾在蓝:呼应「左粉右蓝」的品牌轴。 */}
 						<GlassStatCard
 							label="开播"
 							value={dash(focused.liveSessions)}
 							suffix={`场 · ${dash(focused.liveHours, hours)}h`}
-							color={AMBER}
+							color={BLUE}
 						/>
 					</>
 				) : (
@@ -578,7 +596,7 @@ export default function Stats() {
 							footer={
 								<>
 									<DeltaTag v={totals?.net7d ?? null} size={11.5} />
-									<span className="text-[10.5px] text-bn-text-secondary">近7日</span>
+									<span className="text-bn-2xs text-bn-text-secondary">近7日</span>
 									<span className="ml-auto">
 										<Sparkline
 											data={(totals?.series ?? []).slice(-14)}
@@ -601,12 +619,12 @@ export default function Stats() {
 							value={num(totals?.netWindow ?? null, formatSignedWan)}
 							color={PURPLE}
 						/>
-						<GlassStatCard label="投稿" value={dash(totals?.archives)} suffix="个" color={BLUE} />
+						<GlassStatCard label="投稿" value={dash(totals?.archives)} suffix="个" color={AMBER} />
 						<GlassStatCard
 							label="开播"
 							value={dash(totals?.liveSessions)}
 							suffix={`场 · ${dash(totals?.liveHours, hours)}h`}
-							color={AMBER}
+							color={BLUE}
 						/>
 					</>
 				)}
@@ -698,7 +716,7 @@ export default function Stats() {
 					icon={<Icon.heart width={15} height={15} />}
 					right={
 						<span
-							className="rounded-full px-2 py-0.5 text-[11px] font-bold"
+							className="rounded-bn-pill px-2 py-0.5 text-bn-xs font-bold"
 							style={{
 								// 三档,不是两档:`(x ?? 0) >= 0` 会把「没有记录」归零后判成非负,
 								// 于是粉丝还没采到样本时徽章是绿的 —— 数值那侧显示 `—`,颜色却在
@@ -790,15 +808,15 @@ export default function Stats() {
 									key={label}
 									className="rounded-bn-card border border-bn-border-subtle bg-bn-surface-muted px-2.5 py-2"
 								>
-									<div className="mb-1 text-[10.5px] font-semibold text-bn-text-secondary">
+									<div className="mb-1 text-bn-2xs font-semibold text-bn-text-secondary">
 										{label}
 									</div>
 									<div className="flex items-baseline gap-1">
-										<span className="font-mono text-lg font-bold" style={{ color: PINK }}>
+										<span className="tabular-nums text-bn-lg font-bold" style={{ color: PINK }}>
 											{v}
 										</span>
 										{unit ? (
-											<span className="text-[10.5px] text-bn-text-secondary">{unit}</span>
+											<span className="text-bn-2xs text-bn-text-secondary">{unit}</span>
 										) : null}
 									</div>
 								</div>
@@ -824,7 +842,7 @@ export default function Stats() {
 										const mx = Math.max(...rows.map((x) => x.liveHours ?? 0));
 										const m = meta.get(r.uid);
 										return (
-											<div key={r.uid} className="flex items-center gap-2 text-xs">
+											<div key={r.uid} className="flex items-center gap-2 text-bn-sm">
 												<span className="w-16 truncate font-semibold text-bn-text-primary">
 													{m?.name ?? r.uid}
 												</span>
@@ -837,7 +855,7 @@ export default function Stats() {
 														}}
 													/>
 												</div>
-												<span className="w-9 text-right font-mono font-bold text-bn-text-tertiary">
+												<span className="w-9 text-right tabular-nums font-bold text-bn-text-tertiary">
 													{hours(r.liveHours ?? 0)}h
 												</span>
 											</div>
@@ -852,17 +870,30 @@ export default function Stats() {
 			</div>
 
 			{/* AI 锐评 —— 两张不同的卡:榜单需要对照组,单人只就自己的数据说话 */}
+			{/* 定时配置与手动生成并排:同一件事的两种触发方式,配置在左、现在就生成在右。
+			    页头选了某位 UP 就整组换成他自己的那一套(定时锐评 + 单人锐评),没选就是
+			    全局那套(榜单周报 + 榜单锐评)—— 看的是谁,配的就是谁。窄屏回落成单栏。 */}
 			{focused ? (
-				<SoloRoastCard
-					key={focused.uid}
-					uid={focused.uid}
-					name={focusedMeta?.name ?? `UID ${focused.uid}`}
-					color={focusColor}
-					avatar={focusedMeta?.avatar}
-					days={days}
-				/>
+				<div className="grid gap-4 lg:grid-cols-2 lg:items-stretch">
+					<SoloRoastScheduleBox
+						key={`sched-${focused.uid}`}
+						uid={focused.uid}
+						name={focusedMeta?.name ?? `UID ${focused.uid}`}
+					/>
+					<SoloRoastCard
+						key={focused.uid}
+						uid={focused.uid}
+						name={focusedMeta?.name ?? `UID ${focused.uid}`}
+						color={focusColor}
+						avatar={focusedMeta?.avatar}
+						days={days}
+					/>
+				</div>
 			) : (
-				<RoastCard days={days} meta={meta} />
+				<div className="grid gap-4 lg:grid-cols-2 lg:items-stretch">
+					<RoastScheduleBox />
+					<RoastCard days={days} meta={meta} />
+				</div>
 			)}
 		</div>
 	);

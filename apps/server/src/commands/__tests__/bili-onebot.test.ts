@@ -646,7 +646,6 @@ describe("bili OneBot group command handler", () => {
 		expect(h.segmentReplies).toHaveLength(1);
 		expect(h.runtime.engines.api.getVideoInfo).toHaveBeenCalledWith({
 			bvid: "BV1QY4y1p7Jd",
-			aid: undefined,
 		});
 		const message = h.segmentReplies[0]?.message ?? [];
 		expect(message[0]).toEqual({
@@ -664,7 +663,7 @@ describe("bili OneBot group command handler", () => {
 
 	it("视频解析全局关闭后不处理群聊视频链接", async () => {
 		const h = makeRuntime();
-		h.globals.commands.videoParse.enabled = false;
+		h.globals.groupCommands.videoParse.enabled = false;
 
 		await sendCommand(h.runtime, "https://www.bilibili.com/video/BV1QY4y1p7Jd");
 
@@ -701,10 +700,7 @@ function makeRuntime() {
 						},
 					},
 				})),
-				getVideoInfo: vi.fn(async () => ({
-					code: 0,
-					data: makeVideoInfo(),
-				})),
+				getVideoInfo: vi.fn(async () => makeVideoInfo()),
 				searchByType: vi.fn(async () => ({
 					code: 0,
 					data: { result: [] },

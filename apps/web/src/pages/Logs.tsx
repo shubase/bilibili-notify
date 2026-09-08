@@ -1,7 +1,7 @@
+import { Icon, Input, ToneChip } from "@bilibili-notify/ui";
 import { useQuery } from "@tanstack/react-query";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Input } from "../components/atoms";
-import { Icon } from "../components/icons";
+import { LOG_LEVEL_TONE, LOG_LEVEL_TONE_CONSOLE } from "../config/log-levels";
 import { useLogChannel } from "../hooks/useLogChannel";
 import { api } from "../services/api";
 import {
@@ -24,12 +24,16 @@ import { withDesktopTokenHeader } from "../services/desktop-token";
 
 const LEVELS: ReadonlyArray<LogLineLevel> = ["debug", "info", "warn", "error"];
 
-const LEVEL_TONE: Record<LogLineLevel, string> = {
-	debug: "#94a3b8",
-	info: "#00AEEC",
-	warn: "#f2a053",
-	error: "#ef4444",
-};
+/**
+ * 顶栏两个开关的状态色 —— 与 `LOG_LEVEL_TONE` 的 warn / info **同值但不同义**
+ * (暂停=警示、自动滚动=信息),刻意各写各的:改等级配色时不该连带改开关。
+ * 同 LEVEL_TONE 一样是内容语义色,不跟主强调色换肤。
+ *
+ * 跟着 2026-08-24 那次一起加深了:它俩与四档等级挤在**同一排**胶囊里,只深一半的话
+ * 那排会一半重一半淡 —— 「各写各的」说的是语义不该耦合,不是值该长得不一样。
+ */
+const PAUSED_TONE = "#b45309";
+const AUTOSCROLL_TONE = "#0369a1";
 
 const RENDER_CAP = 800;
 
@@ -133,35 +137,24 @@ export default function Logs() {
 					icon={<Icon.search size={14} />}
 				/>
 				<div className="flex gap-1">
-					{LEVELS.map((l) => {
-						const active = levels.has(l);
-						const tone = LEVEL_TONE[l];
-						return (
-							<button
-								key={l}
-								type="button"
-								onClick={() => toggleLevel(l)}
-								className="rounded-full border px-3 py-1 text-[12px] font-semibold uppercase transition"
-								style={
-									active
-										? { background: `${tone}1f`, color: tone, borderColor: `${tone}55` }
-										: {
-												background: "transparent",
-												color: "var(--color-bn-text-secondary)",
-												borderColor: "var(--color-bn-border)",
-											}
-								}
-							>
-								{l}
-							</button>
-						);
-					})}
+					{LEVELS.map((l) => (
+						<ToneChip
+							key={l}
+							tone={LOG_LEVEL_TONE[l]}
+							active={levels.has(l)}
+							onClick={() => toggleLevel(l)}
+							uppercase
+						>
+							{l}
+						</ToneChip>
+					))}
 				</div>
 
 				<select
 					value={source}
 					onChange={(e) => setSource(e.target.value)}
-					className="rounded-lg border border-black/10 bg-bn-surface px-2.5 py-1.5 text-[12px] text-bn-text-secondary"
+					data-bn="input"
+					className="rounded-lg border border-bn-border bg-bn-field px-2.5 py-1.5 text-bn-sm text-bn-text-secondary"
 				>
 					<option value="">全部来源</option>
 					{sources.map((s) => (
@@ -178,63 +171,37 @@ export default function Logs() {
 					value={isLive ? "" : day}
 					max={todayStr()}
 					onChange={(e) => setDay(e.target.value)}
-					className="rounded-lg border border-black/10 bg-bn-surface px-2.5 py-1.5 text-[12px] text-bn-text-secondary"
+					data-bn="input"
+					className="rounded-lg border border-bn-border bg-bn-field px-2.5 py-1.5 text-bn-sm text-bn-text-secondary"
 				/>
 				{!isLive && (
-					<button
-						type="button"
-						onClick={() => setDay("")}
-						className="rounded-full border border-bn-pink/40 bg-bn-pink/10 px-3 py-1 text-[12px] font-semibold text-bn-pink"
-					>
+					// 常亮 active:它没有未选中态 —— 一旦回到实时,这颗自己就不显示了。
+					<ToneChip active onClick={() => setDay("")}>
 						回到实时
-					</button>
+					</ToneChip>
 				)}
-				<button
-					type="button"
-					onClick={() => setPaused((p) => !p)}
-					className="rounded-full border px-3 py-1 text-[12px] font-semibold transition"
-					style={
-						paused
-							? { background: "#f2a05320", color: "#f2a053", borderColor: "#f2a05355" }
-							: {
-									background: "transparent",
-									color: "var(--color-bn-text-tertiary)",
-									borderColor: "var(--color-bn-border)",
-								}
-					}
-				>
+				<ToneChip tone={PAUSED_TONE} active={paused} onClick={() => setPaused((p) => !p)}>
 					{paused ? "已暂停" : "暂停"}
-				</button>
-				<button
-					type="button"
+				</ToneChip>
+				<ToneChip
+					tone={AUTOSCROLL_TONE}
+					active={autoscroll}
 					onClick={() => setAutoscroll((a) => !a)}
-					className="rounded-full border px-3 py-1 text-[12px] font-semibold transition"
-					style={
-						autoscroll
-							? { background: "#00AEEC1f", color: "#00AEEC", borderColor: "#00AEEC55" }
-							: {
-									background: "transparent",
-									color: "var(--color-bn-text-tertiary)",
-									borderColor: "var(--color-bn-border)",
-								}
-					}
 				>
 					自动滚动
-				</button>
-				<button
-					type="button"
+				</ToneChip>
+				<ToneChip
 					onClick={() => {
 						void downloadRawLog(viewDay).catch((err) => {
 							alert(`下载失败:${String((err as Error).message ?? err)}`);
 						});
 					}}
-					className="inline-flex items-center gap-1 rounded-full border border-black/10 px-3 py-1 text-[12px] font-semibold text-bn-text-secondary hover:text-bn-text-primary"
 				>
 					↓ {viewDay}.jsonl
-				</button>
+				</ToneChip>
 			</div>
 
-			<div className="flex items-center justify-between px-1 text-[11px] text-bn-text-tertiary">
+			<div className="flex items-center justify-between px-1 text-bn-xs text-bn-text-tertiary">
 				<span>
 					{isLive ? "实时" : `归档 · ${day}`} · 显示 {displayed.length} 行
 					{paused ? " · 已冻结" : ""}
@@ -242,11 +209,13 @@ export default function Logs() {
 				{logsQuery.isLoading ? <span>加载中…</span> : null}
 			</div>
 
-			<div className="rounded-[10px] border border-black/6 bg-[#0f1115] px-3 py-2.5 font-mono text-[12px] leading-relaxed">
+			<div className="rounded-bn-sm border border-bn-border-subtle bg-bn-console-bg px-3 py-2.5 font-mono text-bn-sm leading-relaxed">
 				{logsQuery.error ? (
-					<div className="text-red-400">加载失败:{String((logsQuery.error as Error).message)}</div>
+					<div className="text-bn-console-danger">
+						加载失败:{String((logsQuery.error as Error).message)}
+					</div>
 				) : displayed.length === 0 ? (
-					<div className="py-10 text-center text-[12px] text-gray-500">没有符合条件的日志</div>
+					<div className="py-10 text-center text-bn-sm text-bn-console-dim">没有符合条件的日志</div>
 				) : (
 					// biome-ignore lint/suspicious/noArrayIndexKey: 日志行无稳定 id;append-only tail 视图,行不会原地重排,index 复用无状态副作用
 					displayed.map((e, i) => <LogRow key={`${e.ts}-${i}`} entry={e} />)
@@ -256,8 +225,8 @@ export default function Logs() {
 		</div>
 	);
 
-	// 日志页全宽单栏;「更新日志」已迁出到 `/about`。保留 bn-anim-fade-in 入场动画。
-	return <div className="bn-anim-fade-in">{runtimeLogs}</div>;
+	// 日志页全宽单栏;「更新日志」已迁出到 `/about`。入场动画同各页(bn-anim-page-in)。
+	return <div className="bn-anim-page-in">{runtimeLogs}</div>;
 }
 
 export function formatLocalTime(iso: string): string {
@@ -274,19 +243,21 @@ export function formatLocalTime(iso: string): string {
 }
 
 function LogRow({ entry }: { entry: LogLineView }) {
-	const tone = LEVEL_TONE[entry.level];
+	// 控制台那一档 —— 这一行画在 `--color-bn-console-bg`(#0f1115)上,吃的是
+	// 深底那批更亮的值。用浅底那批会当场糊掉(debug 只剩 3.97:1)。
+	const tone = LOG_LEVEL_TONE_CONSOLE[entry.level];
 	const time = formatLocalTime(entry.ts); // yyyy-MM-dd HH:MM:SS.sss(浏览器本地时区)
 	return (
-		<div className="flex gap-2 whitespace-pre-wrap break-all py-0.5 text-gray-300">
-			<span className="shrink-0 text-gray-500">{time}</span>
+		<div className="flex gap-2 whitespace-pre-wrap break-all py-0.5 text-bn-console-text">
+			<span className="shrink-0 text-bn-console-dim">{time}</span>
 			<span className="shrink-0 font-bold uppercase" style={{ color: tone }}>
 				{entry.level}
 			</span>
-			{entry.name ? <span className="shrink-0 text-gray-500">[{entry.name}]</span> : null}
+			{entry.name ? <span className="shrink-0 text-bn-console-dim">[{entry.name}]</span> : null}
 			<span className="min-w-0">
 				{entry.msg}
 				{entry.args && entry.args.length > 0 ? (
-					<span className="text-gray-500"> {JSON.stringify(entry.args)}</span>
+					<span className="text-bn-console-dim"> {JSON.stringify(entry.args)}</span>
 				) : null}
 			</span>
 		</div>

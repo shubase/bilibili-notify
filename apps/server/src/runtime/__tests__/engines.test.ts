@@ -20,7 +20,12 @@
 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { GlobalConfig, Subscription } from "@bilibili-notify/internal";
+import type {
+	GlobalConfig,
+	PushAdapter,
+	PushTarget,
+	Subscription,
+} from "@bilibili-notify/internal";
 import {
 	DEFAULT_CARD_LAYOUT,
 	DEFAULT_MESSAGE_LAYOUT,
@@ -29,6 +34,7 @@ import {
 } from "@bilibili-notify/internal";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import type { ConfigStore } from "../../config/store.js";
+import type { PlatformAdapter } from "../../platforms/types.js";
 import { standaloneContentBuilder } from "../content-builder.js";
 import { createNodeMessageBus } from "../message-bus.js";
 import type { NodeServiceContext } from "../service-context.js";
@@ -58,24 +64,28 @@ vi.mock("@bilibili-notify/push", () => ({
 	},
 }));
 
-vi.mock("@bilibili-notify/dynamic", () => ({
-	// 纯函数镜像(真实实现见 packages/dynamic/src/push-like.ts):dynamic-images 抑制 @全体。
-	atAllOptsForDynamicKind: (kind: string) =>
-		kind === "dynamic-images" ? { allowAtAll: false } : undefined,
-	DynamicEngine: class {
-		opts: any;
-		start = vi.fn();
-		stop = vi.fn();
-		updateConfig = vi.fn();
-		setAi = vi.fn();
-		setImage = vi.fn();
-		applyOps = vi.fn();
-		constructor(opts: any) {
-			this.opts = opts;
-			H.dynamic.push(this);
-		}
-	},
-}));
+vi.mock("@bilibili-notify/dynamic", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("@bilibili-notify/dynamic")>();
+	return {
+		// 纯函数走真实实现(@全体抑制、动态卡配色解析):它们是没有副作用的规则,在这儿
+		// 镜像一份只会跟真实现漂移。只有引擎本体是替身。
+		broadcastOptsForDynamicKind: actual.broadcastOptsForDynamicKind,
+		resolveDynamicColorOptions: actual.resolveDynamicColorOptions,
+		DynamicEngine: class {
+			opts: any;
+			start = vi.fn();
+			stop = vi.fn();
+			updateConfig = vi.fn();
+			setAi = vi.fn();
+			setImage = vi.fn();
+			applyOps = vi.fn();
+			constructor(opts: any) {
+				this.opts = opts;
+				H.dynamic.push(this);
+			}
+		},
+	};
+});
 
 vi.mock("@bilibili-notify/live", () => ({
 	LiveEngine: class {
@@ -108,14 +118,19 @@ vi.mock("@bilibili-notify/ai", () => ({
 		 * 失败」—— 表现是 H.ai 里有实例但 start 一次没调,不是一眼能看懂的报错。
 		 */
 		setSubscriptionsSource = vi.fn();
+		/** 同上:engines.ts 构造后还会接联网搜索的执行器热读口。 */
+		setWebSearchSource = vi.fn();
 		constructor(opts: any) {
 			this.opts = opts;
 			H.ai.push(this);
 		}
 	},
+	webSearchExecutorFromSettings: () => null,
 }));
 
 vi.mock("@bilibili-notify/image", () => ({
+	// 引擎把它当 transform 交给字体读取器 —— 真身在 packages/image,这里只要个能认出来的替身。
+	buildFontFace: (dataUrl: string) => `@font-face{src:url("${dataUrl}")}`,
 	ImageRenderer: class {
 		opts: any;
 		start = vi.fn();
@@ -134,6 +149,7 @@ const {
 	liveTypeToFeature,
 	liveTypeAllowsAtAll,
 	buildDynamicSubViewSingle,
+	resolveDynamicCardStyle,
 	buildLiveSubViewSingle,
 } = await import("../engines.js");
 
@@ -146,12 +162,12 @@ describe("apps/server adapter live-type map (cross-end mirror)", () => {
 		expect(liveTypeToFeature(0)).toBe("live");
 		expect(liveTypeToFeature(3)).toBe("live");
 		expect(liveTypeToFeature(4)).toBe("liveGuardBuy");
-		expect(liveTypeToFeature(5)).toBe("wordcloud");
+		expect(liveTypeToFeature(5)).toBe("liveEnd");
 		expect(liveTypeToFeature(6)).toBe("superchat");
 		expect(liveTypeToFeature(7)).toBe("specialDanmaku");
 		expect(liveTypeToFeature(8)).toBe("specialUserEnter");
 		expect(liveTypeToFeature(9)).toBe("liveEnd");
-		expect(liveTypeToFeature(10)).toBe("liveSummary");
+		expect(liveTypeToFeature(10)).toBe("liveEnd");
 		expect(liveTypeToFeature(999)).toBe("live");
 	});
 
@@ -191,18 +207,26 @@ function makeServiceCtx() {
 
 function makeConfigStore(initial: GlobalConfig) {
 	let g = initial;
+	let targets: PushTarget[] = [];
+	let adapters: PushAdapter[] = [];
 	return {
 		// 背景轮换游标 fs 路径取自此。指向 OS 临时目录下一个**不存在**的子目录(跨平台:
 		// Windows/macOS/Linux 都解析为各自 tmp 根):load 读不到走 catch 返回 {};测试不触发
 		// 轮换故游标不脏、dispose 不写盘(即便写,目标在 tmp 下也无害)。不含任何真实路径/密钥。
 		bootstrap: { dataDir: join(tmpdir(), "bn-engines-test-no-such-dir") },
 		getGlobals: () => g,
-		getTargets: () => [],
-		getAdapters: () => [],
+		getTargets: () => targets,
+		getAdapters: () => adapters,
 		patchTarget: vi.fn(async () => {}),
 		patchAdapter: vi.fn(async () => {}),
 		_set: (next: GlobalConfig) => {
 			g = next;
+		},
+		_setTargets: (next: PushTarget[]) => {
+			targets = next;
+		},
+		_setAdapters: (next: PushAdapter[]) => {
+			adapters = next;
 		},
 	};
 }
@@ -216,19 +240,30 @@ interface Ctx {
 	loginFlow: { setHealthCheckMs: ReturnType<typeof vi.fn> };
 }
 
-function setup(opts?: { globals?: GlobalConfig; puppeteer?: boolean; subs?: Subscription[] }): Ctx {
+function setup(opts?: {
+	globals?: GlobalConfig;
+	puppeteer?: boolean;
+	subs?: Subscription[];
+	/** 配置表里的适配器(开机健康探测会挨个探它们)。 */
+	adapters?: PushAdapter[];
+	/** 平台实现(探测 / 能力都问它)。 */
+	platformAdapters?: PlatformAdapter[];
+}): Ctx {
 	const serviceCtx = makeServiceCtx();
 	const configStore = makeConfigStore(opts?.globals ?? makeDefaultGlobalConfig());
+	if (opts?.adapters) configStore._setAdapters(opts.adapters);
 	const api = { setUserAgent: vi.fn() };
 	const loginFlow = { setHealthCheckMs: vi.fn() };
 	const bus = createNodeMessageBus();
 	const subs = opts?.subs ?? [];
 	const runtime = createEngines({
 		serviceCtx: serviceCtx as unknown as NodeServiceContext,
+		// 这批用例不碰自带字体;真实实现由 runtime 传进来,这里给个空实现即可。
+		loadFontFace: async () => "",
 		api: api as any,
 		loginFlow: loginFlow as any,
 		configStore: configStore as unknown as ConfigStore,
-		historyStore: { append: vi.fn(async () => {}) } as any,
+		historyStore: { record: vi.fn(async () => {}) } as any,
 		subscriptionStore: {
 			list: () => subs,
 			findByUid: (uid: string) => subs.find((s) => s.uid === uid),
@@ -241,7 +276,7 @@ function setup(opts?: { globals?: GlobalConfig; puppeteer?: boolean; subs?: Subs
 			load: vi.fn(async () => {}),
 		} as any,
 		bus,
-		adapters: [],
+		adapters: opts?.platformAdapters ?? [],
 		puppeteer: opts?.puppeteer ? ({} as any) : null,
 	});
 	return { runtime, bus, serviceCtx, configStore, api, loginFlow };
@@ -257,12 +292,15 @@ function patchGlobals(c: Ctx, mutate: (g: GlobalConfig) => void): void {
 function aiGlobals(): GlobalConfig {
 	const g = makeDefaultGlobalConfig();
 	// 连接字段住在服务商桶里(各家一套配置)。
-	g.defaults.ai.provider = "deepseek";
+	g.defaults.ai.activeProfile = "deepseek";
 	g.defaults.ai.providers = {
 		deepseek: {
+			provider: "deepseek",
+			label: "",
 			apiKey: "k-test",
 			baseUrl: "https://api.example.com",
 			model: "gpt-4o-mini",
+			apiFlavor: "chat",
 			temperature: 0.7,
 			enableThinking: false,
 			thinkingLevel: "medium",
@@ -353,6 +391,12 @@ describe("createEngines — boot wiring", () => {
 		active = c;
 		expect(H.ai).toHaveLength(1);
 		expect(H.ai[0].start).toHaveBeenCalledTimes(1);
+	});
+
+	it("构造后立刻接上联网搜索的执行器热读口 —— 快照式接线会让「刚填的 key 不生效」", () => {
+		const c = setup({ globals: aiGlobals() });
+		active = c;
+		expect(H.ai[0].setWebSearchSource).toHaveBeenCalledTimes(1);
 	});
 
 	it("构造后立刻接上只读工具 —— 不接的话女仆连订阅列表都查不到", () => {
@@ -527,6 +571,42 @@ describe("createEngines — config-changed globals 热重载", () => {
 		expect(H.ai[0].updateConfig).not.toHaveBeenCalled();
 	});
 
+	it("启动时没配 AI、之后补齐 → runtime.commentary 跟着变成实例", () => {
+		// 现场(桌面端 2026-08-07):启动那会儿密钥袋还没 key → commentary 为 null。
+		// 随后在设置页填上 apiKey 保存,热重载把实例建起来了(日志确有「commentary
+		// 已激活」),`dynamic`/`live` 也靠显式 setAi/setCommentary 拿到了新引用 ——
+		// 唯独对外暴露的这个字段没人管。聊天路由读的正是它(routes/ai.ts),于是
+		// 「保存成功了,进聊天照样报『baseUrl / apiKey 还没填齐』,重启才好」。
+		const c = setup(); // 不配 AI
+		active = c;
+		expect(c.runtime.commentary).toBeNull();
+
+		patchGlobals(c, (g) => {
+			const ai = aiGlobals().defaults.ai;
+			g.defaults.ai.activeProfile = ai.activeProfile;
+			g.defaults.ai.providers = ai.providers;
+		});
+		c.bus.emit("config-changed", "globals");
+
+		expect(H.ai).toHaveLength(1); // 实例确实建起来了
+		expect(c.runtime.commentary).not.toBeNull(); // 读得到的必须是同一个
+	});
+
+	it("配着 AI 启动、之后清空密钥 → runtime.commentary 跟着变回 null", () => {
+		// 反向的一半:属性若是快照,停用后它还攥着已 stop 的旧实例,聊天会拿一个
+		// 主人已经撤掉的配置继续答话 —— 比报错更难发现。
+		const c = setup({ globals: aiGlobals() });
+		active = c;
+		expect(c.runtime.commentary).not.toBeNull();
+
+		patchGlobals(c, (g) => {
+			g.defaults.ai.providers = {};
+		});
+		c.bus.emit("config-changed", "globals");
+
+		expect(c.runtime.commentary).toBeNull();
+	});
+
 	it("新 dynamicCron 透传进 DynamicEngineConfig", () => {
 		const c = setup();
 		active = c;
@@ -661,7 +741,7 @@ describe("createEngines — AI 热重载三态", () => {
 		expect(H.ai).toHaveLength(0);
 		patchGlobals(c, (g) => {
 			// 添加一家并选中它 —— 「配齐了」现在的意思是「当前那家的桶里连接齐备」。
-			g.defaults.ai.provider = "deepseek";
+			g.defaults.ai.activeProfile = "deepseek";
 			g.defaults.ai.providers = aiGlobals().defaults.ai.providers;
 		});
 		c.bus.emit("config-changed", "globals");
@@ -676,7 +756,7 @@ describe("createEngines — AI 热重载三态", () => {
 		active = c;
 		expect(H.ai).toHaveLength(1);
 		patchGlobals(c, (g) => {
-			const p = g.defaults.ai.providers[g.defaults.ai.provider];
+			const p = g.defaults.ai.providers[g.defaults.ai.activeProfile];
 			if (p) p.apiKey = "";
 		});
 		c.bus.emit("config-changed", "globals");
@@ -691,7 +771,7 @@ describe("createEngines — AI 热重载三态", () => {
 		const c = setup({ globals: aiGlobals() });
 		active = c;
 		patchGlobals(c, (g) => {
-			const p = g.defaults.ai.providers[g.defaults.ai.provider];
+			const p = g.defaults.ai.providers[g.defaults.ai.activeProfile];
 			if (p) p.model = "gpt-4o";
 		});
 		c.bus.emit("config-changed", "globals");
@@ -1029,7 +1109,7 @@ describe("createEngines — 消息版式", () => {
 		expect(payloads).toHaveLength(2);
 		expect(payloads[0].kind).toBe("image");
 		expect(payloads[1]).toEqual({ kind: "text", text: "开播文案" });
-		expect(opts).toEqual({ allowAtAll: true });
+		expect(opts).toMatchObject({ allowAtAll: true, kind: "live" });
 	});
 
 	it("回归镜像:只改全局 messageLayout → live.applyOps 与 dynamic.applyOps 都收到刷新", () => {
@@ -1056,5 +1136,209 @@ describe("createEngines — 消息版式", () => {
 		expect(H.dynamic[0].applyOps).toHaveBeenCalledTimes(1);
 		const dynOps = H.dynamic[0].applyOps.mock.calls.at(-1)?.[0];
 		expect(dynOps[0]).toMatchObject({ type: "update", uid: "1" });
+	});
+});
+
+// ---------------------------------------------------------------------------
+// 链接卡与推送动态卡问同一处
+//
+// 主人在卡片页给「动态」这一类调样式,推送卡认、链接卡不认 —— 版式那半边已经修过一回
+// (只传版式不传配色),这里把另一半钉住:两种卡的样式解析必须是同一个函数,链接卡
+// 的整份呈现(样式 + 图廊轮换 + 版式)从引擎拿,并且随 config-changed 刷新。
+// ---------------------------------------------------------------------------
+
+describe("resolveDynamicCardStyle — 推送卡与链接卡同一把尺", () => {
+	it("全局没给「动态」单独调过 → enable:false(走渲染器全局兜底,保持热更)", () => {
+		const g = makeDefaultGlobalConfig();
+		expect(resolveDynamicCardStyle(g.defaults, null)).toEqual({ enable: false });
+	});
+
+	it("全局给「动态」调了配色 → 全局作用域(null)也解析出完整样式", () => {
+		const g = makeDefaultGlobalConfig();
+		g.defaults.cardStyleByKind = { dynamic: { cardColorStart: "#abcdef" } } as any;
+		const style = resolveDynamicCardStyle(g.defaults, null);
+		expect(style).toMatchObject({ enable: true, cardColorStart: "#abcdef" });
+		// 与 per-UP 视图走的是同一个函数:没有 UP 覆盖的订阅算出来的必须一模一样。
+		const sub = makeEmptySubscription({ id: "s1", uid: "1" });
+		const subRt = { get: () => undefined } as any;
+		expect(buildDynamicSubViewSingle(sub, subRt, g).customCardStyle).toEqual(style);
+	});
+
+	it("只有 UP 自己的基准覆盖、没有 per-kind → 折算那份基准", () => {
+		const g = makeDefaultGlobalConfig();
+		const sub = makeEmptySubscription({ id: "s1", uid: "1" });
+		sub.overrides.cardStyle = { cardColorEnd: "#000001" } as any;
+		expect(resolveDynamicCardStyle(g.defaults, sub.overrides)).toMatchObject({
+			enable: true,
+			cardColorEnd: "#000001",
+		});
+	});
+});
+
+describe("createEngines — 链接卡的呈现与开关", () => {
+	it("开关与版式随 config-changed 刷新,不用每条消息整份深拷贝 globals", () => {
+		const c = setup();
+		active = c;
+		expect(c.runtime.linkParsing()).toEqual({
+			enabled: false,
+			cooldownSeconds: 60,
+			defaults: { parse: true, form: "image" },
+			groups: {},
+		});
+		expect(c.runtime.linkCardPresentation().layout).toEqual(
+			c.configStore.getGlobals().defaults.cardLayout.dynamic,
+		);
+
+		const layout = [{ id: "content", type: "content", visible: true }];
+		patchGlobals(c, (g) => {
+			g.linkParsing = {
+				enabled: true,
+				cooldownSeconds: 5,
+				defaults: { parse: true, form: "image" },
+				groups: {},
+			};
+			g.defaults.cardLayout.dynamic = layout as any;
+		});
+		c.bus.emit("config-changed", "globals");
+
+		expect(c.runtime.linkParsing()).toEqual({
+			enabled: true,
+			cooldownSeconds: 5,
+			defaults: { parse: true, form: "image" },
+			groups: {},
+		});
+		expect(c.runtime.linkCardPresentation().layout).toEqual(layout);
+	});
+
+	// 例外引用的是目标:目标或适配器停用、删掉都会改变答案,所以逐群表要跟着
+	// globals / targets / adapters 三种变更重算,不能只盯 globals。
+	it("逐群答案随 globals、targets、adapters 三种 config-changed 重算", () => {
+		const ADAPTER = "11111111-1111-4111-8111-111111111111";
+		const TARGET = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+		const c = setup();
+		active = c;
+		c.configStore._setAdapters([
+			{ id: ADAPTER, name: "bot", enabled: true, platform: "onebot", config: {} } as any,
+		]);
+		c.configStore._setTargets([
+			{
+				id: TARGET,
+				name: "群",
+				adapterId: ADAPTER,
+				scope: "group",
+				enabled: true,
+				platform: "onebot",
+				session: { groupId: "123" },
+			} as PushTarget,
+		]);
+		const KEY = `onebot:${ADAPTER}:123`;
+		const STRANGER = `onebot:${ADAPTER}:999`;
+		// 出厂默认行解析开:目标群与陌生群都解析。
+		expect(c.runtime.linkPolicyFor(KEY).parse).toBe(true);
+		expect(c.runtime.linkPolicyFor(STRANGER).parse).toBe(true);
+
+		patchGlobals(c, (g) => {
+			g.linkParsing = {
+				enabled: true,
+				cooldownSeconds: 60,
+				defaults: { parse: false, form: "image" },
+				groups: { [TARGET]: { parse: true } },
+			};
+		});
+		c.bus.emit("config-changed", "globals");
+		expect(c.runtime.linkPolicyFor(KEY)).toEqual({ parse: true, form: "image" });
+		expect(c.runtime.linkPolicyFor(STRANGER).parse).toBe(false);
+
+		// 目标停用 → 那群不再解析;只发 targets 的变更,不发 globals。
+		c.configStore._setTargets([{ ...c.configStore.getTargets()[0], enabled: false } as PushTarget]);
+		c.bus.emit("config-changed", "targets");
+		expect(c.runtime.linkPolicyFor(KEY).parse).toBe(false);
+
+		// 目标恢复、但适配器停用 → 同样不算;只发 adapters 的变更。
+		c.configStore._setTargets([{ ...c.configStore.getTargets()[0], enabled: true } as PushTarget]);
+		c.bus.emit("config-changed", "targets");
+		expect(c.runtime.linkPolicyFor(KEY).parse).toBe(true);
+		c.configStore._setAdapters([{ ...c.configStore.getAdapters()[0], enabled: false } as any]);
+		c.bus.emit("config-changed", "adapters");
+		expect(c.runtime.linkPolicyFor(KEY).parse).toBe(false);
+	});
+
+	it("配色 = 全局「动态」样式;没调过就 undefined(渲染器全局兜底)", () => {
+		const c = setup();
+		active = c;
+		expect(c.runtime.linkCardPresentation().colors).toBeUndefined();
+
+		patchGlobals(c, (g) => {
+			g.defaults.cardStyleByKind = { dynamic: { cardColorStart: "#abcdef" } } as any;
+		});
+		c.bus.emit("config-changed", "globals");
+		expect(c.runtime.linkCardPresentation().colors).toMatchObject({ cardColorStart: "#abcdef" });
+	});
+});
+
+describe("createEngines — 适配器的平台能力", () => {
+	const ADAPTER = "11111111-1111-4111-8111-111111111111";
+	const onebot = { id: ADAPTER, name: "bot", enabled: true, platform: "onebot", config: {} } as any;
+
+	/** 探一次就变「支持」的假平台实现;探之前是「未探测」。 */
+	function fakePlatform(answer: "supported" | "unknown" = "supported", probeOk = true) {
+		let state: "unknown" | "supported" = "unknown";
+		const probeCapabilities = vi.fn(async () => {
+			state = answer === "supported" ? "supported" : "unknown";
+			return caps();
+		});
+		const caps = () => ({
+			miniAppCard: state === "supported" ? { state, checkedAt: 1 } : { state },
+		});
+		const pa: PlatformAdapter = {
+			platforms: ["onebot"],
+			isAvailable: () => true,
+			send: async () => ({ ok: true, latencyMs: 1 }),
+			probe: vi.fn(async () => ({ ok: probeOk, latencyMs: 1 })),
+			capabilities: () => caps(),
+			probeCapabilities,
+		};
+		return { pa, probeCapabilities };
+	}
+	const tick = () => new Promise<void>((r) => setTimeout(r, 0));
+
+	it("开机健康探测顺路把「未探测」的能力探一次;之后从 adapterCapabilities 读得到", async () => {
+		const { pa, probeCapabilities } = fakePlatform();
+		const c = setup({ adapters: [onebot], platformAdapters: [pa] });
+		active = c;
+		await tick();
+		expect(probeCapabilities).toHaveBeenCalledTimes(1);
+		expect(c.runtime.adapterCapabilities(ADAPTER)).toEqual({
+			miniAppCard: { state: "supported", checkedAt: 1 },
+		});
+		// 已经有答案的不重探:主人点「测试」只做健康探测。
+		await c.runtime.probeAdapter(ADAPTER);
+		expect(probeCapabilities).toHaveBeenCalledTimes(1);
+	});
+
+	it("探完仍「未探测」→ 主人点「测试」会再给一次机会", async () => {
+		const { pa, probeCapabilities } = fakePlatform("unknown");
+		const c = setup({ adapters: [onebot], platformAdapters: [pa] });
+		active = c;
+		await tick();
+		expect(probeCapabilities).toHaveBeenCalledTimes(1);
+		await c.runtime.probeAdapter(ADAPTER);
+		expect(probeCapabilities).toHaveBeenCalledTimes(2);
+		expect(c.runtime.adapterCapabilities(ADAPTER)).toEqual({ miniAppCard: { state: "unknown" } });
+	});
+
+	it("连都连不上的适配器不补探能力 —— 那一趟只会白等满一个超时", async () => {
+		const { pa, probeCapabilities } = fakePlatform("unknown", false);
+		const c = setup({ adapters: [onebot], platformAdapters: [pa] });
+		active = c;
+		await tick();
+		expect(pa.probe).toHaveBeenCalled();
+		expect(probeCapabilities).not.toHaveBeenCalled();
+	});
+
+	it("没有能力概念的平台(配置里没这条适配器也一样)→ undefined", () => {
+		const c = setup();
+		active = c;
+		expect(c.runtime.adapterCapabilities("nope")).toBeUndefined();
 	});
 });

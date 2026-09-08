@@ -1,0 +1,1327 @@
+import { createHash, sign as cryptoSign, generateKeyPairSync, type KeyObject } from "node:crypto";
+import {
+	existsSync,
+	mkdirSync,
+	mkdtempSync,
+	readdirSync,
+	readFileSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import type { UpdateSettings } from "@bilibili-notify/internal";
+import { zipSync } from "fflate";
+import { afterEach, describe, expect, it, vi } from "vite-plus/test";
+import { pinVersion } from "../select-version-for-boot.js";
+import { createUpdateService, type UpdateService, type UpdateStatus } from "../service.js";
+
+/**
+ * 把已经分别钉好的几块(取清单 → 决策 → 下载 → 落盘 → 钉版本)串成用户看得见的
+ * 那条流程。
+ *
+ * 这一层真正要守的是**错误怎么归因**:同样是「升不上去」,连不上代理站、我们自己
+ * 签错了东西、和有人在中间改包,是三件完全不同的事。混成一句「更新失败」的话,
+ * 代理站抽风会被当成安全事件,而真篡改会被当成小毛病 —— 两种都比不报错更糟。
+ */
+
+const MANIFEST_URLS = {
+	stable: "https://github.com/o/r/releases/download/update-channel/stable.json",
+	prerelease: "https://github.com/o/r/releases/download/update-channel/alpha.json",
+};
+const RELEASES_PAGE = "https://github.com/o/r/releases";
+
+const created: string[] = [];
+
+// 兜底:某个用例漏等了后台下载,unstub 之后它拿到的是这个,而不是真网络。
+globalThis.fetch = (async () => {
+	throw new Error("测试之外没有网络");
+}) as typeof fetch;
+
+afterEach(() => {
+	vi.unstubAllGlobals();
+	for (const dir of created.splice(0)) rmSync(dir, { recursive: true, force: true });
+});
+
+function tempRoot(): string {
+	const dir = mkdtempSync(join(tmpdir(), "bn-update-svc-"));
+	created.push(dir);
+	return dir;
+}
+
+function makeKey(): { privateKey: KeyObject; spkiBase64: string } {
+	const { publicKey, privateKey } = generateKeyPairSync("ed25519");
+	return {
+		privateKey,
+		spkiBase64: publicKey.export({ type: "spki", format: "der" }).toString("base64"),
+	};
+}
+
+/** 一份最小但能真的装起来的载荷 zip。 */
+function makePayloadZip(version: string): Uint8Array {
+	return zipSync({
+		"index.mjs": new TextEncoder().encode(`// bn ${version}\n`),
+		"package.json": new TextEncoder().encode(JSON.stringify({ version })),
+		"web-dist/index.html": new TextEncoder().encode("<!doctype html><title>bn</title>"),
+	});
+}
+
+interface StubWorld {
+	manifestBody?: string;
+	payload?: Uint8Array;
+	/** 命中就抛(模拟代理站卡死 / 连不上)。 */
+	failUrls?: RegExp;
+	/** 命中就回 200 + 一张 HTML(模拟代理站限流页 / 门户页 —— 国内代理站最常见的死法)。 */
+	garbageUrls?: RegExp;
+}
+
+function stubNetwork({
+	manifestBody,
+	payload,
+	failUrls,
+	garbageUrls,
+}: StubWorld): ReturnType<typeof vi.fn> {
+	const fetchMock = vi.fn(async (input: unknown) => {
+		const url = String(input);
+		if (failUrls?.test(url)) throw new Error(`boom ${url}`);
+		if (garbageUrls?.test(url)) return new Response("<html>请求过快</html>", { status: 200 });
+		if (url.endsWith(".json")) {
+			if (manifestBody === undefined) return new Response("nope", { status: 404 });
+			return new Response(manifestBody, { status: 200 });
+		}
+		if (payload === undefined) return new Response("nope", { status: 404 });
+		return new Response(payload, { status: 200 });
+	});
+	vi.stubGlobal("fetch", fetchMock);
+	return fetchMock;
+}
+
+function envelope(
+	key: KeyObject,
+	manifest: Record<string, unknown>,
+	overrides: { signWith?: KeyObject } = {},
+): string {
+	const inner = JSON.stringify(manifest, null, 2);
+	const signature = cryptoSign(null, Buffer.from(inner, "utf8"), overrides.signWith ?? key);
+	return JSON.stringify({ manifest: inner, signature: signature.toString("base64") });
+}
+
+function manifestFor(version: string, zip: Uint8Array, extra: Record<string, unknown> = {}) {
+	return {
+		version,
+		payload: {
+			url: `https://github.com/o/r/releases/download/v${version}/payload.zip`,
+			sha256: createHash("sha256").update(zip).digest("hex"),
+			size: zip.byteLength,
+		},
+		releaseUrl: `https://github.com/o/r/releases/tag/v${version}`,
+		// 签发时间。默认一个固定值:同一用例里多份清单默认是「同一时刻签的」,谁也不比谁旧。
+		issuedAt: 1_000,
+		...extra,
+	};
+}
+
+function payloadFetches(fetchMock: ReturnType<typeof vi.fn>): number {
+	return fetchMock.mock.calls.filter(([u]) => String(u).endsWith("payload.zip")).length;
+}
+
+function manifestFetches(fetchMock: ReturnType<typeof vi.fn>): number {
+	return fetchMock.mock.calls.filter(([u]) => String(u).endsWith(".json")).length;
+}
+
+/**
+ * `check()` / `download()` 只把下载**发起**就回(`downloading`),取包 → 校验 → 落盘在后台跑。
+ * 面板靠轮询等它收尾,这里也一样:等到状态离开 `downloading` 为止。
+ */
+async function settled(service: UpdateService): Promise<UpdateStatus> {
+	for (let i = 0; i < 400; i++) {
+		const status = service.getStatus();
+		if (status.state.phase !== "downloading") return status;
+		await new Promise((r) => setTimeout(r, 5));
+	}
+	throw new Error("后台下载两秒内没收尾");
+}
+
+/** 让 fetch 在某一类地址上卡住,直到测试放行 —— 用来在「正在下载」这一档里停一停。 */
+function gatedFetch(
+	body: string,
+	zip: Uint8Array,
+	holdWhen: (url: string) => boolean,
+): { fetchMock: ReturnType<typeof vi.fn>; release: () => void } {
+	let release: () => void = () => {};
+	const gate = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	const fetchMock = vi.fn(async (input: unknown) => {
+		const url = String(input);
+		if (holdWhen(url)) await gate;
+		if (url.endsWith(".json")) return new Response(body, { status: 200 });
+		return new Response(zip, { status: 200 });
+	});
+	vi.stubGlobal("fetch", fetchMock);
+	return { fetchMock, release };
+}
+
+const SETTINGS: UpdateSettings = { channel: "stable", autoDownload: true, mirrors: [] };
+
+function makeService(
+	overrides: {
+		root?: string;
+		currentVersion?: string;
+		imageVersion?: string;
+		trustedKeys?: readonly string[];
+		settings?: Partial<UpdateSettings>;
+		nodeMajor?: number;
+	} = {},
+) {
+	const root = overrides.root ?? tempRoot();
+	const versionsRoot = join(root, "versions");
+	mkdirSync(versionsRoot, { recursive: true });
+	return {
+		versionsRoot,
+		service: createUpdateService({
+			currentVersion: overrides.currentVersion ?? "0.8.0",
+			imageVersion: overrides.imageVersion ?? "0.8.0",
+			versionsRoot,
+			nodeMajor: overrides.nodeMajor ?? 24,
+			trustedKeys: overrides.trustedKeys ?? [],
+			manifestUrls: MANIFEST_URLS,
+			releasesPageUrl: RELEASES_PAGE,
+			readSettings: () => ({ ...SETTINGS, ...overrides.settings }),
+		}),
+	};
+}
+
+describe("createUpdateService —— 没有内置公钥时", () => {
+	it("整个功能是关的,不是『验签失败』", async () => {
+		// 公钥列表空 = 这个构建根本没打算做自主升级(比如自己 fork 出去构建的)。
+		// 报「签名不对」会让用户以为有人在中间做手脚,然后去查一个根本不存在的
+		// 安全问题;而且他怎么改配置都不会好。
+		const fetchMock = stubNetwork({});
+		const { service } = makeService({ trustedKeys: [] });
+
+		const status = await service.check();
+
+		expect(status.state).toEqual({ phase: "disabled", reason: "no-keys" });
+		// 也别去打扰网络 —— 没有钥匙,拿回来也验不了。
+		expect(fetchMock).not.toHaveBeenCalled();
+	});
+});
+
+describe("createUpdateService —— 开发版", () => {
+	// 源码里独立端的版本一直是 `0.0.0-dev`(发版 workflow 才按 tag 临时同步),它比任何发出去
+	// 的版本都小 —— 不挡的话开发时每次开面板都被提示「有新版」,开着自动下载还真会装。
+	it("占位版本 0.0.0-dev 不参与更新:报 disabled(dev-build),检查也不碰网络", async () => {
+		const key = makeKey();
+		const fetchMock = stubNetwork({});
+		const { service } = makeService({
+			trustedKeys: [key.spkiBase64],
+			currentVersion: "0.0.0-dev",
+		});
+
+		expect(service.getStatus().state).toEqual({ phase: "disabled", reason: "dev-build" });
+		await service.check();
+		expect(fetchMock).not.toHaveBeenCalled();
+	});
+
+	it("读不到 package.json 时的兜底版本 `dev` 同样算开发版", async () => {
+		const key = makeKey();
+		const fetchMock = stubNetwork({});
+		const { service } = makeService({ trustedKeys: [key.spkiBase64], currentVersion: "dev" });
+
+		expect((await service.check()).state).toEqual({ phase: "disabled", reason: "dev-build" });
+		expect(fetchMock).not.toHaveBeenCalled();
+	});
+});
+
+describe("createUpdateService —— 检查更新", () => {
+	it("有新版且开了自动下载 → 一路装到『可以重启了』", async () => {
+		const key = makeKey();
+		const zip = makePayloadZip("0.9.0");
+		stubNetwork({
+			manifestBody: envelope(key.privateKey, manifestFor("0.9.0", zip)),
+			payload: zip,
+		});
+		const { service, versionsRoot } = makeService({ trustedKeys: [key.spkiBase64] });
+
+		await service.check();
+		const status = await settled(service);
+
+		expect(status.state).toMatchObject({
+			phase: "ready",
+			target: "0.9.0",
+			releaseUrl: "https://github.com/o/r/releases/tag/v0.9.0",
+		});
+		// 真的落到盘上了,而且是一个完整的版本目录 —— 下次启动就是靠它选版的。
+		expect(existsSync(join(versionsRoot, "0.9.0", "index.mjs"))).toBe(true);
+		expect(existsSync(join(versionsRoot, "0.9.0", "web-dist", "index.html"))).toBe(true);
+	});
+
+	it("关掉自动下载 → 只告诉你有新版,不动手", async () => {
+		const key = makeKey();
+		const zip = makePayloadZip("0.9.0");
+		stubNetwork({
+			manifestBody: envelope(key.privateKey, manifestFor("0.9.0", zip)),
+			payload: zip,
+		});
+		const { service, versionsRoot } = makeService({
+			trustedKeys: [key.spkiBase64],
+			settings: { autoDownload: false },
+		});
+
+		const status = await service.check();
+
+		expect(status.state).toMatchObject({ phase: "available", target: "0.9.0" });
+		expect(existsSync(join(versionsRoot, "0.9.0"))).toBe(false);
+
+		// 用户自己按下下载,才动手。
+		await service.download();
+		const after = await settled(service);
+		expect(after.state).toMatchObject({ phase: "ready", target: "0.9.0" });
+	});
+
+	it("已经是最新 → up-to-date", async () => {
+		const key = makeKey();
+		const zip = makePayloadZip("0.8.0");
+		stubNetwork({
+			manifestBody: envelope(key.privateKey, manifestFor("0.8.0", zip)),
+			payload: zip,
+		});
+		const { service } = makeService({ trustedKeys: [key.spkiBase64], currentVersion: "0.8.0" });
+
+		expect((await service.check()).state.phase).toBe("up-to-date");
+	});
+
+	it("预发布渠道默认不吃预发布版本,开了才吃", async () => {
+		const key = makeKey();
+		const zip = makePayloadZip("0.9.0-alpha.1");
+		const body = envelope(key.privateKey, manifestFor("0.9.0-alpha.1", zip));
+
+		stubNetwork({ manifestBody: body, payload: zip });
+		const closed = makeService({ trustedKeys: [key.spkiBase64] });
+		expect((await closed.service.check()).state.phase).toBe("up-to-date");
+
+		stubNetwork({ manifestBody: body, payload: zip });
+		const open = makeService({
+			trustedKeys: [key.spkiBase64],
+			settings: { channel: "prerelease" },
+		});
+		await open.service.check();
+		expect((await settled(open.service)).state).toMatchObject({ phase: "ready" });
+	});
+
+	it("按渠道取不同的清单地址 —— 正式版用户永远看不到预发布那份", async () => {
+		const key = makeKey();
+		const zip = makePayloadZip("0.9.0");
+		const fetchMock = stubNetwork({
+			manifestBody: envelope(key.privateKey, manifestFor("0.9.0", zip)),
+			payload: zip,
+		});
+		const { service } = makeService({
+			trustedKeys: [key.spkiBase64],
+			settings: { channel: "prerelease" },
+		});
+
+		await service.check();
+		await settled(service);
+
+		expect(String(fetchMock.mock.calls[0]?.[0])).toBe(MANIFEST_URLS.prerelease);
+	});
+
+	it("新版要更高的 Node → 明说要重拉镜像,并给出那一版的发布页与概述", async () => {
+		const key = makeKey();
+		const zip = makePayloadZip("0.9.0");
+		stubNetwork({
+			manifestBody: envelope(
+				key.privateKey,
+				manifestFor("0.9.0", zip, { requires: { nodeMajor: 26 }, notes: "要换镜像的一版。" }),
+			),
+			payload: zip,
+		});
+		const { service, versionsRoot } = makeService({
+			trustedKeys: [key.spkiBase64],
+			nodeMajor: 24,
+		});
+
+		const status = await service.check();
+
+		// 概述照带:这一版换不了也得让人知道它是什么,右下角那张卡念的就是它。
+		expect(status.state).toMatchObject({
+			phase: "needs-image-pull",
+			target: "0.9.0",
+			releaseUrl: "https://github.com/o/r/releases/tag/v0.9.0",
+			notes: "要换镜像的一版。",
+		});
+		// 载荷能比镜像新,但 Node 来自镜像 —— 下下来也跑不起来,别下。
+		expect(existsSync(join(versionsRoot, "0.9.0"))).toBe(false);
+	});
+});
+
+describe("createUpdateService —— 面板一打开就查一次,所以查得起", () => {
+	it("同一份新版已经装好 → 再查一次不再下第二遍", async () => {
+		// 面板每次打开都会触发一次检查。装好了还没重启的这段时间里,每开一次面板
+		// 就重下 7MB 是说不过去的 —— 尤其对走加速前缀的用户。
+		const key = makeKey();
+		const zip = makePayloadZip("0.9.0");
+		const fetchMock = stubNetwork({
+			manifestBody: envelope(key.privateKey, manifestFor("0.9.0", zip)),
+			payload: zip,
+		});
+		const { service } = makeService({ trustedKeys: [key.spkiBase64] });
+
+		await service.check();
+		await settled(service);
+		const again = await service.check();
+
+		expect(again.state).toMatchObject({ phase: "ready", target: "0.9.0" });
+		expect(payloadFetches(fetchMock)).toBe(1);
+	});
+
+	it("同一个版本号但清单里的包换了 → 还是要重下,别只认版本号", async () => {
+		const key = makeKey();
+		const zipA = makePayloadZip("0.9.0");
+		const world: { body: string; payload: Uint8Array } = {
+			body: envelope(key.privateKey, manifestFor("0.9.0", zipA)),
+			payload: zipA,
+		};
+		const fetchMock = vi.fn(async (input: unknown) => {
+			const url = String(input);
+			if (url.endsWith(".json")) return new Response(world.body, { status: 200 });
+			return new Response(world.payload, { status: 200 });
+		});
+		vi.stubGlobal("fetch", fetchMock);
+		const { service, versionsRoot } = makeService({ trustedKeys: [key.spkiBase64] });
+
+		await service.check();
+		await settled(service);
+		// 同版本号、不同内容(发版侧重传了资产)。
+		const zipB = zipSync({
+			"index.mjs": new TextEncoder().encode("// bn 0.9.0 rebuilt\n"),
+			"package.json": new TextEncoder().encode(JSON.stringify({ version: "0.9.0" })),
+			"web-dist/index.html": new TextEncoder().encode("<!doctype html>"),
+		});
+		world.body = envelope(key.privateKey, manifestFor("0.9.0", zipB));
+		world.payload = zipB;
+		await service.check();
+		const again = await settled(service);
+
+		expect(again.state).toMatchObject({ phase: "ready", target: "0.9.0" });
+		expect(payloadFetches(fetchMock)).toBe(2);
+		// 「重下」不只是多打一次网络 —— 盘上得真的是新那份。以前这条只数 fetch 次数,
+		// 落盘那层看到目录在就跳过,7MB 白下、盘上还是旧的,这条照样绿。
+		expect(readFileSync(join(versionsRoot, "0.9.0", "index.mjs"), "utf8")).toContain("rebuilt");
+	});
+
+	it("关着自动下载、手动下完之后再查一次 → 还是 ready,重启按钮不能因为开了次面板就没了", async () => {
+		const key = makeKey();
+		const zip = makePayloadZip("0.9.0");
+		const fetchMock = stubNetwork({
+			manifestBody: envelope(key.privateKey, manifestFor("0.9.0", zip)),
+			payload: zip,
+		});
+		const { service } = makeService({
+			trustedKeys: [key.spkiBase64],
+			settings: { autoDownload: false },
+		});
+
+		await service.check();
+		await service.download();
+		await settled(service);
+		const again = await service.check();
+
+		expect(again.state).toMatchObject({ phase: "ready", target: "0.9.0" });
+		expect(payloadFetches(fetchMock)).toBe(1);
+	});
+
+	it("装好了等重启,再查一次网络断了 → 还是 ready,「立即重启」不能因为一次抖动就没了", async () => {
+		// 需要加速站的用户正是 GitHub 时通时不通的那批。载荷好端端躺在盘上,一次
+		// 失败的检查把 ready 盖成 error,/apply 就回 409 —— 得等下一次成功的检查才能恢复。
+		const key = makeKey();
+		const zip = makePayloadZip("0.9.0");
+		stubNetwork({
+			manifestBody: envelope(key.privateKey, manifestFor("0.9.0", zip)),
+			payload: zip,
+		});
+		const { service } = makeService({ trustedKeys: [key.spkiBase64] });
+		await service.check();
+		await settled(service);
+
+		stubNetwork({ failUrls: /.*/ });
+		const again = await service.check();
+
+		expect(again.state).toMatchObject({ phase: "ready", target: "0.9.0" });
+	});
+
+	it("装好了等重启,再查一次清单说已是最新 → 还是 ready:重启照样会跑盘上那份,界面不能说谎", async () => {
+		// 选版只看盘上谁最新,不看内存态。清单退回去了(发版侧撤了那条、或用户换了渠道),
+		// 盘上那份新版本还在、重启还是会跑它 —— 这时说「已是最新」就是在骗人。
+		const key = makeKey();
+		const zip = makePayloadZip("0.9.0");
+		stubNetwork({
+			manifestBody: envelope(key.privateKey, manifestFor("0.9.0", zip)),
+			payload: zip,
+		});
+		const { service } = makeService({ trustedKeys: [key.spkiBase64] });
+		await service.check();
+		await settled(service);
+
+		stubNetwork({
+			manifestBody: envelope(key.privateKey, manifestFor("0.8.0", makePayloadZip("0.8.0"))),
+		});
+		const again = await service.check();
+
+		expect(again.state).toMatchObject({ phase: "ready", target: "0.9.0" });
+	});
+
+	it("检查还在跑的时候又来一次 → 共用同一趟,不并发下两份", async () => {
+		// 两趟检查同时发出(概览页与打开面板那次撞上)—— 让第二趟搭第一趟的车,清单只拉
+		// 一次,下载也只发起一次。下载**途中**再来的检查见「下载在后台跑」那组。
+		const key = makeKey();
+		const zip = makePayloadZip("0.9.0");
+		const fetchMock = stubNetwork({
+			manifestBody: envelope(key.privateKey, manifestFor("0.9.0", zip)),
+			payload: zip,
+		});
+		const { service } = makeService({ trustedKeys: [key.spkiBase64] });
+
+		const [a, b] = await Promise.all([service.check(), service.check()]);
+
+		expect(a.state).toMatchObject({ phase: "downloading", target: "0.9.0" });
+		expect(b).toEqual(a);
+		expect((await settled(service)).state).toMatchObject({ phase: "ready", target: "0.9.0" });
+		expect(manifestFetches(fetchMock)).toBe(1);
+		expect(payloadFetches(fetchMock)).toBe(1);
+	});
+});
+
+describe("createUpdateService —— 装完顺手打扫", () => {
+	it("清掉够不着的旧版,但**绝不动正在跑的那份**", async () => {
+		const key = makeKey();
+		const zip = makePayloadZip("0.11.0");
+		stubNetwork({
+			manifestBody: envelope(key.privateKey, manifestFor("0.11.0", zip)),
+			payload: zip,
+		});
+		const { service, versionsRoot } = makeService({
+			trustedKeys: [key.spkiBase64],
+			currentVersion: "0.10.0",
+			imageVersion: "0.8.0",
+		});
+		mkdirSync(join(versionsRoot, "0.9.0"), { recursive: true });
+		mkdirSync(join(versionsRoot, "0.10.0"), { recursive: true });
+
+		await service.check();
+		await settled(service);
+
+		// 正在跑的 0.10.0 是我们此刻正在执行的代码,也是待会儿要退回去的地方。
+		expect(existsSync(join(versionsRoot, "0.10.0"))).toBe(true);
+		expect(existsSync(join(versionsRoot, "0.11.0"))).toBe(true);
+		// 回退只退一步,0.9.0 从此没人够得着 —— 留着只是在小机器上白占 25MB。
+		expect(existsSync(join(versionsRoot, "0.9.0"))).toBe(false);
+	});
+});
+
+describe("createUpdateService —— 三种『升不上去』要分得清清楚楚", () => {
+	it("连不上 → unreachable,并给一个用户自己能去下的页面", async () => {
+		stubNetwork({ failUrls: /.*/ });
+		const key = makeKey();
+		const { service } = makeService({ trustedKeys: [key.spkiBase64] });
+
+		const status = await service.check();
+
+		expect(status.state).toMatchObject({ phase: "error", reason: "unreachable" });
+		// 清单都没拿到,所以给不出「那一版」的发布页,只能给发布列表 —— 但**必须
+		// 给得出**,「下不动就通知 + 给链接」是设计里的兜底出口。
+		expect(status.state).toMatchObject({ helpUrl: RELEASES_PAGE });
+	});
+
+	it("签名验不过 → untrusted,这条才该弹红字", async () => {
+		const ours = makeKey();
+		const stranger = makeKey();
+		const zip = makePayloadZip("0.9.0");
+		stubNetwork({
+			manifestBody: envelope(ours.privateKey, manifestFor("0.9.0", zip), {
+				signWith: stranger.privateKey,
+			}),
+			payload: zip,
+		});
+		const { service } = makeService({ trustedKeys: [ours.spkiBase64] });
+
+		expect((await service.check()).state).toMatchObject({ phase: "error", reason: "untrusted" });
+	});
+
+	it("签名没问题但清单不成形 → malformed:是我们自己发错了,别说成被人改过", async () => {
+		const key = makeKey();
+		stubNetwork({ manifestBody: envelope(key.privateKey, { version: "0.9.0" }) });
+		const { service } = makeService({ trustedKeys: [key.spkiBase64] });
+
+		expect((await service.check()).state).toMatchObject({ phase: "error", reason: "malformed" });
+	});
+
+	it("清单对但包对不上校验和 → checksum-mismatch,而且盘上不留半个版本", async () => {
+		const key = makeKey();
+		const zip = makePayloadZip("0.9.0");
+		// 清单按真包算 sha256,实际发下来的是另一坨字节 —— 代理站掉包就是这个形状。
+		stubNetwork({
+			manifestBody: envelope(key.privateKey, manifestFor("0.9.0", zip)),
+			payload: makePayloadZip("9.9.9"),
+		});
+		const { service, versionsRoot } = makeService({ trustedKeys: [key.spkiBase64] });
+
+		// 后台失败也得落成 error —— 不能永远停在「正在下载」,那样面板会一直转。
+		expect((await service.check()).state.phase).toBe("downloading");
+		const status = await settled(service);
+
+		expect(status.state).toMatchObject({ phase: "error", reason: "checksum-mismatch" });
+		// 只看目录:boot-state / manifest-freshness 这类记账文件不算「半个版本」。
+		expect(readdirSync(versionsRoot).filter((n) => !n.endsWith(".json"))).toEqual([]);
+	});
+
+	it("清单拿到了但包下不动 → download-failed,并给那一版的发布页", async () => {
+		const key = makeKey();
+		const zip = makePayloadZip("0.9.0");
+		stubNetwork({
+			manifestBody: envelope(key.privateKey, manifestFor("0.9.0", zip)),
+			failUrls: /payload\.zip$/,
+		});
+		const { service } = makeService({ trustedKeys: [key.spkiBase64] });
+
+		await service.check();
+		const status = await settled(service);
+
+		// 这条比 unreachable 好:清单在手,能精确告诉用户去哪一版的发布页自己下。
+		expect(status.state).toMatchObject({
+			phase: "error",
+			reason: "download-failed",
+			helpUrl: "https://github.com/o/r/releases/tag/v0.9.0",
+		});
+	});
+});
+
+describe("createUpdateService —— 加速前缀", () => {
+	it("按用户给的顺序试,直连永远排在最后", async () => {
+		const key = makeKey();
+		const zip = makePayloadZip("0.9.0");
+		const fetchMock = stubNetwork({
+			manifestBody: envelope(key.privateKey, manifestFor("0.9.0", zip)),
+			payload: zip,
+			failUrls: /^https:\/\/fast\.example/,
+		});
+		const { service } = makeService({
+			trustedKeys: [key.spkiBase64],
+			settings: { mirrors: ["https://fast.example"] },
+		});
+
+		await service.check();
+		await settled(service);
+
+		// 填了加速前缀的人多半是直连根本走不通的人,所以他填的排前面;而直连**必须
+		// 留在列表里**,否则一个填错的前缀就把人彻底锁死在「检查更新失败」上。
+		const urls = fetchMock.mock.calls.map((c) => String(c[0]));
+		expect(urls[0]).toBe(`https://fast.example/${MANIFEST_URLS.stable}`);
+		expect(urls[1]).toBe(MANIFEST_URLS.stable);
+	});
+
+	it("加速站对清单回 200 垃圾页 → 直连兜底,不报成 malformed", async () => {
+		// 「非 2xx 才换站」拦不住这种:限流页 / 门户页就是 200。它穿过去之后验签失败,
+		// 整条更新就停在「清单不成形」上 —— 而直连从没被试过。一个抽风的代理站不该
+		// 有这么大的杀伤力,更不该被报成「我们发错了东西」。
+		const key = makeKey();
+		const zip = makePayloadZip("0.9.0");
+		stubNetwork({
+			manifestBody: envelope(key.privateKey, manifestFor("0.9.0", zip)),
+			payload: zip,
+			garbageUrls: /^https:\/\/flaky\.example/,
+		});
+		const { service } = makeService({
+			trustedKeys: [key.spkiBase64],
+			settings: { mirrors: ["https://flaky.example"], autoDownload: false },
+		});
+
+		const status = await service.check();
+
+		expect(status.state).toMatchObject({ phase: "available", target: "0.9.0" });
+	});
+
+	it("加速站对包回 200 垃圾 → 直连兜底,不报成 checksum-mismatch", async () => {
+		// 同一件事发生在载荷上更糟:checksum-mismatch 在契约里写的是「包下下来了,但不是
+		// 清单说的那一坨字节」—— 正是要弹红字的安全事件。代理站抽风不配这个待遇。
+		const key = makeKey();
+		const zip = makePayloadZip("0.9.0");
+		const fetchMock = stubNetwork({
+			manifestBody: envelope(key.privateKey, manifestFor("0.9.0", zip)),
+			payload: zip,
+			garbageUrls: /^https:\/\/flaky\.example.*payload\.zip$/,
+		});
+		const { service } = makeService({
+			trustedKeys: [key.spkiBase64],
+			settings: { mirrors: ["https://flaky.example"] },
+		});
+
+		await service.check();
+		const status = await settled(service);
+
+		expect(status.state).toMatchObject({ phase: "ready", target: "0.9.0" });
+		const payloadUrls = fetchMock.mock.calls
+			.map((c) => String(c[0]))
+			.filter((u) => u.endsWith("payload.zip"));
+		expect(payloadUrls).toEqual([
+			"https://flaky.example/https://github.com/o/r/releases/download/v0.9.0/payload.zip",
+			"https://github.com/o/r/releases/download/v0.9.0/payload.zip",
+		]);
+	});
+});
+
+describe("createUpdateService —— 回退", () => {
+	it("退一步 = 钉住上一版,并把之前钉的痕迹换掉", async () => {
+		const key = makeKey();
+		const { service, versionsRoot } = makeService({
+			trustedKeys: [key.spkiBase64],
+			currentVersion: "0.10.0",
+			imageVersion: "0.8.0",
+		});
+		mkdirSync(join(versionsRoot, "0.9.0"), { recursive: true });
+		mkdirSync(join(versionsRoot, "0.10.0"), { recursive: true });
+
+		const status = await service.rollback();
+
+		expect(status.rollbackTarget).toBe("0.9.0");
+		expect(status.state).toMatchObject({ phase: "rolled-back", target: "0.9.0" });
+	});
+
+	it("只升过一次 → 退回镜像自带那版", async () => {
+		const key = makeKey();
+		const { service, versionsRoot } = makeService({
+			trustedKeys: [key.spkiBase64],
+			currentVersion: "0.9.0",
+			imageVersion: "0.8.0",
+		});
+		mkdirSync(join(versionsRoot, "0.9.0"), { recursive: true });
+
+		expect((await service.rollback()).state).toMatchObject({
+			phase: "rolled-back",
+			target: "0.8.0",
+		});
+	});
+
+	it("用户拉了更新的镜像 → 退不到比镜像还旧的载荷,退到镜像那版", async () => {
+		// 选版那边对钉子有一条:比镜像旧的钉子作废(用户拉新镜像是明确动作)。回退目标
+		// 要是不按同一套规矩挑,面板会说「已回退到 1.1.0,重启生效」,重启后版本纹丝不动、
+		// 一行日志都没有 —— 最难查的那类症状。
+		const { service, versionsRoot } = makeService({
+			currentVersion: "1.3.0",
+			imageVersion: "1.2.0",
+			trustedKeys: [makeKey().spkiBase64],
+		});
+		mkdirSync(join(versionsRoot, "1.1.0"), { recursive: true });
+		mkdirSync(join(versionsRoot, "1.3.0"), { recursive: true });
+
+		expect(service.getStatus().rollbackTarget).toBe("1.2.0");
+		expect((await service.rollback()).state).toMatchObject({
+			phase: "rolled-back",
+			target: "1.2.0",
+		});
+	});
+
+	it("上一版已被自愈判死 → 跳过它,别把人退进一个开不了机的版本", async () => {
+		const { service, versionsRoot } = makeService({
+			currentVersion: "0.10.0",
+			imageVersion: "0.8.0",
+			trustedKeys: [makeKey().spkiBase64],
+		});
+		mkdirSync(join(versionsRoot, "0.9.0"), { recursive: true });
+		mkdirSync(join(versionsRoot, "0.10.0"), { recursive: true });
+		writeFileSync(
+			join(versionsRoot, "boot-state.json"),
+			JSON.stringify({ attempts: {}, failed: ["0.9.0"] }),
+		);
+
+		expect(service.getStatus().rollbackTarget).toBe("0.8.0");
+	});
+
+	it("已经在镜像那版上 → 没得退,别给用户一个按了没反应的按钮", async () => {
+		const { service } = makeService({ currentVersion: "0.8.0", imageVersion: "0.8.0" });
+
+		expect(service.getStatus().rollbackTarget).toBeNull();
+		expect((await service.rollback()).state).toMatchObject({
+			phase: "error",
+			reason: "nothing-to-roll-back",
+		});
+	});
+
+	it("重启之后钉子还在盘上 → 状态里报出来,面板才知道这会儿别自动查", async () => {
+		// 回退是靠重启生效的。重启之后这是个全新的进程,内存里那个 rolled-back 早没了 ——
+		// 面板要是只认内存态,开一次面板就自动查、自动下、顺手拔钉子,用户按的回退
+		// 活不过一次开面板。钉子在盘上,状态就得把它报出来。
+		const { service, versionsRoot } = makeService({
+			currentVersion: "0.9.0",
+			imageVersion: "0.8.0",
+			trustedKeys: [makeKey().spkiBase64],
+		});
+		mkdirSync(join(versionsRoot, "0.9.0"), { recursive: true });
+		mkdirSync(join(versionsRoot, "0.10.0"), { recursive: true });
+		pinVersion({ versionsRoot, version: "0.9.0" });
+
+		expect(service.getStatus()).toMatchObject({ state: { phase: "idle" }, pinnedVersion: "0.9.0" });
+	});
+
+	it("钉的那版目录已经没了 → 报没钉(和选版那边同一套判定,别让一颗死钉子永远压着自动检查)", async () => {
+		const { service, versionsRoot } = makeService({
+			currentVersion: "0.9.0",
+			imageVersion: "0.8.0",
+			trustedKeys: [makeKey().spkiBase64],
+		});
+		mkdirSync(join(versionsRoot, "0.9.0"), { recursive: true });
+		pinVersion({ versionsRoot, version: "0.8.5" });
+
+		expect(service.getStatus().pinnedVersion).toBeNull();
+	});
+
+	it("退回去之后又装了新版 → 钉子必须拔掉,否则永远停在退回去那一版", async () => {
+		const key = makeKey();
+		const zip = makePayloadZip("0.11.0");
+		stubNetwork({
+			manifestBody: envelope(key.privateKey, manifestFor("0.11.0", zip)),
+			payload: zip,
+		});
+		const { service, versionsRoot } = makeService({
+			trustedKeys: [key.spkiBase64],
+			currentVersion: "0.9.0",
+			imageVersion: "0.8.0",
+		});
+		mkdirSync(join(versionsRoot, "0.9.0"), { recursive: true });
+		await service.rollback();
+
+		await service.check();
+		await settled(service);
+
+		// 装完新版还留着钉子的话,用户点了「立即更新」、重启、然后发现版本号没变,
+		// 而且界面上一切正常 —— 最难查的一类症状。
+		const bootState = JSON.parse(readFileSync(join(versionsRoot, "boot-state.json"), "utf8"));
+		expect(bootState.pinned).toBeUndefined();
+	});
+});
+
+describe("createUpdateService —— 「下载」按钮到底下不下", () => {
+	it("关着自动下载、检查还在飞时按下载 → 排在检查后面真的下,不是拿检查的结果糊弄", async () => {
+		// 面板打开 → 自动检查走一条慢链路(六个候选 × 超时)→ 用户在系统页按「下载这一版」。
+		// 搭车的话拿到的是那次检查的结果(available),一个字节没下,按钮像是死了。
+		const key = makeKey();
+		const zip = makePayloadZip("0.9.0");
+		let releaseManifest: () => void = () => {};
+		const gate = new Promise<void>((resolve) => {
+			releaseManifest = resolve;
+		});
+		const fetchMock = vi.fn(async (input: unknown) => {
+			const url = String(input);
+			if (url.endsWith(".json")) {
+				await gate;
+				return new Response(envelope(key.privateKey, manifestFor("0.9.0", zip)), { status: 200 });
+			}
+			return new Response(zip, { status: 200 });
+		});
+		vi.stubGlobal("fetch", fetchMock);
+		const { service } = makeService({
+			trustedKeys: [key.spkiBase64],
+			settings: { autoDownload: false },
+		});
+
+		const checking = service.check();
+		const downloading = service.download();
+		releaseManifest();
+		const checked = await checking;
+		const downloaded = await downloading;
+
+		expect(checked.state).toMatchObject({ phase: "available" });
+		expect(downloaded.state).toMatchObject({ phase: "downloading", target: "0.9.0" });
+		expect((await settled(service)).state).toMatchObject({ phase: "ready", target: "0.9.0" });
+		expect(payloadFetches(fetchMock)).toBe(1);
+	});
+
+	it("已经 ready 了再按一次下载 → 不重下", async () => {
+		const key = makeKey();
+		const zip = makePayloadZip("0.9.0");
+		const fetchMock = stubNetwork({
+			manifestBody: envelope(key.privateKey, manifestFor("0.9.0", zip)),
+			payload: zip,
+		});
+		const { service } = makeService({ trustedKeys: [key.spkiBase64] });
+		await service.check();
+		await settled(service);
+
+		const again = await service.download();
+
+		expect(again.state).toMatchObject({ phase: "ready" });
+		expect(payloadFetches(fetchMock)).toBe(1);
+	});
+
+	it("检查失败之后按下载 → 重新查,不装上一次查到的那份(它可能已经被撤回)", async () => {
+		const key = makeKey();
+		const zip = makePayloadZip("0.9.0");
+		stubNetwork({
+			manifestBody: envelope(key.privateKey, manifestFor("0.9.0", zip)),
+			payload: zip,
+		});
+		const { service } = makeService({
+			trustedKeys: [key.spkiBase64],
+			settings: { autoDownload: false },
+		});
+		expect((await service.check()).state).toMatchObject({ phase: "available" });
+
+		const fetchMock = stubNetwork({ failUrls: /.*/ });
+		expect((await service.check()).state).toMatchObject({ phase: "error" });
+		const downloaded = await service.download();
+
+		expect(downloaded.state).toMatchObject({ phase: "error", reason: "unreachable" });
+		expect(payloadFetches(fetchMock)).toBe(0);
+	});
+
+	it("换了渠道再按下载 → 按新渠道重新查,不把上个渠道那份装上去", async () => {
+		const key = makeKey();
+		const alphaZip = makePayloadZip("0.10.0-alpha.1");
+		const fetchMock = vi.fn(async (input: unknown) => {
+			const url = String(input);
+			if (url.endsWith("alpha.json")) {
+				return new Response(envelope(key.privateKey, manifestFor("0.10.0-alpha.1", alphaZip)), {
+					status: 200,
+				});
+			}
+			if (url.endsWith("stable.json")) {
+				return new Response(
+					envelope(key.privateKey, manifestFor("0.8.0", makePayloadZip("0.8.0"))),
+					{
+						status: 200,
+					},
+				);
+			}
+			return new Response(alphaZip, { status: 200 });
+		});
+		vi.stubGlobal("fetch", fetchMock);
+		const settings: Partial<UpdateSettings> = { channel: "prerelease", autoDownload: false };
+		const { service } = makeService({ trustedKeys: [key.spkiBase64], settings });
+		expect((await service.check()).state).toMatchObject({
+			phase: "available",
+			target: "0.10.0-alpha.1",
+		});
+
+		settings.channel = "stable";
+		const downloaded = await service.download();
+
+		expect(downloaded.state).toMatchObject({ phase: "up-to-date" });
+		expect(payloadFetches(fetchMock)).toBe(0);
+	});
+});
+
+describe("createUpdateService —— 清单新鲜度", () => {
+	it("加速站缓存了旧清单 → 直连兜底,拿到的是新的那份", async () => {
+		const key = makeKey();
+		const newZip = makePayloadZip("0.9.2");
+		const oldZip = makePayloadZip("0.9.1");
+		const fresh = envelope(key.privateKey, manifestFor("0.9.2", newZip, { issuedAt: 200 }));
+		const cached = envelope(key.privateKey, manifestFor("0.9.1", oldZip, { issuedAt: 100 }));
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async (input: unknown) => {
+				const url = String(input);
+				if (url.endsWith(".json")) {
+					return new Response(url.startsWith("https://cache.example") ? cached : fresh, {
+						status: 200,
+					});
+				}
+				return new Response(url.includes("0.9.2") ? newZip : oldZip, { status: 200 });
+			}),
+		);
+		const { service, versionsRoot } = makeService({
+			trustedKeys: [key.spkiBase64],
+			settings: { autoDownload: false },
+		});
+		// 之前见过 200 那份(比如上次直连查到的)。
+		await service.check();
+		const later = makeService({
+			root: join(versionsRoot, ".."),
+			trustedKeys: [key.spkiBase64],
+			settings: { autoDownload: false, mirrors: ["https://cache.example"] },
+		});
+
+		const status = await later.service.check();
+
+		expect(status.state).toMatchObject({ phase: "available", target: "0.9.2" });
+	});
+
+	it("回放一份签名有效的旧清单 → stale-manifest,不会把人推回已撤回的版本", async () => {
+		// 不可信中间人拿不出未签名的代码,但**拿得出我们签过的旧清单**。没有新鲜度的话:
+		// 0.9.1 被判坏并撤回、0.9.2 是修复版,一个被接管的加速站一直回放 0.9.1 那份清单 →
+		// 客户端判 newer → 默认自动下载 → 装上一个厂商已经召回的构建,面板全程绿。
+		const key = makeKey();
+		const fixZip = makePayloadZip("0.9.2");
+		const badZip = makePayloadZip("0.9.1");
+		const world = {
+			body: envelope(key.privateKey, manifestFor("0.9.2", fixZip, { issuedAt: 200 })),
+		};
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async (input: unknown) => {
+				const url = String(input);
+				if (url.endsWith(".json")) return new Response(world.body, { status: 200 });
+				return new Response(url.includes("0.9.2") ? fixZip : badZip, { status: 200 });
+			}),
+		);
+		const { service, versionsRoot } = makeService({
+			trustedKeys: [key.spkiBase64],
+			settings: { autoDownload: false },
+		});
+		await service.check();
+
+		// 重放:签名依然有效的旧清单。而且换一个进程(新的 service 实例)也得记得。
+		world.body = envelope(key.privateKey, manifestFor("0.9.1", badZip, { issuedAt: 100 }));
+		const replayed = await service.check();
+		const nextBoot = makeService({ root: join(versionsRoot, ".."), trustedKeys: [key.spkiBase64] });
+		const afterRestart = await nextBoot.service.check();
+
+		expect(replayed.state).toMatchObject({ phase: "error", reason: "stale-manifest" });
+		expect(afterRestart.state).toMatchObject({ phase: "error", reason: "stale-manifest" });
+		expect(existsSync(join(versionsRoot, "0.9.1"))).toBe(false);
+	});
+});
+
+describe("createUpdateService —— 撤回", () => {
+	it("清单撤回了盘上已装好、还没重启的那版 → 目录删掉,ready 撤掉,重启不会跑它", async () => {
+		// 选版只看盘上谁最新。装好 0.9.1 等重启、这时它被撤回 —— 不删目录的话,用户随手
+		// 一重启就装上了厂商已经召回的构建,而面板还在说「已就绪,重启就换」。
+		const key = makeKey();
+		const badZip = makePayloadZip("0.9.1");
+		const world = {
+			body: envelope(key.privateKey, manifestFor("0.9.1", badZip, { issuedAt: 100 })),
+		};
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async (input: unknown) => {
+				const url = String(input);
+				if (url.endsWith(".json")) return new Response(world.body, { status: 200 });
+				return new Response(badZip, { status: 200 });
+			}),
+		);
+		const { service, versionsRoot } = makeService({ trustedKeys: [key.spkiBase64] });
+		await service.check();
+		expect((await settled(service)).state).toMatchObject({ phase: "ready", target: "0.9.1" });
+		expect(existsSync(join(versionsRoot, "0.9.1"))).toBe(true);
+
+		// 发版侧把渠道清单重签为「0.9.1 撤回,当前渠道版本仍是 0.8.0(镜像那版)」。
+		world.body = envelope(
+			key.privateKey,
+			manifestFor("0.8.0", makePayloadZip("0.8.0"), { issuedAt: 200, revoked: ["0.9.1"] }),
+		);
+		const status = await service.check();
+
+		expect(status.state).toMatchObject({ phase: "up-to-date" });
+		expect(existsSync(join(versionsRoot, "0.9.1"))).toBe(false);
+	});
+
+	it("正在跑的版本被撤回、清单给的是更旧的修复版 → 装上它,并把坏版本判死让开机不再选它", async () => {
+		const key = makeKey();
+		const fixZip = makePayloadZip("0.9.0");
+		stubNetwork({
+			manifestBody: envelope(
+				key.privateKey,
+				manifestFor("0.9.0", fixZip, { issuedAt: 300, revoked: ["0.9.1"] }),
+			),
+			payload: fixZip,
+		});
+		const { service, versionsRoot } = makeService({
+			trustedKeys: [key.spkiBase64],
+			currentVersion: "0.9.1",
+			imageVersion: "0.8.0",
+		});
+		mkdirSync(join(versionsRoot, "0.9.1"), { recursive: true });
+
+		await service.check();
+		const status = await settled(service);
+
+		expect(status.state).toMatchObject({ phase: "ready", target: "0.9.0" });
+		expect(existsSync(join(versionsRoot, "0.9.0"))).toBe(true);
+		// 正在跑的那份删不得(Windows 上文件还开着),但开机选版不能再选它:选版取最新,
+		// 不记一笔的话重启后还是 0.9.1。
+		//
+		// 记进 `revoked` 而**不是**自愈那份 `failed`:后者会被「这一版起来了」清掉,
+		// 于是重启一次就把召回撤销了。两份名单为什么必须分开,见 select-version-for-boot.ts。
+		const bootState = JSON.parse(readFileSync(join(versionsRoot, "boot-state.json"), "utf8"));
+		expect(bootState.revoked).toContain("0.9.1");
+		expect(bootState.failed ?? []).not.toContain("0.9.1");
+	});
+});
+
+describe("createUpdateService —— 回退撞上进行中的下载", () => {
+	it("下载途中按回退 → 回退排在下载后面落钉子,而不是被下载完成时的拔钉子抹掉", async () => {
+		// rollback 若不走串行闸:它同步落钉、报 rolled-back,几秒后下载完成的那一趟
+		// clearPinnedVersion 把钉子拔掉、把状态盖成 ready —— 用户的回退无声无息地没了。
+		// 面板「打开就查一次」加上默认开着的自动下载,让这个窗口每次开面板都在。
+		const key = makeKey();
+		const zip = makePayloadZip("0.10.0");
+		let releasePayload: () => void = () => {};
+		const payloadGate = new Promise<void>((resolve) => {
+			releasePayload = resolve;
+		});
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async (input: unknown) => {
+				const url = String(input);
+				if (url.endsWith(".json")) {
+					return new Response(envelope(key.privateKey, manifestFor("0.10.0", zip)), {
+						status: 200,
+					});
+				}
+				await payloadGate; // 卡在下载上,直到测试放行
+				return new Response(zip, { status: 200 });
+			}),
+		);
+		const { service, versionsRoot } = makeService({
+			trustedKeys: [key.spkiBase64],
+			currentVersion: "0.9.0",
+			imageVersion: "0.8.0",
+		});
+		mkdirSync(join(versionsRoot, "0.9.0"), { recursive: true });
+
+		const checking = service.check();
+		await new Promise((r) => setTimeout(r, 0)); // 让它走到下载那一步
+		expect(service.getStatus().state.phase).toBe("downloading");
+
+		const rolling = service.rollback();
+		releasePayload();
+		await checking;
+		const rolled = await rolling;
+
+		expect(rolled.state).toMatchObject({ phase: "rolled-back" });
+		const bootState = JSON.parse(readFileSync(join(versionsRoot, "boot-state.json"), "utf8"));
+		expect(bootState.pinned).toBe(
+			rolled.state.phase === "rolled-back" ? rolled.state.target : undefined,
+		);
+		expect(service.getStatus().state.phase).toBe("rolled-back");
+	});
+});
+
+describe("createUpdateService —— 测一遍加速站", () => {
+	it("每个候选各自归因:直连通、一个站不通、一个站改了内容 —— 互不影响", async () => {
+		const key = makeKey();
+		const other = makeKey();
+		const zip = makePayloadZip("0.9.0");
+		const good = envelope(key.privateKey, manifestFor("0.9.0", zip));
+		const tampered = envelope(key.privateKey, manifestFor("0.9.0", zip), {
+			signWith: other.privateKey,
+		});
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async (input: unknown) => {
+				const url = String(input);
+				if (url.startsWith("https://dead.example/")) throw new Error("boom");
+				if (url.startsWith("https://evil.example/")) return new Response(tampered, { status: 200 });
+				return new Response(good, { status: 200 });
+			}),
+		);
+		const { service } = makeService({ trustedKeys: [key.spkiBase64] });
+
+		const results = await service.probeMirrors([
+			"",
+			"https://dead.example/",
+			"https://evil.example/",
+			"https://fine.example/",
+		]);
+
+		expect(results.map((r) => r.prefix)).toEqual([
+			"",
+			"https://dead.example/",
+			"https://evil.example/",
+			"https://fine.example/",
+		]);
+		expect(results[0]).toMatchObject({ ok: true, version: "0.9.0" });
+		expect(results[1]).toMatchObject({ ok: false, reason: "unreachable" });
+		// 改了内容的站要说「签名验不过」,不能和「连不上」混成一句。
+		expect(results[2]).toMatchObject({ ok: false, reason: "untrusted" });
+		expect(results[3]).toMatchObject({ ok: true, version: "0.9.0" });
+		for (const r of results) expect(r.ms).toBeGreaterThanOrEqual(0);
+	});
+
+	it("按当前渠道的清单去测 —— 预发布用户测的是 alpha 那份", async () => {
+		const key = makeKey();
+		const zip = makePayloadZip("0.9.0-alpha.1");
+		const fetchMock = stubNetwork({
+			manifestBody: envelope(key.privateKey, manifestFor("0.9.0-alpha.1", zip)),
+		});
+		const { service } = makeService({
+			trustedKeys: [key.spkiBase64],
+			settings: { channel: "prerelease" },
+		});
+
+		await service.probeMirrors([""]);
+
+		expect(String(fetchMock.mock.calls[0]?.[0])).toBe(MANIFEST_URLS.prerelease);
+	});
+
+	it("没内置公钥 → 空列表,别去打扰网络", async () => {
+		const fetchMock = stubNetwork({});
+		const { service } = makeService({ trustedKeys: [] });
+
+		expect(await service.probeMirrors(["", "https://a.example/"])).toEqual([]);
+		expect(fetchMock).not.toHaveBeenCalled();
+	});
+
+	it("测一遍不碰状态 —— 它不是检查更新", async () => {
+		const key = makeKey();
+		const zip = makePayloadZip("0.9.0");
+		stubNetwork({
+			manifestBody: envelope(key.privateKey, manifestFor("0.9.0", zip)),
+			payload: zip,
+		});
+		const { service } = makeService({ trustedKeys: [key.spkiBase64] });
+
+		await service.probeMirrors([""]);
+
+		expect(service.getStatus().state).toEqual({ phase: "idle" });
+	});
+});
+
+describe("createUpdateService —— 盘上那份 ready 谁也盖不掉", () => {
+	/**
+	 * 装好了还没重启的那份是**盘上的事实**:重启就会跑它。此后无论检查更新得出什么
+	 * 结论 —— 连不上、已是最新、下一版下载失败 —— 都不能把它盖掉,盖掉的下场是
+	 * 「立即重启并应用」凭空消失,而那份载荷明明还躺在盘上、按一下就能用。
+	 */
+	const key = makeKey();
+
+	async function installReady(root: string) {
+		const zip = makePayloadZip("0.9.0");
+		stubNetwork({
+			manifestBody: envelope(key.privateKey, manifestFor("0.9.0", zip, { issuedAt: 100 })),
+			payload: zip,
+		});
+		const { service, versionsRoot } = makeService({
+			root,
+			trustedKeys: [key.spkiBase64],
+			currentVersion: "0.8.0",
+		});
+		await service.check();
+		expect((await settled(service)).state).toMatchObject({ phase: "ready", target: "0.9.0" });
+		return { service, versionsRoot };
+	}
+
+	it("更新的那一版下载失败 → 仍然报 0.9.0 已就绪,而不是 error", async () => {
+		const { service } = await installReady(tempRoot());
+
+		// 第二次检查:清单给出 0.9.1,但它的包每个候选站都下不下来。
+		const next = makePayloadZip("0.9.1");
+		stubNetwork({
+			manifestBody: envelope(key.privateKey, manifestFor("0.9.1", next, { issuedAt: 200 })),
+			failUrls: /payload\.zip$/,
+		});
+
+		await service.check();
+		const status = await settled(service);
+
+		expect(status.state).toMatchObject({ phase: "ready", target: "0.9.0" });
+	});
+
+	it("关掉自动下载、查到更新的一版 → 也不该把已就绪那份打回 available", async () => {
+		// 手动下载装好 0.9.0 之后,下一次检查看到 0.9.1。自动下载是关的,所以这一趟
+		// 只会得出「有新版」——但盘上那份仍然是按一下就能用的,按钮不能因此消失。
+		const zip = makePayloadZip("0.9.0");
+		stubNetwork({
+			manifestBody: envelope(key.privateKey, manifestFor("0.9.0", zip, { issuedAt: 100 })),
+			payload: zip,
+		});
+		const { service } = makeService({
+			trustedKeys: [key.spkiBase64],
+			currentVersion: "0.8.0",
+			settings: { autoDownload: false },
+		});
+		await service.check();
+		await service.download();
+		expect((await settled(service)).state).toMatchObject({ phase: "ready", target: "0.9.0" });
+
+		const next = makePayloadZip("0.9.1");
+		stubNetwork({
+			manifestBody: envelope(key.privateKey, manifestFor("0.9.1", next, { issuedAt: 200 })),
+			payload: next,
+		});
+		await service.check();
+
+		// 「立即重启并应用」必须还在 —— 它是这条链路上唯一一个用户按了就有结果的按钮。
+		expect(service.getStatus().state).toMatchObject({ phase: "ready", target: "0.9.0" });
+	});
+
+	it("盘上钉着别的版本时,不能说这份 ready —— 重启跑的不是它", async () => {
+		const { service, versionsRoot } = await installReady(tempRoot());
+
+		// 装完之后用户按了回退:钉子指向更旧的一版,重启会跑钉着的那个。
+		pinVersion({ versionsRoot, version: "0.8.0" });
+		stubNetwork({
+			manifestBody: envelope(
+				key.privateKey,
+				manifestFor("0.9.0", makePayloadZip("0.9.0"), { issuedAt: 300 }),
+			),
+		});
+		await service.check();
+
+		expect(service.getStatus().state.phase).not.toBe("ready");
+	});
+});
+
+describe("createUpdateService —— 下载在后台跑", () => {
+	/**
+	 * 以前开着自动下载时 `check()` 会一路等到装完才回:打开面板那次自动检查要等几秒到几十秒,
+	 * 右下角的卡只在下完后弹一次「已就绪」,中途没人知道它在下;手动「检查更新」按钮也跟着
+	 * 转到下完。现在 `check()` 把下载**发起**就回 `downloading`,面板靠 2 秒轮询看着它收尾。
+	 */
+	it("开着自动下载 → check() 立刻回「正在下载」(带版本与概述),盘上的结果之后才到", async () => {
+		const key = makeKey();
+		const zip = makePayloadZip("0.9.0");
+		const body = envelope(
+			key.privateKey,
+			manifestFor("0.9.0", zip, { notes: "链接解析学会了认群。" }),
+		);
+		const { release } = gatedFetch(body, zip, (url) => url.endsWith("payload.zip"));
+		const { service, versionsRoot } = makeService({ trustedKeys: [key.spkiBase64] });
+
+		const started = await service.check();
+
+		expect(started.state).toEqual({
+			phase: "downloading",
+			target: "0.9.0",
+			releaseUrl: "https://github.com/o/r/releases/tag/v0.9.0",
+			notes: "链接解析学会了认群。",
+		});
+		expect(existsSync(join(versionsRoot, "0.9.0"))).toBe(false);
+
+		release();
+		const done = await settled(service);
+
+		expect(done.state).toMatchObject({
+			phase: "ready",
+			target: "0.9.0",
+			notes: "链接解析学会了认群。",
+		});
+		expect(existsSync(join(versionsRoot, "0.9.0", "index.mjs"))).toBe(true);
+	});
+
+	it("下载途中再查 / 再按下载 → 只回当前状态,清单和包都不拉第二次", async () => {
+		// 打开面板那次自动检查在下,用户走到系统页按「检查更新」或「下载」:两趟各下一份、
+		// 各解一次压,最后谁写盘谁赢 —— 所以下载中一律只回「正在下载」。
+		const key = makeKey();
+		const zip = makePayloadZip("0.9.0");
+		const body = envelope(key.privateKey, manifestFor("0.9.0", zip));
+		const { fetchMock, release } = gatedFetch(body, zip, (url) => url.endsWith("payload.zip"));
+		const { service } = makeService({ trustedKeys: [key.spkiBase64] });
+
+		const first = await service.check();
+		expect(first.state.phase).toBe("downloading");
+		const again = await service.check();
+		const pressed = await service.download();
+
+		expect(again).toEqual(first);
+		expect(pressed).toEqual(first);
+		expect(manifestFetches(fetchMock)).toBe(1);
+
+		release();
+		expect((await settled(service)).state).toMatchObject({ phase: "ready", target: "0.9.0" });
+		expect(manifestFetches(fetchMock)).toBe(1);
+		expect(payloadFetches(fetchMock)).toBe(1);
+	});
+});

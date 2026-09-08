@@ -9,26 +9,39 @@ import type {
 	AiTestPushResponse,
 	AiToolTraceDTO,
 } from "@bilibili-notify/contract";
+import { AI_TOOL_LOAD_SKILL } from "@bilibili-notify/contract";
 import {
 	type AISettings,
 	AISettingsSchema,
 	type NotificationPayload,
 	providerMeta,
 	resolveAIProfile,
+	resolveChatThinkingLevel,
 } from "@bilibili-notify/internal";
 import { Hono } from "hono";
 import { streamSSE } from "hono/streaming";
 import { z } from "zod";
 import type { Conversation, ConversationMeta } from "../ai/conversation-store.js";
+import { createSkillChatTool, skillInstruction } from "../maid-skills/chat-tool.js";
+import type { MaidSkillEntry, MaidSkillStore } from "../maid-skills/store.js";
+import { toGeneratorConfig } from "../runtime/ai-config.js";
 import {
 	deleteChatImage,
+	MAX_CHAT_IMAGE_BYTES,
 	MAX_CHAT_IMAGES_PER_MESSAGE,
 	readChatImage,
 	readChatImageDataUrl,
 	saveChatImage,
 } from "../runtime/chat-assets.js";
+import {
+	type ChatSkinImage,
+	createSkinChatTools,
+	SKIN_MODE_SYSTEM_PROMPT,
+} from "../skins/chat-tool.js";
+import type { SkinStore } from "../skins/store.js";
 import { REDACTED_API_KEY } from "./globals.js";
 import type { RouteDeps } from "./types.js";
+import { uploadBodyLimit } from "./upload-limit.js";
 
 /**
  * 智能女仆的「试一句」。
@@ -46,7 +59,21 @@ const TestPushRequestSchema = z.object({
 
 // AiTestPushResponse 在 @bilibili-notify/contract(web 同源消费)。
 
-export function createAiRoute(deps: RouteDeps): Hono {
+export function createAiRoute(
+	deps: RouteDeps,
+	opts?: {
+		/**
+		 * 皮肤库。给了才把 `create_skin` 挂进聊天 —— 女仆手上唯一一个会写东西的
+		 * 工具,不该因为「某处装配忘了传」而以别的形式凭空出现。
+		 */
+		skinStore?: SkinStore;
+		/**
+		 * 女仆技能库。给了才有 `load_skill`(女仆自选)与斜杠命令那条路;
+		 * 不给就当这个部署没装技能,聊天照旧。
+		 */
+		skillStore?: MaidSkillStore;
+	},
+): Hono {
 	const app = new Hono();
 
 	app.post("/test-push", async (c) => {
@@ -106,7 +133,14 @@ export function createAiRoute(deps: RouteDeps): Hono {
 	app.post("/conversations", async (c) => {
 		// 刻意**不**依赖 engines / AI 配置:主人在还没配好 key 的时候点「新对话」,
 		// 该看到一个空会话和一句「去把 key 填上」,而不是一个建不出来的按钮。
-		return c.json<AiConversationResponse>({ conversation: toDetail(await store().create()) });
+		//
+		// 面孔(模式 / 人格)只在**这一刻**收 —— 之后没有任何接口能改它。「锁定」
+		// 不是界面上藏个按钮,是根本没有那条路。
+		const parsed = newConversationSchema.safeParse(await c.req.json().catch(() => ({})));
+		const init = parsed.success ? parsed.data : {};
+		return c.json<AiConversationResponse>({
+			conversation: toDetail(await store().create(init)),
+		});
 	});
 
 	app.get("/conversations/:id", async (c) => {
@@ -136,7 +170,8 @@ export function createAiRoute(deps: RouteDeps): Hono {
 	// 会话生灭的。照抄那套「落盘 + id 引用 + 定向读取」的形状,但各用各的目录。
 
 	/** 上传一张附件 → 落盘 `<dataDir>/assets/chat/<id>`,返回 id 供随消息带上。 */
-	app.post("/assets", async (c) => {
+	// 闸在 parseBody 之前:超大的当场回绝,别先整份读进那 512MB 的堆里。见 upload-limit.ts。
+	app.post("/assets", uploadBodyLimit(MAX_CHAT_IMAGE_BYTES, "图片"), async (c) => {
 		const body = await c.req.parseBody().catch(() => null);
 		const file = body?.file;
 		if (!(file instanceof File)) return c.json({ ok: false, err: "缺少图片文件" }, 400);
@@ -260,7 +295,8 @@ export function createAiRoute(deps: RouteDeps): Hono {
 			// 「主模型直接看图」这条路还要那家**真有**视觉模型才算数:DeepSeek 官方
 			// 接口一个都没有,勾着开关也只会把图带到模型那儿才被拒 —— 白烧一次请求,
 			// 报错还来自上游、主人看不懂。这里当场拦下并指路。
-			const mainModelCanSee = aiProfile.enableVision && providerMeta(aiCfg.provider).supportsVision;
+			const mainModelCanSee =
+				aiProfile.enableVision && providerMeta(aiProfile.provider).supportsVision;
 			if (!mainModelCanSee && !aiProfile.vision.model.trim()) {
 				return c.json(
 					{
@@ -273,18 +309,42 @@ export function createAiRoute(deps: RouteDeps): Hono {
 				);
 			}
 		}
-		// id → data URL。视觉服务商在公网,拉不到主人本地的
-		// `http://localhost:9000/api/ai/assets/xxx` —— 只能把字节本身带过去。
-		// 这与 B 站动态里的图不同,那些本来就是公网可达的,所以那条路直接传 URL。
-		const resolved: Array<{ id: string; url: string }> = [];
-		if (attached.length > 0) {
-			const dataDir = deps.store.bootstrap.dataDir;
-			for (const id of attached) {
-				const url = await readChatImageDataUrl(dataDir, id);
-				// 非法 id(穿越尝试)与盘上已经没了的 id 一律跳过,不让它们混进去。
-				if (url) resolved.push({ id, url });
+		// 主人这一问贴的图(见 readImageUrls:为什么带字节而不是地址)。
+		const resolved =
+			attached.length > 0 ? await readImageUrls(deps.store.bootstrap.dataDir, attached) : [];
+
+		/**
+		 * 这一问自己没带图时,**捎上最近那一次的**。
+		 *
+		 * 拼历史只带 content,`m.images` 整个丢掉 —— 女仆不是「忘了」那张图,是从来
+		 * 没看见过,于是下一句就请主人再传一遍。而主人自己传的那张往往正是整段对话的
+		 * 题眼(做皮肤的参考图、要认的截图),让他一遍遍重传是把最不该重复的一步重复。
+		 *
+		 * 只捎最近一次、且只在这一问空手时捎:主人重新挑了图就说明他要问的是新的那张,
+		 * 旧的一并端上去只会分散注意力,还要多付一份钱。捎来的图**不进落盘的 images**
+		 * —— 那一问并没有真的带图,记错了会连累删会话时的图片回收与重开会话的缩略图。
+		 */
+		let carried: Array<{ id: string; url: string }> = [];
+		if (resolved.length === 0) {
+			// 先找有没有这么一条,再去碰磁盘 —— 一句话都不带图的普通聊天(绝大多数)
+			// 不该为这个功能多走一步,更不该去读它本来用不着的 dataDir。
+			const recent = [...conv.messages].reverse().find((m) => m.images?.length);
+			if (recent?.images?.length) {
+				carried = await readImageUrls(deps.store.bootstrap.dataDir, recent.images);
 			}
 		}
+
+		/**
+		 * 这一轮女仆**看得见**的那批图:主人这一问贴的,空手时是捎来的最近那一批。
+		 *
+		 * 算一次并起个名字 —— 从前「有 resolved 用 resolved,否则用 carried」在下面
+		 * 两处各推导一遍(喂给视觉模型的、做壁纸取的),而这两处**必须选同一批**:
+		 * 女仆描述得出的图就得是她做得出壁纸的图,否则主人贴完图聊两句再说「用刚才
+		 * 那张当背景」,会撞上「她说得出那张图长什么样、一动手却说你没贴图」。
+		 *
+		 * 落盘那一处**刻意不用它**:捎来的图不算这一问带的图(见 carried 的文档)。
+		 */
+		const visible = resolved.length > 0 ? resolved : carried;
 
 		// 先在内存里拼出「历史 + 这一问」交给女仆,**拿到回复之后才落盘**。
 		// 反过来先写用户消息的话,AI 那一跳一失败,磁盘上就留下一个没人回答的
@@ -294,71 +354,243 @@ export function createAiRoute(deps: RouteDeps): Hono {
 			{ role: "user" as const, content: message },
 		];
 
+		/**
+		 * 皮肤工坊模式的装配。写能力**只在这个模式里存在**(主人拍板的隔离):
+		 * 日常聊天的上下文里有 B 站动态正文、图片里的字这些外部可控文本,写工具
+		 * 挂在那儿就是给注入面开口。这个模式反过来 —— 人格、B 站只读工具都不带,
+		 * 模型手上只有 create_skin 一把(联网搜索按主人那颗胶囊来,做「某部作品
+		 * 风格」的皮肤离不开它)。
+		 *
+		 * 工具**每个请求现配**:它带着「一轮最多两套」的预算,建在装配处的话那把
+		 * 计数器会跨请求累加 —— 聊到第三句就再也做不了皮肤,而且得重启才恢复。
+		 */
+		// 面孔归会话所有(见 newConversationSchema)—— 这一行是「锁定」的落点。
+		const skinMode = conv.mode === "skin";
+		if (skinMode && !opts?.skinStore) {
+			// 静默退回普通聊天的话,主人会在一个根本做不了皮肤的窗口里反复说
+			// 「做套皮肤」,而女仆一本正经地打太极。
+			return c.json({ err: "皮肤工坊在这个部署里没有装配好,请改用聊天模式" }, 400);
+		}
+		const skinTools =
+			skinMode && opts?.skinStore
+				? createSkinChatTools({
+						skinStore: opts.skinStore,
+						// 热读同 ai-edit:engines 是后挂的,别做快照。
+						generator: () => deps.runtime.engines?.commentary ?? null,
+						/**
+						 * 壁纸的来源:主人这一问贴的图;**这一问空手就用捎来的那张** —— 跟
+						 * 喂给视觉模型的是同一批。女仆看得见的图她就得做得出壁纸,否则主人
+						 * 贴完图聊两句再说「用刚才那张当背景」,会撞上「她描述得出那张图、
+						 * 一动手却说你没贴图」这种自相矛盾。
+						 *
+						 * 字节直接从聊天附件目录读 —— 上面那两份存的是喂给视觉模型的 data
+						 * URL,拿它再解一次 base64 只是绕远路。
+						 */
+						attachedImage: async (): Promise<ChatSkinImage | null> => {
+							const dataDir = deps.store.bootstrap.dataDir;
+							// 读到一张就收手:壁纸只要一张,后面那几张(每张上限 5MB)读进来也是扔。
+							for (const { id } of visible) {
+								const img = await readChatImage(dataDir, id);
+								if (img) return { bytes: img.bytes, ext: id.split(".").pop() ?? "png" };
+							}
+							return null;
+						},
+					})
+				: undefined;
+
+		/**
+		 * 女仆技能。**皮肤工坊里一条都不挂** —— 那是专职窗口(人格不带、B 站只读
+		 * 工具也不带),技能正文串进去只会跟工坊自己的 system 打架。
+		 *
+		 * 每个请求现读盘:主人刚在编辑器里改完一条,下一句话就该用上新的;更要紧的是
+		 * 他可能刚往 dataDir 里手放了一份(ADR 决策 3)。
+		 */
+		let skillTool: ReturnType<typeof createSkillChatTool> = null;
+		let pickedSkill: MaidSkillEntry | undefined;
+		// 工坊里打了斜杠命令 → 当场说清用不了。静默忽略的话,主人看着自己打的
+		// `/weekly-report` 发了出去、女仆却当普通话回了一句,而消息流里连一枚
+		// 痕迹都没有 —— 他没法从界面上看出技能压根没生效。
+		if (skinMode && parsed.data.skill !== undefined) {
+			return c.json({ err: "皮肤工坊里用不了技能,请回普通聊天窗口" }, 400);
+		}
+		if (!skinMode && opts?.skillStore) {
+			await opts.skillStore.reload();
+			const named = parsed.data.skill;
+			if (named !== undefined) {
+				pickedSkill = opts.skillStore.get(named);
+				// 认不得就当场拒。静默发出去的话,主人以为在用技能、其实在跟模型说
+				// 一句它不认识的暗号 —— 老 `/锐评 只看这三个人` 栽的正是这个坑。
+				// 这一步在 markBusy 之前,所以没有账要销。
+				if (!pickedSkill) return c.json({ err: `没有叫「${named}」的技能` }, 400);
+			} else {
+				// 主人自己点名了就不必再挂「读技能」那把工具 —— 正文这一轮已经在
+				// system 里了,再让模型去调一次是白烧一轮。
+				skillTool = createSkillChatTool(opts.skillStore.list());
+			}
+		}
+
+		// 这一轮开跑。期间盘上仍是零消息(消息「拿到回复之后才落盘」,见上面那段),
+		// 不标一下的话 list() 会把主人正聊着的这一场当空壳藏起来 —— 皮肤生成要几
+		// 分钟,侧栏里却没有「我正在聊的那条」。
+		const doneBusy = store().markBusy(conv.id);
 		return streamSSE(c, async (sse) => {
-			/**
-			 * 这一轮调过的工具,按**开始**的先后排 —— 那是主人眼看着它们冒出来的
-			 * 顺序,落盘之后重开会话得对得上。所以 start 时就占好位子,end 只回填
-			 * 成败,而不是等 end 再往后排(那样先开后完的会被插到后面去)。
-			 *
-			 * 落盘时只取回填过的:一条永远停在「进行中」的痕迹,在界面上就是一个
-			 * 转到天荒地老的圈,而落完盘就再没有第二次机会补状态了。
-			 */
-			const slots: Array<{ name: string; args: Record<string, string>; ok?: boolean }> = [];
-			const byId = new Map<string, (typeof slots)[number]>();
-
-			let reply: string;
 			try {
-				reply = await commentary.chatStatelessStream(history, {
-					imageUrls: resolved.length ? resolved.map((r) => r.url) : undefined,
-					onDelta: (text) => {
-						// 不 await:回调是同步的,这里排一次写就行。真要背压也轮不到
-						// 这一层管 —— SSE 的写在内存里排队,量级是几十 KB。
-						void sse.writeSSE({ event: "delta", data: JSON.stringify({ text }) });
-					},
-					onToolEvent: (ev) => {
-						// 先转发再记账:实时那一份才是这个事件存在的理由,落盘是顺带。
-						void sse.writeSSE({ event: "tool", data: JSON.stringify(ev) });
-						if (ev.phase === "start") {
-							const slot = { name: ev.name, args: ev.args };
-							slots.push(slot);
-							byId.set(ev.id, slot);
-							return;
-						}
-						const slot = byId.get(ev.id);
-						if (slot) slot.ok = ev.ok;
-					},
-				});
-			} catch (err) {
-				await sse.writeSSE({
-					event: "error",
-					data: JSON.stringify({ err: err instanceof Error ? err.message : String(err) }),
-				});
-				return;
-			}
+				/**
+				 * 这一轮调过的工具,按**开始**的先后排 —— 那是主人眼看着它们冒出来的
+				 * 顺序,落盘之后重开会话得对得上。所以 start 时就占好位子,end 只回填
+				 * 成败,而不是等 end 再往后排(那样先开后完的会被插到后面去)。
+				 *
+				 * 落盘时只取回填过的:一条永远停在「进行中」的痕迹,在界面上就是一个
+				 * 转到天荒地老的圈,而落完盘就再没有第二次机会补状态了。
+				 */
+				const slots: Array<{
+					name: string;
+					args: Record<string, string>;
+					ok?: boolean;
+					sources?: Array<{ title: string; url: string; siteName?: string }>;
+				}> = [];
+				const byId = new Map<string, (typeof slots)[number]>();
 
-			const traces = slots.filter((s): s is AiToolTraceDTO => s.ok !== undefined);
-			const updated = await store().appendMessages(conv.id, [
-				// 存**能用的那些** id,不是主人递进来的原样 —— 存进去的每一个都得
-				// 在盘上真实存在,否则重开会话时那几个格子就是一片碎图。
-				{ role: "user", content: message, images: resolved.map((r) => r.id) },
-				{ role: "assistant", content: reply, tools: traces },
-			]);
-			if (!updated) {
-				// 聊天期间这个会话被删了(另一个标签页 / 超出会话数上限被修剪)。
-				await sse.writeSSE({
-					event: "error",
-					data: JSON.stringify({ err: "会话不存在或已被删除" }),
-				});
-				return;
-			}
+				/**
+				 * 斜杠命令那条路的痕迹。
+				 *
+				 * 技能是主人点名的,没有真的走一趟工具环,但**界面上要一样看得见**
+				 * (ADR 决策 9):不留痕的话,女仆突然换了套说法而消息流里毫无交代。
+				 * 所以手工补一枚,与模型自选那条路长得一模一样 —— 它先冒出来、
+				 * 排在所有真工具之前,那正是它发生的时刻。
+				 */
+				if (pickedSkill) {
+					const args = { name: pickedSkill.name };
+					const ev = { name: AI_TOOL_LOAD_SKILL, args };
+					slots.push({ ...ev, ok: true });
+					await sse.writeSSE({
+						event: "tool",
+						data: JSON.stringify({ phase: "start", id: "skill", ...ev }),
+					});
+					await sse.writeSSE({
+						event: "tool",
+						data: JSON.stringify({ phase: "end", id: "skill", ...ev, ok: true }),
+					});
+				}
 
-			const [user, assistant] = updated.messages.slice(-2) as [AiChatMessageDTO, AiChatMessageDTO];
-			const payload: AiChatReplyResponse = {
-				user,
-				reply: assistant,
-				conversation: toMeta(updated),
-			};
-			await sse.writeSSE({ event: "done", data: JSON.stringify(payload) });
+				// 思考流的账本。分片原样拼接 —— 引擎那边多轮(工具轮)的思考也走同一个
+				// 回调,这里不感知轮次边界。
+				let reasoning = "";
+
+				let reply: string;
+				try {
+					// 聊天的思考设置与引擎(点评/总结)分了家。开关是会话级的,按消息走
+					// 请求体,不带 = 关(配置里已经没有它的位置);等级始终从配置读。
+					reply = await commentary.chatStatelessStream(history, {
+						imageUrls: visible.length > 0 ? visible.map((v) => v.url) : undefined,
+						thinking: {
+							enableThinking: parsed.data.thinking ?? false,
+							thinkingLevel: resolveChatThinkingLevel(deps.store.getGlobals().defaults.ai),
+						},
+						// 联网搜索同样会话级;不带 = 不开。执行器没配置时生成器静默不挂。
+						// 皮肤工坊里照样透传 —— 「做套某部作品风格的皮肤」得先查得到那部
+						// 作品的代表色,靠模型记忆猜配色多半是白做一趟。
+						webSearch: parsed.data.search ?? false,
+						// 人格同样归会话所有。皮肤工坊那条路整段顶掉 system,人格本来就
+						// 不在场 —— 这个字段只对日常聊天起作用。
+						persona: conv.persona,
+						// 主人点名的那条技能:正文**追加**在人格之后(ADR 决策 14),工具面
+						// 开局就按它的 allowed-tools 收窄。
+						...(pickedSkill
+							? {
+									systemSuffix: skillInstruction(pickedSkill),
+									...(pickedSkill.allowedTools ? { restrictTools: pickedSkill.allowedTools } : {}),
+								}
+							: {}),
+						/**
+						 * 工坊与技能是**互斥**的两套装配,而这里从前是各展开一个
+						 * `extraTools`,靠这两行的先后让工坊赢。真正保证互斥的是上面那句
+						 * `!skinMode && opts?.skillStore`(工坊里 skillTool 必为 null),
+						 * 所以顺序只是条冗余的保险 —— 但它不显眼:哪天上游那个条件松一松
+						 * (比如想让工坊也用技能),谁赢就由这两行的排列静默决定,而工坊的
+						 * systemPrompt 与 builtinTools 只挂在它自己那支上,顶掉就没了。
+						 * 写成一个三元,互斥这件事就在一处看得见。
+						 */
+						...(skinTools
+							? {
+									extraTools: skinTools,
+									systemPrompt: SKIN_MODE_SYSTEM_PROMPT,
+									builtinTools: false,
+								}
+							: skillTool
+								? { extraTools: [skillTool] }
+								: {}),
+						onDelta: (text) => {
+							// 不 await:回调是同步的,这里排一次写就行。真要背压也轮不到
+							// 这一层管 —— SSE 的写在内存里排队,量级是几十 KB。
+							void sse.writeSSE({ event: "delta", data: JSON.stringify({ text }) });
+						},
+						onReasoning: (text) => {
+							// 先转发再记账,与 tool 事件同一个纪律:实时那一份才是这个回调
+							// 存在的理由,落盘是顺带。
+							void sse.writeSSE({ event: "reasoning", data: JSON.stringify({ text }) });
+							reasoning += text;
+						},
+						onToolEvent: (ev) => {
+							// 先转发再记账:实时那一份才是这个事件存在的理由,落盘是顺带。
+							void sse.writeSSE({ event: "tool", data: JSON.stringify(ev) });
+							if (ev.phase === "start") {
+								const slot = { name: ev.name, args: ev.args };
+								slots.push(slot);
+								byId.set(ev.id, slot);
+								return;
+							}
+							// progress 只转发不记账:它是「此刻」的东西,存进历史就是一条过期的
+							// 数字(重开会话看到「已写 860 字」毫无意义)。落盘的痕迹只认收了尾的。
+							if (ev.phase === "progress") return;
+							const slot = byId.get(ev.id);
+							if (slot) {
+								slot.ok = ev.ok;
+								// web_search 的来源列表:落盘后重开会话还能点开「来源」。
+								if (ev.sources) slot.sources = ev.sources;
+							}
+						},
+					});
+				} catch (err) {
+					await sse.writeSSE({
+						event: "error",
+						data: JSON.stringify({ err: err instanceof Error ? err.message : String(err) }),
+					});
+					return;
+				}
+
+				const traces = slots.filter((s): s is AiToolTraceDTO => s.ok !== undefined);
+				const updated = await store().appendMessages(conv.id, [
+					// 存**能用的那些** id,不是主人递进来的原样 —— 存进去的每一个都得
+					// 在盘上真实存在,否则重开会话时那几个格子就是一片碎图。
+					{ role: "user", content: message, images: resolved.map((r) => r.id) },
+					// reasoning 只作展示,store 会在空串时略去字段;历史回传给模型的
+					// 路径(上面的 history 拼装)读的是 content,思考永不回炉。
+					{ role: "assistant", content: reply, tools: traces, reasoning },
+				]);
+				if (!updated) {
+					// 聊天期间这个会话被删了(另一个标签页 / 超出会话数上限被修剪)。
+					await sse.writeSSE({
+						event: "error",
+						data: JSON.stringify({ err: "会话不存在或已被删除" }),
+					});
+					return;
+				}
+
+				const [user, assistant] = updated.messages.slice(-2) as [
+					AiChatMessageDTO,
+					AiChatMessageDTO,
+				];
+				const payload: AiChatReplyResponse = {
+					user,
+					reply: assistant,
+					conversation: toMeta(updated),
+				};
+				await sse.writeSSE({ event: "done", data: JSON.stringify(payload) });
+			} finally {
+				// 早退(报错 / 会话被删)与正常收尾都要销账,漏一次这场就永久钉在侧栏上。
+				doneBusy();
+			}
 		});
 	});
 
@@ -376,6 +608,36 @@ const ChatRequestSchema = z.object({
 	 * 而不是悄悄截断:主人明明挑了 6 张,只有 4 张被看了却什么都不说,比报错更难查。
 	 */
 	images: z.array(z.string()).max(MAX_CHAT_IMAGES_PER_MESSAGE).optional(),
+	/**
+	 * 这一问开不开深度思考。聊天页那颗胶囊是**会话级**的(默认关、手动开、
+	 * 不落盘),所以按消息走请求体;不带 = 老客户端,回落到配置里的 chat 段。
+	 * 思考**等级**始终从配置读 —— 低频档位不值得每条消息驮一遍。
+	 */
+	thinking: z.boolean().optional(),
+	/** 这一问允不允许联网搜索。同上,会话级;不带 = 不开(默认不烧钱)。 */
+	search: z.boolean().optional(),
+	/**
+	 * 主人打的斜杠命令点名的那条技能。
+	 *
+	 * 走这条路时**服务端**去库里取正文,而不是让网页把正文塞进消息里:落盘的用户
+	 * 消息就该是主人真打的那几个字。名字不认得一律 400 —— 静默当普通消息发出去的话,
+	 * 主人以为在用技能、其实在跟模型说一句它不认识的暗号(老 `/锐评 只看这三个人`
+	 * 栽的正是这个坑)。
+	 */
+	skill: z.string().optional(),
+});
+
+/**
+ * `POST /conversations` 的入参 —— 这场对话的**面孔**,只在建的时候定一次。
+ *
+ * 模式曾经跟思考 / 搜索同口径,按消息走请求体。主人后来定了锁定,而这不只是界面
+ * 上少个 picker:写能力(create_skin)**只在皮肤模式里存在**,让请求体决定模式,
+ * 等于把开那道口子的钥匙交给了每一条消息。现在它归会话所有,聊天会话里再怎么喊
+ * `mode: "skin"` 都不作数。
+ */
+const newConversationSchema = z.object({
+	mode: z.enum(["chat", "skin"]).optional(),
+	persona: z.boolean().optional(),
 });
 
 /**
@@ -392,6 +654,8 @@ function toMeta(conv: Conversation): ConversationMeta {
 		updatedAt: conv.updatedAt,
 		messageCount: conv.messages.length,
 		autoTitled: conv.autoTitled,
+		mode: conv.mode,
+		persona: conv.persona,
 	};
 }
 
@@ -416,16 +680,38 @@ export function resolveDraftApiKey(draft: string | undefined, stored: string | u
 }
 
 /**
+ * 一批附件 id → 能读出来的那些(id + data URL)。
+ *
+ * 非法 id(穿越尝试)与盘上已经没了的一律**跳过**,不让它们混进去 —— 混进去的话
+ * 视觉模型收到一个读不动的地址,而主人只看到女仆说「这张图我看不清」。
+ *
+ * 视觉服务商在公网,拉不到主人本地的 `http://localhost:9000/api/ai/assets/xxx`,
+ * 只能把字节本身带过去。这与 B 站动态里的图不同 —— 那些本来就是公网可达的,
+ * 所以那条路直接传 URL。
+ */
+async function readImageUrls(
+	dataDir: string,
+	ids: readonly string[],
+): Promise<Array<{ id: string; url: string }>> {
+	const out: Array<{ id: string; url: string }> = [];
+	for (const id of ids) {
+		const url = await readChatImageDataUrl(dataDir, id);
+		if (url) out.push({ id, url });
+	}
+	return out;
+}
+
+/**
  * 把草稿里的脱敏占位换回真实密钥。
  *
  * 页面永远看不到真 key(GET /globals 一律回占位),所以主人没改过 key 时草稿里带的
- * 就是那个占位。直接拿去请求必然 401。这里按**草稿选中的那家**去已存配置里取回
- * 对应桶的真 key —— 取错桶就会用 A 家的 key 打 B 家的接口。
+ * 就是那个占位。直接拿去请求必然 401。这里按**草稿选中的那份实例**去已存配置里
+ * 取回对应桶的真 key —— 取错桶就会用 A 家的 key 打 B 家的接口。
  *
  * 主模型与视觉副模型两把各自还原:主人可能只换了其中一把。
  */
 export function withStoredApiKey(draft: AISettings, stored: AISettings): AISettings {
-	const id = draft.provider;
+	const id = draft.activeProfile;
 	const d = draft.providers[id];
 	if (!d) return draft;
 	const s = stored.providers[id];
@@ -442,44 +728,6 @@ export function withStoredApiKey(draft: AISettings, stored: AISettings): AISetti
 	};
 }
 
-/**
- * 草稿 AI 配置 → CommentaryGeneratorConfig。
- *
- * 字段名映射与 `engines.ts` 的 buildAiConfig 一致:schema 用面向用户的 `baseRole` /
- * `extraSystemPrompt`,引擎的 PersonaConfig 用历史命名 `customBase` / `extraPrompt`。
- * preset 固定 `custom` —— 页面上的人格字段就是最终人格,不再二次套内置模板。
- */
-export function toGeneratorConfig(ai: z.infer<typeof AISettingsSchema>) {
-	// 连接与生成参数按服务商分桶存 —— 取当前选中那家的那一套。
-	const p = resolveAIProfile(ai);
-	return {
-		apiKey: p.apiKey,
-		baseURL: p.baseUrl,
-		model: p.model,
-		temperature: p.temperature,
-		persona: {
-			preset: "custom" as const,
-			name: ai.persona.name,
-			addressUser: ai.persona.addressUser,
-			addressSelf: ai.persona.addressSelf,
-			traits: ai.persona.traits,
-			catchphrase: ai.persona.catchphrase,
-			customBase: ai.persona.baseRole,
-			extraPrompt: ai.persona.extraSystemPrompt,
-		},
-		dynamicPrompt: ai.dynamicPrompt,
-		liveSummaryPrompt: ai.liveSummaryPrompt,
-		enableConversation: false,
-		maxHistory: 6,
-		provider: ai.provider,
-		enableThinking: p.enableThinking,
-		thinkingLevel: p.thinkingLevel,
-		extraParams: p.extraParams,
-		enableVision: p.enableVision,
-		vision: {
-			baseURL: p.vision.baseUrl,
-			apiKey: p.vision.apiKey,
-			model: p.vision.model,
-		},
-	};
-}
+// 草稿 AI 配置 → CommentaryGeneratorConfig 的翻译住在 `runtime/ai-config.ts` ——
+// 常驻 generator 与统计页的锐评用的是同一份映射。这里曾经自带一份一模一样的,
+// 于是「人格该从哪儿读」有了两个答案,修一处另一处照旧。

@@ -10,9 +10,14 @@
  */
 
 import type { ServiceContext } from "@bilibili-notify/internal";
+import { defaultMessageKindLayout } from "@bilibili-notify/internal";
 import { describe, expect, it, vi } from "vite-plus/test";
 import type { SubItemView } from "../push-like";
-import { LiveRoomAccessDeniedError, type RoomContext } from "../room-helpers";
+import {
+	LiveRoomAccessDeniedError,
+	LiveRoomPreflightBlockedError,
+	type RoomContext,
+} from "../room-helpers";
 import { RoomSession } from "../room-session";
 
 function makeSub(): SubItemView {
@@ -25,8 +30,7 @@ function makeSub(): SubItemView {
 		liveEnd: true,
 		liveGuardBuy: false,
 		superchat: false,
-		wordcloud: false,
-		liveSummary: false,
+		liveEndExtras: { wordcloud: false, liveSummary: false },
 		target: {},
 		customCardStyle: { enable: false },
 		customLiveMsg: { enable: false },
@@ -38,6 +42,8 @@ function makeSub(): SubItemView {
 		minGuardLevel: 3,
 		pushTime: 0,
 		restartPush: false,
+		// 宿主恒填版式。
+		messageLayout: defaultMessageKindLayout("live"),
 	};
 }
 
@@ -393,6 +399,9 @@ describe("RoomSession 重连成功后的直播状态", () => {
 		// biome-ignore lint/suspicious/noExplicitAny: 测试 private/protected 成员
 		const s = session as any;
 		s.liveStatus = true;
+		// 现实里 liveStatus=true 必然经过完整 bootstrap;摆现场时同步补上这个标志,
+		// 否则重连成功会误入「补跑 bootstrapRoomState」分支而非重连核对分支。
+		s.bootstrapped = true;
 		s.armPeriodicTimer = vi.fn();
 		s.useLiveRoomInfo = vi.fn(async () => {
 			s.liveRoomInfo = {
@@ -481,5 +490,190 @@ describe("RoomSession 重连成功后的直播状态", () => {
 
 		expect(s.liveStatus).toBe(false);
 		expect(s.armPeriodicTimer).not.toHaveBeenCalled();
+	});
+});
+
+describe("预检被 -352 风控拦截 → 长尾退避,不放弃", () => {
+	// WS 是直播状态唯一信号源,而 B 站风控一持续就是几十分钟 —— 秒级梯子 31s 就
+	// 耗尽放弃,会把好房间全停光。主人拍板:-352 走分钟级长尾、永不放弃,也绝不
+	// 做无 token 直连(自实现后只有我们一套指纹,回退直连已无意义)。
+
+	it("bootstrap 被拦 → 按 60s 长尾排重试;风控散去后连上并补跑初始房态", async () => {
+		const { ctx, mocks } = makeMockCtx();
+		mocks.startLiveRoomListener
+			.mockRejectedValueOnce(new LiveRoomPreflightBlockedError("B 站返回 code=-352"))
+			.mockResolvedValue(true);
+		const session = new RoomSession(ctx, makeSub());
+
+		await session.bootstrap();
+		// 不放弃:没有 stopMonitoring / emitEngineError,排的是长尾首档 60s
+		expect(mocks.stopMonitoring).not.toHaveBeenCalled();
+		expect(mocks.emitEngineError).not.toHaveBeenCalled();
+		expect(mocks.delays()).toEqual([60_000]);
+
+		await mocks.flushAll();
+		expect(mocks.startLiveRoomListener).toHaveBeenCalledTimes(2);
+		// 连上后补跑 bootstrapRoomState:拉了房间信息,bootstrapped 落位
+		// biome-ignore lint/suspicious/noExplicitAny: 测试 protected 字段
+		expect((session as any).bootstrapped).toBe(true);
+	});
+
+	it("持续被拦 → 间隔 60s→300s→900s→1800s 后封顶循环,始终不放弃", async () => {
+		const { ctx, mocks } = makeMockCtx();
+		mocks.startLiveRoomListener.mockRejectedValue(
+			new LiveRoomPreflightBlockedError("B 站返回 code=-352"),
+		);
+		const session = new RoomSession(ctx, makeSub());
+
+		await session.bootstrap();
+		for (let i = 0; i < 5; i++) await mocks.runScheduled();
+
+		expect(mocks.delays()).toEqual([60_000, 300_000, 900_000, 1_800_000, 1_800_000, 1_800_000]);
+		expect(mocks.stopMonitoring).not.toHaveBeenCalled();
+		expect(mocks.emitEngineError).not.toHaveBeenCalled();
+	});
+
+	it("WS 错误重连途中被拦 → 从秒级梯子转入长尾,不消耗放弃计数", async () => {
+		const { ctx, mocks } = makeMockCtx();
+		mocks.startLiveRoomListener.mockRejectedValue(
+			new LiveRoomPreflightBlockedError("B 站返回 code=-352"),
+		);
+		const session = new RoomSession(ctx, makeSub());
+
+		// biome-ignore lint/suspicious/noExplicitAny: 测试 private 方法
+		const p = (session as any).onError();
+		await new Promise((r) => setImmediate(r));
+		await mocks.runScheduled(); // 1s 后第一次尝试 → 被拦
+		await mocks.runScheduled(); // 60s 后第二次尝试 → 仍被拦
+		session.cancel(); // 掐断,别让 promise 悬着
+		await p;
+
+		expect(mocks.delays()).toEqual([1000, 60_000, 300_000]);
+		expect(mocks.emitEngineError).not.toHaveBeenCalled();
+	});
+
+	it("熬过风控连上后初始房态拉取失败 → 回长尾重试,不放弃房间", async () => {
+		// 长尾等几十分钟终于连上,补跑 bootstrapRoomState 的 HTTP 拉取多半还泡在
+		// 同一场风控余波里 —— 一次瞬时失败就 cancel 等于把「永不放弃」毙在终点线上。
+		const { ctx, mocks } = makeMockCtx();
+		mocks.startLiveRoomListener
+			.mockRejectedValueOnce(new LiveRoomPreflightBlockedError("B 站返回 code=-352"))
+			.mockResolvedValue(true);
+		const session = new RoomSession(ctx, makeSub());
+		// biome-ignore lint/suspicious/noExplicitAny: 测试 private/protected 成员
+		const s = session as any;
+		const realUse = s.useLiveRoomInfo.bind(session);
+		let failuresLeft = 1;
+		s.useLiveRoomInfo = vi.fn(async (t: unknown) => {
+			if (failuresLeft > 0) {
+				failuresLeft--;
+				return false;
+			}
+			return realUse(t);
+		});
+
+		await session.bootstrap();
+		await mocks.flushAll();
+
+		expect(mocks.stopMonitoring).not.toHaveBeenCalled();
+		expect(mocks.emitEngineError).not.toHaveBeenCalled();
+		expect(s.cancelled).toBe(false);
+		expect(s.bootstrapped).toBe(true);
+		// 首档 60s 进长尾,补跑失败后按长尾第二档 300s 再等,而不是放弃
+		expect(mocks.delays()).toEqual([60_000, 300_000]);
+	});
+
+	it("预检拦截与普通失败交替 → 秒级计数被长尾轮复位,不烧光梯子放弃", async () => {
+		// 风控波中预检拦截(不占秒级梯子)与普通 false 失败(占)交替出现:
+		// 若长尾轮不复位秒级计数,5 个 false 轮凑齐就 break,好房间照样停光。
+		const { ctx, mocks } = makeMockCtx();
+		let call = 0;
+		mocks.startLiveRoomListener.mockImplementation(async () => {
+			call++;
+			if (call % 2 === 1) throw new LiveRoomPreflightBlockedError("B 站返回 code=-352");
+			return false; // 普通可重试失败(如个人信息拉取失败)
+		});
+		const session = new RoomSession(ctx, makeSub());
+
+		await session.bootstrap();
+		for (let i = 0; i < 14; i++) await mocks.runScheduled();
+
+		expect(mocks.emitEngineError).not.toHaveBeenCalled();
+		expect(mocks.stopMonitoring).not.toHaveBeenCalled();
+		// biome-ignore lint/suspicious/noExplicitAny: 测试 private 成员
+		expect((session as any).cancelled).toBe(false);
+		// 秒级轮永远从首档 1000ms 重来,不会爬满 5 档
+		const secondsDelays = mocks.delays().filter((d) => d <= 16_000);
+		expect(secondsDelays.length).toBeGreaterThan(0);
+		expect(new Set(secondsDelays)).toEqual(new Set([1000]));
+	});
+
+	it("reconnect 顶层兜底:内部异常不外泄成 unhandledRejection", async () => {
+		// reconnect 的 promise 被 watchdog/auth-failed/closed/preflight 四个入口
+		// 以 void 丢弃 —— 里面(如补跑推卡渲染失败)抛出去就是 unhandledRejection,
+		// Node 默认直接崩进程。
+		const { ctx, mocks } = makeMockCtx();
+		mocks.startLiveRoomListener.mockResolvedValue(true);
+		const session = new RoomSession(ctx, makeSub());
+		// biome-ignore lint/suspicious/noExplicitAny: 测试 private/protected 成员
+		const s = session as any;
+		s.bootstrapRoomState = vi.fn(async () => {
+			throw new Error("推卡渲染失败");
+		});
+		const errorSpy = vi.spyOn(ctx.logger, "error");
+
+		const p = s.reconnect("close");
+		await new Promise((r) => setImmediate(r));
+		await mocks.flushAll();
+
+		await expect(p).resolves.toBeUndefined();
+		expect(errorSpy).toHaveBeenCalled();
+	});
+
+	it("bootstrap 窗口内断线重连 → 不并发第二个 bootstrapRoomState(单飞)", async () => {
+		// 首跑还挂在信息拉取上时 WS 断线:重连成功后若把「尚未跑完」当「从没跑过」
+		// 再跑一份,已在播房间的「正在直播」卡会推两张、transition 窗口交错记账。
+		const { ctx, mocks } = makeMockCtx();
+		const session = new RoomSession(ctx, makeSub());
+		// biome-ignore lint/suspicious/noExplicitAny: 测试 private/protected 成员
+		const s = session as any;
+		let release!: () => void;
+		const gate = new Promise<void>((r) => {
+			release = r;
+		});
+		const realUse = s.useLiveRoomInfo.bind(session);
+		s.useLiveRoomInfo = vi.fn(async (t: unknown) => {
+			await gate;
+			return realUse(t);
+		});
+		const bsSpy = vi.spyOn(s, "bootstrapRoomState");
+
+		const bootPromise = session.bootstrap(); // 首跑挂在 gate 上
+		await new Promise((r) => setImmediate(r));
+		const reconnectPromise = s.reconnect("close"); // 拉取期间 WS 断线
+		await new Promise((r) => setImmediate(r));
+		await mocks.runScheduled(); // 驱动 1s 退避后的重连尝试
+		release();
+		await reconnectPromise;
+		await bootPromise;
+
+		expect(bsSpy).toHaveBeenCalledTimes(1);
+		expect(s.bootstrapped).toBe(true);
+	});
+
+	it("cancel() 掐断长尾等待:句柄被 dispose,不再有后续尝试", async () => {
+		const { ctx, mocks } = makeMockCtx();
+		mocks.startLiveRoomListener.mockRejectedValue(
+			new LiveRoomPreflightBlockedError("B 站返回 code=-352"),
+		);
+		const session = new RoomSession(ctx, makeSub());
+
+		await session.bootstrap();
+		const before = mocks.startLiveRoomListener.mock.calls.length;
+		session.cancel();
+		await mocks.runScheduled();
+
+		expect(mocks.disposeCount()).toBeGreaterThan(0);
+		expect(mocks.startLiveRoomListener.mock.calls.length).toBe(before);
 	});
 });

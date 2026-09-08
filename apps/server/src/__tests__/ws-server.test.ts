@@ -3,14 +3,12 @@ import { createServer, type Server as HttpServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import {
-	type ConfigScope,
-	type Disposable,
-	type GlobalConfig,
-	type MessageBus,
-	makeDefaultGlobalConfig,
-	type PushTarget,
-	type Subscription,
+import type {
+	ConfigScope,
+	Disposable,
+	MessageBus,
+	PushTarget,
+	Subscription,
 } from "@bilibili-notify/internal";
 import { afterEach, beforeEach, describe, expect, it } from "vite-plus/test";
 import { WebSocket } from "ws";
@@ -144,7 +142,6 @@ describe("WS server", () => {
 		wsServer = createWsServer({
 			httpServer,
 			bus,
-			store,
 			serviceCtx,
 			// Fast heartbeat for the heartbeat test; 0 disables for tests that don't need it.
 			heartbeatIntervalMs: 0,
@@ -170,10 +167,10 @@ describe("WS server", () => {
 		const ack = await c.waitFor((m) => m?.type === "subscribed");
 		expect(ack.channels).toContain("state");
 
+		// 载荷为空是有意的 —— 见 buildStateHydrate 的注释(明文 apiKey 不上线,
+		// 而客户端本来就只拿它当"该重新 fetch 了"的信号)。
 		const hydrate = await c.waitFor((m) => m?.type === "state" && m?.event === "hydrate");
-		expect(dataOf(hydrate).globals).toEqual(makeDefaultGlobalConfig());
-		expect(dataOf(hydrate).subscriptions).toEqual([]);
-		expect(dataOf(hydrate).targets).toEqual([]);
+		expect(hydrate.data).toBeNull();
 		ws.close();
 	});
 
@@ -202,13 +199,16 @@ describe("WS server", () => {
 		bus.emit("auth-lost");
 		bus.emit("history-recorded", {
 			id: "abc-123",
+			pushId: "abc-123",
 			ts: "2026-05-12T00:00:00.000Z",
-			source: "dynamic",
+			kind: "dynamic",
 			uid: "u1",
 			subscriptionId: "sub-1",
-			targetIds: ["t-1"],
-			result: { ok: true, per: [{ targetId: "t-1", ok: true, latencyMs: 1 }] },
-			payload: { kind: "text", text: "hi" },
+			targetId: "t-1",
+			status: "delivered",
+			messages: [
+				{ payload: { kind: "text", text: "hi" }, role: "main", result: { ok: true, latencyMs: 1 } },
+			],
 		});
 
 		const aEvt = await ca.waitFor((m) => m?.type === "auth" && m?.event === "auth-lost");
@@ -217,7 +217,7 @@ describe("WS server", () => {
 			(m) => m?.type === "push-events" && m?.event === "history-recorded",
 		);
 		expect((bEvt.data as { id: string }).id).toBe("abc-123");
-		expect((bEvt.data as { text: string }).text).toBe("hi");
+		expect((bEvt.data as { messages: Array<{ text: string }> }).messages[0]?.text).toBe("hi");
 
 		// Reverse direction: ensure neither leaked.
 		expect(ca.all().some((m) => m.type === "push-events")).toBe(false);
@@ -256,7 +256,7 @@ describe("WS server", () => {
 		ws.close();
 	});
 
-	it("config-changed on state channel includes scope + fresh snapshot", async () => {
+	it("config-changed on state channel carries the scope marker only", async () => {
 		const ws = await connect(port);
 		const c = collect(ws);
 		send(ws, { type: "subscribe", channels: ["state"] });
@@ -264,8 +264,7 @@ describe("WS server", () => {
 
 		await store.patchGlobals({ app: { dynamicCron: "*/15 * * * *" } });
 		const evt = await c.waitFor((m) => m?.type === "state" && m?.event === "config-changed");
-		expect(dataOf(evt).scope).toBe("globals");
-		expect((dataOf(evt).snapshot as GlobalConfig).app.dynamicCron).toBe("*/15 * * * *");
+		expect(dataOf(evt)).toEqual({ scope: "globals" });
 		ws.close();
 	});
 
@@ -312,7 +311,6 @@ describe("WS server heartbeat", () => {
 		const wsServer = createWsServer({
 			httpServer: server,
 			bus,
-			store,
 			serviceCtx,
 			heartbeatIntervalMs: 200,
 			heartbeatTimeoutMs: 500,
@@ -350,7 +348,6 @@ describe("WS server heartbeat", () => {
 		const wsServer = createWsServer({
 			httpServer: server,
 			bus,
-			store,
 			serviceCtx,
 			heartbeatIntervalMs: 100,
 			heartbeatTimeoutMs: 300,

@@ -23,6 +23,7 @@ const DYNAMIC_TYPE_UGC_SEASON = "DYNAMIC_TYPE_UGC_SEASON";
 const ADDITIONAL_TYPE_RESERVE = "ADDITIONAL_TYPE_RESERVE";
 const ADDITIONAL_TYPE_GOODS = "ADDITIONAL_TYPE_GOODS";
 const ADDITIONAL_TYPE_COMMON = "ADDITIONAL_TYPE_COMMON";
+const ADDITIONAL_TYPE_UGC = "ADDITIONAL_TYPE_UGC";
 
 /** 时间戳 / 数字的格式化器(由 image-renderer 注入,保持模版层纯净)。 */
 export type NodeFormatters = {
@@ -220,43 +221,95 @@ function buildBasicContent(dynamic: Dynamic, isArticle: boolean) {
 	);
 }
 
-function buildPicsContent(pics: Array<{ height: number; url: string; width: number }>) {
+/** 图廊最多铺几格 —— 与 B 站网页端一致,余下的折进最后一格的 `+N`。 */
+const MAX_GRID_PICS = 9;
+
+type DynamicPic = { height: number; url: string; width: number; live_url?: string };
+
+/**
+ * 这张图会不会动。
+ *
+ * 两条判据取并集:`live_url` 非空(B 站给动图带的播放地址)**或** URL 后缀是 `.gif`。
+ * 只认一条的话,万一它在某类动态里不成立就是整片漏标;两条都不满足才不标 —— 宁可漏
+ * 也不误标,把静图标成动图更让人费解。
+ */
+function isAnimatedPic(p: DynamicPic): boolean {
+	if (p.live_url) return true;
+	// 真实 URL 常带处理后缀和 query(`….gif@1280w_80q_1s.webp?from=dyn`),直接看结尾
+	// 会把 GIF 认成 webp 而漏标 —— 先把这两截削掉。
+	const path = p.url.split("?")[0].split("@")[0];
+	return path.toLowerCase().endsWith(".gif");
+}
+
+/**
+ * 右下角那个小角标的文案,都不满足则不出。
+ *
+ * 动图压过长图:「这张会动」是截图里绝对看不出来的信息(出图只截得到一帧),而「被裁
+ * 过」在缩略图上多少感觉得到。两者同时成立极罕见,不值得为它另设一个双标签位。
+ */
+function picBadgeText(p: DynamicPic, isLong: boolean): string | null {
+	if (isAnimatedPic(p)) return "动图";
+	return isLong ? "长图" : null;
+}
+
+function buildPicsContent(pics: DynamicPic[]) {
 	if (pics.length === 1) {
 		const pic = pics[0];
 		const isSuperLong = pic.height > pic.width * 2;
 		const isLong = !isSuperLong && pic.height > pic.width;
+		const badge = picBadgeText(pic, isSuperLong);
+		// 三种形态各自的图框宽高都不一样,角标就近挂在各自那层 —— 统一提到最外层的话,
+		// 竖图(width:auto)那支会把角标甩到图片右侧的空白里去。
+		const badgeEl = () =>
+			badge ? (
+				<div class="absolute bottom-2 right-2 bg-black/50 text-white text-[13px] px-[8px] py-[4px] rounded leading-none">
+					{badge}
+				</div>
+			) : null;
 		return (
 			<div class="relative overflow-hidden rounded-lg" style="max-width: 600px;">
 				{isSuperLong ? (
 					<div class="relative" style="height: 400px; overflow: hidden;">
 						<img class="w-full h-full object-cover object-top block" src={pic.url} alt="" />
-						<div class="absolute bottom-2 right-2 bg-black/50 text-white text-[13px] px-[8px] py-[4px] rounded leading-none">
-							长图
-						</div>
+						{badgeEl()}
 					</div>
 				) : isLong ? (
-					<img
-						class="h-auto block rounded-lg"
-						style="max-height: 400px; width: auto;"
-						src={pic.url}
-						alt=""
-					/>
+					<div class="relative inline-block">
+						<img
+							class="h-auto block rounded-lg"
+							style="max-height: 400px; width: auto;"
+							src={pic.url}
+							alt=""
+						/>
+						{badgeEl()}
+					</div>
 				) : (
-					<img class="w-full h-auto block" src={pic.url} alt="" />
+					<>
+						<img class="w-full h-auto block" src={pic.url} alt="" />
+						{badgeEl()}
+					</>
 				)}
 			</div>
 		);
 	}
 
-	const is2col = pics.length === 2 || pics.length === 4;
+	// 超出 9 张的部分不铺格子,折进最后一格的 `+N`。以前是有几张铺几张,十几张图的
+	// 动态能把卡片拉出一米多长,推到群里就是一堵缩略图墙。
+	const shown = pics.slice(0, MAX_GRID_PICS);
+	const overflow = pics.length - shown.length;
+	const is2col = shown.length === 2 || shown.length === 4;
 	// 多图总宽与单图对齐（max 480px），图片在其中平分，gap 8px
 	const containerClass = is2col
 		? "relative w-[calc(50%-4px)] aspect-square shrink-0"
 		: "relative w-[calc(33.33%-6px)] aspect-square shrink-0";
 	return (
 		<div class="flex flex-wrap gap-[8px]" style="max-width: 600px;">
-			{pics.map((p, i) => {
+			{shown.map((p, i) => {
 				const isLong = p.height > p.width * 2;
+				const badge = picBadgeText(p, isLong);
+				// `+N` 盖在**第 9 张图上**,不另起一格 —— 另起就成了 10 格,末格空着,
+				// 三列也就散了。
+				const more = overflow > 0 && i === shown.length - 1 ? overflow : 0;
 				return (
 					<div key={i} class={containerClass}>
 						<img
@@ -264,9 +317,21 @@ function buildPicsContent(pics: Array<{ height: number; url: string; width: numb
 							src={p.url}
 							alt=""
 						/>
-						{isLong && (
+						{more > 0 && (
+							// 遮罩压到 40% —— 再深就成了整格纯黑,九宫格里凭空多出一块深色补丁,
+							// 比它盖住的那张图还抢眼。压浅之后白字在亮图上会发虚,靠一层文字投影
+							// 兜住(写成 inline style:它是全卡唯一的一条,类名走 uno 有被 Fragment
+							// 锚点吞掉的风险,吞了就只剩一行虚字,而且构建全绿看不出来)。
+							<div
+								class="absolute inset-0 flex items-center justify-center rounded bg-black/40 text-white text-[28px] font-bold leading-none"
+								style="text-shadow: 0 1px 4px rgba(0, 0, 0, 0.55);"
+							>
+								{`+${more}`}
+							</div>
+						)}
+						{badge && (
 							<div class="absolute bottom-1 right-1 bg-black/50 text-white text-[10px] px-[5px] py-[2px] rounded-sm leading-none">
-								长图
+								{badge}
 							</div>
 						)}
 					</div>
@@ -277,8 +342,8 @@ function buildPicsContent(pics: Array<{ height: number; url: string; width: numb
 }
 
 /**
- * 附加内容(预约 / 商品 / 通用卡)。返回内层 VNode(无外边距 —— 间距由 additional
- * 版式块的 marginTop 控制),无附加内容时返回 null(块自动收起)。
+ * 附加内容(预约 / 商品 / 通用卡 / 关联视频)。返回内层 VNode(无外边距 —— 间距由
+ * additional 版式块的 marginTop 控制),无附加内容时返回 null(块自动收起)。
  */
 function buildAdditionalContent(dynamic: Dynamic): VNode | null {
 	const additional = dynamic.modules.module_dynamic.additional;
@@ -290,6 +355,9 @@ function buildAdditionalContent(dynamic: Dynamic): VNode | null {
 			return buildGoodsAdditional(additional.goods);
 		case ADDITIONAL_TYPE_COMMON:
 			return buildCommonAdditional(additional.common);
+		case ADDITIONAL_TYPE_UGC:
+			// type 说是 UGC 但 ugc 缺席的情况真实存在(接口降级),没内容就当没附加块。
+			return additional.ugc ? buildUgcAdditional(additional.ugc) : null;
 		default:
 			return null;
 	}
@@ -405,12 +473,58 @@ function buildCommonAdditional(common: any) {
 	);
 }
 
+/**
+ * 关联视频卡 —— 图文/文字动态正文下方挂的那条投稿。
+ *
+ * 与 DYNAMIC_TYPE_AV 的主视频卡(buildVideoContent)是两套数据:那边 `stat.play` /
+ * `stat.danmaku` 是两个各自配图标的计数(接口给的是「6.5万」这种成品字符串;链接解析
+ * 拼出来的动态也照这个样子给),这边 `desc_second` 已经是接口拼好的一整句(「2654观看
+ * 102弹幕」),官方页面也是当纯文本灰字渲染的,别再套图标重排。
+ */
+// biome-ignore lint/suspicious/noExplicitAny: Bilibili API 返回的关联视频数据类型不固定
+function buildUgcAdditional(ugc: any) {
+	return (
+		<div>
+			{/* head_text 在抓包里常为空串,空就整行不渲染,免得多出一条空白灰字。 */}
+			{ugc.head_text && (
+				<div class="flex items-center gap-1 text-[12px] text-[#999] mb-[6px]">{ugc.head_text}</div>
+			)}
+			<div class="bg-black/4 rounded-lg p-[10px]">
+				<div class="flex gap-[10px] items-center">
+					<div class="relative w-[140px] h-[80px] shrink-0 rounded-md overflow-hidden bg-black/8">
+						<img class="w-full h-full object-cover block" src={ugc.cover} alt="" />
+						{/*
+						 * 角标衬一层深色底,不是只给文字加 text-shadow —— 封面右下角是什么颜色
+						 * 完全由 UP 决定,遇上亮底(放射光、白背景)白字加弱阴影就糊没了。
+						 * 主视频卡靠整张压暗 bg-black/20 兜住,这里封面小、压暗会让整卡发灰,
+						 * 改成只在角标下垫一块。
+						 */}
+						{ugc.duration && (
+							<span class="absolute bottom-[4px] right-[4px] px-[4px] py-[1px] rounded-[3px] bg-black/60 text-white text-[11px] font-bold leading-[1.4]">
+								{ugc.duration}
+							</span>
+						)}
+					</div>
+					<div class="flex-1 min-w-0">
+						<div class="text-[13px] font-bold text-[#18191C] line-clamp-2 mb-[6px]">
+							{ugc.title}
+						</div>
+						{ugc.desc_second && (
+							<div class="text-[12px] text-[#999] truncate">{ugc.desc_second}</div>
+						)}
+					</div>
+				</div>
+			</div>
+		</div>
+	);
+}
+
 function buildVideoContent(archive: {
 	cover: string;
 	duration_text: string;
 	title: string;
 	desc: string;
-	stat: { play: number; danmaku: number };
+	stat: { play: number | string; danmaku: number | string };
 }) {
 	return (
 		<div

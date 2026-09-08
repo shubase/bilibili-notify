@@ -1,3 +1,4 @@
+import { SELECTED_TINT_BG } from "@bilibili-notify/ui";
 import { useState } from "react";
 import { api } from "../services/api";
 
@@ -14,6 +15,43 @@ type DetectState = "idle" | "detecting" | "enabling" | "connecting" | "enabled";
  * 两条路都走 POST /api/cards/enable-rendering:后端运行时构造 puppeteer 并注入
  * live/dynamic 引擎 + 写回 bn.config.yaml,无需重启。
  */
+/**
+ * 提示条里的小药丸钮。三颗(自动探测 / 启用 / 连接远程)只差色调与文案,此前
+ * 各写一遍,绿的那两颗逐字相同。挂 `data-bn="btn"` 让皮肤搬得动 —— 页面里手写
+ * 的按钮不会自己带上挂点。
+ */
+// 粉底走 SELECTED_TINT_BG 的不透明出法 —— 旧 bg-bn-pink/10 的纱靠底下垫白才好看,
+// 皮肤换底后会隐形;绿的那档 bg-bn-success-soft 本来就是实底,粉档补齐同款待遇。
+// 描边保持 /40 淡档:这是动作钮不是选中项,全浓粉边会长得像已选中。
+const PILL_TONE = {
+	pink: `border-bn-pink/40 ${SELECTED_TINT_BG} text-bn-pink`,
+	success: "border-bn-success/50 bg-bn-success-soft text-bn-success-text",
+} as const;
+
+function ActionPill({
+	tone,
+	onClick,
+	disabled,
+	children,
+}: {
+	tone: keyof typeof PILL_TONE;
+	onClick: () => void;
+	disabled?: boolean;
+	children: React.ReactNode;
+}) {
+	return (
+		<button
+			type="button"
+			onClick={onClick}
+			disabled={disabled}
+			data-bn="btn"
+			className={`rounded-bn-pill border px-3 py-1 font-semibold disabled:opacity-60 ${PILL_TONE[tone]}`}
+		>
+			{children}
+		</button>
+	);
+}
+
 export function ChromeAutoDetect({ onEnabled }: { onEnabled: () => void }) {
 	const [state, setState] = useState<DetectState>("idle");
 	const [path, setPath] = useState<string | null>(null);
@@ -74,40 +112,30 @@ export function ChromeAutoDetect({ onEnabled }: { onEnabled: () => void }) {
 
 	if (state === "enabled") {
 		return (
-			<div className="mt-2 rounded border border-bn-success-border bg-bn-success-soft p-2 text-[11px] font-semibold text-bn-success-text">
+			<div className="mt-2 rounded-sm border border-bn-success-border bg-bn-success-soft p-2 text-bn-xs font-semibold text-bn-success-text">
 				✓ 卡片渲染已启用 · 已写回配置,重启仍生效
 			</div>
 		);
 	}
 
 	return (
-		<div className="mt-2 rounded border border-bn-warning-border bg-bn-warning-soft p-2 text-[11px] text-bn-warning-text">
+		<div className="mt-2 rounded-sm border border-bn-warning-border bg-bn-warning-soft p-2 text-bn-xs text-bn-warning-text">
 			<div className="mb-1.5">
 				设置 <code className="font-mono">BN_CHROME_PATH</code> 环境变量或 yaml{" "}
 				<code className="font-mono">chromePath</code>,或一键自动探测本机浏览器:
 			</div>
 			<div className="flex flex-wrap items-center gap-2">
-				<button
-					type="button"
-					onClick={detect}
-					disabled={state === "detecting"}
-					className="rounded-full border border-bn-pink/40 bg-bn-pink/10 px-3 py-1 font-semibold text-bn-pink disabled:opacity-60"
-				>
+				<ActionPill tone="pink" onClick={detect} disabled={state === "detecting"}>
 					{state === "detecting" ? "探测中…" : "自动探测 Chrome"}
-				</button>
+				</ActionPill>
 				{path ? (
 					<>
-						<code className="rounded bg-bn-code-bg px-1.5 py-0.5 font-mono text-bn-warning-text">
+						<code className="rounded-sm bg-bn-code-bg px-1.5 py-0.5 font-mono text-bn-warning-text">
 							{path}
 						</code>
-						<button
-							type="button"
-							onClick={enable}
-							disabled={state === "enabling"}
-							className="rounded-full border border-emerald-400/50 bg-bn-success-soft px-3 py-1 font-semibold text-bn-success-text disabled:opacity-60"
-						>
+						<ActionPill tone="success" onClick={enable} disabled={state === "enabling"}>
 							{state === "enabling" ? "启用中…" : "启用"}
-						</button>
+						</ActionPill>
 					</>
 				) : null}
 			</div>
@@ -126,16 +154,16 @@ export function ChromeAutoDetect({ onEnabled }: { onEnabled: () => void }) {
 						value={endpoint}
 						onChange={(e) => setEndpoint(e.target.value)}
 						placeholder="ws://browser:3000?token=… 或 http://host:9222"
-						className="min-w-56 flex-1 rounded border border-bn-warning-border bg-bn-code-bg px-2 py-1 font-mono text-bn-warning-text placeholder:opacity-50"
+						data-bn="input"
+						className="min-w-56 flex-1 rounded-sm border border-bn-warning-border bg-bn-code-bg px-2 py-1 font-mono text-bn-warning-text placeholder:opacity-50"
 					/>
-					<button
-						type="button"
+					<ActionPill
+						tone="success"
 						onClick={connectRemote}
 						disabled={state === "connecting" || !endpoint.trim()}
-						className="rounded-full border border-emerald-400/50 bg-bn-success-soft px-3 py-1 font-semibold text-bn-success-text disabled:opacity-60"
 					>
 						{state === "connecting" ? "连接中…" : "连接远程浏览器"}
-					</button>
+					</ActionPill>
 				</div>
 			</div>
 			{err ? <div className="mt-1.5 text-bn-danger-text">{err}</div> : null}

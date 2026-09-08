@@ -2,13 +2,14 @@
  * AI page (智能女仆)。
  *
  * 两层 Tab,与 `Cards.tsx` 同一套双层结构(顶部 tab 条 + 左侧 `SectionNav`,
- * 外层 `grid xl:grid-cols-[220px_1fr]`):
+ * 外层 `grid xl:grid-bn-rail`):
  *
- * - **模型配置** —— 左栏列**已添加的服务商**(点添加才出现,同推送目标的适配器)。
- *   点一项 = 切换**我在编辑谁**,不是「换用这一家」—— 后者是「全局配置」里那个
- *   `ai.provider` 选择器的事,与人格那半边的 `activePreset` 同一套语义。右侧是那一家
- *   的整套配置:模型连接 / 图片理解 / 生成参数。哪些字段摆出来由 `AIProviderMeta`
- *   的能力位说了算 —— 摆一个那家根本不支持的选项,主人调了没反应只会以为保存坏了。
+ * - **模型配置** —— 左栏列**已添加的服务商实例**(点添加才出现;同一家可以有多份,
+ *   比如两个 DeepSeek 号)。点一项 = 切换**我在编辑谁**,不是「换用这一份」—— 后者是
+ *   「全局配置」里那个 `ai.activeProfile` 选择器的事,与人格那半边的 `activePreset`
+ *   同一套语义。右侧是那一份的整套配置:模型连接 / 图片理解 / 生成参数。哪些字段
+ *   摆出来由 `AIProviderMeta` 的能力位说了算 —— 摆一个那家根本不支持的选项,
+ *   主人调了没反应只会以为保存坏了。
  * - **女仆性格** —— 左栏是「默认 + presets[]」。点某一项 = 切换**我在编辑谁**,
  *   不再像旧界面那样把预设复制进 `ai.persona`(点着看看就覆盖掉主人手写的全局
  *   人格)。要套用到全局有单独的「设为默认」按钮。
@@ -20,18 +21,32 @@
  */
 
 import {
-	AI_PROVIDER_IDS,
-	type AIProviderId,
 	type AIProviderProfileShape,
+	type APIFlavorId,
+	canProfileThink,
 	EMPTY_AI_PROVIDER_PROFILE,
 	providerMeta,
+	resolveActivePersona,
 	resolveAIProfile,
 	type ThinkingLevel,
+	WEB_SEARCH_BACKENDS,
+	webSearchBackendMeta,
 } from "@bilibili-notify/internal/constants";
 import { buildPatch } from "@bilibili-notify/internal/patch";
+import {
+	Btn,
+	EmptyNote,
+	GlassBox,
+	Icon,
+	LoadingBlock,
+	Pill,
+	RailDot,
+	SectionNav,
+	TabBar,
+	Toggle,
+} from "@bilibili-notify/ui";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useMemo, useState } from "react";
-import { Pill, Toggle } from "../components/atoms";
 import {
 	Field,
 	LogLevelPicker,
@@ -41,34 +56,34 @@ import {
 	TInput,
 	TNum,
 } from "../components/forms";
-import { GlassBox } from "../components/glass-box";
-import { Icon } from "../components/icons";
+import { HeroStrip } from "../components/hero-strip";
 import { PROVIDER_BRANDS, ProviderLogo } from "../components/provider-logos";
 import { ProviderPicker } from "../components/provider-picker";
-import { RailDot, SectionNav } from "../components/section-nav";
-import { TabBar } from "../components/tab-bar";
+import { AI_PURPLE } from "../config/colors";
+import { SECTION_ACCENT } from "../config/section-accents";
 import { useDirtyDraft } from "../hooks/useDirtyDraft";
 import { api } from "../services/api";
 import type { AIPersona, AISettings, GlobalConfig, LogLevel } from "../types/globals";
+import { MaidSkills } from "./ai/MaidSkills";
 import {
-	addableProviders,
-	addedProviders,
 	addPersona,
-	addProvider,
+	addProfile,
 	duplicatePersona,
 	globalPersonaRailId,
 	isBuiltinPersona,
 	missingBuiltinPersonas,
 	personaAt,
 	personaRailItems,
+	profileRailItems,
 	removePersona,
-	removeProvider,
+	removeProfile,
 	renamePersona,
-	resolveEditingProvider,
+	renameProfile,
+	resolveEditingProfile,
 	resolvePersonaRailId,
 	restoreBuiltinPersona,
+	setActiveProfile,
 	setGlobalPersona,
-	setGlobalProvider,
 	updatePersonaAt,
 } from "./ai/model-ops";
 import { personaIconKey } from "./ai/persona-icons";
@@ -89,29 +104,34 @@ const toPickerValue = (v: AiLogLevel): LogLevelValue | null =>
 const fromPickerValue = (v: LogLevelValue | null): AiLogLevel =>
 	v === null ? "" : NUM_TO_LOG_LEVEL[v];
 
-type TopTab = "global" | "model" | "persona";
+type TopTab = "global" | "model" | "persona" | "skills";
 
-/** 顶部三个 tab。观感与 Rules / Cards 的作用域条同源(共用 `TabBar` 原语)。 */
+/** 顶部四个 tab。观感与 Rules / Cards 的作用域条同源(共用 `TabBar` 原语)。 */
 const TOP_TABS = [
 	{ id: "global" as const, label: "全局配置", code: "global" },
 	{ id: "model" as const, label: "模型配置", code: "provider" },
 	{ id: "persona" as const, label: "女仆性格", code: "persona" },
+	// 技能不是配置(自己的一份 REST 资源),所以它的 `code` 与整页那条保存栏无关
+	// —— 这一栏底下自带保存。摆在这儿只是因为「她是谁」与「她会做什么」该挨着。
+	{ id: "skills" as const, label: "女仆技能", code: "skills" },
 ];
 
 const TAB_HINTS: Record<TopTab, string> = {
 	global: "整个 AI 子系统的设置,不分服务商也不分性格",
 	model: "每家服务商各存一套,点左栏切换",
 	persona: "备着的性格清单;平时用哪一份在「全局配置」里选",
+	skills: "主人写给女仆的做事步骤;聊天里打 / 唤起,她也会自己挑",
 };
 
 /**
- * 逐家摊平服务商的桶,code 走 `ai.providers.<家>.<字段>`(字典里有一条前缀规则
+ * 逐实例摊平桶,code 走 `ai.providers.<实例>.<字段>`(字典里有一条前缀规则
  * 认它们,label / hint / **secret** 全继承 `ai.<字段>` 那条)。
  *
- * 曾经这里只摊平「当前在用的那一家」。左栏改成纯编辑器之后那样就漏了:改别家的桶
+ * 曾经这里只摊平「当前在用的那一份」。左栏改成纯编辑器之后那样就漏了:改别份的桶
  * 在灵动岛眼里毫无变化 —— 保存条不亮,主人一离开页面改动就白做了。
  *
- * 没添加过的那家也摆一副空档案,而不是整个缺席 —— 这一条是**安全项**:`walkTreeDiff`
+ * `keys` 是 draft 与 baseline 的**键并集**:只在一侧存在的实例(刚添加 / 刚删掉)
+ * 在另一侧摆一副空档案,而不是整个缺席 —— 这一条是**安全项**:`walkTreeDiff`
  * 碰上「一侧是对象、另一侧 undefined」会把整只桶当**一个叶子**吐出来,那一行的值
  * 就是整只桶的 JSON,里面带着**明文 apiKey**(脱敏位挂在字段级,管不到整只桶)。
  * 铺平之后每个字段各走各的 code,该脱敏的照样脱敏。
@@ -121,9 +141,9 @@ const TAB_HINTS: Record<TopTab, string> = {
  * `(未设置) → ""` 的噪音。真有内容的桶被删掉时照样逐字段亮;全默认的那只桶靠
  * 下面那行 providerList 兜(它就是为这一刻存在的)。
  */
-function packProviders(ai: AISettings): Record<string, unknown> {
+function packProviders(ai: AISettings, keys: readonly string[]): Record<string, unknown> {
 	const out: Record<string, unknown> = {};
-	for (const id of AI_PROVIDER_IDS) out[id] = ai.providers[id] ?? EMPTY_AI_PROVIDER_PROFILE;
+	for (const id of keys) out[id] = ai.providers[id] ?? EMPTY_AI_PROVIDER_PROFILE;
 	return out;
 }
 
@@ -135,19 +155,34 @@ function packProviders(ai: AISettings): Record<string, unknown> {
  * - 连接 / 参数:`<Field code={`ai.providers.${家}.apiKey`}>` → `ai.providers` 下逐家
  * - 人格 / 预设:`<Field code="persona.name">` / `code="presets"` → 顶层
  */
-function packIsland(ai: AISettings, levelOverride: AiLogLevel) {
-	const { dynamicPrompt, liveSummaryPrompt, persona, presets, enabled, provider, activePreset } =
-		ai;
+function packIsland(ai: AISettings, levelOverride: AiLogLevel, providerKeys: readonly string[]) {
+	const {
+		dynamicPrompt,
+		liveSummaryPrompt,
+		persona,
+		presets,
+		enabled,
+		activeProfile,
+		activePreset,
+		search,
+	} = ai;
 	return {
 		ai: {
 			dynamicPrompt,
 			liveSummaryPrompt,
-			// 女仆真正在用的是哪一家 —— 它是个**指针**,与左栏在看哪一家无关。
-			provider,
-			// 「已添加哪几家」的人话版。逐家摊平之后删一家其实也能逐字段看出来,
+			// `ai.chat`(聊天页的思考等级)**不在**这里:它的编辑口在聊天侧栏的
+			// 「设置」弹层,点档位立即 PATCH,不走本页的草稿 + 保存条。
+			// 联网搜索(后端 / key / 引擎开关)。两侧都经 schema 补齐,恒为完整对象,
+			// 不会踩「一侧 undefined 整块当叶子」那个明文 key 外泄的坑。
+			search,
+			// 女仆真正在用的是哪一份实例 —— 它是个**指针**,与左栏在看哪一份无关。
+			activeProfile,
+			// 「已添加哪几份」的人话版。逐实例摊平之后删一份其实也能逐字段看出来,
 			// 但那是十来行「(未设置)」;这一行让主人一眼知道到底是加了还是删了。
-			providerList: addedProviders(ai).join(","),
-			providers: packProviders(ai),
+			providerList: profileRailItems(ai)
+				.map((i) => i.id)
+				.join(","),
+			providers: packProviders(ai, providerKeys),
 			// 全局用哪份人格是个指针,不改写 persona —— 不显式喂给灵动岛的话,
 			// 换一份性格在它眼里毫无变化,保存条不亮。
 			activePreset: activePreset ?? "",
@@ -166,34 +201,9 @@ function packIsland(ai: AISettings, levelOverride: AiLogLevel) {
  */
 function FieldNote({ children }: { children: React.ReactNode }) {
 	return (
-		<div className="rounded-lg border border-bn-border-subtle bg-bn-surface-muted px-3 py-2 text-[11.5px] leading-relaxed text-bn-text-secondary">
+		<div className="rounded-lg border border-bn-border-subtle bg-bn-surface-muted px-3 py-2 text-bn-xs leading-relaxed text-bn-text-secondary">
 			{children}
 		</div>
-	);
-}
-
-/** 危险动作的小按钮(删除服务商 / 删除性格)。 */
-function DangerButton({ onClick, children }: { onClick: () => void; children: React.ReactNode }) {
-	return (
-		<button
-			type="button"
-			onClick={onClick}
-			className="rounded-md border border-dashed border-bn-danger-border px-2.5 py-1 text-[11.5px] font-bold text-bn-danger-text transition hover:border-bn-danger-text hover:bg-bn-danger-soft"
-		>
-			{children}
-		</button>
-	);
-}
-
-function GhostButton({ onClick, children }: { onClick: () => void; children: React.ReactNode }) {
-	return (
-		<button
-			type="button"
-			onClick={onClick}
-			className="rounded-md border border-bn-border px-2.5 py-1 text-[11.5px] font-bold text-bn-text-secondary transition hover:border-bn-pink hover:text-bn-pink"
-		>
-			{children}
-		</button>
 	);
 }
 
@@ -210,9 +220,9 @@ export default function Ai() {
 	// 左栏选中的那份人格。存左栏 id 而不是 presets 下标 —— 下标会在删除时整体前移,
 	// 指向另一份人格。空串交给 resolvePersonaRailId 收敛到第一份。
 	const [personaRailId, setPersonaRailId] = useState<string>("");
-	// 左栏在看哪一家 —— **纯界面状态**,与「女仆在用哪一家」(`ai.provider`)无关。
-	// 两者曾经共用一个字段,于是点左栏想看看另一家 = 当场换掉了在用的那家。
-	const [editingProvider, setEditingProvider] = useState<AIProviderId | null>(null);
+	// 左栏在看哪一份实例 —— **纯界面状态**,与「女仆在用哪一份」(`ai.activeProfile`)
+	// 无关。两者曾经共用一个字段,于是点左栏想看看另一份 = 当场换掉了在用的那份。
+	const [editingProfile, setEditingProfile] = useState<string | null>(null);
 	// 「+ 添加服务商」展开中。一家都没添加时无条件展开(那就是空态引导本身)。
 	const [addingProvider, setAddingProvider] = useState(false);
 	// 「添加性格」面板展开中(新建空白 / 从内置恢复)。与服务商那半边同一套交互。
@@ -261,17 +271,25 @@ export default function Ai() {
 		},
 	});
 
+	// draft 与 baseline 的实例键**并集** —— 两侧同键打包,刚添加 / 刚删掉的实例
+	// 在缺席的那侧摆空档案,免得 walkTreeDiff 把整只桶(含明文 key)当一个叶子吐出来。
+	const providerKeys = useMemo(() => {
+		const keys = new Set<string>(Object.keys(draft?.providers ?? {}));
+		for (const k of Object.keys(globalsQuery.data?.defaults.ai.providers ?? {})) keys.add(k);
+		return [...keys];
+	}, [draft, globalsQuery.data]);
 	const islandDraft = useMemo(
-		() => (draft === null ? null : packIsland(draft, aiLogLevel)),
-		[draft, aiLogLevel],
+		() => (draft === null ? null : packIsland(draft, aiLogLevel, providerKeys)),
+		[draft, aiLogLevel, providerKeys],
 	);
 	const islandBaseline = useMemo(() => {
 		if (!globalsQuery.data) return null;
 		return packIsland(
 			globalsQuery.data.defaults.ai,
 			(globalsQuery.data.app.logLevels?.ai ?? "") as AiLogLevel,
+			providerKeys,
 		);
-	}, [globalsQuery.data]);
+	}, [globalsQuery.data, providerKeys]);
 
 	useDirtyDraft({
 		pageKey: "ai",
@@ -290,39 +308,41 @@ export default function Ai() {
 	});
 
 	if (!draft) {
-		return (
-			<div className="bn-glass rounded-bn-card p-10 text-center text-sm text-bn-text-secondary shadow-bn-card">
-				加载 AI 配置中…
-			</div>
-		);
+		return <LoadingBlock label="正在读取 AI 配置" />;
 	}
 
-	// 左栏在看的那一家,收敛到真实存在的一家(可能刚被删掉、也可能还没选过)。
-	const editing = resolveEditingProvider(draft, editingProvider);
-	// 这一家是不是女仆平时用的那家。右上角的按钮与说明条都跟着它 —— 与人格那半边
+	// 左栏在看的那一份,收敛到真实存在的一份(可能刚被删掉、也可能还没选过)。
+	const editing = resolveEditingProfile(draft, editingProfile);
+	// 这一份是不是女仆平时用的那份。右上角的按钮与说明条都跟着它 —— 与人格那半边
 	// 的 `isGlobalPersona` 同一套语义。
-	const isGlobalProvider = editing !== null && editing === draft.provider;
-	// 选中服务商的能力描述。**设置页上显示什么由它说了算** —— 摆出一个那家根本
-	// 不支持的选项,主人调了没反应,只会以为是保存坏了。
-	const meta = providerMeta(editing ?? draft.provider);
-	// 正在编辑那家的整套配置。桶可能还不存在(刚切到一家没配过的),
-	// resolveAIProfile 兜一套空默认值 —— 表单照常显示空,一编辑即建桶。
+	const isActiveProfile = editing !== null && editing === draft.activeProfile;
+	// 正在编辑那份实例的整套配置。桶可能还不存在(一份都没添加时 editing 为 null),
+	// resolveAIProfile 兜一套空默认值 —— 表单照常显示空。
 	const profile = resolveAIProfile({
-		provider: editing ?? draft.provider,
+		activeProfile: editing ?? "",
 		providers: draft.providers,
 	});
-	// 头图那颗药丸报的是**女仆真正在用的那家**的模型,与左栏在看哪一家无关。
+	// 选中实例的能力描述,认桶里的 provider 章 —— 键只是实例 id,认不得方言。
+	// **设置页上显示什么由它说了算**:摆出一个那家根本不支持的选项,主人调了
+	// 没反应,只会以为是保存坏了。
+	const meta = providerMeta(profile.provider);
+	// 左栏 / 删除按钮上的显示名。
+	const rail = profileRailItems(draft);
+	const editingLabel = rail.find((i) => i.id === editing)?.label ?? meta.label;
+	// 头图那颗药丸报的是**女仆真正在用的那份**的模型,与左栏在看哪一份无关。
 	const globalProfile = resolveAIProfile(draft);
+	// 头图那行名字同理:报的是**女仆真正在用的那份人格**(`activePreset` 指的那份),
+	// 与左栏在编辑哪一份无关。直读 `draft.persona` 的话换来换去它一动不动 —— 那个
+	// 字段自人格指针上线就没有界面入口、永远冻在老值上。
+	const globalPersona = resolveActivePersona(draft).persona;
 	// 配了视觉副模型 = 副模型无条件接管,enableVision 与它的地址/密钥两格的
 	// 可交互性都跟着这一个判断走(与 CommentaryGenerator#resolveImages 同源)。
 	const visionSubModelOn = profile.vision.model.trim().length > 0;
 	// 这家开思考时会静默忽略 temperature(DeepSeek 如此)。露着它纯属误导。
 	const temperatureLive = !(meta.temperatureIgnoredWhenThinking && profile.enableThinking);
 
-	const added = addedProviders(draft);
-	const addable = addableProviders(draft);
-	// 一家都没添加 → 右侧直接就是添加面板,那本身就是空态引导。
-	const showAddPanel = addingProvider || added.length === 0;
+	// 一份都没添加 → 右侧直接就是添加面板,那本身就是空态引导。
+	const showAddPanel = addingProvider || rail.length === 0;
 
 	// 左栏选中项收敛到真实存在的一项,否则会出现「左栏没有任何高亮、右侧却显示着
 	// 默认那一份」——高亮项与内容各说各话。
@@ -345,6 +365,31 @@ export default function Ai() {
 		setDraft((d) => (d ? { ...d, [k]: v } : d));
 	}
 	/**
+	 * 改联网搜索段的若干项 —— backend 指针 / keys / engines 都走这一个口
+	 * (曾经三个 setter 各抄一遍嵌套 spread)。
+	 * keys / engines 是嵌套袋:调用方只给改动的那几格,这里在**函数式更新**里
+	 * 补上其余的 —— 漏一层内 spread 就是静默丢兄弟键(换后端丢另一家的 key)。
+	 */
+	function setSearch(delta: {
+		backend?: AISettings["search"]["backend"];
+		keys?: Partial<AISettings["search"]["keys"]>;
+		engines?: Partial<AISettings["search"]["engines"]>;
+	}): void {
+		setDraft((d) =>
+			d
+				? {
+						...d,
+						search: {
+							...d.search,
+							...delta,
+							keys: { ...d.search.keys, ...delta.keys },
+							engines: { ...d.search.engines, ...delta.engines },
+						},
+					}
+				: d,
+		);
+	}
+	/**
 	 * 改**正在编辑**那家桶里的一项(不是在用的那家 —— 两者可以不是同一家)。
 	 * 桶不存在时按当前显示值(空默认)建出来。
 	 */
@@ -360,7 +405,7 @@ export default function Ai() {
 						providers: {
 							...d.providers,
 							[editing]: {
-								...resolveAIProfile({ provider: editing, providers: d.providers }),
+								...resolveAIProfile({ activeProfile: editing, providers: d.providers }),
 								[k]: v,
 							},
 						},
@@ -386,56 +431,38 @@ export default function Ai() {
 	}
 
 	return (
-		<div className="bn-anim-fade-in flex flex-col gap-4">
+		<div className="bn-anim-page-in flex flex-col gap-4">
 			{/* Hero strip。总开关是页面级的 —— 它既不属于某一家服务商,也不属于某一份人格。 */}
-			<div
-				className="relative rounded-bn-card border p-5"
-				style={{
-					background: "linear-gradient(135deg, rgba(162,155,254,0.18), rgba(108,92,231,0.08))",
-					borderColor: "rgba(108,92,231,0.25)",
-				}}
-			>
-				<div className="flex items-center gap-3.5">
-					<div
-						className="grid h-13 w-13 shrink-0 place-items-center rounded-2xl text-white"
-						style={{
-							background: "linear-gradient(135deg, #a29bfe, #6c5ce7)",
-							boxShadow: "0 6px 18px rgba(108,92,231,0.35)",
-							width: 52,
-							height: 52,
-						}}
-					>
-						<Icon.ai size={26} />
-					</div>
-					<div className="flex-1">
-						<div className="flex items-center gap-2 text-[15.5px] font-bold text-bn-text-primary">
-							智能女仆 · {draft.persona.name || "女仆"}
-							<span data-hero-model>
-								<Pill color="#a29bfe" subtle size="sm">
-									{globalProfile.model || "未配置"}
-								</Pill>
-							</span>
-						</div>
-						<div className="mt-1 text-xs text-bn-text-tertiary">
-							会写动态点评、直播总结，支持 OpenAI 兼容的任意 base URL (｡•̀ᴗ-)✧
-						</div>
-					</div>
+			<HeroStrip
+				icon={<Icon.ai size={26} />}
+				title={
+					<>
+						智能女仆 · {globalPersona.name || "女仆"}
+						<span data-hero-model>
+							<Pill color="var(--color-bn-purple)" subtle size="sm">
+								{globalProfile.model || "未配置"}
+							</Pill>
+						</span>
+					</>
+				}
+				subtitle="会写动态点评、直播总结，支持 OpenAI 兼容的任意 base URL (｡•̀ᴗ-)✧"
+				right={
 					<Picker
 						value={draft.enabled}
 						onChange={(v) => setAi("enabled", v)}
 						options={[
-							{ value: true, label: "启用", color: "#6c5ce7" },
-							{ value: false, label: "停用", color: "#94a3b8" },
+							{ value: true, label: "启用", color: AI_PURPLE },
+							{ value: false, label: "停用", color: "var(--color-bn-inactive)" },
 						]}
 					/>
-				</div>
-			</div>
+				}
+			/>
 
 			{/* 开着总开关却一家都没配 —— 这不是「还没填完」而是**此刻确实不工作**:
 			    引擎不会创建实例、发图与点评一律回 400。不偷偷替主人把开关关掉
 			    (那是改主人存过的值),也不做点不动的置灰开关,只把话说明白。 */}
-			{draft.enabled && added.length === 0 ? (
-				<div className="rounded-bn-card border border-bn-warning-border bg-bn-warning-soft px-4 py-3 text-[12.5px] leading-relaxed text-bn-warning-text">
+			{draft.enabled && rail.length === 0 ? (
+				<div className="rounded-bn-card border border-bn-warning-border bg-bn-warning-soft px-4 py-3 text-bn-sm leading-relaxed text-bn-warning-text">
 					AI 总开关是开着的，但<strong>一家服务商都还没添加</strong>
 					，所以女仆此刻并不会真的写点评。到下面添加一家、填好模型与密钥就好了
 				</div>
@@ -450,6 +477,8 @@ export default function Ai() {
 						) : t.id === "persona" ? (
 							// 「性格」问的是**她是谁**,不是「喜不喜欢」—— 心形读作后者。
 							<Icon.user size={14} />
+						) : t.id === "skills" ? (
+							<Icon.sparkle size={14} />
 						) : (
 							<Icon.gear size={14} />
 						),
@@ -459,40 +488,103 @@ export default function Ai() {
 				hint={TAB_HINTS[tab]}
 			/>
 
-			{tab === "global" ? (
+			{tab === "skills" ? (
+				<MaidSkills />
+			) : tab === "global" ? (
 				<div className="flex flex-col gap-4">
-					{/* 全局服务商选择 —— 与人格那条同一套语义:这里决定女仆**用**哪一家,
-					    「模型配置」那个 Tab 的左栏只决定**在编辑**哪一家。两件事曾经共用
-					    `ai.provider`,于是点左栏看看别家 = 当场把在用的那家换掉了。 */}
+					{/* 全局实例选择 —— 与人格那条同一套语义:这里决定女仆**用**哪一份,
+					    「模型配置」那个 Tab 的左栏只决定**在编辑**哪一份。两件事曾经共用
+					    一个字段,于是点左栏看看别份 = 当场把在用的那份换掉了。 */}
 					<GlassBox
-						title="全局服务商 · provider"
-						subtitle="女仆平时用哪一家 · ai.provider"
-						accent="#6c5ce7"
+						title="全局服务商 · profile"
+						subtitle="女仆平时用哪一份 · ai.activeProfile"
+						accent={AI_PURPLE}
 						icon={<Icon.link size={14} />}
-						badge="provider"
+						badge="profile"
 					>
 						<Field
-							code="ai.provider"
+							code="ai.activeProfile"
 							full
 							hint={
-								added.length === 0
+								rail.length === 0
 									? "还没添加任何服务商 —— 到「模型配置」那个 Tab 点「+ 添加」加一家"
 									: undefined
 							}
 						>
-							<Picker<AIProviderId>
-								value={draft.provider}
-								onChange={(v) => setDraft((d) => (d ? setGlobalProvider(d, v) : d))}
-								options={added.map((id) => ({
-									value: id,
-									label: providerMeta(id).label,
-									color: PROVIDER_BRANDS[id].color,
+							<Picker<string>
+								value={draft.activeProfile}
+								onChange={(v) => setDraft((d) => (d ? setActiveProfile(d, v) : d))}
+								options={rail.map((i) => ({
+									value: i.id,
+									label: i.label,
+									color: PROVIDER_BRANDS[i.provider].color,
 								}))}
 							/>
 						</Field>
 						<FieldNote>
-							这里只决定<strong>用哪一家</strong>，不改它的配置 ——
-							密钥、模型、思考那几项在「模型配置」那个 Tab 里填。每家各存一套，换来换去都不会丢
+							这里只决定<strong>用哪一份</strong>，不改它的配置 ——
+							密钥、模型、思考那几项在「模型配置」那个 Tab 里填。每份各存一套，换来换去都不会丢
+						</FieldNote>
+					</GlassBox>
+
+					{/* 聊天页的思考设置不在这里:开关是输入框旁那颗 ✦ 胶囊(会话级不落盘),
+					    **等级**(ai.chat.thinkingLevel)搬进了聊天侧栏的「设置」弹层 ——
+					    深度只有聊天在用,编辑口跟着聊天走。 */}
+
+					{/* 联网搜索 —— 与选哪家 AI 服务商**正交**:web_search 工具由这里选定的
+					    后端真正执行,任何支持 function calling 的服务商都能用上。所以它不挂
+					    在实例桶下,自己一块。聊天页那颗「联网搜索」胶囊是会话级的不落盘,
+					    这里落盘的只有后端 / key / 引擎开关。 */}
+					<GlassBox
+						title="联网搜索"
+						subtitle="web_search 工具的执行后端与引擎开关 · ai.search"
+						accent={SECTION_ACCENT.capability}
+						icon={<Icon.search size={14} />}
+						badge="search"
+					>
+						<Field code="ai.search.backend" full>
+							<Picker<AISettings["search"]["backend"]>
+								value={draft.search.backend}
+								onChange={(v) => setSearch({ backend: v })}
+								options={WEB_SEARCH_BACKENDS.map((b) => ({ value: b.id, label: b.label }))}
+							/>
+						</Field>
+						<Field
+							code={`ai.search.keys.${draft.search.backend}`}
+							full
+							hint={`到 ${webSearchBackendMeta(draft.search.backend).keyUrl} 申请;两家的 key 各存一格,换来换去不会丢`}
+						>
+							<TInput
+								value={draft.search.keys[draft.search.backend]}
+								onChange={(v) => setSearch({ keys: { [draft.search.backend]: v } })}
+								secret
+								mono
+							/>
+						</Field>
+						{/* 三个引擎开关按表生成 —— 手抄三块只差 key/ariaLabel 的 JSX,
+						    抄错一处在评审里根本看不出来;加第四个引擎也只改这张表。 */}
+						{(
+							[
+								["dynamic", "动态点评联网搜索"],
+								["live", "直播总结联网搜索"],
+								["roast", "锐评联网搜索"],
+							] as const
+						).map(([k, aria]) => (
+							<Field key={k} code={`ai.search.engines.${k}`}>
+								<div className="flex h-7.5 items-center">
+									<Toggle
+										value={draft.search.engines[k]}
+										onChange={(v) => setSearch({ engines: { [k]: v } })}
+										ariaLabel={aria}
+									/>
+								</div>
+							</Field>
+						))}
+						<FieldNote>
+							搜索<strong>按次计费</strong>，引擎开关出厂全关：开了之后每条点评 / 总结 / 锐评
+							都可能多几次搜索调用和几秒延迟。聊天页的「联网搜索」胶囊按会话手动点亮，不在这里。
+							另外别在实例的「额外请求参数」里同时开那家自带的联网（如 OpenRouter 的 plugins）——
+							两头都开等于每次问话搜两遍
 						</FieldNote>
 					</GlassBox>
 
@@ -501,7 +593,7 @@ export default function Ai() {
 					<GlassBox
 						title="全局人格 · persona"
 						subtitle="女仆平时用哪一份性格 · ai.activePreset"
-						accent="#fdcb6e"
+						accent={SECTION_ACCENT.persona}
 						icon={<Icon.heart size={14} />}
 						badge="persona"
 					>
@@ -530,7 +622,7 @@ export default function Ai() {
 					<GlassBox
 						title="诊断 · logging"
 						subtitle="只影响日志详略，不影响生成 · app.logLevels.ai"
-						accent="#94a3b8"
+						accent={SECTION_ACCENT.diagnostic}
 						icon={<Icon.list size={14} />}
 						badge="logging"
 					>
@@ -547,36 +639,46 @@ export default function Ai() {
 					<AiTestPanel draft={draft} />
 				</div>
 			) : tab === "model" ? (
-				<div className="grid gap-4 xl:grid-cols-[220px_1fr]">
+				<div className="grid gap-4 xl:grid-bn-rail">
 					<SectionNav
 						heading="服务商"
-						items={added.map((id) => {
-							const m = providerMeta(id);
-							const bucket = draft.providers[id];
+						items={rail.map((item) => {
+							const bucket = draft.providers[item.id];
 							return {
-								id,
-								label: m.label,
+								id: item.id,
+								label: item.label,
 								desc: bucket?.model || "未填模型",
-								// 左栏是**编辑器**,高亮的是「在看谁」。哪一家是女仆真在用的,
+								// 左栏是**编辑器**,高亮的是「在看谁」。哪一份是女仆真在用的,
 								// 靠这颗指示器说 —— 否则两个概念在同一栏里没法区分。
-								badge: id === draft.provider ? <RailDot title="女仆平时用的就是这家" /> : undefined,
-								icon: <ProviderLogo id={id} size={16} />,
-								iconTint: PROVIDER_BRANDS[id].color,
+								badge:
+									item.id === draft.activeProfile ? (
+										<RailDot title="女仆平时用的就是这份" active={item.id === editing} />
+									) : undefined,
+								// 同 Targets 左栏:选中那格的品牌色会跟皮肤的实心块撞,喂
+								// currentColor 跟随。服务商名就在标签上,认得出是哪家。
+								icon: (
+									<ProviderLogo
+										id={item.provider}
+										size={16}
+										tone={item.id === editing ? "currentColor" : undefined}
+									/>
+								),
+								iconTint: PROVIDER_BRANDS[item.provider].color,
 							};
 						})}
 						activeId={editing}
 						onPick={(id) => {
-							setEditingProvider(id as AIProviderId);
+							setEditingProfile(id);
 							setAddingProvider(false);
 						}}
-						onAdd={addable.length > 0 ? () => setAddingProvider(true) : undefined}
+						onAdd={() => setAddingProvider(true)}
 						addLabel="+ 添加"
 						emptyState={
-							<div className="rounded-[9px] border border-dashed border-bn-border px-3 py-4 text-center text-[11.5px] leading-relaxed text-bn-text-tertiary">
+							<EmptyNote size="sm" className="leading-relaxed">
 								还没添加任何服务商
 								<br />
 								先添加一家吧
-							</div>
+							</EmptyNote>
 						}
 					/>
 
@@ -584,76 +686,89 @@ export default function Ai() {
 						{showAddPanel ? (
 							<GlassBox
 								title="添加服务商"
-								subtitle="每家各存一套自己的配置 · ai.providers"
-								accent="#6c5ce7"
+								subtitle="每份实例各存一套自己的配置 · ai.providers"
+								accent={AI_PURPLE}
 								icon={<Icon.link size={14} />}
 								badge="add"
 							>
-								{addable.length === 0 ? (
-									<FieldNote>五家都添加过了 —— 在左栏点一家开始配置吧</FieldNote>
-								) : (
-									<>
-										<FieldNote>
-											选哪家决定了「开思考」翻译成哪家的方言（四家四种写法，没有通用解），也决定了这页摆出哪些选项。
-											<strong>不按地址猜</strong>
-											——
-											猜错就是替主人往别家发方言参数。不在这几家里的话选「自定义」，需要什么写到额外请求参数里
-										</FieldNote>
-										<div className="pt-3">
-											<ProviderPicker
-												value={null}
-												only={addable}
-												onChange={(id) => {
-													// 添加 ≠ 换用:新加的那家只是**切过去编辑**(否则左栏多一项、
-													// 右侧还停在原来那家,像没反应)。要真换用得点「设为默认」。
-													setDraft((d) => (d ? addProvider(d, id) : d));
-													setEditingProvider(id);
-													setAddingProvider(false);
-												}}
-											/>
-										</div>
-									</>
-								)}
+								<FieldNote>
+									选哪家决定了「开思考」翻译成哪家的方言（各家各的写法，没有通用解），也决定了这页摆出哪些选项。
+									<strong>不按地址猜</strong>
+									——
+									猜错就是替主人往别家发方言参数。不在这几家里的话选「自定义」，需要什么写到额外请求参数里。
+									同一家可以添加<strong>多份</strong>（比如两个 DeepSeek
+									号），每份各有各的密钥与模型
+								</FieldNote>
+								<div className="pt-3">
+									<ProviderPicker
+										value={null}
+										onChange={(pid) => {
+											// 添加 ≠ 换用:新加的那份只是**切过去编辑**(否则左栏多一项、
+											// 右侧还停在原来那份,像没反应)。要真换用得点「设为默认」。
+											if (!draft) return;
+											const { ai: next, id } = addProfile(draft, pid);
+											setDraft(next);
+											setEditingProfile(id);
+											setAddingProvider(false);
+										}}
+									/>
+								</div>
 							</GlassBox>
 						) : (
 							<>
 								<GlassBox
 									title="模型连接"
-									subtitle="OpenAI 兼容 API · ai.providers.<服务商>.{baseUrl,apiKey,model}"
-									accent="#6c5ce7"
+									subtitle="OpenAI 兼容 API · ai.providers.<实例>.{label,baseUrl,apiKey,model,apiFlavor}"
+									accent={AI_PURPLE}
 									icon={<Icon.link size={14} />}
 									badge="connection"
 									right={
 										<div className="flex items-center gap-1.5">
-											{/* 「在看这家」不等于「在用这家」。要换用得明确点一下 —— 与人格
+											{/* 「在看这份」不等于「在用这份」。要换用得明确点一下 —— 与人格
 											    那半边的「设为默认」同一个动作、同一句话。 */}
-											{isGlobalProvider || editing === null ? null : (
-												<GhostButton
-													onClick={() => setDraft((d) => (d ? setGlobalProvider(d, editing) : d))}
+											{isActiveProfile || editing === null ? null : (
+												<Btn
+													variant="outline"
+													size="sm"
+													onClick={() => setDraft((d) => (d ? setActiveProfile(d, editing) : d))}
 												>
 													设为默认
-												</GhostButton>
+												</Btn>
 											)}
-											<DangerButton
+											<Btn
+												variant="danger-outline"
+												size="sm"
 												onClick={() =>
-													setDraft((d) => (d && editing !== null ? removeProvider(d, editing) : d))
+													setDraft((d) => (d && editing !== null ? removeProfile(d, editing) : d))
 												}
 											>
-												删除 {meta.label}
-											</DangerButton>
+												删除 {editingLabel}
+											</Btn>
 										</div>
 									}
 								>
-									{isGlobalProvider ? (
+									{isActiveProfile ? (
 										<FieldNote>
-											<strong>女仆平时用的就是这家</strong>。改哪一项都立刻算数
+											<strong>女仆平时用的就是这份</strong>。改哪一项都立刻算数
 										</FieldNote>
 									) : (
 										<FieldNote>
-											这一家<strong>现在没在用</strong>
+											这一份<strong>现在没在用</strong>
 											，配置照样存着。想让女仆换用它，点右上角「设为默认」（或到「全局配置」里选）
 										</FieldNote>
 									)}
+									{/* 实例名。同一家添加多份时全靠它区分;留空则显示家名。 */}
+									<Field code={`ai.providers.${editing}.label`}>
+										<TInput
+											value={profile.label}
+											onChange={(v) => {
+												if (editing !== null) {
+													setDraft((d) => (d ? renameProfile(d, editing, v) : d));
+												}
+											}}
+											placeholder={meta.label}
+										/>
+									</Field>
 									<Field code={`ai.providers.${editing}.apiKey`} required>
 										<TInput
 											value={profile.apiKey}
@@ -682,14 +797,38 @@ export default function Ai() {
 											full={false}
 										/>
 									</Field>
+									{/* 接口风味 —— 只对确认支持 /responses 的家摆出来(supportsResponses),
+									    硅基/火山未确认前不给选:选得到却必然 404 的组合比没有选项更糟。 */}
+									{meta.supportsResponses ? (
+										<>
+											<Field code={`ai.providers.${editing}.apiFlavor`} full>
+												<Picker<APIFlavorId>
+													value={profile.apiFlavor}
+													onChange={(v) => setProfile("apiFlavor", v)}
+													options={[
+														{ value: "chat", label: "chat completions" },
+														{ value: "responses", label: "responses" },
+													]}
+												/>
+											</Field>
+											{profile.apiFlavor === "responses" ? (
+												<FieldNote>
+													responses 是 OpenAI 这套接口的<strong>新协议</strong>
+													:深度思考是标准字段（统一三档，不再按家翻译方言），思考 +
+													工具连用也更稳。DeepSeek 需要 v4 系模型；这里失败
+													<strong>不会</strong>悄悄换回旧协议，报错就是真没配对
+												</FieldNote>
+											) : null}
+										</>
+									) : null}
 								</GlassBox>
 
 								{/* 图片理解。它同样是在描述「接哪个模型」,只不过整块可以不填:
 								    两条路都不开时,发图会被明确拒绝而不是静默丢掉。 */}
 								<GlassBox
 									title="图片理解"
-									subtitle="两条路二选一 · ai.providers.<服务商>.{enableVision,vision}"
-									accent="#00b894"
+									subtitle="两条路二选一 · ai.providers.<实例>.{enableVision,vision}"
+									accent={SECTION_ACCENT.capability}
 									icon={<Icon.image size={14} />}
 									badge="vision"
 								>
@@ -765,7 +904,7 @@ export default function Ai() {
 								<GlassBox
 									title="生成参数"
 									subtitle="temperature / 深度思考 · ai.{temperature,enableThinking,thinkingLevel,extraParams}"
-									accent="#a29bfe"
+									accent="var(--color-bn-purple)"
 									icon={<Icon.sparkle size={14} />}
 									badge="generation"
 								>
@@ -788,7 +927,9 @@ export default function Ai() {
 											（连同 top_p 那几个）， 调了也不生效，所以先收起来。关掉下面的深度思考它就回来
 										</FieldNote>
 									)}
-									{meta.supportsThinking ? (
+									{/* responses 风味下思考是标准字段(reasoning.effort),custom 也能开 ——
+									    「方言未知不敢发」只是 chat completions 的处境。谓词一份,住 constants。 */}
+									{canProfileThink(profile) ? (
 										<>
 											<Field code={`ai.providers.${editing}.enableThinking`}>
 												<div className="flex h-7.5 items-center">
@@ -812,7 +953,12 @@ export default function Ai() {
 													/>
 												</Field>
 											) : null}
-											{meta.thinkingDefaultsOn && !profile.enableThinking ? (
+											{/* 「默认开着」的说明只描述 chat 方言的关位语义;responses 那边
+											    的关位各家不同(百炼发 effort:none,DeepSeek 什么都不发),
+											    没有一句能概括两家的话,索性不说。 */}
+											{meta.thinkingDefaultsOn &&
+											!profile.enableThinking &&
+											profile.apiFlavor !== "responses" ? (
 												<FieldNote>
 													{meta.label} 的思考模型<strong>默认就是开着</strong>的 ——
 													正因为如此，关掉这个开关女仆会显式告诉它别想那么久，而不是什么都不发
@@ -834,13 +980,20 @@ export default function Ai() {
 											placeholder={'{"enable_search": true}'}
 										/>
 									</Field>
+									{profile.apiFlavor === "responses" ? (
+										<FieldNote>
+											这份实例走 responses 协议，额外参数会摊进 responses 的请求体 ——
+											<strong>字段名与 chat completions 不同</strong>（如 max_tokens 在那边叫
+											max_output_tokens），别照抄旧写法
+										</FieldNote>
+									) : null}
 								</GlassBox>
 							</>
 						)}
 					</div>
 				</div>
 			) : (
-				<div className="grid gap-4 xl:grid-cols-[220px_1fr]">
+				<div className="grid gap-4 xl:grid-bn-rail">
 					<SectionNav
 						heading="性格"
 						items={personaRailItems(draft).map((item) => {
@@ -854,7 +1007,7 @@ export default function Ai() {
 								// 两栏各说各的;共用之后观感只有一处定义。
 								badge:
 									globalPersonaRailId(draft) === item.id ? (
-										<RailDot title="女仆平时用的就是这份" />
+										<RailDot title="女仆平时用的就是这份" active={item.id === activePersonaId} />
 									) : undefined,
 								icon: <Glyph size={14} />,
 							};
@@ -873,12 +1026,14 @@ export default function Ai() {
 							<GlassBox
 								title="添加性格"
 								subtitle="新建一份,或把删掉的内置那份找回来 · ai.presets[]"
-								accent="#fdcb6e"
+								accent={SECTION_ACCENT.persona}
 								icon={<Icon.plus size={14} />}
 								badge="add"
 							>
 								<Field code="presets" label="新建" full>
-									<GhostButton
+									<Btn
+										variant="outline"
+										size="sm"
 										onClick={() => {
 											// 新建即切过去 —— 否则左栏多一项、右侧还停在原来那份,像没反应。
 											const next = draft ? addPersona(draft) : null;
@@ -889,7 +1044,7 @@ export default function Ai() {
 										}}
 									>
 										+ 空白性格
-									</GhostButton>
+									</Btn>
 								</Field>
 								{restorable.length > 0 ? (
 									<Field
@@ -902,8 +1057,9 @@ export default function Ai() {
 											{restorable.map((b) => {
 												const Glyph = Icon[personaIconKey(b.id)];
 												return (
-													<button
-														type="button"
+													<Btn
+														variant="outline"
+														size="sm"
 														key={b.id}
 														onClick={() => {
 															const next = restoreBuiltinPersona(draft, b.id);
@@ -911,11 +1067,10 @@ export default function Ai() {
 															setPersonaRailId(next.railId);
 															setAddingPersona(false);
 														}}
-														className="flex items-center gap-1.5 rounded-md border border-bn-border px-2.5 py-1 text-[11.5px] font-bold text-bn-text-secondary transition hover:border-bn-pink hover:text-bn-pink"
 													>
 														<Glyph size={13} />
 														{b.label}
-													</button>
+													</Btn>
 												);
 											})}
 										</div>
@@ -928,14 +1083,16 @@ export default function Ai() {
 							<GlassBox
 								title="人格塑造 · persona"
 								subtitle="这一份的口吻与称呼 · ai.presets[]"
-								accent="#fdcb6e"
+								accent={SECTION_ACCENT.persona}
 								icon={<ActivePersonaGlyph size={14} />}
 								badge="persona"
 								right={
 									<div className="flex items-center gap-1.5">
 										{/* 内置那份改不动 —— 给一条出路:以它为蓝本另存一份可改的。 */}
 										{personaLocked ? (
-											<GhostButton
+											<Btn
+												variant="outline"
+												size="sm"
 												onClick={() => {
 													const next = duplicatePersona(draft, activePersonaId);
 													setDraft(next.ai);
@@ -943,28 +1100,32 @@ export default function Ai() {
 												}}
 											>
 												从内置修改
-											</GhostButton>
+											</Btn>
 										) : null}
 										{isGlobalPersona ? null : (
-											<GhostButton
+											<Btn
+												variant="outline"
+												size="sm"
 												onClick={() =>
 													setDraft((d) => (d ? setGlobalPersona(d, activePersonaId) : d))
 												}
 											>
 												设为默认
-											</GhostButton>
+											</Btn>
 										)}
 										{/* 最后一份删不掉 —— AI 总得有一份人格。按钮直接不摆,
 									    好过摆一个点了没反应的。 */}
 										{draft.presets.length > 1 ? (
-											<DangerButton
+											<Btn
+												variant="danger-outline"
+												size="sm"
 												onClick={() => {
 													setDraft((d) => (d ? removePersona(d, activePersonaId) : d));
 													setPersonaRailId("");
 												}}
 											>
 												删除
-											</DangerButton>
+											</Btn>
 										) : null}
 									</div>
 								}

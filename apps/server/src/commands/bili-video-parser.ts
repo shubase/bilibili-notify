@@ -1,5 +1,5 @@
 import type { VideoInfo } from "@bilibili-notify/api";
-import type { CommandConfig } from "@bilibili-notify/internal";
+import type { GroupCommandConfig } from "@bilibili-notify/internal";
 import type { OnebotInboundEventContext, OnebotMessageSegment } from "../platforms/onebot.js";
 import type { AppRuntime } from "../runtime/bootstrap.js";
 
@@ -59,15 +59,9 @@ export async function handleBiliVideoParse(
 	}
 
 	try {
-		const response = await engines.api.getVideoInfo({ bvid: target.bvid, aid: target.aid });
-		const video = response.data;
-		if (response.code !== 0 || !video) {
-			runtime.serviceCtx.logger.debug(
-				`[bili-video] 获取视频详情失败 code=${response.code} message=${response.message ?? response.msg ?? ""}`,
-			);
-			return false;
-		}
-
+		const video = await engines.api.getVideoInfo(
+			target.bvid ? { bvid: target.bvid } : { aid: String(target.aid) },
+		);
 		const result = await ctx.sendGroupMessage(event.groupId, buildBiliVideoReplySegments(video));
 		if (!result.ok) {
 			runtime.serviceCtx.logger.warn(
@@ -308,7 +302,7 @@ function rememberParsedVideo(groupId: string, cacheKey: string): void {
 }
 
 function resolveVideoParseConfig(runtime: AppRuntime): VideoParseConfig {
-	const commands = runtime.configStore.getGlobals().commands as CommandConfig | undefined;
+	const commands = runtime.configStore.getGlobals().groupCommands as GroupCommandConfig | undefined;
 	return { enabled: commands?.videoParse?.enabled ?? true };
 }
 

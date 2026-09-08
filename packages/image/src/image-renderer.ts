@@ -1,17 +1,19 @@
 import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import type {
-	CardBlock,
-	Disposable,
-	GuardLayout,
-	Logger,
-	ServiceContext,
+import { GuardLevel } from "@bilibili-notify/blive";
+import {
+	type CardBlock,
+	createSerialGate,
+	type Disposable,
+	type GuardLayout,
+	type Logger,
+	type ServiceContext,
 } from "@bilibili-notify/internal";
-import { GuardLevel } from "blive-message-listener";
 import { JSDOM } from "jsdom";
 import { DateTime } from "luxon";
-import type { PuppeteerLike } from "./puppeteer";
-import { renderCard } from "./render";
+import { numberToStr } from "./format";
+import type { PuppeteerLike, RenderPriority } from "./puppeteer";
+import { renderCard, USER_FONT_FAMILY } from "./render";
 import { BG_COLORS, getSCLevel, SC_COLORS, SC_LEVELS } from "./styles";
 import { DynamicCard } from "./templates/dynamic-card";
 import { buildDynamicNode } from "./templates/dynamic-content";
@@ -40,8 +42,8 @@ import type { CardColorOptions, Dynamic, LiveData } from "./types";
  * 打包后 pack 的 copy 规则把它搬到 `lib/static/`,而那时本文件已被并进
  * `lib/index.*` —— 都是「同级的 static」。
  *
- * 三种消费形态都验过:`lib/index.mjs`(独立端)、`lib/index.cjs` 与 koishi 的
- * CJS bundle(打包器会把 `import.meta.url` 改写成 CJS 能跑的形式)。
+ * 两种消费形态都验过:`lib/index.mjs`(独立端裸跑 / dev)与内联进 server 单文件 bundle
+ * (打包器把本模块并进 dist/index.mjs,`static/` 由装配脚本搬到 dist/ 旁)。
  */
 export const ASSET_DIR = dirname(fileURLToPath(import.meta.url));
 
@@ -57,11 +59,11 @@ export type RoastSoloData = Omit<RoastSoloCardProps, RoastStyleKeys>;
 
 const GUARD_LEVEL_IMG: Record<GuardLevel, string> = {
 	[GuardLevel.None]: "",
-	[GuardLevel.Jianzhang]:
+	[GuardLevel.Captain]:
 		"https://s1.hdslb.com/bfs/static/blive/live-pay-mono/relation/relation/assets/captain-Bjw5Byb5.png",
-	[GuardLevel.Tidu]:
+	[GuardLevel.Admiral]:
 		"https://s1.hdslb.com/bfs/static/blive/live-pay-mono/relation/relation/assets/supervisor-u43ElIjU.png",
-	[GuardLevel.Zongdu]:
+	[GuardLevel.Governor]:
 		"https://s1.hdslb.com/bfs/static/blive/live-pay-mono/relation/relation/assets/governor-DpDXKEdA.png",
 };
 
@@ -90,11 +92,9 @@ function fmtOptional(v: number | boolean | undefined): string {
 }
 
 /**
- * Runtime configuration for {@link ImageRenderer}. Mirrors the platform-neutral
- * subset of the original koishi `BilibiliNotifyImageConfig` schema; the koishi
- * shell maps its schema fields onto this struct, and the standalone runtime
- * fills it from its own config store. The `logLevel` field is intentionally
- * dropped — the adapter is responsible for setting the logger level externally.
+ * Runtime configuration for {@link ImageRenderer}. The standalone runtime fills it
+ * from its own config store. The `logLevel` field is intentionally dropped — the
+ * host is responsible for setting the logger level externally.
  */
 export interface ImageRendererConfig {
 	/** 卡片渐变背景起始颜色（十六进制）。 */
@@ -107,6 +107,12 @@ export interface ImageRendererConfig {
 	glassClear?: boolean;
 	/** 自定义卡片背景图资产 id(空 = 渐变);渲染期经 resolveAsset 解析成 data URL。 */
 	backgroundImage?: string;
+	/**
+	 * 主人自带的字体文件资产 id(独立端专属);渲染期经 `resolveFontFace` 解析成一条
+	 * 现成的 `@font-face` 规则。设了就**优先于 `font`**;宿主没注入 resolver、或资产
+	 * 悬空时静静回落 `font`。
+	 */
+	fontAsset?: string;
 	/** CSS font-family，默认值由 adapter 提供(通常透传 `DEFAULT_CARD_STYLE.font`)。 */
 	font: string;
 	/** 直播卡数据区:显示人气 / 点赞(直播中=人气,下播=点赞)。 */
@@ -122,10 +128,20 @@ export interface ImageRendererOptions {
 	puppeteer: PuppeteerLike;
 	config: ImageRendererConfig;
 	/**
-	 * 把卡片背景图资产 id 解析成可渲染的 data URL(服务端注入,读 `<dataDir>/assets/card-bg`)。
-	 * 未注入 = 背景图特性不可用(返回 "")。已是 data:/http URL 的值直接透传、不经此回调。
+	 * 把卡片背景图资产 id 解析成可渲染的 data URL(宿主注入,读 `<dataDir>/assets/card-bg`)。
+	 * 解析不出来返回空串。已是 data:/http URL 的值直接透传、不经此回调。
 	 */
-	resolveAsset?: (id: string) => Promise<string>;
+	resolveAsset: (id: string) => Promise<string>;
+	/**
+	 * 把字体资产 id 解析成**一整条 `@font-face` 规则**(宿主注入,读
+	 * `<dataDir>/assets/font` 后用 {@link buildFontFace} 拼好)。解析不出来返回空串,
+	 * 渲染器回落家族名。
+	 *
+	 * 契约是整条规则而不是 data URL,为的是**省一整份内存**:一款中文字库 base64 之后
+	 * 二三十兆,渲染器若再自己拼一遍,同一串东西在堆里就有两份 —— 而镜像里 V8 的
+	 * old-space 上限只有 512MB。宿主那边本来就按资产 id 缓存着解析结果,顺手拼好即可。
+	 */
+	resolveFontFace: (id: string) => Promise<string>;
 	/**
 	 * 热更日志降级到 debug。**预览渲染器**(dashboard 每来一次预览请求就
 	 * updateConfig 一遍)必须开:主人在 Cards 页拖一格滑块就是一条 INFO「配置已
@@ -140,8 +156,21 @@ export class ImageRenderer {
 	private readonly serviceCtx: ServiceContext;
 	private readonly puppeteer: PuppeteerLike;
 	private config: ImageRendererConfig;
-	private readonly resolveAsset?: (id: string) => Promise<string>;
+	private readonly resolveAsset: (id: string) => Promise<string>;
+	private readonly resolveFontFace: (id: string) => Promise<string>;
 	private readonly quietConfigUpdates: boolean;
+
+	/**
+	 * 自带字体的解析结果缓存 —— **只留一款,且留的是拼好的那条规则**。
+	 *
+	 * 一款完整中文字库十几到几十兆,base64 之后还要再涨三分之一。每张卡重读一遍盘既慢
+	 * 又在 Docker 那点堆上限里反复搓大字符串;而同一时刻真正在用的通常就一款,留一份
+	 * 足够(per-UP 换了一款就换掉这一份,不攒)。
+	 *
+	 * 存 `@font-face` 规则而不是 data URL:规则本身就把 data URL 包在里头,只留它就等于
+	 * 少留一整份几十兆的串。
+	 */
+	private fontCache: { id: string; fontFace: string } | null = null;
 
 	// 图片 base64 缓存
 	private readonly imageCache = new Map<string, { dataUrl: string; updatedAt: number }>();
@@ -168,14 +197,19 @@ export class ImageRenderer {
 	/** IM2:单张远端图字节上限,防超大图全量入内存 + base64 膨胀驻留 cache → OOM。 */
 	private readonly MAX_REMOTE_IMG_BYTES = 8 * 1024 * 1024;
 
-	// 串行渲染队列，避免 puppeteer 并发问题
-	private renderQueue: Promise<void> = Promise.resolve();
+	/**
+	 * 串行渲染队列,避免 puppeteer 并发问题。带两条车道:链接卡这类低优先级的渲染在
+	 * 正常车道排空之前不动 —— 优先级得在这一级就生效,只在浏览器闸那级让路的话,
+	 * 低优先级的渲染在这里就已经排到推送卡前面了。
+	 */
+	private readonly renderGate = createSerialGate();
 
 	constructor(opts: ImageRendererOptions) {
 		this.serviceCtx = opts.serviceCtx;
 		this.puppeteer = opts.puppeteer;
 		this.config = opts.config;
 		this.resolveAsset = opts.resolveAsset;
+		this.resolveFontFace = opts.resolveFontFace;
 		this.quietConfigUpdates = opts.quietConfigUpdates ?? false;
 		this.logger = opts.serviceCtx.logger;
 	}
@@ -205,6 +239,11 @@ export class ImageRenderer {
 			diffs.push(`cardColorEnd=${config.cardColorEnd}`);
 		}
 		if (prev.font !== config.font) diffs.push(`font=${config.font}`);
+		if (prev.fontAsset !== config.fontAsset) {
+			diffs.push(`fontAsset=${config.fontAsset ? "(自带字体)" : "(无)"}`);
+			// 换了一款就把缓存里那份几十兆的 base64 放掉,别攥着已经不用的字体。
+			this.fontCache = null;
+		}
 		if (prev.showPopularity !== config.showPopularity) {
 			diffs.push(`showPopularity=${config.showPopularity}`);
 		}
@@ -234,12 +273,6 @@ export class ImageRenderer {
 
 	// ── 公共工具方法 ─────────────────────────────────────────────────────────────
 
-	numberToStr(num: number): string {
-		if (num >= 100_000_000) return `${(num / 100_000_000).toFixed(1)}亿`;
-		if (num >= 10_000) return `${(num / 10_000).toFixed(1)}万`;
-		return num.toString();
-	}
-
 	unixTimestampToString(timestamp: number): string {
 		const d = new Date(timestamp * 1000);
 		const pad = (n: number) => `0${n}`.slice(-2);
@@ -248,12 +281,39 @@ export class ImageRenderer {
 
 	/**
 	 * 解析卡片背景图字段为可渲染 URL:空 → "";已是 data:/http URL → 透传(预览路由已解析);
-	 * 否则当资产 id,经注入的 resolveAsset 读盘解析成 data URL。无 resolver → ""(特性不可用)。
+	 * 否则当资产 id,经注入的 resolveAsset 读盘解析成 data URL(解析不出来即 "")。
 	 */
 	private async resolveBg(v?: string): Promise<string> {
 		if (!v) return "";
 		if (v.startsWith("data:") || v.startsWith("http")) return v;
-		return this.resolveAsset ? await this.resolveAsset(v) : "";
+		return await this.resolveAsset(v);
+	}
+
+	/**
+	 * 这张卡用哪款字体 —— 每个 generate* 都经它,per-call 覆盖优先于全局 config。
+	 *
+	 * `colorOptions.font` 曾经**根本没被读过**:设置页允许给单个 UP / 单类卡另设字体,
+	 * 存得下也解析得出,就是没人交给渲染器,于是选了等于没选。这一族 bug 长得都一样 ——
+	 * 界面上改得动、保存得下、行为不变。
+	 *
+	 * 自带的字体文件优先:宿主把它解析成一条现成的 `@font-face`,家族名换成内部那个。
+	 * 解析不出来(资产被删了、卷丢了)就静静回落家族名 —— 出图不该因为
+	 * 少一个文件而崩,也不该塞一条空 src 的规则进 CSS。
+	 */
+	private async resolveFont(
+		colorOptions: CardColorOptions = {},
+	): Promise<{ font: string; fontFace?: string }> {
+		const font = colorOptions.font ?? this.config.font;
+		const assetId = colorOptions.fontAsset ?? this.config.fontAsset;
+		if (!assetId) return { font };
+
+		if (this.fontCache?.id !== assetId) {
+			const fontFace = await this.resolveFontFace(assetId);
+			this.fontCache = fontFace ? { id: assetId, fontFace } : null;
+		}
+		if (!this.fontCache) return { font };
+		// 原样透传,**不再自己拼** —— 拼一遍就是在堆里多一份几十兆的串。
+		return { font: USER_FONT_FAMILY, fontFace: this.fontCache.fontFace };
 	}
 
 	async getTimeDifference(dateString: string): Promise<string> {
@@ -315,7 +375,7 @@ export class ImageRenderer {
 		const glassOpacity = colorOptions.glassOpacity ?? this.config.glassOpacity;
 		const glassClear = colorOptions.glassClear ?? this.config.glassClear;
 		// 背景图与直播封面(独立端专属)两次独立解析(各自 resolveAsset → 读盘),互不依赖 ——
-		// 并发发起,省掉一次串行 I/O 往返。封面无 resolver(koishi)解析为 "" → 模板回退
+		// 并发发起,省掉一次串行 I/O 往返。封面解析为 "" 时模板回退
 		// API 封面/关键帧,特性自动无感。
 		const [backgroundImage, coverOverride] = await Promise.all([
 			this.resolveBg(colorOptions.backgroundImage ?? this.config.backgroundImage),
@@ -349,18 +409,18 @@ export class ImageRenderer {
 				liveStatus: cardBadgeStatus,
 				cover,
 				coverOverride: coverOverride || undefined,
-				onlineNum: this.numberToStr(+(data.online ?? 0)),
+				onlineNum: numberToStr(+(data.online ?? 0)),
 				likedNum:
 					typeof liveData.likedNum === "number"
-						? this.numberToStr(liveData.likedNum)
+						? numberToStr(liveData.likedNum)
 						: (liveData.likedNum ?? ""),
 				watchedNum:
 					typeof liveData.watchedNum === "number"
-						? this.numberToStr(liveData.watchedNum)
+						? numberToStr(liveData.watchedNum)
 						: (liveData.watchedNum ?? ""),
 				fansNum:
 					typeof liveData.fansNum === "number"
-						? this.numberToStr(liveData.fansNum)
+						? numberToStr(liveData.fansNum)
 						: (liveData.fansNum ?? ""),
 				fansChanged: (() => {
 					if (typeof liveData.fansChanged !== "number") return liveData.fansChanged ?? "";
@@ -370,7 +430,7 @@ export class ImageRenderer {
 				})(),
 				layout,
 			},
-			{ title: "直播通知", font: this.config.font, htmlWidth: 600 },
+			{ title: "直播通知", ...(await this.resolveFont(colorOptions)), htmlWidth: 600 },
 		);
 
 		return withRetry(() => this.renderHtml(html))
@@ -424,7 +484,7 @@ export class ImageRenderer {
 				glassClear,
 				backgroundImage,
 			},
-			{ title: "上舰通知", font: this.config.font, htmlWidth: 430 },
+			{ title: "上舰通知", ...(await this.resolveFont(colorOptions)), htmlWidth: 430 },
 		);
 
 		return withRetry(() => this.renderHtml(html))
@@ -489,7 +549,7 @@ export class ImageRenderer {
 				glassClear,
 				backgroundImage,
 			},
-			{ title: "醒目留言通知", font: this.config.font, htmlWidth: 290 },
+			{ title: "醒目留言通知", ...(await this.resolveFont(colorOptions)), htmlWidth: 290 },
 		);
 
 		return withRetry(() => this.renderHtml(html))
@@ -507,7 +567,8 @@ export class ImageRenderer {
 		colorOptions: CardColorOptions = {},
 		/** dynamic 版式描述符;缺省 = 默认版式(复刻现状)。 */
 		layout?: CardBlock[],
-		options: { helpHint?: string } = {},
+		/** 群聊提示文案与渲染优先级都可选。 */
+		options: { helpHint?: string; priority?: RenderPriority } = {},
 	): Promise<Buffer> {
 		const t0 = Date.now();
 		const { cardColorStart = this.config.cardColorStart, cardColorEnd = this.config.cardColorEnd } =
@@ -523,7 +584,7 @@ export class ImageRenderer {
 
 		const node = await buildDynamicNode(data, false, {
 			time: (ts) => this.unixTimestampToString(ts),
-			num: (n) => this.numberToStr(n),
+			num: (n) => numberToStr(n),
 		});
 
 		const html = await renderCard(
@@ -538,10 +599,10 @@ export class ImageRenderer {
 				node,
 				layout,
 			},
-			{ title: "动态通知", font: this.config.font, htmlWidth: 600 },
+			{ title: "动态通知", ...(await this.resolveFont(colorOptions)), htmlWidth: 600 },
 		);
 
-		return withRetry(() => this.renderHtml(html))
+		return withRetry(() => this.renderHtml(html, undefined, options?.priority))
 			.then((buf) => {
 				this.logger.debug(
 					`[dynamic] 动态卡片渲染完成：${moduleAuthor.name}（${Date.now() - t0}ms）`,
@@ -560,6 +621,7 @@ export class ImageRenderer {
 	): Promise<Buffer> {
 		const t0 = Date.now();
 		this.logger.debug(`[wordcloud] 开始渲染词云卡片：${masterName}（${words.length} 词）`);
+		const { font, fontFace } = await this.resolveFont();
 		const html = await buildWordCloudHtml(
 			masterName,
 			words,
@@ -567,7 +629,8 @@ export class ImageRenderer {
 			masterAvatarUrl,
 			this.config.cardColorStart,
 			this.config.cardColorEnd,
-			this.config.font,
+			font,
+			fontFace,
 		);
 		return withRetry(() => this.renderHtml(html, "window.wordcloudDone === true"))
 			.then((buf) => {
@@ -601,7 +664,7 @@ export class ImageRenderer {
 				glassClear: this.config.glassClear,
 				backgroundImage: await this.roastStyle(),
 			},
-			{ title: "UP 主周报", font: this.config.font, htmlWidth: 600 },
+			{ title: "UP 主周报", ...(await this.resolveFont()), htmlWidth: 600 },
 		);
 		return withRetry(() => this.renderHtml(html))
 			.then((buf) => {
@@ -626,7 +689,7 @@ export class ImageRenderer {
 				glassClear: this.config.glassClear,
 				backgroundImage: await this.roastStyle(),
 			},
-			{ title: "UP 主锐评", font: this.config.font, htmlWidth: 430 },
+			{ title: "UP 主锐评", ...(await this.resolveFont()), htmlWidth: 430 },
 		);
 		return withRetry(() => this.renderHtml(html))
 			.then((buf) => {
@@ -687,10 +750,20 @@ export class ImageRenderer {
 	}
 
 	/** B 站图片处理服务的缩放目标宽 / 质量(webp)。动态原图常达十几 MB,超 8MB 上限会
-	 * 被丢成透明占位 → 图渲染不出来。给 i*.hdslb.com 的 /bfs/ 资源加 `@<w>w_<q>q.webp`
+	 * 被丢成透明占位 → 图渲染不出来。给 i*.hdslb.com 的 /bfs/ 资源加 `@<w>w_<q>q_1s.webp`
 	 * 后缀,让 CDN 直接返回缩放压缩版,既不触发上限,内联体积也小一个数量级。 */
 	private static readonly BILI_IMG_MAX_W = 1280;
 	private static readonly BILI_IMG_QUALITY = 80;
+	/**
+	 * 「只要第一帧」。**没有它 GIF 会被转成动画 webp** —— 实测一张 6.7MB 的 GIF:
+	 * 带 `_1s` 是 37KB / 0.17s 的静态图,不带是 2.33MB / 6.9s、含 74 个动画帧块。
+	 * 出图走截图,动画本来就只截得到一帧,那点体积和秒数纯属白烧,还正好撞上 10s
+	 * 抓取超时 —— 一超时就被静默换成 1x1 透明占位,于是卡片上凭空缺几张图。
+	 *
+	 * 对静图无副作用(实测两张 face 图带不带 `_1s` 返回字节分毫不差),所以不按源
+	 * 格式分流,一律带上 —— 少一条「靠扩展名猜是不是动图」的分支,也就少一处会错。
+	 */
+	private static readonly BILI_IMG_FIRST_FRAME = "_1s";
 
 	/**
 	 * 对 B 站图片处理服务器(i0/i1/i2…​.hdslb.com 的 /bfs/ 资源)的 URL 追加缩放 +
@@ -709,7 +782,7 @@ export class ImageRenderer {
 		const [beforeQuery, query] = url.split("?", 2);
 		// B 站图 URL 无 userinfo,`@` 只可能是已有的处理后缀 → 截到它之前。
 		const cleanBase = beforeQuery.split("@")[0];
-		const suffix = `@${ImageRenderer.BILI_IMG_MAX_W}w_${ImageRenderer.BILI_IMG_QUALITY}q.webp`;
+		const suffix = `@${ImageRenderer.BILI_IMG_MAX_W}w_${ImageRenderer.BILI_IMG_QUALITY}q${ImageRenderer.BILI_IMG_FIRST_FRAME}.webp`;
 		return query ? `${cleanBase}${suffix}?${query}` : `${cleanBase}${suffix}`;
 	}
 
@@ -722,8 +795,30 @@ export class ImageRenderer {
 			return cached.dataUrl;
 		}
 
+		let dataUrl: string;
+		try {
+			dataUrl = await this.fetchOnce(url);
+		} catch (err) {
+			// 加处理后缀是**为了**避开 8MB 上限,但它自己也是一条会断的路:CDN 得现场
+			// 转码,可能超时,也可能对某个源根本不吃这套参数。而预取失败在上游是被吞掉
+			// 的(换 1x1 透明占位、整张卡照样「渲染成功」),主人只能靠肉眼发现某几格
+			// 是空的 —— 所以这条路断了必须退回原图再试一次。原图不需要转码,通常直接
+			// 命中 CDN 存储;只有它也拿不到才算真没辙。
+			if (url === rawUrl) throw err;
+			this.logger.warn(`[prefetch] 处理版取图失败,回退原图重试:${url} (${err})`);
+			dataUrl = await this.fetchOnce(rawUrl);
+		}
+		// 缓存键恒用处理后 URL(回退拿到的也记在这个键上)—— 同一张图在一张卡里常出现
+		// 多次,让后面几次直接命中,而不是每次都先把那条死路重撞一遍。
+		this.imageCache.set(url, { dataUrl, updatedAt: Date.now() });
+		this.pruneImageCache();
+		return dataUrl;
+	}
+
+	/** 真正发起一次抓取并转成 data URL。失败一律抛,由调用方决定要不要换条路再来。 */
+	private async fetchOnce(url: string): Promise<string> {
 		// IM1:SSRF 闸门(防御纵深 —— 调用方也已 gate,但这里才是真正发起 fetch
-		// 的点,独立守一道)。
+		// 的点,独立守一道)。回退路径同样经过这里,不存在绕过。
 		if (!this.isFetchAllowed(url)) {
 			throw new Error(`SSRF blocked: non-allowlisted image host (${url})`);
 		}
@@ -752,10 +847,9 @@ export class ImageRenderer {
 			const buf = await this.readCapped(response, controller);
 			const contentType =
 				response.headers.get("content-type")?.split(";")[0]?.trim() || this.getMimeType(url);
-			const dataUrl = `data:${contentType};base64,${buf.toString("base64")}`;
-			this.imageCache.set(url, { dataUrl, updatedAt: Date.now() });
-			this.pruneImageCache();
-			return dataUrl;
+			// 写缓存由调用方统一做 —— 这里若自己写一笔,回退路径就会在 rawUrl 上多留
+			// 一个键,跟处理后 URL 那个键各存一份同一张图,白占额度还搅乱逐出顺序。
+			return `data:${contentType};base64,${buf.toString("base64")}`;
 		} finally {
 			clearTimeout(timeout);
 		}
@@ -900,10 +994,14 @@ export class ImageRenderer {
 		return dom.serialize();
 	}
 
-	private async doRender(html: string, waitForCondition?: string): Promise<Buffer> {
+	private async doRender(
+		html: string,
+		waitForCondition?: string,
+		priority: RenderPriority = "normal",
+	): Promise<Buffer> {
 		// 先 inline 远程图片（耗时操作），再获取 page，避免 page 在空闲期间被回收
 		const inlinedHtml = await this.inlineRemoteImages(html);
-		const page = await this.puppeteer.page();
+		const page = await this.puppeteer.page({ priority });
 		try {
 			await page.setContent(inlinedHtml, { waitUntil: "load", timeout: 15_000 });
 			if (waitForCondition) {
@@ -941,18 +1039,17 @@ export class ImageRenderer {
 		}
 	}
 
-	/** 将渲染任务加入串行队列 */
-	private renderHtml(html: string, waitForCondition?: string): Promise<Buffer> {
-		return new Promise<Buffer>((resolve, reject) => {
-			this.renderQueue = this.renderQueue
-				.catch(() => {}) // 隔离前一任务的错误，防止阻断后续任务
-				.then(async () => {
-					try {
-						resolve(await this.doRender(html, waitForCondition));
-					} catch (err) {
-						reject(err);
-					}
-				});
-		});
+	/** 将渲染任务加入串行队列;一个任务抛错不影响后面的(release 在 finally 里)。 */
+	private async renderHtml(
+		html: string,
+		waitForCondition?: string,
+		priority: RenderPriority = "normal",
+	): Promise<Buffer> {
+		const release = await this.renderGate.acquire({ priority });
+		try {
+			return await this.doRender(html, waitForCondition, priority);
+		} finally {
+			release();
+		}
 	}
 }

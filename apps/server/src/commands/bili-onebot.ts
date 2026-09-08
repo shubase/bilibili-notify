@@ -2,13 +2,13 @@ import { randomUUID } from "node:crypto";
 import { ensureFollowed } from "@bilibili-notify/api";
 import {
 	type CachedProfile,
-	type CommandAliases,
-	type CommandConfig,
-	DEFAULT_COMMAND_ALIASES,
-	DEFAULT_COMMAND_OWNER_QQ,
-	DEFAULT_COMMAND_PREFIX,
+	DEFAULT_GROUP_COMMAND_ALIASES,
+	DEFAULT_GROUP_COMMAND_OWNER_QQ,
+	DEFAULT_GROUP_COMMAND_PREFIX,
 	FEATURE_KEYS,
 	type GlobalConfig,
+	type GroupCommandAliases,
+	type GroupCommandConfig,
 	makeEmptySubscription,
 	type PushTarget,
 	type Subscription,
@@ -43,16 +43,16 @@ interface ResolvedCommandConfig {
 	enabled: boolean;
 	prefix: string;
 	ownerQq: string;
-	aliases: CommandAliases;
+	aliases: GroupCommandAliases;
 }
 
 const DEFAULT_COMMAND_CONFIG: ResolvedCommandConfig = {
 	enabled: true,
-	prefix: DEFAULT_COMMAND_PREFIX,
-	ownerQq: DEFAULT_COMMAND_OWNER_QQ,
-	aliases: { ...DEFAULT_COMMAND_ALIASES },
+	prefix: DEFAULT_GROUP_COMMAND_PREFIX,
+	ownerQq: DEFAULT_GROUP_COMMAND_OWNER_QQ,
+	aliases: { ...DEFAULT_GROUP_COMMAND_ALIASES },
 };
-const LEGACY_COMMAND_ALIASES: CommandAliases = {
+const LEGACY_COMMAND_ALIASES: GroupCommandAliases = {
 	help: "help",
 	add: "add",
 	del: "del",
@@ -979,35 +979,37 @@ function resolveCommandConfig(runtime: AppRuntime): ResolvedCommandConfig {
 }
 
 function resolveCommandConfigFromGlobals(globals: GlobalConfig): ResolvedCommandConfig {
-	const commandConfig = globals.commands as CommandConfig | undefined;
+	const commandConfig = globals.groupCommands as GroupCommandConfig | undefined;
 	const aliases = isLegacyDefaultAliases(commandConfig?.aliases)
 		? undefined
 		: commandConfig?.aliases;
 	const ownerQq =
-		commandConfig?.ownerQq?.trim() || globals.master.ownerQq?.trim() || DEFAULT_COMMAND_OWNER_QQ;
+		commandConfig?.ownerQq?.trim() ||
+		globals.master.ownerQq?.trim() ||
+		DEFAULT_GROUP_COMMAND_OWNER_QQ;
 	return {
 		enabled: commandConfig?.enabled ?? true,
-		prefix: normalizeToken(commandConfig?.prefix, DEFAULT_COMMAND_PREFIX),
-		ownerQq: /^\d+$/.test(ownerQq) ? ownerQq : DEFAULT_COMMAND_OWNER_QQ,
+		prefix: normalizeToken(commandConfig?.prefix, DEFAULT_GROUP_COMMAND_PREFIX),
+		ownerQq: /^\d+$/.test(ownerQq) ? ownerQq : DEFAULT_GROUP_COMMAND_OWNER_QQ,
 		aliases: normalizeAliases(aliases),
 	};
 }
 
-function isLegacyDefaultAliases(aliases: Partial<CommandAliases> | undefined): boolean {
+function isLegacyDefaultAliases(aliases: Partial<GroupCommandAliases> | undefined): boolean {
 	if (!aliases) return false;
 	return COMMAND_KINDS.every((kind) => aliases[kind] === LEGACY_COMMAND_ALIASES[kind]);
 }
 
-function normalizeAliases(aliases: Partial<CommandAliases> | undefined): CommandAliases {
+function normalizeAliases(aliases: Partial<GroupCommandAliases> | undefined): GroupCommandAliases {
 	return {
-		help: normalizeToken(aliases?.help, DEFAULT_COMMAND_ALIASES.help),
-		add: normalizeToken(aliases?.add, DEFAULT_COMMAND_ALIASES.add),
-		del: normalizeToken(aliases?.del, DEFAULT_COMMAND_ALIASES.del),
-		list: normalizeToken(aliases?.list, DEFAULT_COMMAND_ALIASES.list),
-		listall: normalizeToken(aliases?.listall, DEFAULT_COMMAND_ALIASES.listall),
-		delall: normalizeToken(aliases?.delall, DEFAULT_COMMAND_ALIASES.delall),
-		delallall: normalizeToken(aliases?.delallall, DEFAULT_COMMAND_ALIASES.delallall),
-		member: normalizeToken(aliases?.member, DEFAULT_COMMAND_ALIASES.member),
+		help: normalizeToken(aliases?.help, DEFAULT_GROUP_COMMAND_ALIASES.help),
+		add: normalizeToken(aliases?.add, DEFAULT_GROUP_COMMAND_ALIASES.add),
+		del: normalizeToken(aliases?.del, DEFAULT_GROUP_COMMAND_ALIASES.del),
+		list: normalizeToken(aliases?.list, DEFAULT_GROUP_COMMAND_ALIASES.list),
+		listall: normalizeToken(aliases?.listall, DEFAULT_GROUP_COMMAND_ALIASES.listall),
+		delall: normalizeToken(aliases?.delall, DEFAULT_GROUP_COMMAND_ALIASES.delall),
+		delallall: normalizeToken(aliases?.delallall, DEFAULT_GROUP_COMMAND_ALIASES.delallall),
+		member: normalizeToken(aliases?.member, DEFAULT_GROUP_COMMAND_ALIASES.member),
 	};
 }
 
@@ -1018,7 +1020,7 @@ function normalizeToken(value: string | undefined, fallback: string): string {
 
 function parseCommandAction(
 	text: string,
-	aliases: CommandAliases,
+	aliases: GroupCommandAliases,
 ): { matched: BiliCommandKind; argsText: string } | null {
 	if (!text) return { matched: "help", argsText: "" };
 

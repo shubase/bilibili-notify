@@ -9,10 +9,10 @@
  */
 
 import { DEFAULT_AI, makeDefaultGlobalConfig } from "@bilibili-notify/internal";
+import { Icon } from "@bilibili-notify/ui";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
-import { Icon } from "../../components/icons";
 import { useDraftStore } from "../../store/draft";
 import { formatDiffValue } from "../../utils/formatDiffValue";
 import Ai from "../Ai";
@@ -30,9 +30,12 @@ type Bucket = NonNullable<Globals["defaults"]["ai"]["providers"]["deepseek"]>;
 
 function bucket(over: Partial<Bucket> = {}): Bucket {
 	return {
+		provider: "deepseek",
+		label: "",
 		apiKey: "sk-x",
 		baseUrl: "",
 		model: "m-1",
+		apiFlavor: "chat",
 		temperature: 0.7,
 		enableThinking: false,
 		thinkingLevel: "medium",
@@ -120,11 +123,37 @@ describe("模型配置 · 服务商左栏", () => {
 		expect(await screen.findByText(/一家服务商都还没添加/)).toBeTruthy();
 	});
 
+	it("同一家的两份实例并排列在左栏,第二份默认名带序号", async () => {
+		// 一家可设多份是这轮的新能力:两行都叫「DeepSeek」的话主人分不清哪只是哪只,
+		// 所以 addProfile 给后续实例的默认名带序号,起过名的显示自己的名字。
+		mount(
+			globalsWith((g) => {
+				g.defaults.ai.activeProfile = "deepseek";
+				g.defaults.ai.providers = {
+					deepseek: bucket({ provider: "deepseek", model: "m-a" }),
+					"deepseek-2": bucket({ provider: "deepseek", label: "DeepSeek 2", model: "m-b" }),
+				};
+			}),
+		);
+		await gotoModel();
+		await screen.findByText("模型连接");
+		expect(screen.queryAllByText("DeepSeek").length).toBeGreaterThan(0);
+		expect(screen.queryAllByText("DeepSeek 2").length).toBeGreaterThan(0);
+		// 点第二份(取左栏那一处 —— label 输入框的值等处也可能带同样文本)→ 右侧换到它的桶。
+		const row = screen.getAllByText("DeepSeek 2")[0];
+		if (!row) throw new Error("左栏没有 DeepSeek 2 那一行");
+		fireEvent.click(row);
+		await waitFor(() => expect(screen.getByDisplayValue("m-b")).toBeTruthy());
+	});
+
 	it("左栏只列已添加的那几家,没添加的一家都不露", async () => {
 		mount(
 			globalsWith((g) => {
-				g.defaults.ai.provider = "deepseek";
-				g.defaults.ai.providers = { deepseek: bucket(), openrouter: bucket() };
+				g.defaults.ai.activeProfile = "deepseek";
+				g.defaults.ai.providers = {
+					deepseek: bucket({ provider: "deepseek" }),
+					openrouter: bucket({ provider: "openrouter" }),
+				};
 			}),
 		);
 		await gotoModel();
@@ -139,10 +168,10 @@ describe("模型配置 · 服务商左栏", () => {
 	it("点左栏另一家 → 右侧字段跟着换那家的桶", async () => {
 		mount(
 			globalsWith((g) => {
-				g.defaults.ai.provider = "deepseek";
+				g.defaults.ai.activeProfile = "deepseek";
 				g.defaults.ai.providers = {
-					deepseek: bucket({ model: "ds-model" }),
-					openrouter: bucket({ model: "or-model" }),
+					deepseek: bucket({ provider: "deepseek", model: "ds-model" }),
+					openrouter: bucket({ provider: "openrouter", model: "or-model" }),
 				};
 			}),
 		);
@@ -157,8 +186,11 @@ describe("模型配置 · 服务商左栏", () => {
 	it("按能力门控:DeepSeek 不摆「主模型支持看图」,OpenRouter 摆", async () => {
 		mount(
 			globalsWith((g) => {
-				g.defaults.ai.provider = "deepseek";
-				g.defaults.ai.providers = { deepseek: bucket(), openrouter: bucket() };
+				g.defaults.ai.activeProfile = "deepseek";
+				g.defaults.ai.providers = {
+					deepseek: bucket({ provider: "deepseek" }),
+					openrouter: bucket({ provider: "openrouter" }),
+				};
 			}),
 		);
 		await gotoModel();
@@ -179,9 +211,9 @@ describe("模型配置 · 服务商左栏", () => {
 		// providerList 就是为这一刻。
 		mount(
 			globalsWith((g) => {
-				g.defaults.ai.provider = "custom";
+				g.defaults.ai.activeProfile = "custom";
 				g.defaults.ai.providers = {
-					custom: bucket({ apiKey: "", model: "", temperature: 0.7 }),
+					custom: bucket({ provider: "custom", apiKey: "", model: "", temperature: 0.7 }),
 				};
 			}),
 		);
@@ -196,10 +228,10 @@ describe("模型配置 · 服务商左栏", () => {
 	it("删掉正在用的那家 → 指针落到剩下的一家,右侧跟着换过去", async () => {
 		mount(
 			globalsWith((g) => {
-				g.defaults.ai.provider = "deepseek";
+				g.defaults.ai.activeProfile = "deepseek";
 				g.defaults.ai.providers = {
-					deepseek: bucket({ model: "ds-model" }),
-					openrouter: bucket({ model: "or-model" }),
+					deepseek: bucket({ provider: "deepseek", model: "ds-model" }),
+					openrouter: bucket({ provider: "openrouter", model: "or-model" }),
 				};
 			}),
 		);
@@ -225,10 +257,10 @@ describe("模型配置 · 服务商左栏", () => {
 describe("在用哪一家 vs 在看哪一家", () => {
 	function twoProviders() {
 		return globalsWith((g) => {
-			g.defaults.ai.provider = "deepseek";
+			g.defaults.ai.activeProfile = "deepseek";
 			g.defaults.ai.providers = {
-				deepseek: bucket({ model: "ds-model" }),
-				openrouter: bucket({ model: "or-model" }),
+				deepseek: bucket({ provider: "deepseek", model: "ds-model" }),
+				openrouter: bucket({ provider: "openrouter", model: "or-model" }),
 			};
 		});
 	}
@@ -277,13 +309,13 @@ describe("在用哪一家 vs 在看哪一家", () => {
 		mount(twoProviders());
 		await gotoModel();
 		expect(screen.queryByText("设为默认")).toBeNull();
-		expect(screen.getByText(/女仆平时用的就是这家/)).toBeTruthy();
+		expect(screen.getByText(/女仆平时用的就是这份/)).toBeTruthy();
 	});
 
 	it("「全局配置」里能直接选用哪一家 —— 和选人格同一个地方", async () => {
 		mount(twoProviders());
 		// 落地页就是「全局配置」。
-		await screen.findByText("全局服务商 · provider");
+		await screen.findByText("全局服务商 · profile");
 		fireEvent.click(screen.getByText("OpenRouter"));
 		await waitFor(() => expect(heroModel()).toBe("or-model"));
 	});
@@ -303,10 +335,14 @@ describe("在用哪一家 vs 在看哪一家", () => {
 		// JSON,脱敏位挂在字段级、管不到整只桶,于是密钥明文直接摊在面板上。
 		mount(
 			globalsWith((g) => {
-				g.defaults.ai.provider = "deepseek";
+				g.defaults.ai.activeProfile = "deepseek";
 				g.defaults.ai.providers = {
-					deepseek: bucket({ model: "ds-model" }),
-					openrouter: bucket({ apiKey: "sk-super-secret", model: "or-model" }),
+					deepseek: bucket({ provider: "deepseek", model: "ds-model" }),
+					openrouter: bucket({
+						provider: "openrouter",
+						apiKey: "sk-super-secret",
+						model: "or-model",
+					}),
 				};
 			}),
 		);
@@ -543,6 +579,28 @@ describe("全局配置 Tab", () => {
 		expect(body.defaults.ai.persona?.name ?? "梦梦").toBe("梦梦");
 	});
 
+	/**
+	 * 头图那行名字得跟着**指针**走。
+	 *
+	 * `ai.persona` 自指针上线就没有界面入口了,永远冻在老值上。头图直读它的话,主人
+	 * 在这一页把人格换成谁,标题都还写着原来那位 —— 而下面的选择器、左栏指示器全都
+	 * 指着新那份。这正是「换了人格没反应」看起来的样子。
+	 */
+	it("换全局人格 → 头图那行名字跟着换,不是冻着的 ai.persona", async () => {
+		mount(
+			globalsWith((g) => {
+				g.defaults.ai.persona.name = "小绫";
+				g.defaults.ai.presets = [
+					{ id: "m", label: "温柔女仆", persona: { ...g.defaults.ai.persona } },
+					{ id: "t", label: "傲娇", persona: { ...g.defaults.ai.persona, name: "凛子" } },
+				];
+				g.defaults.ai.activePreset = "t";
+			}),
+		);
+		await gotoGlobal();
+		expect(screen.getByText(/智能女仆 · 凛子/)).toBeTruthy();
+	});
+
 	it("换全局人格 → 灵动岛亮起来", async () => {
 		mount(
 			globalsWith((g) => {
@@ -677,3 +735,7 @@ describe("内置性格:锁死、可删、可恢复、可另存", () => {
 		expect(await screen.findByText(/都在清单里/)).toBeTruthy();
 	});
 });
+
+// 「AI 聊天 —— 思考设置与实例分家」那组测试搬去了 thinking-level-setting.test.tsx:
+// 编辑口如今在聊天侧栏的「设置」弹层。继承展示在那边逐条守;「改等级不碰实例桶」
+// 由 PATCH 载荷的深等断言接住 —— 载荷只有 `ai.chat` 一片,想碰实例桶都写不进去。

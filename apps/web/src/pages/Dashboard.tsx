@@ -1,10 +1,29 @@
+import type { LogLevel, UpdateStatusDTO } from "@bilibili-notify/contract";
+import {
+	Avatar,
+	Btn,
+	EmptyNote,
+	ErrorNote,
+	GlassBox,
+	GlassPanel,
+	GlassStatCard,
+	Icon,
+	Pill,
+	StatsBar,
+	StatusDot,
+} from "@bilibili-notify/ui";
 import { useQuery } from "@tanstack/react-query";
-import { useMemo } from "react";
+import { type ReactNode, useMemo } from "react";
 import { Link } from "react-router-dom";
-import { Avatar, Btn, Pill, StatsBar } from "../components/atoms";
-import { GlassPanel, GlassStatCard } from "../components/glass";
-import { GlassBox } from "../components/glass-box";
-import { Icon } from "../components/icons";
+import { HeroStrip } from "../components/hero-strip";
+import {
+	newerVersionOf,
+	phaseLabel,
+	UPDATE_SECTION_PATH,
+	useUpdateStatus,
+} from "../components/update/status";
+import { LOG_LEVEL_TONE, logLevelTint } from "../config/log-levels";
+import { familyTone, PUSH_KIND_META, PUSH_STATUS_META, PUSH_TONE } from "../config/push-kinds";
 import {
 	HEALTH_QUERY_KEY,
 	HEALTH_QUERY_OPTIONS,
@@ -30,6 +49,8 @@ import { useAuthStore } from "../store/auth";
 import { BiliLoginStatus } from "../types/auth";
 import type { PushTarget, Subscription } from "../types/domain";
 import type { GlobalConfig, ModuleLogLevels } from "../types/globals";
+import { headlineOf, messageCountOf } from "../utils/push-row";
+import { DeltaTag, Sparkline } from "./stats/charts";
 import { colorFromUid, displayName } from "./up/helpers";
 
 interface HealthSnapshot {
@@ -68,14 +89,7 @@ function relativeTimeFromNow(iso: string): string {
 // 跟后端 `LIVE_ROOM_MASTER_KEYS` 同集合 —— 只要任意一项的 routing 数组非空,
 // LiveEngine 就会为该订阅开 B 站 WS 监听;反之 sub 即使 enabled 也不会出现
 // 在「正在直播」面板里(needsLiveMonitor 返回 false)。
-const LIVE_ROUTING_KEYS = [
-	"live",
-	"liveEnd",
-	"liveGuardBuy",
-	"superchat",
-	"wordcloud",
-	"liveSummary",
-] as const;
+const LIVE_ROUTING_KEYS = ["live", "liveEnd", "liveGuardBuy", "superchat"] as const;
 
 function hasAnyLiveTarget(sub: Subscription): boolean {
 	return LIVE_ROUTING_KEYS.some((k) => (sub.routing[k]?.length ?? 0) > 0);
@@ -95,20 +109,20 @@ function LiveNowPanel({ live, subs }: { live: LiveListenerSnapshot[]; subs: Subs
 	);
 	return (
 		<GlassPanel
-			accent="#fb7299"
+			accent="var(--color-bn-pink)"
 			title="正在直播"
 			subtitle="实时刷新"
 			right={
-				<Pill color="#FF6699" size="sm">
+				<Pill color="var(--color-bn-pink)" size="sm">
 					● {live.length} 人在播
 				</Pill>
 			}
 		>
 			{live.length === 0 ? (
-				<div className="rounded-lg border border-dashed border-bn-border p-6 text-center text-[12.5px] text-bn-text-secondary">
+				<EmptyNote>
 					当前没有订阅 UP 主在直播
 					<br />
-					<span className="text-[11px] text-bn-text-secondary/80">
+					<span className="text-bn-xs text-bn-text-secondary/80">
 						女仆会在直播开始时第一时间推送 (｡•̀ᴗ-)✧
 					</span>
 					{unmonitoredCount > 0 ? (
@@ -116,13 +130,13 @@ function LiveNowPanel({ live, subs }: { live: LiveListenerSnapshot[]; subs: Subs
 							<br />
 							<Link
 								to="/subs"
-								className="mt-1 inline-block text-[11px] text-bn-pink underline-offset-2 hover:underline"
+								className="mt-1 inline-block text-bn-xs text-bn-pink underline-offset-2 hover:underline"
 							>
 								有 {unmonitoredCount} 位订阅未配置直播推送目标,他们不会被监听 →
 							</Link>
 						</>
 					) : null}
-				</div>
+				</EmptyNote>
 			) : (
 				// auto-fit grid + max-h 上限 ≈ 3 行 chip(每 chip ~70px + 10px gap)。
 				// chip 少时高度自然撑;chip ≥4 时超出部分被 overflow-hidden 裁掉,
@@ -132,40 +146,43 @@ function LiveNowPanel({ live, subs }: { live: LiveListenerSnapshot[]; subs: Subs
 						const sub = subByUid.get(r.uid);
 						const name = sub ? displayName(sub) : `UID ${r.uid}`;
 						const color = colorFromUid(r.uid);
+						// 数据小卡同款视觉语法(淡染色渐变 + 同色细描边),单层直接画在
+						// 区块玻璃上 —— 旧的「渐变包裹 + 白底内层」在行条透明化后会整块露色。
 						return (
 							<Link
 								key={r.uid}
 								to="/subs"
-								className="block overflow-hidden rounded-xl p-px"
-								style={{ background: `linear-gradient(135deg, ${color}, ${color}88)` }}
+								className="flex items-center gap-3 rounded-xl border p-2.5"
+								style={{
+									background: `linear-gradient(135deg, color-mix(in srgb, ${color} 12%, transparent), color-mix(in srgb, ${color} 4%, transparent))`,
+									borderColor: `color-mix(in srgb, ${color} 20%, transparent)`,
+								}}
 							>
-								<div className="flex items-center gap-3 rounded-[10px] bg-bn-surface/95 p-2.5 backdrop-blur-sm">
-									<Avatar
-										name={name}
-										color={color}
-										size={44}
-										status="living"
-										url={sub?.cachedProfile?.avatar}
-									/>
-									<div className="min-w-0 flex-1">
-										<div className="mb-0.5 flex items-center gap-2">
-											<span className="text-[13.5px] font-bold text-bn-text-primary">{name}</span>
-											{r.areaName ? (
-												<Pill color="#FB7299" subtle size="sm">
-													{r.areaName}
-												</Pill>
-											) : null}
-										</div>
-										<div className="truncate text-xs text-bn-text-tertiary">
-											{r.title ?? "（未拉取到房间标题）"}
-										</div>
+								<Avatar
+									name={name}
+									color={color}
+									size={44}
+									status="living"
+									url={sub?.cachedProfile?.avatar}
+								/>
+								<div className="min-w-0 flex-1">
+									<div className="mb-0.5 flex items-center gap-2">
+										<span className="text-bn-base font-bold text-bn-text-primary">{name}</span>
+										{r.areaName ? (
+											<Pill color="var(--color-bn-pink)" subtle size="sm">
+												{r.areaName}
+											</Pill>
+										) : null}
 									</div>
-									<div className="flex flex-col items-end gap-1">
-										<span className="inline-flex items-center gap-1 text-[11px] font-bold text-bn-pink">
-											<Icon.eye size={11} />
-											{formatViewers(r.viewers)}
-										</span>
+									<div className="truncate text-bn-sm text-bn-text-tertiary">
+										{r.title ?? "（未拉取到房间标题）"}
 									</div>
+								</div>
+								<div className="flex flex-col items-end gap-1">
+									<span className="inline-flex items-center gap-1 text-bn-xs font-bold text-bn-pink">
+										<Icon.eye size={11} />
+										{formatViewers(r.viewers)}
+									</span>
 								</div>
 							</Link>
 						);
@@ -190,23 +207,33 @@ function TrendPanel({ daily }: { daily: DailyHistoryCountView[] }) {
 	}, [daily]);
 	const total = daily.reduce((sum, day) => sum + day.total, 0);
 	return (
-		<GlassPanel title="本周推送趋势" subtitle="按推送类型分布" accent="#00aeec">
+		<GlassPanel title="本周推送趋势" subtitle="按推送类型分布" accent="var(--color-bn-blue)">
 			{/* TimelinePanel 6 条 history × 单行 ~50px + padding ≈ 320px;StatsBar 抬高
 			    到 280 让同行 TrendPanel 视觉对齐,不至于半空。 */}
-			<StatsBar data={data} height={280} />
-			<div className="mt-3.5 flex flex-wrap items-center gap-3 text-[11px] text-bn-text-tertiary">
+			{/* 柱子与下面的图例走同一份家族色 —— 此前柱子在库里写死,和图例只是碰巧同色。 */}
+			<StatsBar
+				data={data}
+				height={280}
+				colors={{
+					live: PUSH_TONE.live,
+					dyn: PUSH_TONE.dynamic,
+					sc: PUSH_TONE.sc,
+					guard: PUSH_TONE.guard,
+				}}
+			/>
+			<div className="mt-3.5 flex flex-wrap items-center gap-3 text-bn-xs text-bn-text-tertiary">
 				{[
-					["直播", "#FB7299"],
-					["动态", "#00AEEC"],
-					["SC", "#fdcb6e"],
-					["舰长", "#f2a053"],
+					["直播", PUSH_TONE.live],
+					["动态", PUSH_TONE.dynamic],
+					["SC", PUSH_TONE.sc],
+					["舰长", PUSH_TONE.guard],
 				].map(([label, c]) => (
 					<span key={label} className="inline-flex items-center gap-1.5">
 						<span className="block h-2 w-2 rounded-sm" style={{ background: c }} />
 						{label}
 					</span>
 				))}
-				<span className="ml-auto font-mono text-[11px] text-bn-text-secondary">
+				<span className="ml-auto tabular-nums text-bn-xs text-bn-text-secondary">
 					近 7 天共 {total} 次
 				</span>
 			</div>
@@ -216,48 +243,22 @@ function TrendPanel({ daily }: { daily: DailyHistoryCountView[] }) {
 
 function AiInsightStrip({ tip }: { tip: React.ReactNode }) {
 	return (
-		<div
-			className="flex items-center gap-3.5 rounded-bn-card border p-4"
-			style={{
-				background: "linear-gradient(135deg, rgba(162,155,254,0.18), rgba(0,174,236,0.08))",
-				borderColor: "rgba(162,155,254,0.3)",
-			}}
+		<HeroStrip
+			compact
+			icon={<Icon.ai size={20} />}
+			right={
+				<Btn size="sm" variant="ghost">
+					查看完整总结 →
+				</Btn>
+			}
 		>
-			<div
-				className="grid h-10 w-10 shrink-0 place-items-center rounded-xl text-white shadow-bn-card"
-				style={{ background: "linear-gradient(135deg, #a29bfe, #6c5ce7)" }}
-			>
-				<Icon.ai size={20} />
-			</div>
-			<div className="flex-1 text-[12.5px] leading-relaxed text-bn-text-tertiary">
-				<span className="font-bold text-[#6c5ce7]">AI 直播洞察 · </span>
+			<div className="text-bn-sm leading-relaxed text-bn-text-tertiary">
+				<span className="font-bold text-(--bn-ai-purple)">AI 直播洞察 · </span>
 				{tip}
 			</div>
-			<Btn size="sm" variant="ghost">
-				查看完整总结 →
-			</Btn>
-		</div>
+		</HeroStrip>
 	);
 }
-
-const TIMELINE_TONE: Record<string, string> = {
-	live: "#FB7299",
-	"live-summary": "#FB7299",
-	"special-enter": "#FB7299",
-	"special-danmaku": "#FB7299",
-	dynamic: "#00AEEC",
-	sc: "#fdcb6e",
-	guard: "#f2a053",
-};
-const TIMELINE_LABEL: Record<string, string> = {
-	live: "直播",
-	"live-summary": "总结",
-	"special-enter": "进房",
-	"special-danmaku": "弹幕",
-	dynamic: "动态",
-	sc: "SC",
-	guard: "舰长",
-};
 
 function TimelinePanel({
 	entries,
@@ -292,19 +293,20 @@ function TimelinePanel({
 			}
 		>
 			{recent.length === 0 ? (
-				<div className="rounded-lg border border-dashed border-bn-border p-6 text-center text-[12.5px] text-bn-text-secondary">
+				<EmptyNote>
 					还没有推送活动
 					<br />
-					<span className="text-[11px] text-bn-text-secondary/80">
+					<span className="text-bn-xs text-bn-text-secondary/80">
 						先去「推送目标」配置好通道，订阅 UP 主以后就会出现在这里 ~
 					</span>
-				</div>
+				</EmptyNote>
 			) : (
 				<div className="relative pl-1">
 					<div
 						className="absolute left-15 top-2 bottom-2 w-0.5 opacity-25"
 						style={{
-							background: "linear-gradient(to bottom, #FB7299, #00AEEC, transparent)",
+							background:
+								"linear-gradient(to bottom, var(--color-bn-pink), var(--color-bn-blue), transparent)",
 						}}
 					/>
 					{recent.map((h) => {
@@ -313,45 +315,49 @@ function TimelinePanel({
 						const name = h.unameSnapshot ?? (sub ? displayName(sub) : `UID ${h.uid}`);
 						const avatar = h.uavatarSnapshot ?? sub?.cachedProfile?.avatar;
 						const color = colorFromUid(h.uid);
-						const tone = TIMELINE_TONE[h.source] ?? "#999";
-						const targetNames = h.targetIds
-							.map((id) => targetById.get(id)?.name ?? id.slice(0, 6))
-							.join(" / ");
+						const tone = familyTone(h.kind);
+						const status = PUSH_STATUS_META[h.status];
+						const marked = h.status !== "delivered";
+						const targetName =
+							h.targetId === null
+								? "—"
+								: (targetById.get(h.targetId)?.name ?? h.targetId.slice(0, 6));
+						const headline = headlineOf(h);
+						const count = messageCountOf(h);
 						return (
 							<div key={h.id} className="mb-2.5 flex items-center gap-3">
-								<div className="w-11 text-right font-mono text-[11px] text-bn-text-secondary">
+								<div className="w-11 text-right tabular-nums text-bn-xs text-bn-text-secondary">
 									{relativeTimeFromNow(h.ts)}
 								</div>
-								<div className="relative z-10">
+								<div className="relative z-bn-raised">
 									<span
-										className="block h-3 w-3 rounded-full border-[2.5px] border-white"
+										className="block h-3 w-3 rounded-full border-[2.5px] border-bn-surface"
 										style={{ background: tone, boxShadow: "0 0 0 1.5px rgba(0,0,0,0.04)" }}
 									/>
 								</div>
 								<div
-									className="flex min-w-0 flex-1 items-center gap-2.5 rounded-lg bg-bn-surface/70 px-3 py-2 text-[12.5px]"
-									// 失败标记用 inset 阴影而非 border-left:不占 box 宽度,内容不被挤右、与其它行对齐,
-									// 且被 rounded-lg 圆角裁成左侧细红条,比硬边框精致。
-									style={!h.ok ? { boxShadow: "inset 3px 0 0 #ef4444" } : undefined}
+									className="flex min-w-0 flex-1 items-center gap-2.5 rounded-lg border border-bn-list-row-border bg-bn-list-row px-3 py-2 text-bn-sm"
+									// 状态标记用 inset 阴影而非 border-left:不占 box 宽度,内容不被挤右、与其它行对齐,
+									// 且被 rounded-lg 圆角裁成左侧细色条,比硬边框精致。失败红、部分失败 / 无目标警示色。
+									style={marked ? { boxShadow: `inset 3px 0 0 ${status.tone}` } : undefined}
 								>
 									<Avatar name={name} color={color} size={24} url={avatar} />
 									<Pill color={tone} subtle size="sm">
-										{TIMELINE_LABEL[h.source] ?? h.source}
+										{PUSH_KIND_META[h.kind].label}
 									</Pill>
 									<div className="min-w-0 flex-1 truncate text-bn-text-tertiary">
 										<span className="font-bold text-bn-text-primary">{name}</span>
-										{h.text ? ` · ${h.text}` : ""}
+										{headline ? ` · ${headline}` : ""}
 									</div>
-									<span className="text-[11px] text-bn-text-secondary">→ {targetNames}</span>
-									{h.ok ? (
-										<Pill color="#22c55e" subtle size="sm">
-											已送达
+									{count > 1 ? (
+										<Pill color={tone} subtle size="sm">
+											{count} 条
 										</Pill>
-									) : (
-										<Pill color="#ef4444" subtle size="sm">
-											失败
-										</Pill>
-									)}
+									) : null}
+									<span className="text-bn-xs text-bn-text-secondary">→ {targetName}</span>
+									<Pill color={status.tone} subtle size="sm">
+										{status.label}
+									</Pill>
 								</div>
 							</div>
 						);
@@ -380,13 +386,19 @@ function formatDeltaNumber(n: number): string {
 function FansDeltaCol({ label, value }: { label: string; value: number | null }) {
 	const isNull = value == null;
 	const text = isNull ? "—" : value === 0 ? "±0" : formatDeltaNumber(value);
-	const color = isNull ? "#94a3b8" : value === 0 ? "#94a3b8" : value > 0 ? "#22c55e" : "#ef4444";
+	// 无数据与持平共用静默档 —— 两者都是「这里没有变化可看」。
+	const color =
+		isNull || value === 0
+			? "var(--color-bn-inactive)"
+			: value > 0
+				? "var(--color-bn-success)"
+				: "var(--color-bn-danger)";
 	return (
 		<div className="w-16 text-right">
-			<div className="font-mono text-[13px] font-bold" style={{ color }}>
+			<div className="tabular-nums text-bn-base font-bold" style={{ color }}>
 				{text}
 			</div>
-			<div className="font-mono text-[10px] text-bn-text-tertiary">{label}</div>
+			<div className="tabular-nums text-bn-2xs text-bn-text-tertiary">{label}</div>
 		</div>
 	);
 }
@@ -417,21 +429,21 @@ function FansPanel({ subs }: { subs: Subscription[] }) {
 		<GlassPanel
 			title="粉丝数变化"
 			subtitle="自订阅起点 / 近 24h / 近 7d"
-			accent="#fb7299"
+			accent="var(--color-bn-pink)"
 			right={
-				<Pill color="#FB7299" size="sm">
+				<Pill color="var(--color-bn-pink)" size="sm">
 					● {entries.length} 位订阅
 				</Pill>
 			}
 		>
 			{entries.length === 0 ? (
-				<div className="rounded-lg border border-dashed border-bn-border p-6 text-center text-[12.5px] text-bn-text-secondary">
+				<EmptyNote>
 					采样中…
 					<br />
-					<span className="text-[11px] text-bn-text-secondary/80">
+					<span className="text-bn-xs text-bn-text-secondary/80">
 						FansPoller 第一轮 cron tick 完成后会填充(约 1–2 分钟)
 					</span>
-				</div>
+				</EmptyNote>
 			) : (
 				// 单列布局,max-h 上限 ≈ 3 行行卡(每行 ~62px + 8px gap);N 多时走
 				// 内滚动,bn-no-scrollbar 隐藏滚动条不破坏卡片视觉。N 少时高度自然撑,
@@ -444,12 +456,12 @@ function FansPanel({ subs }: { subs: Subscription[] }) {
 						return (
 							<div
 								key={e.uid}
-								className="flex items-center gap-3 rounded-lg bg-bn-surface/70 px-3 py-2.5 text-[12.5px]"
+								className="flex items-center gap-3 rounded-lg border border-bn-list-row-border bg-bn-list-row px-3 py-2.5 text-bn-sm"
 							>
 								<Avatar name={name} color={color} size={32} url={sub?.cachedProfile?.avatar} />
 								<div className="min-w-0 flex-1">
 									<div className="truncate font-bold text-bn-text-primary">{name}</div>
-									<div className="font-mono text-[11px] text-bn-text-tertiary">
+									<div className="tabular-nums text-bn-xs text-bn-text-tertiary">
 										{formatFans(e.current)} 粉丝
 									</div>
 								</div>
@@ -486,15 +498,18 @@ interface PluginCell {
 	logLevelSource: "global" | "module";
 }
 
-const LOG_LEVEL_TONE: Record<"error" | "info" | "debug", { fg: string; bg: string }> = {
-	error: { fg: "#ef4444", bg: "rgba(239,68,68,0.1)" },
-	info: { fg: "#00AEEC", bg: "rgba(0,174,236,0.1)" },
-	debug: { fg: "#a29bfe", bg: "rgba(162,155,254,0.1)" },
-};
-
 function pickLogTone(level: string | undefined): { fg: string; bg: string } {
-	if (level === "error" || level === "info" || level === "debug") return LOG_LEVEL_TONE[level];
-	return LOG_LEVEL_TONE.info;
+	const key: LogLevel = level === "error" || level === "debug" || level === "warn" ? level : "info";
+	return { fg: LOG_LEVEL_TONE[key], bg: logLevelTint(key) };
+}
+
+/** 等宽数字的版本小徽章(核心 / 面板)—— 收编前同一串 className 在 subtitle 里抄了两份。 */
+function VersionBadge({ children }: { children: ReactNode }) {
+	return (
+		<span className="inline-block rounded-md bg-bn-code-bg px-1.5 py-px text-bn-2xs font-semibold tabular-nums tracking-tight text-bn-text-primary">
+			{children}
+		</span>
+	);
 }
 
 function PluginMatrix({ cells }: { cells: PluginCell[] }) {
@@ -510,25 +525,22 @@ function PluginMatrix({ cells }: { cells: PluginCell[] }) {
 				const levelLabel = c.logLevel ? c.logLevel.toUpperCase() : "—";
 				const isOverride = c.logLevelSource === "module";
 				return (
-					<div key={c.id} className="rounded-lg border border-black/6 bg-bn-surface px-3 py-2.5">
+					<div key={c.id} className="rounded-lg px-3 py-2.5">
 						<div className="mb-1.5 flex items-center justify-between">
-							<span className="text-[12.5px] font-bold text-bn-text-primary">{c.label}</span>
-							<span
-								className="inline-block h-1.5 w-1.5 rounded-full"
-								style={{ background: c.enabled ? "#22c55e" : "#cbd5e1" }}
-							/>
+							<span className="text-bn-sm font-bold text-bn-text-primary">{c.label}</span>
+							<StatusDot size="sm" kind={c.enabled ? "ok" : "off"} />
 						</div>
-						<div className="flex items-center gap-1.5 whitespace-nowrap text-[11px] text-bn-text-secondary">
+						<div className="flex items-center gap-1.5 whitespace-nowrap text-bn-xs text-bn-text-secondary">
 							日志{" "}
 							<span
-								className="rounded px-1.5 font-bold"
-								style={{ background: tone.bg, color: tone.fg, fontSize: 10 }}
+								className="rounded-sm px-1.5 text-bn-2xs font-bold"
+								style={{ background: tone.bg, color: tone.fg }}
 								title={isOverride ? "按模块覆盖" : "继承全局"}
 							>
 								{levelLabel}
 								{isOverride ? "*" : ""}
 							</span>
-							{c.sub ? <span className="ml-auto text-[10.5px]">{c.sub}</span> : null}
+							{c.sub ? <span className="ml-auto text-bn-2xs">{c.sub}</span> : null}
 						</div>
 					</div>
 				);
@@ -537,7 +549,7 @@ function PluginMatrix({ cells }: { cells: PluginCell[] }) {
 	);
 }
 
-function SystemHealthCard({
+export function SystemHealthCard({
 	health,
 	reachable,
 	logLevel,
@@ -549,9 +561,12 @@ function SystemHealthCard({
 	liveEnabled,
 	imageEnabled,
 	aiEnabled,
+	update,
 }: {
 	health: HealthSnapshot | undefined;
 	reachable: boolean;
+	/** 应用内更新的状态;有比现在新的一版就在版本号旁边说一句、给个直达按钮。 */
+	update?: UpdateStatusDTO;
 	logLevel: string | undefined;
 	logLevels: ModuleLogLevels | undefined;
 	loggedIn: boolean;
@@ -609,32 +624,48 @@ function SystemHealthCard({
 		buildCell("ai", "AI · ai", aiEnabled, aiEnabled ? "运行中" : "未启用"),
 	];
 
+	// 失联时那份更新状态只是快照,按了「去更新」也去不了哪 —— 不催。
+	// 直接算成要显示的那句话:`newer` 非 null 蕴含 `update` 在,但 TS narrow 不出来,
+	// 留着中间量就得在每个用处再守一次 `update`。
+	const updateLabel = reachable && update && newerVersionOf(update) ? phaseLabel(update) : null;
+
 	return (
 		<GlassBox
 			title="系统状态 · 各模块"
 			subtitle={
-				<span className="inline-flex items-center gap-1.5">
+				<span className="inline-flex flex-wrap items-center gap-1.5">
 					<span>核心</span>
-					<span className="inline-block rounded-md bg-bn-code-bg px-1.5 py-px text-[10.5px] font-semibold tabular-nums tracking-tight text-bn-text-primary">
-						{health?.version ?? "—"}
-					</span>
+					<VersionBadge>{health?.version ?? "—"}</VersionBadge>
 					<span className="opacity-40">·</span>
 					<span>面板</span>
-					<span className="inline-block rounded-md bg-bn-code-bg px-1.5 py-px text-[10.5px] font-semibold tabular-nums tracking-tight text-bn-text-primary">
-						{__WEB_VERSION__}
-					</span>
+					<VersionBadge>{__WEB_VERSION__}</VersionBadge>
+					{updateLabel ? (
+						<>
+							<span className="opacity-40">·</span>
+							<span className="font-semibold text-bn-pink">{updateLabel}</span>
+						</>
+					) : null}
 				</span>
 			}
-			accent={reachable ? "#22c55e" : "#ef4444"}
+			accent={reachable ? "var(--color-bn-success)" : "var(--color-bn-danger)"}
 			icon={<Icon.check size={14} />}
 			badge={!reachable ? "失联" : health?.status === "ok" ? "健康" : "—"}
+			right={
+				updateLabel ? (
+					<Link to={UPDATE_SECTION_PATH}>
+						<Btn size="sm" variant="primary">
+							去更新
+						</Btn>
+					</Link>
+				) : undefined
+			}
 			dense
 		>
 			{!reachable ? (
-				<div className="mb-2.5 rounded border border-bn-danger-border bg-bn-danger-soft p-2 text-[11.5px] text-bn-danger-text">
+				<ErrorNote className="mb-2.5">
 					后端 API 当前不可达 (apps/server 未运行 或
 					网络中断),以下数据可能为最后一次成功拉取的快照。
-				</div>
+				</ErrorNote>
 			) : null}
 			<PluginMatrix cells={cells} />
 		</GlassBox>
@@ -651,6 +682,7 @@ export default function Dashboard() {
 		queryFn: () => api.get<HealthSnapshot>("/api/health"),
 		...HEALTH_QUERY_OPTIONS,
 	});
+	const updateQuery = useUpdateStatus();
 	const subsQuery = useQuery({
 		queryKey: ["subscriptions"],
 		queryFn: () => api.get<Subscription[]>("/api/subs"),
@@ -697,6 +729,11 @@ export default function Dashboard() {
 	const today = daily.at(-1);
 	const todayPushes = today?.total ?? 0;
 	const todayFailed = today?.failures ?? 0;
+	// KPI 卡 footer 素材(与统计页同构:首张有素材的卡吃 footer,同行其余卡由
+	// grid 等高拉齐):较昨日增减 + 近 7 日走势。窗口不足两天时徽章显「—」。
+	const yesterday = daily.at(-2);
+	const pushDelta = today && yesterday ? today.total - yesterday.total : null;
+	const pushSeries = daily.map((d) => d.total);
 
 	const aiTip = loggedIn ? (
 		live.length > 0 ? (
@@ -721,28 +758,47 @@ export default function Dashboard() {
 	);
 
 	return (
-		<div className="bn-anim-fade-in flex flex-col gap-4">
-			{/* KPI grid */}
-			<div className="grid grid-cols-2 gap-3.5 xl:grid-cols-4">
+		<div className="bn-anim-page-in flex flex-col gap-4">
+			{/* KPI grid(构图对齐统计页:gap-3、带 footer 的卡定行高,其余同行等高)*/}
+			<div className="grid grid-cols-2 gap-3 xl:grid-cols-4">
 				<GlassStatCard
 					label="正在直播"
 					value={live.length}
 					suffix={`/ ${subs.length}`}
-					color="#FB7299"
+					color="var(--color-bn-pink)"
 					pulse={live.length > 0}
 				/>
 				<GlassStatCard
 					label="已启用订阅"
 					value={enabledSubs}
 					suffix={`/ ${subs.length}`}
-					color="#00AEEC"
+					color="var(--color-bn-blue)"
 				/>
-				<GlassStatCard label="今日推送" value={todayPushes} suffix="次" color="#a29bfe" />
+				<GlassStatCard
+					label="今日推送"
+					value={todayPushes}
+					suffix="次"
+					color="var(--color-bn-purple)"
+					footer={
+						<>
+							<DeltaTag v={pushDelta} size={11.5} />
+							<span className="text-bn-2xs text-bn-text-secondary">较昨日</span>
+							<span className="ml-auto">
+								<Sparkline
+									data={pushSeries}
+									color="var(--color-bn-purple)"
+									width={64}
+									height={20}
+								/>
+							</span>
+						</>
+					}
+				/>
 				<GlassStatCard
 					label="今日失败"
 					value={todayFailed}
 					suffix="次"
-					color={todayFailed > 0 ? "#ef4444" : "#22c55e"}
+					color={todayFailed > 0 ? "var(--color-bn-danger)" : "var(--color-bn-success)"}
 					pulse={todayFailed > 0}
 				/>
 			</div>
@@ -775,6 +831,7 @@ export default function Dashboard() {
 				liveEnabled={health.data?.modules?.live ?? false}
 				imageEnabled={health.data?.modules?.image ?? false}
 				aiEnabled={health.data?.modules?.ai ?? false}
+				update={updateQuery.data}
 			/>
 		</div>
 	);
