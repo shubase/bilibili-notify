@@ -23,9 +23,14 @@ import {
 	parseBiliCommand,
 	parseOnebotGroupMessage,
 } from "../bili-onebot.js";
-import { clearBiliVideoParseCacheForTest, parseBiliVideoTarget } from "../bili-video-parser.js";
+import {
+	clearBiliVideoParseCacheForTest,
+	findBiliVideoTargetFromMessage,
+	parseBiliVideoTarget,
+} from "../bili-video-parser.js";
 
 beforeEach(() => {
+	vi.unstubAllGlobals();
 	H.ensureFollowed.mockReset();
 	clearBiliVideoParseCacheForTest();
 });
@@ -72,6 +77,81 @@ describe("bili OneBot group command parser", () => {
 			aid: 170001,
 			cacheKey: "av170001",
 		});
+	});
+
+	it("从嵌套 QQ 小程序卡片字段中解析 Bilibili 视频", async () => {
+		await expect(
+			findBiliVideoTargetFromMessage(
+				[
+					{
+						type: "json",
+						data: {
+							content: {
+								app: "com.tencent.miniapp_01",
+								meta: {
+									detail_1: {
+										qqdocurl: "https://www.bilibili.com/video/BV1QY4y1p7Jd?share_source=qq",
+									},
+								},
+							},
+						},
+					},
+				],
+				"",
+			),
+		).resolves.toEqual({ bvid: "BV1QY4y1p7Jd", cacheKey: "BV1QY4y1p7Jd" });
+	});
+
+	it("从 NapCat QQ 小程序卡片 qqdocurl 的 b23 短链解析 Bilibili 视频", async () => {
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async () => {
+				return new Response(null, {
+					status: 302,
+					headers: { location: "https://www.bilibili.com/video/BV1QY4y1p7Jd" },
+				});
+			}),
+		);
+
+		await expect(
+			findBiliVideoTargetFromMessage(
+				[
+					{
+						type: "json",
+						data: {
+							data: JSON.stringify({
+								app: "com.tencent.miniapp_01",
+								meta: {
+									detail_1: {
+										title: "哔哩哔哩",
+										qqdocurl: "https://b23.tv/QLujKj9?share_medium=android&share_source=qq",
+									},
+								},
+							}),
+						},
+					},
+				],
+				"",
+			),
+		).resolves.toEqual({ bvid: "BV1QY4y1p7Jd", cacheKey: "BV1QY4y1p7Jd" });
+	});
+
+	it("b23 短链返回中间页时，从 HTML 内容里继续提取视频链接", async () => {
+		const fetchMock = vi
+			.fn()
+			.mockResolvedValueOnce(new Response("", { status: 200 }))
+			.mockResolvedValueOnce(
+				new Response(
+					'<script>location.href="https://www.bilibili.com/video/BV1QY4y1p7Jd"</script>',
+				),
+			);
+		vi.stubGlobal("fetch", fetchMock);
+
+		await expect(parseBiliVideoTarget("https://b23.tv/QLujKj9")).resolves.toEqual({
+			bvid: "BV1QY4y1p7Jd",
+			cacheKey: "BV1QY4y1p7Jd",
+		});
+		expect(fetchMock).toHaveBeenCalledTimes(2);
 	});
 
 	it("支持配置命令前缀和关键字", () => {
@@ -660,6 +740,44 @@ describe("bili OneBot group command handler", () => {
 		expect(text).toContain("📝 简介：测试简介");
 		expect(text).toContain("🔗 https://www.bilibili.com/video/BV1QY4y1p7Jd");
 		expect(text).not.toContain("🎬 Bilibili 视频解析");
+	});
+
+	it("自动解析 QQ 小程序卡片二次转发里的 Bilibili 视频链接", async () => {
+		const h = makeRuntime();
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async () => {
+				return new Response(null, {
+					status: 302,
+					headers: { location: "https://www.bilibili.com/video/BV1QY4y1p7Jd" },
+				});
+			}),
+		);
+
+		await sendCommand(h.runtime, "", {
+			message: [
+				{
+					type: "json",
+					data: {
+						data: JSON.stringify({
+							app: "com.tencent.miniapp_01",
+							meta: {
+								detail_1: {
+									qqdocurl: "https://b23.tv/QLujKj9?share_medium=android&share_source=qq",
+								},
+							},
+						}),
+					},
+				},
+			],
+		});
+
+		expect(h.replies).toHaveLength(0);
+		expect(h.segmentReplies).toHaveLength(1);
+		expect(h.runtime.engines.api.getVideoInfo).toHaveBeenCalledWith({
+			bvid: "BV1QY4y1p7Jd",
+			aid: undefined,
+		});
 	});
 
 	it("视频解析全局关闭后不处理群聊视频链接", async () => {
