@@ -1,31 +1,27 @@
-import type {
-	FeatureKey,
-	PushTarget,
-	PushTargetPlatform,
-	Subscription,
-	SubscriptionRouting,
-} from "../../types/domain";
+import type { FeatureKey, PushTarget, Subscription, SubscriptionRouting } from "../../types/domain";
 import { DEFAULT_FEATURE_FLAGS, FEATURE_KEYS } from "../../types/domain";
 
 /**
- * UP 主配色住在 `@bilibili-notify/internal`,不在这里 —— 服务端渲染周报图片时
- * 要用同一套色,同一位 UP 在页面上和推到群里的图片上必须是同一个颜色。这里
- * re-export 只是让页面侧的既有引用点不用改。调色板的取舍见那边的说明。
+ * 两样从 internal 转口的值,都是「页面和服务端必须是同一份」的东西:
+ *
+ * - **UP 主配色**:服务端渲染周报图片时要用同一套色,同一位 UP 在页面上和推到群里的
+ *   图片上必须是同一个颜色。调色板的取舍见那边的说明。
+ * - **平台支不支持 @全体**(`platformSupportsAtAll`):推送层据它不给这种目标单发 @全体,
+ *   这里据它禁用开关并提示「发送时会自动跳过」。曾经这里自己写了一份、推送层不知道,
+ *   官机目标每次开播都多记一条「empty payload」失败 —— 界面上说跳过就得真的跳过。
+ *
+ * **必须走 `/constants` 子路径**,不能从根入口拿:根入口带 zod,而这是页面里唯一
+ * 一处从 internal 做**运行时**导入的地方 —— 曾经写成根入口,于是整个 zod(300+ 处
+ * 引用)被拖进浏览器 bundle,只为一个调色板。其余对 internal 的引用一律 `import type`
+ * (编译后擦除),见 `types/domain.ts` 开头那段。
  */
-export { colorFromUid, UP_COLORS } from "@bilibili-notify/internal";
-
-export function displayName(sub: Subscription): string {
-	return sub.cachedProfile?.name?.trim() || `UID ${sub.uid}`;
-}
-
-/**
- * 该平台是否支持「@全体成员」。QQ 官方机器人在群聊 @全体需特殊权限,后端适配器对
- * at-all 段是 best-effort 跳过(apps/server/src/platforms/qq-official.ts 的
- * `qqPayloadToParts`),故前端在其 @全体 开关上提示并禁用;onebot / webhook 正常支持。
- */
-export function platformSupportsAtAll(platform: PushTargetPlatform): boolean {
-	return platform !== "qq-official";
-}
+export {
+	colorFromUid,
+	platformSupportsAtAll,
+	UP_COLORS,
+} from "@bilibili-notify/internal/constants";
+// displayName 真身在 utils/up-display(组件层也要用,不能反向 import 页面层),这里转口。
+export { displayName } from "../../utils/up-display";
 
 /**
  * 该订阅「实际开启」的推送特性 = `overrides.features` 覆写值,缺省继承
@@ -43,9 +39,13 @@ export function targetsById(targets: PushTarget[]): Map<string, PushTarget> {
 	return m;
 }
 
-export function relativeTime(iso: string | undefined): string {
-	if (!iso) return "—";
-	const ts = new Date(iso).getTime();
+/**
+ * 距今多久。收 ISO 串**或** epoch 毫秒 —— 后者是给拓展面板那边的:桥报上来的
+ * `connectedAt` 就是个数字,为它再抄一份同样的阶梯是这仓里已经有三份的那种重复。
+ */
+export function relativeTime(iso: string | number | undefined): string {
+	if (iso === undefined || iso === "") return "—";
+	const ts = typeof iso === "number" ? iso : new Date(iso).getTime();
 	if (Number.isNaN(ts)) return "—";
 	const delta = Date.now() - ts;
 	if (delta < 60_000) return "刚刚";

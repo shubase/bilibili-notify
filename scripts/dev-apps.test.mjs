@@ -1,4 +1,7 @@
 import { EventEmitter } from "node:events";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it, vi } from "vite-plus/test";
 import {
 	buildWindowsTreeKillArgs,
@@ -45,7 +48,19 @@ describe("dev-apps supervisor", () => {
 			expect.objectContaining({
 				name: "apps/server dev",
 				command: "vp",
-				args: ["exec", "tsx", "watch", "--tsconfig", "tsconfig.dev.json", "src/index.ts"],
+				// 三路输出共用一个终端:server 重跑不许清屏(否则 Vite+ 的地址一起被擦掉),
+				// 也不许因为拓展产物重写而重跑(那是 devtools 热重载的活,重跑会断直播间)。
+				args: [
+					"exec",
+					"tsx",
+					"watch",
+					"--clear-screen=false",
+					"--ignore",
+					"../../extensions/**",
+					"--tsconfig",
+					"tsconfig.dev.json",
+					"src/index.ts",
+				],
 				cwd: "/repo/apps/server",
 			}),
 			expect.objectContaining({
@@ -58,6 +73,33 @@ describe("dev-apps supervisor", () => {
 		expect(specs.flatMap((spec) => [spec.command, ...spec.args])).not.toContain("pnpm");
 	});
 
+	it("仓里的拓展顺带 watch 打包 —— 改完 30ms 重建,配 devtools 的自动重载就是保存即生效", async () => {
+		const root = mkdtempSync(join(tmpdir(), "bn-dev-specs-"));
+		try {
+			mkdirSync(join(root, "extensions", "bridge"), { recursive: true });
+			writeFileSync(join(root, "extensions", "bridge", "extension.json"), "{}");
+			// 没有清单的目录不算拓展(node_modules、临时目录都会落在这儿)。
+			mkdirSync(join(root, "extensions", "node_modules"), { recursive: true });
+
+			const specs = createDevProcessSpecs(root);
+			const packs = specs.filter((spec) => spec.args[0] === "pack");
+			expect(packs).toEqual([
+				expect.objectContaining({
+					// 🔴 `--no-clean`:清一次 dist 会让装载器**在开机那一眼**看见一个空目录,
+					// 而软链正指着它 —— 症状是拓展页上那条突然变成「装不起来」。
+					args: ["pack", "-w", "--no-clean"],
+					cwd: join(root, "extensions", "bridge"),
+				}),
+			]);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("仓里没有 extensions 目录时不多起进程", () => {
+		expect(createDevProcessSpecs("/repo")).toHaveLength(2);
+	});
+
 	it("等待后端可连接后再启动 web,避免 Vite 首次请求打到未监听的 8787", async () => {
 		const { children, spawnProcess } = createFakeSpawn();
 		let markReady;
@@ -68,6 +110,8 @@ describe("dev-apps supervisor", () => {
 				}),
 		);
 		const run = runDevApps({
+			// 显式给一个空 root:不给的话这条测试悄悄依赖「仓里眼下有几个拓展」。
+			root: "/repo",
 			spawnProcess,
 			processPlatform: "test",
 			log: () => {},
@@ -79,6 +123,8 @@ describe("dev-apps supervisor", () => {
 		expect(waitForBackendReady).toHaveBeenCalledWith("http://127.0.0.1:8787/api/health", {
 			timeoutMs: 20_000,
 			intervalMs: 200,
+			// 停机信号:起步那 20 秒里按 Ctrl-C,轮询要当场收手。
+			signal: expect.any(AbortSignal),
 		});
 		markReady();
 		await new Promise((r) => setImmediate(r));
@@ -105,6 +151,7 @@ describe("dev-apps supervisor", () => {
 	it("SIGINT 后停止两个 dev 子进程并返回 0", async () => {
 		const { children, spawnProcess } = createFakeSpawn();
 		const run = runDevAppsNoWait({
+			root: "/repo",
 			spawnProcess,
 			processPlatform: "test",
 			log: () => {},
@@ -118,9 +165,69 @@ describe("dev-apps supervisor", () => {
 		expect(children.map((child) => child.signals)).toEqual([["SIGINT"], ["SIGINT"]]);
 	});
 
+	/**
+	 * 直接子进程只是 `vp exec` 那层壳,它一收到 SIGINT 就退了;真正的 tsx / server 在它下面、
+	 * 同一个进程组里,还在走优雅退出。壳一退就返回,等于把 8 秒宽限期扔了 —— 组里剩下的
+	 * 谁卡住了都没人管,主人 Ctrl-C 之后 server 照跑(2026-09-11 真撞过)。
+	 */
+	it("有意停止后,子进程壳退了但进程组还有人 → 等到组空才返回,不补 SIGKILL", async () => {
+		const { children, spawnProcess } = createFakeSpawn();
+		let polls = 0;
+		const probeGroupAlive = vi.fn(() => polls++ < 3);
+		const run = runDevAppsNoWait({
+			root: "/repo",
+			spawnProcess,
+			processPlatform: "test",
+			log: () => {},
+			graceMs: 1_000,
+			groupPollMs: 1,
+			probeGroupAlive,
+		});
+		process.emit("SIGINT");
+		await expect(run).resolves.toBe(0);
+		expect(probeGroupAlive).toHaveBeenCalled();
+		expect(polls).toBeGreaterThanOrEqual(3);
+		for (const child of children) expect(child.signals).not.toContain("SIGKILL");
+	});
+
+	it("宽限期过了进程组还有人 → SIGKILL 整组,再返回", async () => {
+		const { children, spawnProcess } = createFakeSpawn();
+		// 组一直「有人」,直到有人对它下 SIGKILL。
+		const probeGroupAlive = vi.fn((child) => !child.signals.includes("SIGKILL"));
+		const run = runDevAppsNoWait({
+			root: "/repo",
+			spawnProcess,
+			processPlatform: "test",
+			log: () => {},
+			graceMs: 30,
+			groupPollMs: 1,
+			probeGroupAlive,
+		});
+		process.emit("SIGINT");
+		await expect(run).resolves.toBe(0);
+		for (const child of children) expect(child.signals).toEqual(["SIGINT", "SIGKILL"]);
+	});
+
+	it("终端被关(SIGHUP)也走同一套停止流程,不把整棵树留成孤儿", async () => {
+		const { children, spawnProcess } = createFakeSpawn();
+		const run = runDevAppsNoWait({
+			root: "/repo",
+			spawnProcess,
+			processPlatform: "test",
+			log: () => {},
+			graceMs: 100,
+			groupPollMs: 1,
+			probeGroupAlive: () => false,
+		});
+		process.emit("SIGHUP");
+		await expect(run).resolves.toBe(0);
+		expect(children.map((child) => child.signals)).toEqual([["SIGTERM"], ["SIGTERM"]]);
+	});
+
 	it("子进程非 0 退出时停止另一个 dev 子进程并保留退出码", async () => {
 		const { children, spawnProcess } = createFakeSpawn();
 		const run = runDevAppsNoWait({
+			root: "/repo",
 			spawnProcess,
 			processPlatform: "test",
 			log: () => {},
@@ -133,6 +240,61 @@ describe("dev-apps supervisor", () => {
 
 		await expect(run).resolves.toBe(7);
 		expect(children[1].signals).toEqual(["SIGINT"]);
+	});
+
+	/**
+	 * 🔴 **探活要能被叫停。**
+	 *
+	 * 后端起步的 20 秒里按 Ctrl-C:子进程收到信号退了,而这个轮询还在自己的 setTimeout 上
+	 * 睡着 —— runner 早就 resolve 了,node 的事件循环却被那串定时器吊着,终端要一直挂到
+	 * 探活的 deadline 才回来。
+	 */
+	it("探活收到停机信号 → 当场收手,不等到 deadline", async () => {
+		const controller = new AbortController();
+		const fetchImpl = vi.fn(async () => {
+			throw new Error("ECONNREFUSED");
+		});
+		// 第一轮还没连上,睡的那一下里主人按了 Ctrl-C。
+		const sleep = vi.fn(async () => controller.abort());
+
+		await expect(
+			waitForHttpReachable("http://127.0.0.1:8787/api/health", {
+				fetchImpl,
+				sleep,
+				intervalMs: 5,
+				// 生产是 20 秒;这里短一点,回归时这条不至于自己先卡 20 秒再红。
+				timeoutMs: 1_000,
+				signal: controller.signal,
+			}),
+		).rejects.toThrow(/停/);
+		// 没有第二次重试 —— 没这条的话它会一路重试到 deadline。
+		expect(fetchImpl).toHaveBeenCalledTimes(1);
+	});
+
+	/**
+	 * 🔴 这条钉的是**接线**:上面那条证明探活认停机信号,但证明不了 runner 真的把信号递了
+	 * 进去、并且在停机时真的拉了它。剪断这一头,两个零件各自的测试照样全绿。
+	 */
+	it("SIGINT 时把停机信号递给探活", async () => {
+		const { spawnProcess } = createFakeSpawn();
+		let probeOptions;
+		const run = runDevApps({
+			root: "/repo",
+			spawnProcess,
+			processPlatform: "test",
+			log: () => {},
+			graceMs: 10,
+			// 永远不 resolve —— 模拟「后端还没起来」那 20 秒。
+			waitForBackendReady: (_url, options) => {
+				probeOptions = options;
+				return new Promise(() => {});
+			},
+		});
+
+		expect(probeOptions?.signal?.aborted).toBe(false);
+		process.emit("SIGINT");
+		expect(probeOptions?.signal?.aborted).toBe(true);
+		await expect(run).resolves.toBe(0);
 	});
 
 	it("waitForHttpReachable 在 HTTP 可达后返回", async () => {

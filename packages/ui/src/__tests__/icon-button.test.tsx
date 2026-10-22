@@ -1,0 +1,213 @@
+// @vitest-environment jsdom
+
+/**
+ * IconButton —— 只装一枚图标的方钮/圆钮。
+ *
+ * 收编前站内 23 处手写,尺寸漂成 h-4 / 4.5 / 5 / 5.5 / 6 / 7 / 7.5 / 8.5 / 9 /
+ * [34px] **十档**,而语义只有五档;hover 也漂成六种写法,语义只有四种。挂点更是
+ * 各挂各的。这里钉的是那份共同骨架:居中、不被压扁、有名字、带皮肤挂点。
+ *
+ * `size` 走命名档而不是像 `Avatar` 那样收数字 —— 收数字只是把漂移换个地方放。
+ */
+
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vite-plus/test";
+import { Icon, IconButton } from "../index";
+
+afterEach(cleanup);
+
+const btn = () => screen.getByRole("button");
+
+describe("IconButton", () => {
+	it("图标居中、不被 flex 压扁,并且挂着皮肤挂点", () => {
+		render(<IconButton icon={<Icon.close size={13} />} label="关闭" onClick={() => {}} />);
+		const cls = btn().className.split(/\s+/);
+		for (const c of ["grid", "place-items-center", "shrink-0"]) {
+			expect([c, cls.includes(c)]).toEqual([c, true]);
+		}
+		expect(btn().getAttribute("data-bn")).toBe("btn");
+	});
+
+	/** ⠿ 那种裸字形按钮之所以不能用它,就是因为这层壳自带外观。 */
+	it("label 是读屏器唯一的抓手 —— 图标本身没有文字", () => {
+		render(
+			<IconButton icon={<Icon.close size={13} />} label="移除该推送目标" onClick={() => {}} />,
+		);
+		expect(screen.getByRole("button", { name: "移除该推送目标" })).toBeTruthy();
+		expect(btn().getAttribute("title")).toBe("移除该推送目标");
+	});
+
+	/**
+	 * 两处调用点的 tooltip 与读屏器名字**刻意不同**:侧栏的删除钮 tooltip 只写
+	 * 「删除这个对话」,读屏器要念出是哪个对话。合成一个就把后者砍没了。
+	 */
+	it("title 可与 label 分开,不给就跟着 label", () => {
+		render(
+			<IconButton
+				icon={<Icon.close size={13} />}
+				label="删除对话「昨天的皮肤」"
+				title="删除这个对话"
+				onClick={() => {}}
+			/>,
+		);
+		expect(btn().getAttribute("title")).toBe("删除这个对话");
+		expect(btn().getAttribute("aria-label")).toBe("删除对话「昨天的皮肤」");
+	});
+
+	it("下拉触发器的 aria 状态照直透传", () => {
+		render(
+			<IconButton
+				icon={<Icon.plus size={13} />}
+				label="添加"
+				ariaHasPopup
+				ariaExpanded
+				onClick={() => {}}
+			/>,
+		);
+		expect(btn().getAttribute("aria-haspopup")).toBe("true");
+		expect(btn().getAttribute("aria-expanded")).toBe("true");
+	});
+
+	it("五档尺寸各自是一对相等的宽高", () => {
+		const want: Record<string, string> = {
+			xs: "h-4 w-4",
+			sm: "h-5 w-5",
+			md: "h-6 w-6",
+			lg: "h-7 w-7",
+			xl: "h-9 w-9",
+		};
+		for (const [size, pair] of Object.entries(want)) {
+			const { unmount } = render(
+				<IconButton
+					icon={<Icon.close size={13} />}
+					label="x"
+					size={size as "xs"}
+					onClick={() => {}}
+				/>,
+			);
+			const cls = btn().className.split(/\s+/);
+			for (const c of pair.split(" ")) {
+				expect([size, c, cls.includes(c)]).toEqual([size, c, true]);
+			}
+			unmount();
+		}
+	});
+
+	it("默认 sm —— 站内最常见的那一档", () => {
+		render(<IconButton icon={<Icon.close size={13} />} label="x" onClick={() => {}} />);
+		expect(btn().className).toContain("h-5");
+	});
+
+	it("tone 只管 hover 语义,静态字色统一走 tertiary", () => {
+		const { unmount } = render(
+			<IconButton icon={<Icon.close size={13} />} label="x" onClick={() => {}} />,
+		);
+		expect(btn().className).toContain("text-bn-text-tertiary");
+		expect(btn().className).toContain("hover:bg-bn-hover-muted");
+		unmount();
+
+		render(
+			<IconButton icon={<Icon.close size={13} />} label="x" tone="danger" onClick={() => {}} />,
+		);
+		expect(btn().className).toContain("hover:bg-bn-danger-soft");
+		expect(btn().className).toContain("hover:text-bn-danger-text");
+	});
+
+	it("shape=pill 换成药丸圆角,默认是小方角", () => {
+		const { unmount } = render(
+			<IconButton icon={<Icon.close size={13} />} label="x" onClick={() => {}} />,
+		);
+		expect(btn().className).toContain("rounded-bn-xs");
+		unmount();
+		render(
+			<IconButton icon={<Icon.close size={13} />} label="x" shape="pill" onClick={() => {}} />,
+		);
+		expect(btn().className).toContain("rounded-bn-pill");
+	});
+
+	/** 描边+底色那一档:section-nav 的滚动箭头、附件的移除角标都是这个样子。 */
+	it("surface=filled 加一圈描边与面底色", () => {
+		render(
+			<IconButton icon={<Icon.close size={13} />} label="x" surface="filled" onClick={() => {}} />,
+		);
+		const cls = btn().className;
+		expect(cls).toContain("border");
+		expect(cls).toContain("bg-bn-surface");
+	});
+
+	/**
+	 * 遮罩那一档:压在图片 / 渐变上的钮(UP 弹窗封面的关闭、壁纸缩略图的删除)。
+	 *
+	 * 它**必须连静态字色一起换掉** —— 底下是任意内容,常规的 tertiary 灰不可读。
+	 * 而仓库没装 tailwind-merge:两个 `text-*` 同时出现时谁赢由样式表生成顺序定,
+	 * 不是由 class 串的先后定。所以这一档不能只是「在 tone 之上再叠一个字色」。
+	 */
+	it("surface=scrim 走遮罩 + 实底前景色,且不带 tone 那份 tertiary 字色", () => {
+		render(
+			<IconButton icon={<Icon.close size={13} />} label="x" surface="scrim" onClick={() => {}} />,
+		);
+		const cls = btn().className;
+		expect(cls).toContain("bg-bn-overlay");
+		expect(cls).toContain("text-bn-on-solid");
+		expect(cls).not.toContain("text-bn-text-tertiary");
+	});
+
+	it("className 只追加定位这类不冲突的工具类,接在本体之后", () => {
+		render(
+			<IconButton
+				icon={<Icon.close size={13} />}
+				label="x"
+				className="absolute right-1 top-1"
+				onClick={() => {}}
+			/>,
+		);
+		expect(btn().className.endsWith("absolute right-1 top-1")).toBe(true);
+	});
+
+	it("点得动,禁用时点不动", () => {
+		const onClick = vi.fn();
+		const { unmount } = render(
+			<IconButton icon={<Icon.close size={13} />} label="x" onClick={onClick} />,
+		);
+		fireEvent.click(btn());
+		expect(onClick).toHaveBeenCalledTimes(1);
+		unmount();
+
+		render(<IconButton icon={<Icon.close size={13} />} label="x" disabled onClick={onClick} />);
+		fireEvent.click(btn());
+		expect(onClick).toHaveBeenCalledTimes(1);
+	});
+});
+
+/**
+ * `scrim` 档**不挂 `btn`** —— 它是压在任意图片上的一层深纱 + 白图标,而皮肤给
+ * `btn` 刷的实底会把纱盖掉,白图标当场压在近白的底上看不见了(2026-08-24 审这套
+ * 像素风皮肤时算出来的:亮色 `btn` 底 #FCFEFF,而 `--color-bn-on-solid` 是 #ffffff)。
+ *
+ * 皮肤没有别的出路:纱与白图标都是 class,`on-solid` 也不是可配键 —— 想救它只能
+ * 给 `btn` 写 `color`,而那会连 IconButton 的 danger 红一起抹平。
+ *
+ * 这与豁免名单里「盖在图片上的透明选取层」是同一条口径:**浮在图片上的东西不吃
+ * 按钮的皮**。它损失的只是皮肤造型,而那本来就该由纱说了算。
+ */
+describe("scrim 档不吃按钮的皮", () => {
+	it("surface=scrim 时不挂 btn —— 皮肤实底会把深纱盖掉,白图标就没了", () => {
+		render(<IconButton icon={<i />} label="关闭" surface="scrim" onClick={() => {}} />);
+		const el = screen.getByLabelText("关闭");
+		expect(el.getAttribute("data-bn")).toBe(null);
+		// 纱与白图标都还在 —— 丢的只是挂点。
+		expect(el.className).toContain("bg-bn-overlay");
+		expect(el.className).toContain("text-bn-on-solid");
+	});
+
+	it("其他档照旧挂 btn —— 只有 scrim 这一档特殊", () => {
+		render(
+			<>
+				<IconButton icon={<i />} label="填充" surface="filled" onClick={() => {}} />
+				<IconButton icon={<i />} label="裸的" onClick={() => {}} />
+			</>,
+		);
+		expect(screen.getByLabelText("填充").getAttribute("data-bn")).toBe("btn");
+		expect(screen.getByLabelText("裸的").getAttribute("data-bn")).toBe("btn");
+	});
+});

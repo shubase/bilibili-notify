@@ -1,0 +1,376 @@
+/**
+ * LiveClient 行为规格,经注入的假 socket 从外部观察:
+ * 连接参数全注入、无内部 HTTP、无内部重连;close() 之后保证静默 ——
+ * 主动关闭的回声不会再从漏斗里冒出来,上层不需要「有意关闭」记账。
+ *
+ * 上行包的断言用 DataView 手拆头部;下行帧喂真实录制 fixture。
+ */
+
+import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
+import {
+	connectLiveRoom,
+	type LiveConnectionInfo,
+	type LiveConnectOptions,
+	observeLiveConnections,
+	type SocketLike,
+} from "../client.js";
+import type { LiveEvent } from "../events.js";
+import frames from "./fixtures/frames.json" with { type: "json" };
+
+const b64 = (s: string): Uint8Array => new Uint8Array(Buffer.from(s, "base64"));
+
+class FakeSocket implements SocketLike {
+	binaryType = "";
+	sent: Uint8Array[] = [];
+	closeCalls = 0;
+	private handlers = new Map<string, ((...args: unknown[]) => void)[]>();
+
+	on(event: string, fn: (...args: unknown[]) => void): void {
+		const list = this.handlers.get(event) ?? [];
+		list.push(fn);
+		this.handlers.set(event, list);
+	}
+
+	send(data: Uint8Array): void {
+		this.sent.push(data);
+	}
+
+	close(): void {
+		this.closeCalls++;
+	}
+
+	emit(event: string, ...args: unknown[]): void {
+		for (const fn of this.handlers.get(event) ?? []) fn(...args);
+	}
+}
+
+function decodeSent(packet: Uint8Array): { op: number; body: unknown } {
+	const view = new DataView(packet.buffer, packet.byteOffset, packet.byteLength);
+	return {
+		op: view.getUint32(8),
+		body: JSON.parse(new TextDecoder().decode(packet.subarray(16))),
+	};
+}
+
+describe("connectLiveRoom", () => {
+	let socket: FakeSocket;
+	let urls: string[];
+	let headersSeen: Record<string, string>[];
+	let events: LiveEvent[];
+
+	beforeEach(() => {
+		vi.useFakeTimers();
+		socket = new FakeSocket();
+		urls = [];
+		headersSeen = [];
+		events = [];
+	});
+
+	afterEach(() => {
+		vi.useRealTimers();
+	});
+
+	function connect(overrides: Partial<LiveConnectOptions> = {}) {
+		return connectLiveRoom({
+			roomId: 5050,
+			uid: 42,
+			token: "tok",
+			buvid: "buv",
+			hostList: [{ host: "danmu.example.com", wssPort: 2245 }],
+			cookieHeader: "SESSDATA=x",
+			userAgent: "UA/1.0",
+			onEvent: (ev) => events.push(ev),
+			createSocket: (url, headers) => {
+				urls.push(url);
+				headersSeen.push(headers);
+				return socket;
+			},
+			...overrides,
+		});
+	}
+
+	it("按 host_list 首项拼 wss URL,带 Cookie / UA 头", () => {
+		connect();
+
+		expect(urls).toEqual(["wss://danmu.example.com:2245/sub"]);
+		expect(headersSeen[0]).toEqual({ Cookie: "SESSDATA=x", "User-Agent": "UA/1.0" });
+	});
+
+	it("wss_port 为 443 时省略端口", () => {
+		connect({ hostList: [{ host: "h.example.com", wssPort: 443 }] });
+
+		expect(urls).toEqual(["wss://h.example.com/sub"]);
+	});
+
+	it("socket open → 发认证包并上报 open 事件", () => {
+		connect();
+		socket.emit("open");
+
+		expect(events).toEqual([{ kind: "open" }]);
+		expect(socket.sent).toHaveLength(1);
+		const auth = decodeSent(socket.sent[0] as Uint8Array);
+		expect(auth.op).toBe(7);
+		expect(auth.body).toEqual({
+			uid: 42,
+			roomid: 5050,
+			protover: 3,
+			platform: "web",
+			type: 2,
+			key: "tok",
+			buvid: "buv",
+		});
+	});
+
+	it("认证回执 code=0 → auth-ok,随后立刻发首个心跳,之后每 30s 一次", () => {
+		connect();
+		socket.emit("open");
+		socket.emit("message", b64(frames.authReply));
+
+		expect(events).toContainEqual({ kind: "auth-ok" });
+		// 认证包 + 首心跳
+		expect(socket.sent).toHaveLength(2);
+		expect(decodeSent(socket.sent[1] as Uint8Array).op).toBe(2);
+
+		vi.advanceTimersByTime(30_000);
+		expect(socket.sent).toHaveLength(3);
+		vi.advanceTimersByTime(30_000);
+		expect(socket.sent).toHaveLength(4);
+	});
+
+	it("认证回执 code≠0 → auth-failed,不起心跳", () => {
+		connect();
+		socket.emit("open");
+		// 合成失败回执:与真实回执同构,仅 code 不同
+		const body = new TextEncoder().encode('{"code":-101}');
+		const reply = new Uint8Array(16 + body.length);
+		const view = new DataView(reply.buffer);
+		view.setUint32(0, reply.length);
+		view.setUint16(4, 16);
+		view.setUint16(6, 1);
+		view.setUint32(8, 8);
+		reply.set(body, 16);
+		socket.emit("message", reply);
+
+		expect(events).toContainEqual({ kind: "auth-failed", code: -101 });
+		vi.advanceTimersByTime(60_000);
+		expect(socket.sent).toHaveLength(1);
+	});
+
+	it("认证回执缺 code 字段 → 按认证失败处理(code=-1),不起心跳", () => {
+		// 协议成功形态恒为 {"code":0};缺字段当成功会把认证失败伪装成 auth-ok,
+		// 上层要等 3 分钟 watchdog 才自愈 —— 保守默认按失败走重连梯子。
+		connect();
+		socket.emit("open");
+		const body = new TextEncoder().encode("{}");
+		const reply = new Uint8Array(16 + body.length);
+		const view = new DataView(reply.buffer);
+		view.setUint32(0, reply.length);
+		view.setUint16(4, 16);
+		view.setUint16(6, 1);
+		view.setUint32(8, 8);
+		reply.set(body, 16);
+		socket.emit("message", reply);
+
+		expect(events).toContainEqual({ kind: "auth-failed", code: -1 });
+		expect(events).not.toContainEqual({ kind: "auth-ok" });
+		vi.advanceTimersByTime(60_000);
+		expect(socket.sent).toHaveLength(1);
+	});
+
+	it("重复认证回执 → 只处理首个,不重复 auth-ok、不叠心跳定时器", () => {
+		connect();
+		socket.emit("open");
+		socket.emit("message", b64(frames.authReply));
+		socket.emit("message", b64(frames.authReply));
+
+		expect(events.filter((ev) => ev.kind === "auth-ok")).toHaveLength(1);
+		// 认证包 + 首心跳(仅一次)
+		expect(socket.sent).toHaveLength(2);
+		vi.advanceTimersByTime(30_000);
+		// 单个定时器:每 30s 恰好多 1 个心跳,叠了定时器会多 2 个
+		expect(socket.sent).toHaveLength(3);
+	});
+
+	it("buvid 为空串时认证包省略该键(与真机验证过的包形一致)", () => {
+		connect({ buvid: "" });
+		socket.emit("open");
+
+		const auth = decodeSent(socket.sent[0] as Uint8Array);
+		expect(auth.body).toEqual({
+			uid: 42,
+			roomid: 5050,
+			protover: 3,
+			platform: "web",
+			type: 2,
+			key: "tok",
+		});
+	});
+
+	it("心跳回执 → heartbeat 事件带人气值", () => {
+		connect();
+		socket.emit("message", b64(frames.heartbeatReply));
+
+		expect(events).toEqual([{ kind: "heartbeat", popularity: 1 }]);
+	});
+
+	it("brotli MESSAGE 帧 → 解码解析后逐条进漏斗", () => {
+		connect();
+		socket.emit("message", b64(frames.brotliMessage));
+
+		// 录制时该帧含 2 条 INTERACT_WORD_V2
+		expect(events).toHaveLength(2);
+		for (const ev of events) expect(ev.kind).toBe("user-action");
+	});
+
+	it("连接挂起(始终不 open)→ 默认 15s 超时:error 事件 + 主动关 socket", () => {
+		// TCP 半开/对端不响应时 ws 层可能永远没有事件 —— 没有这道闸,上游要等
+		// watchdog 3 分钟才发现;有了它,重连梯子在 15s 后立即接手。
+		connect();
+		vi.advanceTimersByTime(14_999);
+		expect(events).toEqual([]);
+		vi.advanceTimersByTime(1);
+
+		expect(events).toHaveLength(1);
+		expect(events[0]).toMatchObject({ kind: "error" });
+		expect(socket.closeCalls).toBe(1);
+	});
+
+	it("open 了但认证无回执 → 同一段限时覆盖到 auth-ok 为止", () => {
+		connect();
+		socket.emit("open");
+		vi.advanceTimersByTime(15_000);
+
+		expect(events.filter((ev) => ev.kind === "error")).toHaveLength(1);
+		expect(socket.closeCalls).toBe(1);
+	});
+
+	it("auth-ok 之后超时闸解除,不再误报", () => {
+		connect();
+		socket.emit("open");
+		socket.emit("message", b64(frames.authReply));
+		vi.advanceTimersByTime(120_000);
+
+		expect(events.filter((ev) => ev.kind === "error")).toHaveLength(0);
+		expect(socket.closeCalls).toBe(0);
+	});
+
+	it("connectTimeoutMs 可配", () => {
+		connect({ connectTimeoutMs: 3000 });
+		vi.advanceTimersByTime(3000);
+
+		expect(events.filter((ev) => ev.kind === "error")).toHaveLength(1);
+	});
+
+	it("服务器先关了连接 → 超时闸随之解除,不在 closed 之后再补一个 error", () => {
+		connect();
+		socket.emit("close", 1006);
+		vi.advanceTimersByTime(60_000);
+
+		expect(events).toEqual([{ kind: "closed", code: 1006 }]);
+	});
+
+	it("对面把连接断了 → closed 旗子也立起来(不只是自己 close() 才算)", () => {
+		// 调用方拿 `closed` 当「这条还通不通」用。只在自己 close() 时才立的话,对面断开
+		// (最常见的那种断)之后它一直是 false —— 一条死连接会被当成活的继续记在册上。
+		const client = connect();
+		expect(client.closed).toBe(false);
+
+		socket.emit("close", 1006);
+
+		expect(client.closed).toBe(true);
+		// 这一条 closed 事件本身照样报得出去,不能被刚立的旗子吞掉。
+		expect(events.at(-1)).toEqual({ kind: "closed", code: 1006 });
+	});
+
+	it("closed 事件透传服务器给的关闭理由", () => {
+		connect();
+		socket.emit("close", 1008, Buffer.from("policy violation"));
+
+		expect(events).toEqual([{ kind: "closed", code: 1008, reason: "policy violation" }]);
+	});
+
+	it("socket 错误 → error 事件;非主动关闭 → closed 事件", () => {
+		connect();
+		socket.emit("error", new Error("boom"));
+		socket.emit("close", 1006);
+
+		expect(events[0]).toMatchObject({ kind: "error" });
+		expect(events[1]).toEqual({ kind: "closed", code: 1006 });
+	});
+
+	it("close() 之后保证静默:关 socket、停心跳、任何事件不再上报", () => {
+		const client = connect();
+		socket.emit("open");
+		socket.emit("message", b64(frames.authReply));
+		const before = events.length;
+
+		client.close();
+		expect(socket.closeCalls).toBe(1);
+		expect(client.closed).toBe(true);
+
+		socket.emit("close", 1000);
+		socket.emit("message", b64(frames.heartbeatReply));
+		socket.emit("error", new Error("late"));
+		const sentBefore = socket.sent.length;
+		vi.advanceTimersByTime(120_000);
+
+		expect(events).toHaveLength(before);
+		expect(socket.sent).toHaveLength(sentBefore);
+	});
+
+	it("close() 幂等", () => {
+		const client = connect();
+		client.close();
+		client.close();
+
+		expect(socket.closeCalls).toBe(1);
+	});
+});
+
+/**
+ * 连接观察钩子(devtools 用):每建一条连接就报一声,带着这条连接的 `onEvent` —— 拿到它
+ * 就能往房间的事件漏斗里塞事件,走的是与真帧完全相同的那条回调。不装就什么都不发生。
+ */
+describe("observeLiveConnections", () => {
+	afterEach(() => {
+		observeLiveConnections(null);
+	});
+
+	it("每建一条连接报一声,带 roomId / onEvent / client;卸掉后不再报", () => {
+		const seen: LiveConnectionInfo[] = [];
+		observeLiveConnections((info) => seen.push(info));
+		const socket = new FakeSocket();
+		const events: LiveEvent[] = [];
+		const client = connectLiveRoom({
+			roomId: 5050,
+			uid: 42,
+			token: "tok",
+			buvid: "buv",
+			hostList: [{ host: "danmu.example.com", wssPort: 2245 }],
+			userAgent: "UA/1.0",
+			onEvent: (ev) => events.push(ev),
+			createSocket: () => socket,
+		});
+
+		expect(seen).toHaveLength(1);
+		expect(seen[0]?.roomId).toBe(5050);
+		expect(seen[0]?.client).toBe(client);
+		// 塞进去的事件走的就是调用方那条 onEvent。
+		seen[0]?.onEvent({ kind: "live-start" });
+		expect(events).toEqual([{ kind: "live-start" }]);
+
+		observeLiveConnections(null);
+		connectLiveRoom({
+			roomId: 6060,
+			uid: 42,
+			token: "tok",
+			buvid: "buv",
+			hostList: [{ host: "danmu.example.com", wssPort: 2245 }],
+			userAgent: "UA/1.0",
+			onEvent: () => {},
+			createSocket: () => new FakeSocket(),
+		});
+		expect(seen).toHaveLength(1);
+		client.close();
+	});
+});

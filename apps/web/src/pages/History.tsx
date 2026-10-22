@@ -1,26 +1,44 @@
-import { useQuery } from "@tanstack/react-query";
+import {
+	Avatar,
+	Btn,
+	DisclosurePill,
+	ErrorNote,
+	Icon,
+	IconButton,
+	Input,
+	LoadingBlock,
+	Picker,
+	Pill,
+} from "@bilibili-notify/ui";
+import { useMutation, useQuery } from "@tanstack/react-query";
 import { useMemo, useState } from "react";
-import { Avatar, Input, Pill } from "../components/atoms";
-import { Icon } from "../components/icons";
+import {
+	familyTone,
+	PUSH_KIND_META,
+	PUSH_STATUS_META,
+	PUSH_TONE,
+	type PushFamily,
+} from "../config/push-kinds";
 import { api } from "../services/api";
 import {
 	type HistoryEntryView,
+	type HistoryMessageView,
+	type HistoryRepushResponse,
 	type HistoryResponse,
-	type HistorySource,
 	historyQueryKey,
 } from "../services/dashboard";
 import type { PushTarget, Subscription } from "../types/domain";
 import type { GlobalConfig } from "../types/globals";
+import { hasDetails, headlineOf, messageCountOf } from "../utils/push-row";
 import { colorFromUid, displayName, relativeTime } from "./up/helpers";
 
 /**
  * `/history` — 1:1 port of `.bn-design/variation-a-tabs.jsx#HistoryTab`,
  * backed by the live `/api/history` route + jsonl-by-day store.
  *
- * Source families collapse onto four primary pill filters (live / 动态 /
- * SC / 舰长). The seven HistorySource buckets fan into the four families
- * the same way `services/dashboard.ts#FAMILY` does, so per-family counts
- * line up with the Dashboard trend chart.
+ * 一行 = 一次推送 × 一个目标:首条本体当文案,多条挂「N 条」胶囊,行可展开逐条看
+ * (文案 / 图缩略 / 结果);状态四态。八种推送类型折进四个家族筛选(直播 / 动态 /
+ * SC / 舰长),与 `services/dashboard.ts#FAMILY` 同一张表,和概览趋势图对得上。
  *
  * The "重发" column from the design source is intentionally not ported:
  * /api/push/test sends a dummy text payload, so a button labelled
@@ -29,41 +47,15 @@ import { colorFromUid, displayName, relativeTime } from "./up/helpers";
  * that replays a recorded NotificationPayload.
  */
 
-type FilterId = "all" | "live" | "dynamic" | "sc" | "guard";
-
-const FAMILY: Record<HistorySource, Exclude<FilterId, "all">> = {
-	live: "live",
-	"live-summary": "live",
-	"special-enter": "live",
-	"special-danmaku": "live",
-	dynamic: "dynamic",
-	sc: "sc",
-	guard: "guard",
-};
-
-const SOURCE_LABEL: Record<HistorySource, string> = {
-	dynamic: "动态",
-	live: "直播",
-	sc: "SC",
-	guard: "舰长",
-	"special-danmaku": "弹幕",
-	"special-enter": "入场",
-	"live-summary": "总结",
-};
-
-const FAMILY_TONE: Record<Exclude<FilterId, "all">, string> = {
-	live: "#FB7299",
-	dynamic: "#00AEEC",
-	sc: "#fdcb6e",
-	guard: "#f2a053",
-};
+/** 筛选胶囊 = 四个家族(见 PUSH_KIND_META 的 family)加一个「全部」。 */
+type FilterId = "all" | PushFamily;
 
 const FILTERS: ReadonlyArray<{ id: FilterId; label: string; tone: string }> = [
-	{ id: "all", label: "全部", tone: "#666" },
-	{ id: "live", label: "直播", tone: FAMILY_TONE.live },
-	{ id: "dynamic", label: "动态", tone: FAMILY_TONE.dynamic },
-	{ id: "sc", label: "SC", tone: FAMILY_TONE.sc },
-	{ id: "guard", label: "舰长", tone: FAMILY_TONE.guard },
+	{ id: "all", label: "全部", tone: "var(--color-bn-inactive)" },
+	{ id: "live", label: "直播", tone: PUSH_TONE.live },
+	{ id: "dynamic", label: "动态", tone: PUSH_TONE.dynamic },
+	{ id: "sc", label: "SC", tone: PUSH_TONE.sc },
+	{ id: "guard", label: "舰长", tone: PUSH_TONE.guard },
 ];
 
 export default function History() {
@@ -105,28 +97,37 @@ export default function History() {
 
 	const entries = historyQuery.data?.entries ?? [];
 
+	// 每行的检索串只跟这一行有关,先算好:搜的是整行的每一条文案(总结正文就藏在后面
+	// 几条里,可以有几 KB),挂在过滤那个 memo 里的话,每敲一个字都要把两百行重拼一遍。
+	const haystacks = useMemo(() => {
+		const m = new Map<string, string>();
+		for (const e of entries) {
+			const sub = subByUid.get(e.uid);
+			m.set(
+				e.id,
+				[
+					e.uid,
+					sub ? displayName(sub) : "",
+					e.targetId ? (targetById.get(e.targetId)?.name ?? "") : "",
+					...e.messages.map((x) => x.text ?? ""),
+				]
+					.join("\n")
+					.toLowerCase(),
+			);
+		}
+		return m;
+	}, [entries, subByUid, targetById]);
+
 	const filtered = useMemo(() => {
 		const ql = q.trim().toLowerCase();
 		return entries.filter((e) => {
-			if (filterId !== "all" && FAMILY[e.source] !== filterId) return false;
-			if (!ql) return true;
-			const sub = subByUid.get(e.uid);
-			const upName = sub ? displayName(sub).toLowerCase() : "";
-			const targets = e.targetIds
-				.map((id) => targetById.get(id)?.name ?? "")
-				.join(" ")
-				.toLowerCase();
-			return (
-				e.uid.includes(ql) ||
-				upName.includes(ql) ||
-				(e.text ?? "").toLowerCase().includes(ql) ||
-				targets.includes(ql)
-			);
+			if (filterId !== "all" && PUSH_KIND_META[e.kind].family !== filterId) return false;
+			return !ql || (haystacks.get(e.id)?.includes(ql) ?? false);
 		});
-	}, [entries, filterId, q, subByUid, targetById]);
+	}, [entries, filterId, q, haystacks]);
 
 	return (
-		<div className="bn-anim-fade-in space-y-3.5">
+		<div className="bn-anim-page-in space-y-3.5">
 			<div className="flex flex-wrap items-center gap-2.5">
 				<Input
 					value={q}
@@ -134,46 +135,26 @@ export default function History() {
 					placeholder="按 UP 主、内容、目标搜索..."
 					icon={<Icon.search size={14} />}
 				/>
-				<div className="flex gap-1">
-					{FILTERS.map((f) => {
-						const active = filterId === f.id;
-						return (
-							<button
-								key={f.id}
-								type="button"
-								onClick={() => setFilterId(f.id)}
-								className="rounded-full border px-3 py-1 text-[12px] font-semibold transition"
-								style={
-									active
-										? {
-												background: `${f.tone}1f`,
-												color: f.tone,
-												borderColor: `${f.tone}55`,
-											}
-										: {
-												background: "transparent",
-												color: "var(--color-bn-text-tertiary)",
-												borderColor: "var(--color-bn-border)",
-											}
-								}
-							>
-								{f.label}
-							</button>
-						);
-					})}
-				</div>
+				{/*
+				 * 段选而不是一排散胶囊(2026-08-24 主人真机指出「都看不清」):描边胶囊
+				 * 浮在页面背景上,而背景是皮肤说了算的 —— 花底一铺,组和选中态就都读不出来。
+				 * Picker 自带实底轨道,选中那段抬起来,不吃背景的亏。
+				 */}
+				<Picker<FilterId>
+					value={filterId}
+					onChange={setFilterId}
+					options={FILTERS.map((f) => ({ value: f.id, label: f.label, color: f.tone }))}
+				/>
 				<div className="flex-1" />
-				<span className="text-[11px] text-bn-text-tertiary">
+				<span className="text-bn-xs text-bn-text-tertiary">
 					共 {filtered.length} 条{retentionDays != null ? ` · 保留近 ${retentionDays} 天` : ""}
 				</span>
 			</div>
 
 			{historyQuery.isLoading ? (
-				<div className="text-sm text-bn-text-tertiary">加载中…</div>
+				<LoadingBlock label="正在读取推送历史" hint="女仆正在翻记录本,一条条对过去 (｡･ω･｡)ﾉ" />
 			) : historyQuery.error ? (
-				<div className="rounded border border-bn-danger-border bg-bn-danger-soft p-3 text-xs text-bn-danger-text">
-					加载失败：{String((historyQuery.error as Error).message)}
-				</div>
+				<ErrorNote>加载失败：{String((historyQuery.error as Error).message)}</ErrorNote>
 			) : (
 				<HistoryTable entries={filtered} subByUid={subByUid} targetById={targetById} />
 			)}
@@ -191,9 +172,9 @@ function HistoryTable({
 	targetById: Map<string, PushTarget>;
 }) {
 	return (
-		<div className="overflow-hidden rounded-[10px] border border-bn-border-subtle bg-bn-surface">
+		<div className="bn-glass overflow-hidden rounded-bn-sm shadow-bn-card">
 			<div
-				className="grid items-center gap-2.5 border-b border-bn-border-subtle bg-bn-surface-muted px-4 py-2.5 text-[11px] font-bold tracking-wide text-bn-text-tertiary"
+				className="grid items-center gap-2.5 border-b border-bn-border-subtle bg-bn-surface-muted/70 px-4 py-2.5 text-bn-xs font-bold tracking-wide text-bn-text-tertiary"
 				style={{ gridTemplateColumns: HISTORY_GRID }}
 			>
 				<span>时间</span>
@@ -205,7 +186,7 @@ function HistoryTable({
 			</div>
 
 			{entries.length === 0 ? (
-				<div className="px-4 py-10 text-center text-[12.5px] text-bn-text-tertiary">
+				<div className="px-4 py-10 text-center text-bn-sm text-bn-text-tertiary">
 					没有符合条件的推送记录
 				</div>
 			) : (
@@ -214,7 +195,7 @@ function HistoryTable({
 						key={e.id}
 						entry={e}
 						sub={subByUid.get(e.uid)}
-						targets={e.targetIds.map((id) => targetById.get(id)).filter(Boolean) as PushTarget[]}
+						target={e.targetId ? targetById.get(e.targetId) : undefined}
 						isLast={i === entries.length - 1}
 					/>
 				))
@@ -225,67 +206,270 @@ function HistoryTable({
 
 const HISTORY_GRID = "100px 28px 64px 1fr 200px 100px";
 
+/** 目标列:无目标行写「—」;目标事后被删写「已删除目标」。 */
+function targetLabelOf(entry: HistoryEntryView, target: PushTarget | undefined): string {
+	if (entry.targetId === null) return "—";
+	return target?.name ?? "已删除目标";
+}
+
 function HistoryRow({
 	entry,
 	sub,
-	targets,
+	target,
 	isLast,
 }: {
 	entry: HistoryEntryView;
 	sub: Subscription | undefined;
-	targets: PushTarget[];
+	target: PushTarget | undefined;
 	isLast: boolean;
 }) {
-	const family = FAMILY[entry.source];
-	const tone = FAMILY_TONE[family];
+	const [open, setOpen] = useState(false);
+	const [repushOpen, setRepushOpen] = useState(false);
+	const tone = familyTone(entry.kind);
+	const status = PUSH_STATUS_META[entry.status];
 	// 优先 entry 写入期的 snapshot,订阅事后被删也能稳定显示。
 	const upName = entry.unameSnapshot ?? (sub ? displayName(sub) : entry.uid || "未知");
 	const upAvatar = entry.uavatarSnapshot ?? sub?.cachedProfile?.avatar;
 	const upColor = colorFromUid(entry.uid || entry.id);
-	const targetLabel =
-		targets.length === 0
-			? entry.targetIds.length === 0
-				? "—"
-				: `${entry.targetIds.length} 个已删除目标`
-			: targets.map((t) => t.name).join(", ");
+	const headline = headlineOf(entry);
+	const count = messageCountOf(entry);
+	const expandable = hasDetails(entry);
+	const targetLabel = targetLabelOf(entry, target);
+	// 按钮长在 failed 与 partial 上(ADR-0017 决策 6)。**判据是行的状态,不是 `repush`
+	// 字段在不在** —— WS 推来的新行不带那个字段,可它恰恰是最该能补的那一种。
+	const canOfferRepush = entry.status === "failed" || entry.status === "partial";
+	// 不能补时按钮灰掉**并写上原因**,不是藏起来(决策 9)。字段缺省按「能补」处理。
+	const repushBlocked = entry.repush && !entry.repush.can ? entry.repush.reason : null;
+	const repushCounts = entry.repush?.can ? entry.repush : null;
 
 	return (
-		<div
-			className={`grid items-center gap-2.5 px-4 py-3 text-[12.5px] ${
-				isLast ? "" : "border-b border-black/4"
-			}`}
-			style={{ gridTemplateColumns: HISTORY_GRID }}
-		>
-			<span className="font-mono text-[11.5px] text-bn-text-tertiary">
-				{relativeTime(entry.ts)}
-			</span>
-			<Avatar name={upName} color={upColor} size={24} url={upAvatar} />
-			<Pill color={tone} subtle size="sm">
-				{SOURCE_LABEL[entry.source]}
-			</Pill>
-			<div className="min-w-0 truncate" title={entry.text}>
-				<span className="font-bold text-bn-text-primary">{upName}</span>
-				{entry.text ? (
-					<span className="ml-1.5 text-bn-text-secondary">{entry.text}</span>
-				) : (
-					<span className="ml-1.5 text-bn-text-tertiary">（无内容）</span>
-				)}
-			</div>
-			<span
-				className="truncate text-[11.5px] text-bn-text-secondary"
-				title={targets.map((t) => t.name).join(", ")}
+		<div className={isLast ? "" : "border-b border-bn-border-subtle"}>
+			<div
+				className="grid items-center gap-2.5 px-4 py-3 text-bn-sm"
+				style={{ gridTemplateColumns: HISTORY_GRID }}
 			>
-				→ {targetLabel}
-			</span>
-			{entry.ok ? (
-				<Pill color="#22c55e" subtle size="sm">
-					已送达
+				<span className="tabular-nums text-bn-xs text-bn-text-tertiary">
+					{relativeTime(entry.ts)}
+				</span>
+				<Avatar name={upName} color={upColor} size={24} url={upAvatar} />
+				<Pill color={tone} subtle size="sm">
+					{PUSH_KIND_META[entry.kind].label}
 				</Pill>
-			) : (
-				<Pill color="#ef4444" subtle size="sm">
-					失败
-				</Pill>
-			)}
+				<div className="flex min-w-0 items-center gap-2">
+					<div className="min-w-0 flex-1 truncate" title={headline}>
+						<span className="font-bold text-bn-text-primary">{upName}</span>
+						{headline ? (
+							<span className="ml-1.5 text-bn-text-secondary">{headline}</span>
+						) : (
+							<span className="ml-1.5 text-bn-text-tertiary">（无内容）</span>
+						)}
+					</div>
+					{expandable ? (
+						// 多条时写条数,单条(带图 / 带错)写「详情」。
+						<DisclosurePill
+							open={open}
+							onToggle={() => setOpen((v) => !v)}
+							color={tone}
+							title={open ? "收起" : "展开逐条查看"}
+							className="shrink-0 text-bn-2xs leading-4"
+						>
+							<span>{count > 1 ? `${count} 条` : "详情"}</span>
+							<span aria-hidden="true">{open ? " ▴" : " ▾"}</span>
+						</DisclosurePill>
+					) : null}
+				</div>
+				<span className="truncate text-bn-xs text-bn-text-secondary" title={targetLabel}>
+					→ {targetLabel}
+				</span>
+				<div className="flex min-w-0 items-center gap-1">
+					<Pill color={status.tone} subtle size="sm">
+						{status.label}
+					</Pill>
+					{canOfferRepush ? (
+						<IconButton
+							size="sm"
+							icon={<Icon.refresh size={12} />}
+							label="补一次"
+							title={repushBlocked ?? "没送到的，让女仆再补一次"}
+							disabled={repushBlocked !== null}
+							ariaExpanded={repushOpen}
+							onClick={() => setRepushOpen((v) => !v)}
+						/>
+					) : null}
+				</div>
+			</div>
+			{repushOpen && canOfferRepush && repushBlocked === null ? (
+				<RepushBar entry={entry} counts={repushCounts} onClose={() => setRepushOpen(false)} />
+			) : null}
+			{open ? <MessageList entry={entry} /> : null}
 		</div>
+	);
+}
+
+/**
+ * **第二下**(ADR-0017 决策 8)。点了那颗钮之后在行下面展开的一条 —— 不是模态框:
+ * 一屏十几行,每行一个弹窗太重;但也不能点一下就发,误触的代价是群里多一条撤不回
+ * 的消息。
+ *
+ * `failed` 行只给一个选项:那一行本来就全没到,「整行重发」与「只补没到的」在这儿是
+ * 同一件事。条数是服务端按身份号算好交下来的,面板不自己算(自己算就是第二份实现)。
+ */
+function RepushBar({
+	entry,
+	counts,
+	onClose,
+}: {
+	entry: HistoryEntryView;
+	counts: { total: number; missing: number } | null;
+	onClose: () => void;
+}) {
+	const repush = useMutation<{ count: number }, Error, "all" | "missing">({
+		mutationFn: async (mode) => {
+			const res = await api.post<HistoryRepushResponse>(`/api/history/${entry.id}/repush`, {
+				ts: entry.ts,
+				mode,
+			});
+			// 非 2xx 由 `api` 抛,走到这儿的只可能是 202 —— 判别联合让这件事在类型上也
+			// 成立,成功那支不必再判一次「count 会不会是 undefined」。
+			if (!res.ok) throw new Error(res.err);
+			return { count: res.count };
+		},
+	});
+	const n = (v: number | undefined) => (v === undefined ? "" : `（${v} 条）`);
+	// 服务端回的是「收下了」,消息一条都还没发出去 —— 所以说「去补」不说「补好了」。
+	// 真正的结果随后经 WS 一条条回来,这一行会自己变。
+	if (repush.isSuccess) {
+		return (
+			<div className="flex items-center gap-2 border-t border-bn-border-subtle bg-bn-surface-muted/50 px-4 py-2 pl-38 text-bn-xs text-bn-text-secondary">
+				<span>女仆去补（{repush.data.count} 条）啦，好了这一行会自己更新～ (｡･ω･｡)ﾉ</span>
+				<Btn size="sm" variant="ghost" onClick={onClose}>
+					知道啦
+				</Btn>
+			</div>
+		);
+	}
+
+	const busy = repush.isPending;
+	return (
+		<div className="border-t border-bn-border-subtle bg-bn-surface-muted/50 px-4 py-2 pl-38">
+			<div className="flex flex-wrap items-center gap-2 text-bn-xs text-bn-text-secondary">
+				<span>{busy ? "女仆这就去～" : "要女仆补哪些呀？"}</span>
+				{entry.status === "failed" ? (
+					// 决策 8 只给这一行一颗钮,理由是「本来就全没到,两个选项是同一件事」——
+					// 可 `failed` 判的是**本体那一号**没 ok,不是全没到:@全体先落地且成功、
+					// 本体失败的行就是 failed,此时 total=2 而 missing=1。这颗钮发的是
+					// `missing`(把已经到了的 @全体再发一遍,群里就多 @ 一次全体,撤不回),
+					// 所以印的数也得是 missing —— 印 total 是当面说错话。
+					<Btn size="sm" variant="primary" disabled={busy} onClick={() => repush.mutate("missing")}>
+						重新推送{n(counts?.missing)}
+					</Btn>
+				) : (
+					<>
+						<Btn
+							size="sm"
+							variant="primary"
+							disabled={busy}
+							onClick={() => repush.mutate("missing")}
+						>
+							只补没到的{n(counts?.missing)}
+						</Btn>
+						<Btn size="sm" variant="outline" disabled={busy} onClick={() => repush.mutate("all")}>
+							整行重发{n(counts?.total)}
+						</Btn>
+					</>
+				)}
+				<Btn size="sm" variant="ghost" disabled={busy} onClick={onClose}>
+					先不用了
+				</Btn>
+			</div>
+			{repush.isError ? (
+				<ErrorNote size="sm" className="mt-1.5">
+					{repush.error.message}
+				</ErrorNote>
+			) : null}
+		</div>
+	);
+}
+
+/**
+ * 展开后的逐条明细:序号 / 本体还是附加项 / 文案 / 图缩略 / 这条的结果。
+ *
+ * **号不是数组下标,是 `retryOf ?? 下标`**(ADR-0017 决策 15 与「后果」那一节)。重推
+ * 是追加进原行的(决策 14),3 条的行补过之后展开是 6 条 —— 按位置印 1..6 的话,后三条
+ * 看上去就是三条凭空多出来的新消息,既看不出是谁的重投,也看不出前三条已经作废。
+ * 印它补的**那一号**、再标一句「女仆补的」,那份可追溯才落到界面上;`retryOf` 就是
+ * 这个标记的来源,不另开第二个字段。
+ *
+ * ⚠️ 「每一号只认它**最后那次**尝试」的判定**只在服务端有一份**(决策 16),面板不重做
+ * 一遍。「这条被顶掉了」用的是本地就看得见的那件事:**后面还有一条补这一号的**。
+ */
+function MessageList({ entry }: { entry: HistoryEntryView }) {
+	return (
+		<ol className="space-y-1.5 border-t border-bn-border-subtle bg-bn-surface-muted/50 px-4 py-2.5 pl-38">
+			{entry.messages.map((m, i) => {
+				const no = m.retryOf ?? i;
+				return (
+					<MessageItem
+						// biome-ignore lint/suspicious/noArrayIndexKey: 行内消息按序追加、从不重排删除,位置就是它在这一行里的身份
+						key={`${entry.id}-${i}`}
+						no={no}
+						message={m}
+						superseded={entry.messages.some((o, j) => j > i && o.retryOf === no)}
+					/>
+				);
+			})}
+		</ol>
+	);
+}
+
+/**
+ * `no` = 这条顶的是哪一号(从 0 数,印出来 +1);`superseded` = 后面还有一条补这一号的,
+ * 也就是这条已经作废了 —— 压暗它,让「这条没成、下面那条是它的重投」一眼看得出来。
+ */
+function MessageItem({
+	no,
+	message,
+	superseded,
+}: {
+	no: number;
+	message: HistoryMessageView;
+	superseded: boolean;
+}) {
+	// 没有结果 = 没发出去(无目标那行的每一条都是这样);有结果就跟整行状态同一份词表。
+	const result =
+		message.ok === undefined
+			? { label: "未发送", tone: "var(--color-bn-inactive)" }
+			: PUSH_STATUS_META[message.ok ? "delivered" : "failed"];
+	return (
+		<li className={`flex items-start gap-2.5 text-bn-xs${superseded ? " opacity-60" : ""}`}>
+			<span className="w-4 shrink-0 tabular-nums text-bn-text-tertiary">{no + 1}</span>
+			<span className="w-10 shrink-0 text-bn-text-tertiary">
+				{message.role === "main" ? "本体" : "附加"}
+			</span>
+			{message.imageRef ? (
+				<img
+					src={`/api/history/img/${message.imageRef}`}
+					alt={message.text ?? "图片"}
+					className="h-12 w-12 shrink-0 rounded-md object-cover"
+					loading="lazy"
+				/>
+			) : null}
+			<span className="min-w-0 flex-1 break-words text-bn-text-secondary">
+				{message.text ?? <span className="text-bn-text-tertiary">（无内容）</span>}
+				{message.err ? <span className="ml-1.5 text-bn-danger">{message.err}</span> : null}
+				{superseded ? (
+					<span className="ml-1.5 text-bn-text-tertiary">女仆后来又补了一次～</span>
+				) : null}
+			</span>
+			{message.retryOf !== undefined ? (
+				// 这一条是女仆补的那次,不是当时发出去的那次。
+				<Pill subtle size="sm">
+					女仆补的
+				</Pill>
+			) : null}
+			<Pill color={result.tone} subtle size="sm">
+				{result.label}
+			</Pill>
+		</li>
 	);
 }

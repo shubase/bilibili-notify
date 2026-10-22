@@ -2,7 +2,7 @@
  * 单元测试 — 直播推送(开播 / 直播中 / 下播)的消息版式(messageLayout)路径。
  *
  * 版式覆盖 `LiveType.StartBroadcasting` / `LiveBroadcast` / `StopBroadcast` 三类:
- * 卡片 / 文本(各自模板,{link} 剥离) / 链接(房间链接)三部件按块序装配,分条符切
+ * 卡片 / 文本(各自模板) / 链接(房间链接)三部件按块序装配,分条符切
  * 多条经 `broadcastSequenceToTargets`。SC / 上舰不经 `sendLiveNotifyCard`,不受影响。
  *
  * 策略:`RoomContext.prototype.sendLiveNotifyCard.call(fakeCtx, params)` 白盒直调
@@ -23,14 +23,16 @@ const silentLogger: Logger = { debug() {}, info() {}, warn() {}, error() {} };
 type Seg = { kind: string; text?: string };
 type Msg = { kind: "message"; segs: Seg[] };
 
-function makeCtx(opts?: { renderFail?: boolean; noSequence?: boolean }) {
+function makeCtx(opts?: { renderFail?: boolean }) {
 	const broadcastToTargets = vi.fn(async (..._args: unknown[]) => {});
 	const broadcastSequenceToTargets = vi.fn(async (..._args: unknown[]) => {});
+	// 参数签名照抄 `ImageRenderer#generateLiveCard`,不写成零参 —— 零参的 mock 让
+	// `mock.calls[0][5]` 在类型上成了「长度 0 的元组」,断言第 6 个参数根本编译不过。
 	const generateLiveCard = opts?.renderFail
-		? vi.fn(async () => {
+		? vi.fn(async (..._args: unknown[]): Promise<Buffer> => {
 				throw new Error("boom");
 			})
-		: vi.fn(async () => Buffer.from("img"));
+		: vi.fn(async (..._args: unknown[]) => Buffer.from("img"));
 	const ctx = {
 		logger: silentLogger,
 		isDisposed: () => false,
@@ -40,9 +42,7 @@ function makeCtx(opts?: { renderFail?: boolean; noSequence?: boolean }) {
 			image: (): Seg => ({ kind: "image" }),
 			message: (segs: Seg[]): Msg => ({ kind: "message", segs }),
 		},
-		push: opts?.noSequence
-			? { broadcastToTargets }
-			: { broadcastToTargets, broadcastSequenceToTargets },
+		push: { broadcastToTargets, broadcastSequenceToTargets },
 	} as unknown as RoomContext;
 	// 白盒:挂上真实原型,让 sendLiveNotifyCard 内部调用的私有 helper 可达。
 	Object.setPrototypeOf(ctx, RoomContext.prototype);
@@ -77,6 +77,8 @@ function baseParams(over?: Record<string, unknown>) {
 		uid: "u1",
 		notifyMsg: "开播文案",
 		roomLink: LINK,
+		// 宿主恒填版式;单个用例按需覆盖。
+		messageLayout: layoutOf([{ type: "card" }, { type: "text" }, { type: "link" }]),
 		...over,
 	};
 }
@@ -85,17 +87,6 @@ const send = (ctx: RoomContext, params: ReturnType<typeof baseParams>) =>
 	RoomContext.prototype.sendLiveNotifyCard.call(ctx, params as never);
 
 describe("RoomContext.sendLiveNotifyCard — 消息版式", () => {
-	it("无 messageLayout(旧路径)→ 一条 message([image, text]),不受影响", async () => {
-		const { ctx, broadcastToTargets } = makeCtx();
-		await send(ctx, baseParams());
-		expect(broadcastToTargets).toHaveBeenCalledTimes(1);
-		const [uid, content, type] = broadcastToTargets.mock.calls[0] as [string, Msg, number];
-		expect(uid).toBe("u1");
-		expect(type).toBe(LivePushType.StartBroadcasting);
-		expect(content.segs.map((s) => s.kind)).toEqual(["image", "text"]);
-		expect(content.segs[1]?.text).toBe("开播文案");
-	});
-
 	it("版式 [card,text,link] 一条:链接独立部件,同条内以分隔符连接", async () => {
 		const { ctx, broadcastToTargets } = makeCtx();
 		await send(
@@ -108,6 +99,15 @@ describe("RoomContext.sendLiveNotifyCard — 消息版式", () => {
 		const content = broadcastToTargets.mock.calls[0]?.[1] as Msg;
 		expect(content.segs.map((s) => s.kind)).toEqual(["image", "text"]);
 		expect(content.segs[1]?.text).toBe(`开播文案\n${LINK}`);
+	});
+
+	// 皮肤 id 要一路走到 generateLiveCard 的 colorOptions:断在这一跳的话,主人给这位
+	// UP 选的皮肤只有预览认,推出去还是默认那副样子,而且全绿。
+	it("皮肤 id 透传给 generateLiveCard(样式没启用也照带)", async () => {
+		const { ctx, generateLiveCard } = makeCtx();
+		await send(ctx, baseParams({ cardSkin: "k4ddd-0ddba11" }));
+		// 验红:把 room-helpers.ts 里那句 `cardSkin` 删掉,这条红。
+		expect(generateLiveCard.mock.calls[0]?.[5]).toEqual({ cardSkin: "k4ddd-0ddba11" });
 	});
 
 	it("分条符切两条 → broadcastSequenceToTargets,一次收齐、顺序正确", async () => {
@@ -183,34 +183,6 @@ describe("RoomContext.sendLiveNotifyCard — 消息版式", () => {
 		expect(broadcastToTargets).not.toHaveBeenCalled();
 		expect(broadcastSequenceToTargets).not.toHaveBeenCalled();
 	});
-
-	it("adapter 不支持 sequence(防御兜底)→ 合并回一条", async () => {
-		const { ctx, broadcastToTargets } = makeCtx({ noSequence: true });
-		await send(
-			ctx,
-			baseParams({
-				messageLayout: layoutOf([
-					{ type: "card" },
-					{ type: "split", id: "split-1" },
-					{ type: "text" },
-				]),
-			}),
-		);
-		expect(broadcastToTargets).toHaveBeenCalledTimes(1);
-		const content = broadcastToTargets.mock.calls[0]?.[1] as Msg;
-		expect(content.segs.map((s) => s.kind)).toEqual(["image", "text"]);
-	});
-
-	it("无 messageLayout 的直播中 / 下播推送 → 走旧路径,不受影响", async () => {
-		for (const liveType of [LiveType.LiveBroadcast, LiveType.StopBroadcast]) {
-			const { ctx, broadcastToTargets } = makeCtx();
-			await send(ctx, baseParams({ liveType }));
-			const content = broadcastToTargets.mock.calls[0]?.[1] as Msg;
-			expect(content.segs.map((s) => s.kind)).toEqual(["image", "text"]);
-			expect(content.segs[1]?.text).toBe("开播文案");
-		}
-	});
-
 	it("直播中推送(LiveBroadcast)传版式 → 同开播一样按块序装配,链接独立部件", async () => {
 		const { ctx, broadcastToTargets } = makeCtx();
 		await send(
@@ -248,116 +220,57 @@ describe("RoomContext.sendLiveNotifyCard — 消息版式", () => {
 	});
 });
 
-describe("LiveTemplateRenderer.renderLiveStart — omitLink", () => {
+describe("LiveTemplateRenderer.renderLiveStart — 模板不带链接", () => {
 	const master = { username: "主播", userface: "", roomId: "123" } as never;
 	const sub = { customLiveMsg: { enable: false } } as SubItemView;
 
-	it("omitLink → {link} 连同前导空白剥离,不留孤行", () => {
+	it("默认模板不带链接,链接由版式部件提供", () => {
 		const r = new LiveTemplateRenderer();
 		const out = r.renderLiveStart({
 			sub,
 			master,
 			diffTime: "",
 			followerNum: "100",
-			roomLink: LINK,
-			omitLink: true,
 		});
 		expect(out).toBe("主播 开播啦，当前粉丝数：100");
 	});
 
-	it("默认模板已不含 {link}:不传 omitLink 也不再出现链接(链接由版式部件提供)", () => {
-		const r = new LiveTemplateRenderer();
-		const out = r.renderLiveStart({
-			sub,
-			master,
-			diffTime: "",
-			followerNum: "100",
-			roomLink: LINK,
-		});
-		expect(out).toBe("主播 开播啦，当前粉丝数：100");
-	});
-
-	it("旧存档自定义模板写 {link} 且不 omitLink(旧路径)→ 链接仍内嵌渲染", () => {
+	it("模板里的字面 \\n 展开为换行", () => {
 		const r = new LiveTemplateRenderer();
 		const out = r.renderLiveStart({
 			sub: {
-				customLiveMsg: { enable: true, customLiveStart: "{name}开播:{link}" },
+				customLiveMsg: { enable: true, customLiveStart: "{name}开播\\n粉丝 {follower}" },
 			} as SubItemView,
 			master,
 			diffTime: "",
 			followerNum: "100",
-			roomLink: LINK,
 		});
-		expect(out).toBe(`主播开播:${LINK}`);
-	});
-
-	it("omitLink 兼容用户模板里的字面 \\n 与 legacy -link 写法", () => {
-		const r = new LiveTemplateRenderer();
-		const out = r.renderLiveStart({
-			sub: {
-				customLiveMsg: { enable: true, customLiveStart: "{name}开播\\n-link" },
-			} as SubItemView,
-			master,
-			diffTime: "",
-			followerNum: "100",
-			roomLink: LINK,
-			omitLink: true,
-		});
-		expect(out).toBe("主播开播");
+		expect(out).toBe("主播开播\n粉丝 100");
 	});
 });
 
-describe("LiveTemplateRenderer.renderLiveOngoing / renderLiveEnd — omitLink", () => {
+describe("LiveTemplateRenderer.renderLiveOngoing / renderLiveEnd — 模板不带链接", () => {
 	const master = { username: "主播", userface: "", roomId: "123" } as never;
 	const sub = { customLiveMsg: { enable: false } } as SubItemView;
 
-	it("renderLiveOngoing omitLink → {link} 剥离,不留孤行", () => {
+	it("renderLiveOngoing:默认模板不带链接", () => {
 		const r = new LiveTemplateRenderer();
 		const out = r.renderLiveOngoing({
 			sub,
 			master,
 			diffTime: "1小时",
 			watched: "100",
-			roomLink: LINK,
-			omitLink: true,
 		});
 		expect(out).toBe("主播 正在直播，已播 1小时，累计观看：100");
 	});
-
-	it("renderLiveOngoing 旧存档自定义模板写 {link} 且不 omitLink(旧路径)→ 链接仍内嵌渲染", () => {
-		const r = new LiveTemplateRenderer();
-		const out = r.renderLiveOngoing({
-			sub: { customLiveMsg: { enable: true, customLive: "{name}直播中:{link}" } } as SubItemView,
-			master,
-			diffTime: "1小时",
-			watched: "100",
-			roomLink: LINK,
-		});
-		expect(out).toBe(`主播直播中:${LINK}`);
-	});
-
-	it("renderLiveEnd omitLink → {link} 剥离,不留孤行", () => {
+	it("renderLiveEnd:默认模板不带链接", () => {
 		const r = new LiveTemplateRenderer();
 		const out = r.renderLiveEnd({
 			sub,
 			master,
 			diffTime: "1小时",
 			followerChange: 5,
-			roomLink: LINK,
-			omitLink: true,
 		});
 		expect(out).toBe("主播 下播啦，本次直播了 1小时，粉丝变化 +5");
-	});
-
-	it("renderLiveEnd 自定义模板写 {link} 且不 omitLink(旧路径)→ 链接仍内嵌渲染", () => {
-		const r = new LiveTemplateRenderer();
-		const out = r.renderLiveEnd({
-			sub: { customLiveMsg: { enable: true, customLiveEnd: "{name}下播:{link}" } } as SubItemView,
-			master,
-			diffTime: "1小时",
-			followerChange: 5,
-			roomLink: LINK,
-		});
-		expect(out).toBe(`主播下播:${LINK}`);
 	});
 });

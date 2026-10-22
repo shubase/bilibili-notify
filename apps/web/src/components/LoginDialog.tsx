@@ -1,13 +1,15 @@
+import { Btn, Input, MODAL_HOOK } from "@bilibili-notify/ui";
 import { useEffect, useRef, useState } from "react";
 import { submitLogin } from "../services/session";
 import { useSessionStore } from "../store/session";
-import { Btn, Input } from "./atoms";
 
 /**
  * Dashboard login card (Q5). Replaces the browser-native HTTP Basic popup.
  *
  * - Cold start (`variant="cold"`): centered card on the app gradient backdrop;
- *   the authed app is not mounted yet (so WS never connects pre-login).
+ *   the authed app is not mounted yet (so WS never connects pre-login). The
+ *   pink tint must stay translucent — an opaque layer (e.g. `via-white`)
+ *   ignores dark mode and washes the whole viewport bright.
  * - Mid-session expiry (`variant="overlay"`): same card floating on a blurred
  *   backdrop over the still-mounted (frozen) app — resume in place after
  *   re-login, with an explicit "session expired" hint.
@@ -72,10 +74,10 @@ export function LoginDialog({ variant }: { variant: "cold" | "overlay" }) {
 
 	return (
 		<div
-			className={`fixed inset-0 z-50 flex items-center justify-center p-6 ${
+			className={`fixed inset-0 z-bn-overlay flex items-center justify-center p-6 ${
 				expired
-					? "bg-black/30 backdrop-blur-sm"
-					: "bg-gradient-to-br from-bn-pink/10 via-white to-bn-pink/5"
+					? "bg-bn-overlay backdrop-blur-sm"
+					: "bg-gradient-to-br from-bn-pink/10 via-transparent to-bn-pink/5"
 			}`}
 		>
 			<form
@@ -83,15 +85,22 @@ export function LoginDialog({ variant }: { variant: "cold" | "overlay" }) {
 					e.preventDefault();
 					void doSubmit();
 				}}
-				className="bn-glass-strong w-full max-w-sm rounded-2xl px-7 py-8 shadow-xl"
+				// 这张卡是弹窗卡片本体,所以 `modal` 挂点跟 ModalShell 那 9 个弹窗一样要挂。
+				// 只有 `.bn-glass-strong` 的话,皮肤给弹窗定的圆角 / 描边 / 阴影会落到那 9 个
+				// 身上、独独绕过登录卡 —— 而这是主人见到的第一屏。
+				//
+				// 登录页也吃皮肤(SkinRoot 在 main.tsx,包着 AuthGate),但不必为此留一块不挂当
+				// 逃生舱:真的逃生口是 `?skin=off`(services/skin.ts 的 skinKillSwitchActive)。
+				data-bn={MODAL_HOOK}
+				className="bn-glass-strong w-full max-w-sm rounded-bn-card px-7 py-8 shadow-bn-elev"
 			>
 				<div className="mb-1 flex items-center gap-2">
 					<img alt="Bilibili Notify" src="/logo.png" className="h-9 w-auto object-contain" />
-					<div className="text-[17px] font-bold tracking-tight text-bn-text-primary">
+					<div className="text-bn-lg font-bold tracking-tight text-bn-text-primary">
 						女仆值班室登录
 					</div>
 				</div>
-				<div className="mb-6 text-[12px] text-bn-text-secondary">
+				<div className="mb-6 text-bn-sm text-bn-text-secondary">
 					{expired ? "会话已过期,请重新登录以继续。" : "请输入管理凭证进入控制台。"}
 				</div>
 
@@ -101,7 +110,7 @@ export function LoginDialog({ variant }: { variant: "cold" | "overlay" }) {
 				</div>
 
 				{error ? (
-					<div className="mt-3 rounded-md bg-bn-danger-soft px-3 py-2 text-[12px] font-medium text-bn-danger-text">
+					<div className="mt-3 rounded-md bg-bn-danger-soft px-3 py-2 text-bn-sm font-medium text-bn-danger-text">
 						{lockSec > 0 ? `登录尝试过多,请 ${lockSec} 秒后再试` : error}
 					</div>
 				) : null}

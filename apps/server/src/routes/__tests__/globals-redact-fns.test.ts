@@ -25,9 +25,12 @@ function withAllBuckets() {
 		AI_PROVIDER_IDS.map((id) => [
 			id,
 			{
+				provider: id,
+				label: "",
 				apiKey: `sk-main-${id}`,
 				baseUrl: "https://x/v1",
 				model: "m",
+				apiFlavor: "chat" as const,
 				temperature: 0.7,
 				enableThinking: false,
 				thinkingLevel: "medium" as const,
@@ -60,9 +63,12 @@ describe("redactGlobals — 每个桶的两把 key 都要打码", () => {
 		const g = makeDefaultGlobalConfig();
 		g.defaults.ai.providers = {
 			deepseek: {
+				provider: "deepseek",
+				label: "",
 				apiKey: "",
 				baseUrl: "",
 				model: "",
+				apiFlavor: "chat" as const,
 				temperature: 0.7,
 				enableThinking: false,
 				thinkingLevel: "medium",
@@ -80,9 +86,12 @@ describe("redactGlobals — 每个桶的两把 key 都要打码", () => {
 		const g = makeDefaultGlobalConfig();
 		g.defaults.ai.providers = {
 			deepseek: {
+				provider: "deepseek",
+				label: "",
 				apiKey: "",
 				baseUrl: "",
 				model: "",
+				apiFlavor: "chat" as const,
 				temperature: 0.7,
 				enableThinking: false,
 				thinkingLevel: "medium",
@@ -99,9 +108,12 @@ describe("redactGlobals — 每个桶的两把 key 都要打码", () => {
 		const g = makeDefaultGlobalConfig();
 		g.defaults.ai.providers = {
 			deepseek: {
+				provider: "deepseek",
+				label: "",
 				apiKey: "sk-x",
 				baseUrl: "",
 				model: "",
+				apiFlavor: "chat" as const,
 				temperature: 0.7,
 				enableThinking: false,
 				thinkingLevel: "medium",
@@ -192,5 +204,32 @@ describe("stripRedactedSecrets — 占位回传即保留原值", () => {
 	it("patch 里完全没碰 ai 时原样返回", () => {
 		const patch = { defaults: { cardStyle: { enabled: false } } };
 		expect(stripRedactedSecrets(patch)).toBe(patch);
+	});
+});
+
+describe("联网搜索 key 的 redact 与占位回传", () => {
+	it("redactGlobals:非空的搜索 key 换占位,空的保持空(前端要靠它区分配没配)", () => {
+		const g = makeDefaultGlobalConfig();
+		g.defaults.ai.search.keys = { bocha: "sk-bocha", tavily: "" };
+		const out = redactGlobals(g);
+		expect(out.defaults.ai.search.keys.bocha).toBe(REDACTED_API_KEY);
+		expect(out.defaults.ai.search.keys.tavily).toBe("");
+	});
+
+	it("stripRedactedSecrets:回传的占位被剥掉,不覆盖真 key", () => {
+		const patch = {
+			defaults: {
+				ai: {
+					search: { backend: "tavily", keys: { bocha: REDACTED_API_KEY, tavily: "tvly-new" } },
+				},
+			},
+		};
+		const out = stripRedactedSecrets(patch) as {
+			defaults: { ai: { search: { backend: string; keys: Record<string, string> } } };
+		};
+		// 占位剥掉、真实新值保留、别的字段不动。
+		expect("bocha" in out.defaults.ai.search.keys).toBe(false);
+		expect(out.defaults.ai.search.keys.tavily).toBe("tvly-new");
+		expect(out.defaults.ai.search.backend).toBe("tavily");
 	});
 });

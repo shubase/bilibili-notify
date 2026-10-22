@@ -2,17 +2,13 @@ pre-commit:
   commands:
     lint:
       glob: "*.{ts,tsx,js,jsx,mjs,css}"
-      run: vpx biome check --staged --write --no-errors-on-unmatched {staged_files}
+      run: biome check --staged --write --no-errors-on-unmatched {staged_files}
       stage_fixed: true
-    # Python(astrbot/core)的 ruff 门禁。root 限定执行目录并把 {staged_files} 相对化,
-    # 只对暂存的 .py 跑 ruff(读 astrbot/core/pyproject.toml 配置),自动修后 re-stage。
-    python:
-      root: "astrbot/core/"
-      glob: "*.py"
-      run: uv run --no-project --with ruff ruff check --fix {staged_files} && uv run --no-project --with ruff ruff format {staged_files}
-      stage_fixed: true
+    # 本机绝对路径(/Users/<名>/ 等)不许进仓库;刻意为之的行写 local-path-ok 放行。
+    local-paths:
+      run: node scripts/check-local-paths.mjs {staged_files}
 
 commit-msg:
   commands:
     commitlint:
-      run: vpx commitlint --edit {1}
+      run: commitlint --edit {1}

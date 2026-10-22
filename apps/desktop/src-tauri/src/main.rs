@@ -670,8 +670,6 @@ fn restart_service_blocking(app: &AppHandle) -> Result<(), String> {
         .arg(port.to_string())
         .arg("--data-dir")
         .arg(&sidecar_data_dir)
-        .arg("--web-dist")
-        .arg(&resources.web_dist)
         .current_dir(&resources.server_dir)
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
@@ -680,13 +678,7 @@ fn restart_service_blocking(app: &AppHandle) -> Result<(), String> {
             .arg("--chrome-path")
             .arg(child_process_path(&chrome_path));
     }
-    sanitize_bn_env(&mut command);
-    command
-        .env("BN_CONFIG_DISABLED", "1")
-        .env("BN_ALLOW_NO_AUTH", "1")
-        .env("BN_DESKTOP_TOKEN", &desktop_token)
-        .env("BN_DESKTOP_ALLOWED_ORIGIN", &url)
-        .env("NODE_ENV", "production");
+    apply_sidecar_env(&mut command, &desktop_token, &url, std::process::id());
     configure_sidecar_command(&mut command);
 
     let pid = {
@@ -773,6 +765,30 @@ fn strip_windows_verbatim_path(path: &Path) -> PathBuf {
     path.to_path_buf()
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum SidecarExit {
+    /// 外壳自己在退出,子进程跟着走,不用管。
+    Quitting,
+    /// 服务端**自己要求**重启:应用更新 / 回退时它优雅停机并退 0,等着被拉起来。
+    Restart,
+    /// 其余一律是崩溃。
+    Crashed,
+}
+
+/// 容器里有 `restart:` 策略把退出的服务端拉起来;桌面版没有进程管理器,外壳就得当那个
+/// 策略 —— 否则用户在面板里按「立即重启并应用」,看到的是一张「后端服务已退出」的崩溃页。
+/// 退出码 0 是服务端约定的「我是故意退的」(见 apps/server/src/index.ts 的 applyUpdate),
+/// 被信号杀掉(Unix 上 code 是 None)或非 0 才是崩溃。
+fn sidecar_exit_disposition(quitting: bool, exit_code: Option<i32>) -> SidecarExit {
+    if quitting {
+        return SidecarExit::Quitting;
+    }
+    match exit_code {
+        Some(0) => SidecarExit::Restart,
+        _ => SidecarExit::Crashed,
+    }
+}
+
 fn spawn_child_monitor(app: AppHandle, pid: u32) {
     thread::spawn(move || loop {
         thread::sleep(Duration::from_secs(1));
@@ -786,7 +802,7 @@ fn spawn_child_monitor(app: AppHandle, pid: u32) {
                 return;
             }
             match service.child.try_wait() {
-                Ok(Some(status)) => Some(Ok(status.to_string())),
+                Ok(Some(status)) => Some(Ok((status.code(), status.to_string()))),
                 Ok(None) => None,
                 Err(err) => Some(Err(err.to_string())),
             }
@@ -795,25 +811,51 @@ fn spawn_child_monitor(app: AppHandle, pid: u32) {
             continue;
         };
         let paths = current_paths(&app).ok();
-        {
+        // 持锁只做「改状态」,拿到的是一个二选一的结论 —— 拉起来还是摊开崩溃页。
+        // 曾经这里回的是三态 `SidecarExit`,于是锁外还得再 match 一遍,而 `Quitting`
+        // 那条 arm 在锁里就 return 了、永远到不了:三个分支在两处各写一遍,加一档状态
+        // 得记着改两处。
+        let restart = {
             let state = app.state::<LauncherState>();
             let mut inner = state.inner.lock().expect("launcher state poisoned");
-            let quitting = inner.quitting;
             inner.service = None;
-            if quitting {
-                return;
+            let exit_code = status.as_ref().ok().and_then(|(code, _)| *code);
+            match sidecar_exit_disposition(inner.quitting, exit_code) {
+                SidecarExit::Quitting => return,
+                SidecarExit::Restart => {
+                    // 不在这里置 Starting:start_service_async 看到 Starting 会当成
+                    // 「已经在启动」直接返回。
+                    inner.status = LauncherStatus::Stopped;
+                    inner.message =
+                        "后端已按要求退出（应用更新 / 回退），正在重新拉起。".to_string();
+                    inner.detail = None;
+                    true
+                }
+                SidecarExit::Crashed => {
+                    inner.status = LauncherStatus::Crashed;
+                    inner.message = "后端服务已退出，请重试启动或查看日志。".to_string();
+                    inner.detail = Some(match &status {
+                        Ok((_, status)) => format!("sidecar exit status: {status}"),
+                        Err(err) => format!("sidecar wait failed: {err}"),
+                    });
+                    false
+                }
             }
-            inner.status = LauncherStatus::Crashed;
-            inner.message = "后端服务已退出，请重试启动或查看日志。".to_string();
-            inner.detail = Some(match status {
-                Ok(status) => format!("sidecar exit status: {status}"),
-                Err(err) => format!("sidecar wait failed: {err}"),
-            });
+        };
+        if restart {
+            if let Some(paths) = paths {
+                append_launcher_log(
+                    &paths.launcher_log_dir,
+                    "sidecar exited with code 0: restarting to apply the update / rollback",
+                );
+            }
+            start_service_async(app.clone());
+        } else {
+            if let Some(paths) = paths {
+                append_launcher_log(&paths.launcher_log_dir, "sidecar exited unexpectedly");
+            }
+            show_status_page(&app);
         }
-        if let Some(paths) = paths {
-            append_launcher_log(&paths.launcher_log_dir, "sidecar exited unexpectedly");
-        }
-        show_status_page(&app);
         return;
     });
 }
@@ -996,8 +1038,13 @@ fn resolve_resources(app: &AppHandle) -> Result<ResourcePaths, String> {
                 .join("bin")
                 .join(if cfg!(windows) { "node.exe" } else { "node" });
         let server_dir = root.join("app").join("apps").join("server");
-        let server_entry = server_dir.join("lib").join("index.mjs");
-        let web_dist = root.join("app").join("apps").join("web").join("dist");
+        // 起的是 boot.mjs 而不是 index.mjs:它先决定跑哪一份载荷(安装包自带的,
+        // 还是用户数据目录里那份更新过的),再在同一个进程里把它加载起来。
+        let server_entry = server_dir.join("lib").join("boot.mjs");
+        // dashboard 资源是 lib/index.mjs 的同级目录,服务端按入口就近找它 ——
+        // 所以这里只做存在性检查,**不再用 --web-dist 指过去**(指过去就等于钉死
+        // 安装包自带那份前端,应用内更新换了后端却换不掉界面)。
+        let web_dist = server_dir.join("lib").join("web-dist");
         if node.is_file() && server_entry.is_file() && web_dist.join("index.html").is_file() {
             return Ok(ResourcePaths {
                 root: child_process_path(&root),
@@ -1012,6 +1059,23 @@ fn resolve_resources(app: &AppHandle) -> Result<ResourcePaths, String> {
         "找不到桌面资源，请先运行 vp run -F @bilibili-notify/desktop prepare-resources。"
             .to_string(),
     )
+}
+
+/// sidecar 的环境变量。抽成函数是为了能被测到 —— 尤其是 `BN_PARENT_PID`:
+/// 它是个守卫的**唯一开关**,少了这一行 sidecar 侧的孤儿自检会静默失效,
+/// 而且不会有任何东西报错。
+fn apply_sidecar_env(command: &mut Command, desktop_token: &str, url: &str, parent_pid: u32) {
+    sanitize_bn_env(command);
+    command
+        .env("BN_CONFIG_DISABLED", "1")
+        .env("BN_ALLOW_NO_AUTH", "1")
+        .env("BN_DESKTOP_TOKEN", desktop_token)
+        .env("BN_DESKTOP_ALLOWED_ORIGIN", url)
+        // 让 sidecar 认得自己的爹。launcher 被强杀时不会带走它 —— 它会被 launchd
+        // 收养继续跑,占着数据目录,后续启动全撞车(2026-08-31 实地踩过)。拿到这个
+        // pid 后 sidecar 自己会盯着 ppid,发现被收养就主动退出。
+        .env("BN_PARENT_PID", parent_pid.to_string())
+        .env("NODE_ENV", "production");
 }
 
 fn sanitize_bn_env(command: &mut Command) {
@@ -1160,14 +1224,22 @@ fn navigate_main_window(app: &AppHandle, url: &str) {
 
 fn show_status_page(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
-        let _ = window.navigate(app_status_url());
+        let _ = window.navigate(app_status_url(app));
         let _ = window.show();
         let _ = window.set_focus();
         activate_app(app);
     }
 }
 
-fn app_status_url() -> Url {
+fn app_status_url(app: &AppHandle) -> Url {
+    // 与 tauri 自身对 WebviewUrl::App 的解析同口径:dev 下前端由 vite dev
+    // server(devUrl)供页,asset 协议里没有文件,硬导 tauri://localhost 会
+    // 「asset not found: index.html」;产物构建才走 asset 协议。
+    if tauri::is_dev() {
+        if let Some(url) = app.config().build.dev_url.clone() {
+            return url;
+        }
+    }
     Url::parse("tauri://localhost/index.html").expect("valid app status url")
 }
 
@@ -1458,12 +1530,67 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
+    // 这几条是「桌面版按『立即重启并应用』得到崩溃页」那个缺陷的守卫:服务端优雅退 0 是在
+    // 请求重启,外壳得把它拉起来;只有非 0 / 被信号杀才是崩溃。
+    #[test]
+    fn clean_exit_asks_for_a_restart() {
+        assert_eq!(
+            sidecar_exit_disposition(false, Some(0)),
+            SidecarExit::Restart
+        );
+    }
+
+    #[test]
+    fn non_zero_or_signal_is_a_crash() {
+        assert_eq!(
+            sidecar_exit_disposition(false, Some(1)),
+            SidecarExit::Crashed
+        );
+        assert_eq!(sidecar_exit_disposition(false, None), SidecarExit::Crashed);
+    }
+
+    #[test]
+    fn nothing_is_restarted_while_quitting() {
+        assert_eq!(
+            sidecar_exit_disposition(true, Some(0)),
+            SidecarExit::Quitting
+        );
+        assert_eq!(
+            sidecar_exit_disposition(true, Some(1)),
+            SidecarExit::Quitting
+        );
+    }
+
     fn test_env(vars: &[(&str, &str)]) -> impl Fn(&str) -> Option<OsString> {
         let vars: HashMap<String, OsString> = vars
             .iter()
             .map(|(key, value)| ((*key).to_string(), OsString::from(value)))
             .collect();
         move |key| vars.get(key).cloned()
+    }
+
+    #[test]
+    fn sidecar_env_carries_parent_pid_so_the_orphan_watch_can_arm() {
+        let mut command = Command::new("node");
+        apply_sidecar_env(&mut command, "token", "http://127.0.0.1:1234", 4321);
+        let envs: HashMap<String, Option<OsString>> = command
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|v| v.to_os_string()),
+                )
+            })
+            .collect();
+        assert_eq!(
+            envs.get("BN_PARENT_PID").cloned().flatten(),
+            Some(OsString::from("4321")),
+            "少了 BN_PARENT_PID,sidecar 的孤儿自检会静默关掉"
+        );
+        assert_eq!(
+            envs.get("BN_DESKTOP_TOKEN").cloned().flatten(),
+            Some(OsString::from("token"))
+        );
     }
 
     #[test]
@@ -1474,16 +1601,15 @@ mod tests {
 
     #[test]
     fn windows_open_command_uses_explorer_without_cmd_shell() {
-        let command = windows_explorer_open_command(OsStr::new(
-            r"C:\Users\akokko\AppData\Local\bilibili-notify",
-        ));
+        let target = r"C:\Users\akokko\AppData\Local\bilibili-notify"; // local-path-ok
+        let command = windows_explorer_open_command(OsStr::new(target));
         let args = command
             .get_args()
             .map(|arg| arg.to_string_lossy().to_string())
             .collect::<Vec<_>>();
 
         assert_eq!(command.get_program(), OsStr::new("explorer.exe"));
-        assert_eq!(args, vec![r"C:\Users\akokko\AppData\Local\bilibili-notify"]);
+        assert_eq!(args, vec![target]);
     }
 
     #[test]
@@ -1507,9 +1633,9 @@ mod tests {
     fn windows_verbatim_path_strips_drive_prefix_for_child_processes() {
         assert_eq!(
             strip_windows_verbatim_path(Path::new(
-                r"\\?\C:\Users\akokko\bilibili-notify\resources\app",
+                r"\\?\C:\Users\akokko\bilibili-notify\resources\app", // local-path-ok
             )),
-            PathBuf::from(r"C:\Users\akokko\bilibili-notify\resources\app")
+            PathBuf::from(r"C:\Users\akokko\bilibili-notify\resources\app") // local-path-ok
         );
     }
 
@@ -1525,22 +1651,22 @@ mod tests {
     fn windows_local_app_data_root_uses_localappdata_without_home() {
         let root = windows_local_app_data_root_from(test_env(&[(
             "LOCALAPPDATA",
-            r"C:\Users\akokko\AppData\Local",
+            r"C:\Users\akokko\AppData\Local", // local-path-ok
         )]))
         .expect("root");
 
-        assert_eq!(root, PathBuf::from(r"C:\Users\akokko\AppData\Local"));
+        assert_eq!(root, PathBuf::from(r"C:\Users\akokko\AppData\Local")); // local-path-ok
     }
 
     #[test]
     fn windows_local_app_data_root_falls_back_to_userprofile() {
         let root =
-            windows_local_app_data_root_from(test_env(&[("USERPROFILE", r"C:\Users\akokko")]))
+            windows_local_app_data_root_from(test_env(&[("USERPROFILE", r"C:\Users\akokko")])) // local-path-ok
                 .expect("root");
 
         assert_eq!(
             root,
-            PathBuf::from(r"C:\Users\akokko")
+            PathBuf::from(r"C:\Users\akokko") // local-path-ok
                 .join("AppData")
                 .join("Local")
         );
@@ -1556,7 +1682,7 @@ mod tests {
 
         assert_eq!(
             root,
-            PathBuf::from(r"C:\Users\akokko")
+            PathBuf::from(r"C:\Users\akokko") // local-path-ok
                 .join("AppData")
                 .join("Local")
         );

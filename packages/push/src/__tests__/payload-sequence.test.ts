@@ -5,15 +5,16 @@
  *   - 同一 target 内 payload 顺序 await 保序
  *   - 某条失败 → **该 target** 的后续 payload 不再发(既然失败了后面大概率也失败);
  *     其他 target 不受牵连
- *   - onSend 每条 payload 记一行(含失败那条;被中止的不记)
+ *   - onSend 每个 target 回调一次,消息列表含失败那条,**也含被中止的**(没有结果,
+ *     表示从没出过网 —— ADR-0017 决策 17)
  *   - @全体仍是独立一条、在序列首条之前 fire-and-forget
  *   - 单 payload(非数组)行为与旧签名完全一致(koishi 兼容)
  */
 
 import {
 	type DeliveryResult,
+	FEATURE_KEYS,
 	type GlobalDefaults,
-	type Logger,
 	makeDefaultGlobalConfig,
 	makeEmptySubscription,
 	type NotificationPayload,
@@ -24,13 +25,7 @@ import {
 import type { SubscriptionStore } from "@bilibili-notify/subscription";
 import { describe, expect, it } from "vite-plus/test";
 import { BilibiliPush, type PushSendInfo } from "../bilibili-push";
-
-const silentLogger: Logger = {
-	debug() {},
-	info() {},
-	warn() {},
-	error() {},
-};
+import { pushBase, setExtraDefault, silentLogger } from "./helpers";
 
 interface SendCall {
 	targetId: string;
@@ -46,6 +41,7 @@ function makeSink(failOn?: (targetId: string, nthCallForTarget: number) => boole
 	const perTarget = new Map<string, number>();
 	const sink: NotificationSink = {
 		isAvailable: () => true,
+		isEnabled: () => true,
 		send: async (targetId, payload) => {
 			const nth = (perTarget.get(targetId) ?? 0) + 1;
 			perTarget.set(targetId, nth);
@@ -63,7 +59,7 @@ function makeSink(failOn?: (targetId: string, nthCallForTarget: number) => boole
 			({
 				id,
 				name: id,
-				adapterId: "a",
+				connectionId: "a",
 				platform: "test",
 				scope: "group",
 				enabled: true,
@@ -85,9 +81,7 @@ function makeStore(subs: Subscription[]): SubscriptionStore {
 
 function loopbackDefaults(): GlobalDefaults {
 	const g = makeDefaultGlobalConfig();
-	for (const k of Object.keys(g.defaults.features)) {
-		(g.defaults.features as Record<string, boolean>)[k] = true;
-	}
+	for (const k of FEATURE_KEYS) g.defaults.features[k] = true;
 	g.defaults.schedule.quietHours = [];
 	return g.defaults;
 }
@@ -98,7 +92,7 @@ const T2 = "22222222-2222-4222-8222-222222222222";
 function subWithTargets(targets: string[], atAllLiveDefault = false): Subscription {
 	const sub = makeEmptySubscription({ id: "s1", uid: "u1" });
 	sub.routing.dynamic = [...targets];
-	sub.atAllDefaults.dynamic = atAllLiveDefault;
+	setExtraDefault(sub, "atAllDynamic", atAllLiveDefault);
 	return sub;
 }
 
@@ -114,6 +108,7 @@ describe("BilibiliPush.broadcastToFeature — payload 序列", () => {
 	it("payload 数组 → 每个 target 顺序收到全部消息", async () => {
 		const { sink, calls } = makeSink();
 		const push = new BilibiliPush({
+			...pushBase(),
 			sink,
 			store: makeStore([subWithTargets([T1, T2])]),
 			logger: silentLogger,
@@ -132,6 +127,7 @@ describe("BilibiliPush.broadcastToFeature — payload 序列", () => {
 	it("某 target 首条失败 → 该 target 后续条中止,其他 target 不受影响", async () => {
 		const { sink, calls } = makeSink((id, nth) => id === T1 && nth === 1);
 		const push = new BilibiliPush({
+			...pushBase(),
 			sink,
 			store: makeStore([subWithTargets([T1, T2])]),
 			logger: silentLogger,
@@ -147,29 +143,66 @@ describe("BilibiliPush.broadcastToFeature — payload 序列", () => {
 		]);
 	});
 
-	it("onSend 每条 payload 记一行:含失败那条,不含被中止的", async () => {
+	/**
+	 * **被中止的那几条也回调,只是没有结果**(ADR-0017 决策 17)。
+	 *
+	 * 从前它们静默消失:一次本该发 3 条的推送,面板上只看得见 1 条,展开药丸上的数字
+	 * 与「本来要发几条」对不上,而少掉的那两条无从查起。人工重推按钮上写着「补 N 条」,
+	 * 这个 N 必须数得出来 —— 所以中止之后剩下的 payload 照样交给 onSend,`result`
+	 * 缺省表示「它从来没出过网」,与无目标行的每一条同形状。
+	 */
+	it("onSend 每个 target 回调一次:含失败那条,也含被中止的(它们没有结果)", async () => {
 		const { sink } = makeSink((id, nth) => id === T1 && nth === 2);
-		const seen: Array<[string, string, boolean]> = [];
+		const seen: Array<[string | null, Array<[string, boolean | undefined]>]> = [];
 		const push = new BilibiliPush({
+			...pushBase(),
 			sink,
 			store: makeStore([subWithTargets([T1])]),
 			logger: silentLogger,
 			defaults: loopbackDefaults,
 			onSend: (info: PushSendInfo) => {
-				seen.push([info.target.id, textOf(info.payload), info.result.ok]);
+				if (info.target === null) return;
+				seen.push([info.target.id, info.messages.map((m) => [textOf(m.payload), m.result?.ok])]);
 			},
 		});
 		push.start();
 		await push.broadcastToFeature("u1", "dynamic", [M1, M2, M3]);
 		expect(seen).toEqual([
-			[T1, "m1", true],
-			[T1, "m2", false], // 失败条本身要落历史
+			[
+				T1,
+				[
+					["m1", true],
+					["m2", false], // 失败条本身要落历史
+					["m3", undefined], // 被中止,从没发出去
+				],
+			],
 		]);
+	});
+
+	/**
+	 * 🔴 **落进历史 ≠ 真的发了。** 上一条把被中止的消息放进了回调,这一条钉住它们
+	 * **一次都没出网** —— 两条必须一起看:少了这一条,一个把 `break` 删掉、让后续条
+	 * 硬着头皮继续发的实现也能让上一条变绿,而那正是「失败即中止」要挡的东西
+	 * (失败后大概率继续失败,乱序补发比缺失更糟)。
+	 */
+	it("被中止的那几条一次都没进 sink", async () => {
+		const { sink, calls } = makeSink((id, nth) => id === T1 && nth === 2);
+		const push = new BilibiliPush({
+			...pushBase(),
+			sink,
+			store: makeStore([subWithTargets([T1])]),
+			logger: silentLogger,
+			defaults: loopbackDefaults,
+		});
+		push.start();
+		await push.broadcastToFeature("u1", "dynamic", [M1, M2, M3]);
+		expect(calls.map((c) => textOf(c.payload))).toEqual(["m1", "m2"]);
 	});
 
 	it("空数组 → 不调 sink", async () => {
 		const { sink, calls } = makeSink();
 		const push = new BilibiliPush({
+			...pushBase(),
 			sink,
 			store: makeStore([subWithTargets([T1])]),
 			logger: silentLogger,
@@ -184,6 +217,7 @@ describe("BilibiliPush.broadcastToFeature — payload 序列", () => {
 	it("单 payload(非数组)→ 行为与旧签名一致", async () => {
 		const { sink, calls } = makeSink();
 		const push = new BilibiliPush({
+			...pushBase(),
 			sink,
 			store: makeStore([subWithTargets([T1, T2])]),
 			logger: silentLogger,
@@ -201,6 +235,7 @@ describe("BilibiliPush.broadcastToFeature — payload 序列", () => {
 	it("@全体 target:独立 at-all 消息先发,再顺序发序列", async () => {
 		const { sink, calls } = makeSink();
 		const push = new BilibiliPush({
+			...pushBase(),
 			sink,
 			store: makeStore([subWithTargets([T1], true)]),
 			logger: silentLogger,

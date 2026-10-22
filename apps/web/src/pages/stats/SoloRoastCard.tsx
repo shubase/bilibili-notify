@@ -1,7 +1,7 @@
 import type { StatsSoloRoastResponse, StatsSoloRoastResult } from "@bilibili-notify/contract";
+import { Avatar, StatusDot } from "@bilibili-notify/ui";
 import { useMutation } from "@tanstack/react-query";
 import { useEffect } from "react";
-import { Avatar } from "../../components/atoms";
 import { api } from "../../services/api";
 import { localTzOffset } from "../../services/stats";
 import { RoastPushBox } from "./RoastPushBox";
@@ -48,7 +48,7 @@ export function SoloRoastCard({
 		<RoastShell
 			title={`AI 锐评 · ${name}`}
 			subtitle={`把这位 UP 主近${days}日的数据交给智能女仆,单独点评`}
-			pendingText="女仆正在阅读数据并撰写锐评…"
+			pendingText="女仆正在阅读数据并撰写锐评"
 			isPending={roast.isPending}
 			err={roastError(roast)}
 			onRun={() => roast.mutate()}
@@ -65,8 +65,8 @@ export function SoloRoastCard({
 						<div className="flex items-start gap-3">
 							<Avatar name={name} color={color} size={44} url={avatar} />
 							<div className="min-w-0 flex-1">
-								<div className="truncate text-sm font-bold text-bn-text-primary">{name}</div>
-								<div className="mt-1 text-xs leading-relaxed text-bn-text-tertiary">
+								<div className="truncate text-bn-base font-bold text-bn-text-primary">{name}</div>
+								<div className="mt-1 text-bn-sm leading-relaxed text-bn-text-tertiary">
 									{result.verdict}
 								</div>
 							</div>
@@ -74,11 +74,8 @@ export function SoloRoastCard({
 						{result.highlights.length ? (
 							<div className="flex flex-col gap-1.5">
 								{result.highlights.map((h) => (
-									<div key={h.label} className="flex gap-2 text-xs leading-relaxed">
-										<span
-											className="mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full"
-											style={{ background: color }}
-										/>
+									<div key={h.label} className="flex gap-2 text-bn-sm leading-relaxed">
+										<StatusDot size="sm" color={color} className="mt-1.5" />
 										<div>
 											<b className="text-bn-text-primary">{h.label}</b>{" "}
 											<span className="text-bn-text-tertiary">{h.comment}</span>
@@ -98,15 +95,15 @@ export function SoloRoastCard({
 					</div>
 
 					<div className="flex flex-col justify-center rounded-bn-card border border-bn-border-subtle p-4">
-						<div className="text-xs font-bold text-bn-text-primary">综合勤奋度评分</div>
-						<div className="mb-3 text-[10.5px] text-bn-text-secondary">
+						<div className="text-bn-sm font-bold text-bn-text-primary">综合勤奋度评分</div>
+						<div className="mb-3 text-bn-2xs text-bn-text-secondary">
 							由女仆依据近{days}日数据评分 · 0–100
 						</div>
 						<div className="mb-2 flex items-baseline gap-1.5">
-							<span className="font-mono text-4xl font-bold leading-none" style={{ color }}>
+							<span className="tabular-nums text-bn-hero font-bold leading-none" style={{ color }}>
 								{result.score}
 							</span>
-							<span className="text-xs text-bn-text-secondary">/ 100</span>
+							<span className="text-bn-sm text-bn-text-secondary">/ 100</span>
 						</div>
 						<div className="h-3 overflow-hidden rounded-full bg-bn-code-bg">
 							<div

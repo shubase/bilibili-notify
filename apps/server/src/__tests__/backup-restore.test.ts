@@ -18,7 +18,7 @@ function currentWith(subs: Subscription[]): CurrentState {
 	return {
 		globals: makeDefaultGlobalConfig(),
 		subscriptions: subs,
-		adapters: [],
+		connections: [],
 		targets: [],
 	};
 }
@@ -47,9 +47,12 @@ describe("planImport", () => {
 	it("overwrite applies globals when the backup carries them", () => {
 		const current = currentWith([]);
 		const g = makeDefaultGlobalConfig();
-		g.defaults.ai.provider = "deepseek";
+		g.defaults.ai.activeProfile = "deepseek";
 		g.defaults.ai.providers = {
 			deepseek: {
+				provider: "deepseek",
+				apiFlavor: "chat",
+				label: "",
 				apiKey: "sk-imported",
 				baseUrl: "",
 				model: "",
@@ -70,9 +73,12 @@ describe("planImport", () => {
 	it("merge never touches globals, even when the backup carries them", () => {
 		const current = currentWith([]);
 		const g = makeDefaultGlobalConfig();
-		g.defaults.ai.provider = "deepseek";
+		g.defaults.ai.activeProfile = "deepseek";
 		g.defaults.ai.providers = {
 			deepseek: {
+				provider: "deepseek",
+				apiFlavor: "chat",
+				label: "",
 				apiKey: "sk-imported",
 				baseUrl: "",
 				model: "",
@@ -93,7 +99,7 @@ describe("planImport", () => {
 	it("a scope absent from the backup produces no writes for it", () => {
 		const current = currentWith([sub("1")]);
 
-		const plan = planImport(current, { adapters: [] }, "overwrite");
+		const plan = planImport(current, { connections: [] }, "overwrite");
 
 		// subscriptions untouched (not in the backup) — no upserts, no deletes
 		expect(plan.subscriptions.upsert).toEqual([]);

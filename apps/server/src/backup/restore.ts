@@ -1,9 +1,4 @@
-import type {
-	GlobalConfig,
-	PushAdapter,
-	PushTarget,
-	Subscription,
-} from "@bilibili-notify/internal";
+import type { Connection, GlobalConfig, PushTarget, Subscription } from "@bilibili-notify/internal";
 
 /**
  * Restore planning — turns (current state + imported sections + mode) into a
@@ -25,14 +20,14 @@ export type ImportMode = "overwrite" | "merge";
 export interface CurrentState {
 	globals: GlobalConfig;
 	subscriptions: Subscription[];
-	adapters: PushAdapter[];
+	connections: Connection[];
 	targets: PushTarget[];
 }
 
 export interface ImportSections {
 	globals?: GlobalConfig;
 	subscriptions?: Subscription[];
-	adapters?: PushAdapter[];
+	connections?: Connection[];
 	targets?: PushTarget[];
 }
 
@@ -44,7 +39,7 @@ interface ScopePlan<T> {
 export interface ImportPlan {
 	setGlobals?: GlobalConfig;
 	subscriptions: ScopePlan<Subscription>;
-	adapters: ScopePlan<PushAdapter>;
+	connections: ScopePlan<Connection>;
 	targets: ScopePlan<PushTarget>;
 }
 
@@ -67,9 +62,40 @@ export function planImport(
 ): ImportPlan {
 	const plan: ImportPlan = {
 		subscriptions: planScope(current.subscriptions, incoming.subscriptions, mode),
-		adapters: planScope(current.adapters, incoming.adapters, mode),
+		connections: planScope(current.connections, incoming.connections, mode),
 		targets: planScope(current.targets, incoming.targets, mode),
 	};
 	if (mode === "overwrite" && incoming.globals) plan.setGlobals = incoming.globals;
 	return plan;
+}
+
+function applyScope<T extends { id: string }>(
+	current: readonly T[],
+	plan: ScopePlan<T>,
+): T[] | undefined {
+	if (plan.upsert.length === 0 && plan.delete.length === 0) return undefined;
+	const del = new Set(plan.delete);
+	const next = current.filter((x) => !del.has(x.id));
+	for (const item of plan.upsert) {
+		const idx = next.findIndex((x) => x.id === item.id);
+		if (idx < 0) next.push(item);
+		else next[idx] = item;
+	}
+	return next;
+}
+
+/**
+ * 把计划折成「这个分区最终应当是什么」。
+ *
+ * 恢复不是一串用户编辑,是一次整体替换 —— 所以 ConfigStore 那边要的是**终态**而不是
+ * upsert/delete 序列。分区没有任何改动时返回 `undefined`,让它保持不动;返回空数组才是
+ * 真清空(overwrite 模式下备份里给了空分区就是这个意思)。
+ */
+export function foldPlan(current: CurrentState, plan: ImportPlan): ImportSections {
+	return {
+		globals: plan.setGlobals,
+		subscriptions: applyScope(current.subscriptions, plan.subscriptions),
+		connections: applyScope(current.connections, plan.connections),
+		targets: applyScope(current.targets, plan.targets),
+	};
 }

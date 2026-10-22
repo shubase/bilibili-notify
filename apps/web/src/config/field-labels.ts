@@ -19,6 +19,7 @@
 import {
 	AI_PROVIDER_IDS,
 	type AIProviderId,
+	LINK_LIMITS,
 	providerMeta,
 } from "@bilibili-notify/internal/constants";
 
@@ -27,6 +28,7 @@ export type FieldSection =
 	| "general"
 	| "master"
 	| "commands"
+	| "groupCommands"
 	| "ai"
 	| "persona"
 	| "cardStyle"
@@ -38,10 +40,10 @@ export type FieldSection =
 	| "specialUsers"
 	| "imageGroup"
 	| "target"
-	| "adapter"
+	| "connection"
 	| "transport"
-	| "session"
-	| "logging";
+	| "logging"
+	| "linkParsing";
 
 export interface FieldLabel {
 	/** UI 显示标签(中文)。 */
@@ -87,18 +89,8 @@ export const FIELD_LABELS = {
 		hint: "留「跟随全局」即用 app.logLevel；保存后会立即推到对应模块的 pino 实例,无需重启",
 		section: "logging",
 	},
-	"app.logLevels.ai": {
-		label: "日志等级",
-		hint: "只影响 ai 模块;选「跟随全局」时与 app.logLevel 同步。保存后立即生效,无需重启。",
-		section: "logging",
-	},
-	"app.logLevels.image": {
-		label: "日志等级",
-		hint: "只影响 image 模块;选「跟随全局」时与 app.logLevel 同步。保存后立即生效,无需重启。",
-		section: "logging",
-	},
-	// 以下 3 条仅作 diff-path entry 用(System 页 SYSTEM_MODULES 改 core/dynamic/live
-	// 时 walkTreeDiff 会输出对应 dot-path,跳转锚点回到包裹整组的 <Field code="app.logLevels">)。
+	// 以下 5 条仅作 diff-path entry 用(System 页 SYSTEM_MODULES 改某一格时 walkTreeDiff
+	// 会输出对应 dot-path,跳转锚点回到包裹整组的 <Field code="app.logLevels">)。
 	"app.logLevels.core": {
 		label: "日志等级",
 		hint: "只影响 core 模块",
@@ -112,6 +104,16 @@ export const FIELD_LABELS = {
 	"app.logLevels.live": {
 		label: "日志等级",
 		hint: "只影响 live 模块",
+		section: "logging",
+	},
+	"app.logLevels.image": {
+		label: "日志等级",
+		hint: "只影响 image 模块",
+		section: "logging",
+	},
+	"app.logLevels.ai": {
+		label: "日志等级",
+		hint: "只影响 ai 模块",
 		section: "logging",
 	},
 	"app.userAgent": {
@@ -129,6 +131,11 @@ export const FIELD_LABELS = {
 		hint: "到期的 jsonl 日志会被清理",
 		section: "logging",
 	},
+	"app.memoryLog": {
+		label: "内存自检打印",
+		hint: "每 10 分钟往日志写一行 [mem](堆用量 / 上限 / RSS / 弹幕规模),给排泄漏留曲线;概览页的系统资源卡不靠它。堆逼近上限的警告始终会响",
+		section: "logging",
+	},
 
 	// ── Master ────────────────────────────────────────────────────────────
 	"master.ownerQq": {
@@ -141,81 +148,174 @@ export const FIELD_LABELS = {
 		section: "master",
 	},
 
-	// ── 群聊指令 ──────────────────────────────────────────────────────────
+	// ── 私聊指令 ──────────────────────────────────────────────────────────
 	"commands.enabled": {
-		label: "启用群聊指令",
-		hint: "关闭后不再响应 OneBot 群聊里的 bili 命令。",
+		label: "私聊指令",
+		hint: "关掉之后只剩审批的 y/n —— 否则手里那份等审批的周报就再也批不掉了",
 		section: "commands",
 	},
 	"commands.prefix": {
+		label: "指令前缀",
+		hint: "可以留空;留空后认不出的话一律当没看见(否则会对你每句聊天都回一句)",
+		section: "commands",
+	},
+	"commands.aliases": {
+		label: "指令别名",
+		hint: "主名永远有效;别名撞了会在保存时拦下",
+		section: "commands",
+	},
+
+	// ── 群聊指令 ──────────────────────────────────────────────────────────
+	"groupCommands.enabled": {
+		label: "启用群聊指令",
+		hint: "关闭后不再响应 OneBot 群聊里的 bili 命令。",
+		section: "groupCommands",
+	},
+	"groupCommands.prefix": {
 		label: "命令前缀",
 		hint: "默认 bili；不支持空格。示例：bili订阅123456",
-		section: "commands",
+		section: "groupCommands",
 	},
-	"commands.ownerQq": {
+	"groupCommands.ownerQq": {
 		label: "主人 QQ",
 		hint: "可执行全局订阅命令；默认 1319870047。",
-		section: "commands",
+		section: "groupCommands",
 	},
-	"commands.videoParse.enabled": {
+	"groupCommands.videoParse.enabled": {
 		label: "自动解析视频链接",
 		hint: "开启后，群聊中出现 Bilibili 视频链接时自动回复封面和视频信息。",
-		section: "commands",
+		section: "groupCommands",
 	},
-	"commands.aliases.help": {
+	"groupCommands.aliases.help": {
 		label: "帮助",
 		hint: "显示群聊命令说明。",
-		section: "commands",
+		section: "groupCommands",
 	},
-	"commands.aliases.add": {
+	"groupCommands.aliases.add": {
 		label: "订阅本群",
 		hint: "把指定 UID 或名字的 UP 主订阅到当前群。",
-		section: "commands",
+		section: "groupCommands",
 	},
-	"commands.aliases.del": {
+	"groupCommands.aliases.del": {
 		label: "取消订阅",
 		hint: "取消当前群对指定 UID 的订阅。",
-		section: "commands",
+		section: "groupCommands",
 	},
-	"commands.aliases.list": {
+	"groupCommands.aliases.list": {
 		label: "查看本群订阅",
-		section: "commands",
+		section: "groupCommands",
 	},
-	"commands.aliases.listall": {
+	"groupCommands.aliases.listall": {
 		label: "查看全部订阅",
 		hint: "仅主人可用。",
-		section: "commands",
+		section: "groupCommands",
 	},
-	"commands.aliases.delall": {
+	"groupCommands.aliases.delall": {
 		label: "清空本群订阅",
 		hint: "仅主人可用。",
-		section: "commands",
+		section: "groupCommands",
 	},
-	"commands.aliases.delallall": {
+	"groupCommands.aliases.delallall": {
 		label: "删除全部订阅",
 		hint: "仅主人可用。",
-		section: "commands",
+		section: "groupCommands",
 	},
-	"commands.aliases.member": {
+	"groupCommands.aliases.member": {
 		label: "普通成员管理权限",
 		hint: "群主、管理员、主人可用；默认用法 bili权限开启 / bili权限关闭 / bili权限状态。",
-		section: "commands",
+		section: "groupCommands",
+	},
+
+	// ── 链接解析 ──────────────────────────────────────────────────────────
+	"linkParsing.enabled": {
+		label: "链接解析",
+		hint: "群里有人贴 B 站视频链接就回一张卡,谁贴都算;在哪些群响应、回什么由下面的默认行与按群例外定。OneBot 直接可用;QQ 官方机器人要群主在群设置里把消息范围放到「获取群内全部消息」,留在「仅 @ 机器人」档的话得 @ 它再贴链接",
+		section: "linkParsing",
+	},
+	"linkParsing.cooldownSeconds": {
+		label: "冷却时间",
+		hint: `同一个群里同一个视频多久内只出一次图;0 = 不节流。另有不可调的底线:每个群每分钟最多 ${LINK_LIMITS.groupPerMinute} 张、全局同时最多处理 ${LINK_LIMITS.maxInflight} 张,防换着视频刷`,
+		section: "linkParsing",
+	},
+	"linkParsing.defaults": {
+		label: "默认(所有群)",
+		hint: "机器人在的所有群默认解不解析、回图片卡还是小程序卡;下面没写例外的群都跟这一行。小程序卡要目标所在的 OneBot 实现支持 get_mini_app_ark(目前已知 NapCat),不支持的会回落图片卡",
+		section: "linkParsing",
+	},
+	"linkParsing.groups": {
+		label: "按群例外",
+		hint: "从推送目标里列出的群,每格「跟默认」就是不例外;想只在某几群解析,把默认解析关掉、给那几群显式开。已停用的目标不解析,恢复启用后自动生效;目标删掉了这里就不再显示",
+		section: "linkParsing",
 	},
 
 	// ── AI 连接 ───────────────────────────────────────────────────────────
 	"ai.apiKey": { label: "API Key", section: "ai", secret: true },
 	"ai.baseUrl": { label: "Base URL", section: "ai" },
-	"ai.provider": {
-		label: "服务商",
-		hint: "「开思考」这件事各家写法完全不一样，女仆得知道是哪家才翻译得对。选「自定义」则不发任何服务商专属参数，需要什么请写到下面的额外请求参数里",
+	// 指向当前在用实例的**指针**(与人格的 activePreset 同一套语义)。
+	"ai.activeProfile": {
+		label: "使用的服务商",
+		hint: "女仆平时用哪一份实例。只拨指针不改配置，换来换去各份的密钥与模型都不会丢",
 		section: "ai",
 	},
-	// 合成字段,不是 schema 里的东西 —— 灵动岛只认得「摊平后的当前那一家」,
-	// 添加/删除别家在它眼里毫无变化,于是保存条不亮、主人一走就丢。这一行把
-	// 「已添加哪几家」显式喂给它。见 Ai.tsx#packIsland。
+	// 实例桶里的方言归属字段(经 `ai.providers.<实例>.provider` 前缀规则继承到这条)。
+	"ai.provider": {
+		label: "所属服务商",
+		hint: "「开思考」这件事各家写法完全不一样，女仆得知道是哪家才翻译得对。「自定义」则不发任何服务商专属参数，需要什么请写到额外请求参数里",
+		section: "ai",
+	},
+	"ai.label": {
+		label: "实例名称",
+		hint: "同一家添加多份时全靠它区分。留空则显示那家的名字",
+		section: "ai",
+	},
+	// 实例桶的接口风味(经 `ai.providers.<实例>.apiFlavor` 前缀规则继承到这条)。
+	"ai.apiFlavor": {
+		label: "接口风味",
+		hint: "chat completions 是现状；responses 是 OpenAI 一系的新协议，思考是标准字段、思考 + 工具连用更稳。只有确认支持的家才摆这一格，失败不会悄悄换回旧协议",
+		section: "ai",
+	},
+	// 聊天页自己的思考等级(ai.chat.thinkingLevel)**不在**这张表里:它的编辑口
+	// 在聊天侧栏的「设置」弹层,点档位直接 PATCH,不经过灵动岛的 diff,也没有
+	// `Field code` —— 表里挂一条永远显示不出来的死条目只会误导。
+	// 联网搜索(ai.search)—— web_search 工具的执行后端,与选哪家 AI 服务商正交。
+	"ai.search.backend": {
+		label: "搜索后端",
+		hint: "女仆的 web_search 工具由这家真正执行。博查中文质量好;Tavily 有免费额度",
+		section: "ai",
+	},
+	"ai.search.keys.bocha": {
+		label: "博查 API Key",
+		hint: "在 open.bochaai.com 申请。留空 = 未配置,女仆不会挂搜索工具",
+		section: "ai",
+		secret: true,
+	},
+	"ai.search.keys.tavily": {
+		label: "Tavily API Key",
+		hint: "在 app.tavily.com 申请。留空 = 未配置,女仆不会挂搜索工具",
+		section: "ai",
+		secret: true,
+	},
+	"ai.search.engines.dynamic": {
+		label: "动态点评联网搜索",
+		hint: "开了之后每条动态点评都可能多几次搜索调用(按次计费)和几秒延迟",
+		section: "ai",
+	},
+	"ai.search.engines.live": {
+		label: "直播总结联网搜索",
+		hint: "开了之后每次下播总结都可能多几次搜索调用(按次计费)和几秒延迟",
+		section: "ai",
+	},
+	"ai.search.engines.roast": {
+		label: "锐评联网搜索",
+		hint: "开了之后每次锐评都可能多几次搜索调用(按次计费)",
+		section: "ai",
+	},
+	// 合成字段,不是 schema 里的东西 —— 灵动岛只认得「摊平后的那几只桶」,
+	// 添加/删除实例在它眼里毫无变化,于是保存条不亮、主人一走就丢。这一行把
+	// 「已添加哪几份」显式喂给它。见 Ai.tsx#packIsland。
 	"ai.providerList": {
 		label: "已添加的服务商",
-		hint: "左栏列着的那几家。删掉一家会连同它存着的密钥一起抹掉",
+		hint: "左栏列着的那几份实例。删掉一份会连同它存着的密钥一起抹掉",
 		section: "ai",
 	},
 	"ai.enableThinking": {
@@ -348,26 +448,25 @@ export const FIELD_LABELS = {
 	},
 
 	// ── 卡片样式 ──────────────────────────────────────────────────────────
-	cardColorStart: { label: "渐变起始", section: "cardStyle" },
-	cardColorEnd: { label: "渐变结束", section: "cardStyle" },
 	font: {
 		label: "字体",
-		hint: "CSS font-family。容器/浏览器没装时自动回退到内置兜底链(Microsoft YaHei / Noto Sans CJK / sans-serif)。",
+		hint: "字体家族名。渲染那台机器没装这个字体时自动回退到内置兜底链(Microsoft YaHei / Noto Sans CJK / sans-serif)。想用别的字体就把文件传上来。",
 		section: "cardStyle",
 	},
-	showPopularity: { label: "人气 / 点赞", section: "cardStyle" },
-	showArea: { label: "直播分区", section: "cardStyle" },
-	showFans: { label: "粉丝数据", section: "cardStyle" },
-	glassOpacity: { label: "玻璃片透明度", section: "cardStyle" },
-	glassClear: { label: "完全透明", section: "cardStyle" },
-	backgroundImages: { label: "自定义背景图", section: "cardStyle" },
+	fontAsset: {
+		label: "自带字体",
+		hint: "主人上传的字体文件。设了就优先于字体家族名;文件被删掉时静静回退,不会让出图崩。",
+		section: "cardStyle",
+	},
 	liveCoverImages: { label: "直播封面替换", section: "cardStyle" },
-	// 卡片版式(灵动岛 diff 码 —— walkTreeDiff 把每张卡的块数组当叶子整体比较)。
-	"cardLayout.live": { label: "直播卡版式", section: "cardStyle" },
-	"cardLayout.dynamic": { label: "动态卡版式", section: "cardStyle" },
-	"cardLayout.sc": { label: "SC 卡版式", section: "cardStyle" },
-	"cardLayout.guard.badgeSide": { label: "上舰卡徽章位置", section: "cardStyle" },
-	"cardLayout.guard.blocks": { label: "上舰卡版式", section: "cardStyle" },
+	// 卡片皮肤(ADR-0014):整套外观住皮肤包里,旧的一维版式编辑器已退役。全局那一档
+	// 由皮肤库当场启用(PUT /api/card-skins/active),不走草稿;这个 code 只给 per-UP
+	// 的「这个 UP 用哪套」——「跟随全局」= 把 overrides.cardSkin 整个键清掉。
+	cardSkin: {
+		label: "卡片皮肤",
+		hint: "这个 UP 的推送卡用哪套皮肤;不选就跟随全局。想单独改排版,先在皮肤库「复制一份」再改。",
+		section: "cardStyle",
+	},
 
 	// ── 卡片预览(Cards 页样本数据,不真正写回 globals) ───────────────────
 	roomId: {
@@ -529,15 +628,10 @@ export const FIELD_LABELS = {
 		section: "target",
 	},
 
-	// ── Targets(推送目标 / 适配器 / 传输 / 会话) ────────────────────────
-	"adapter.platform": { label: "平台", section: "adapter" },
-	"adapter.name": { label: "显示名称", section: "adapter" },
-	"adapter.enabled": { label: "启用", section: "adapter" },
-	"config.provider": {
-		label: "Webhook 协议",
-		hint: "Generic 保持旧 JSON envelope；钉钉/飞书按平台机器人协议发送文本消息",
-		section: "transport",
-	},
+	// ── Targets(推送目标 / 连接 / 传输 / 会话) ────────────────────────
+	"connection.platform": { label: "平台", section: "connection" },
+	"connection.name": { label: "显示名称", section: "connection" },
+	"connection.enabled": { label: "启用", section: "connection" },
 	"config.transport": { label: "连接方式", section: "transport" },
 	"config.baseUrl": { label: "HTTP baseUrl", section: "transport" },
 	"config.url": { label: "URL", section: "transport" },
@@ -552,6 +646,16 @@ export const FIELD_LABELS = {
 		secret: true,
 	},
 	"config.timeoutMs": { label: "超时", section: "transport" },
+	"config.imageMinTimeoutMs": {
+		label: "带图超时下限",
+		hint: "带图消息实际等 max(超时, 此值);0 = 不放宽",
+		section: "transport",
+	},
+	"config.forwardMinTimeoutMs": {
+		label: "合并转发超时下限",
+		hint: "合并转发要逐张下载再上传,比单图更慢;0 = 不放宽",
+		section: "transport",
+	},
 	"config.retryTimes": {
 		label: "重试次数",
 		hint: "不含首次,失败后再尝试",
@@ -569,7 +673,7 @@ export const FIELD_LABELS = {
 		section: "transport",
 		secret: true,
 	},
-	// QQ 官方机器人(q.qq.com)适配器凭据
+	// QQ 官方机器人(q.qq.com)连接凭据
 	"config.appId": {
 		label: "AppID",
 		hint: "QQ 开放平台机器人的 AppID(明文存储)",
@@ -599,18 +703,50 @@ export const FIELD_LABELS = {
 	"target.name": { label: "显示名称", section: "target" },
 	"target.scope": { label: "作用域", section: "target" },
 	"target.enabled": { label: "启用", section: "target" },
-	"session.userId": { label: "QQ 号 (userId)", section: "session" },
-	"session.groupId": { label: "群号 (groupId)", section: "session" },
-	"session.allowMemberManage": {
+	// 地址这一格原先是每平台一套 session 字段(session.groupId / session.groupOpenid / …),
+	// 六个词条对着六个字段名。收成一格之后只剩这两条 —— 界面上叫什么由 scope 决定,
+	// 但差异摘要里不该逐 scope 换名字(同一格改了就是改了)。
+	"target.address": { label: "会话地址", section: "target" },
+	"target.parentAddress": { label: "上级容器 ID", section: "target" },
+	"target.allowMemberManage": {
 		label: "普通成员可管理本群订阅",
-		hint: "关闭时只有群主、管理员和主人能执行 bili订阅 / bili取消；bili清空 仅主人可用。",
-		section: "session",
+		hint: "开启后，普通群成员也可以使用 bili订阅、bili取消 等群聊命令。",
+		section: "target",
 	},
-	// QQ 官方机器人会话寻址(按 scope)
-	"session.guildId": { label: "频道服务器 ID (guildId)", section: "session" },
-	"session.channelId": { label: "子频道 ID (channelId)", section: "session" },
-	"session.groupOpenid": { label: "群 openid (groupOpenid)", section: "session" },
-	"session.userOpenid": { label: "用户 openid (C2C)", section: "session" },
+
+	// ── 定时周报(roastSchedule.*) ─────────────────────────────────────────
+	// 周期与统计范围是**解耦**的两个字段:cron 定何时发,days 定统计多少天。
+	// 不预设「周报 / 月报」这类组合 —— 用户自己搭。
+	"roastSchedule.enabled": {
+		label: "定时锐评",
+		hint: "到点自动生成并发送 · 关掉就只剩手动那颗按钮",
+		section: "schedule",
+	},
+	"roastSchedule.approval": {
+		label: "发送前先给主人过目",
+		hint: "私聊发预览 · 回复 y 才进群,48 小时没回复就作废",
+		section: "schedule",
+	},
+	"roastSchedule.notifyOnError": {
+		label: "没发出去时通知我",
+		hint: "生成失败 / 没配目标 / 群发失败都会私聊说明原因",
+		section: "schedule",
+	},
+	"roastSchedule.cron": {
+		label: "发送时间",
+		hint: "cron 表达式 · 如 0 9 * * 1(每周一早九点)",
+		section: "schedule",
+	},
+	"roastSchedule.days": {
+		label: "统计范围",
+		hint: "周报往前统计多少天(近 7 / 30 / 90 日)· 与发送周期无关,想每天发一份近 7 天的榜也可以",
+		section: "schedule",
+	},
+	"roastSchedule.targets": {
+		label: "发送到",
+		hint: "可多选 · 一个群发失败不影响其他群",
+		section: "schedule",
+	},
 } satisfies Record<string, FieldLabel>;
 
 /** 所有已知 code 的联合类型。 */
@@ -630,17 +766,32 @@ export const FIELD_LABELS = {
 const SEEN_PREFIX = "templateDefaultsSeen.";
 
 /**
- * 逐家服务商的桶前缀 —— `ai.providers.<家>.<字段>`。
+ * 逐实例的桶前缀 —— `ai.providers.<实例>.<字段>`。
  *
- * 连接与生成参数一家存一套,code 因此是**家数 × 十来个字段**的笛卡尔积,逐条登记
- * 就是把 `ai.*` 那批 entry 抄五遍。所以走前缀 fallback:hint / section / **secret**
- * 全部继承 `ai.<字段>` 那条,label 前面缀上是哪一家。
+ * 连接与生成参数一份实例存一套,code 因此是**份数 × 十来个字段**的笛卡尔积,逐条
+ * 登记就是把 `ai.*` 那批 entry 抄几遍。所以走前缀 fallback:hint / section /
+ * **secret** 全部继承 `ai.<字段>` 那条,label 前面缀上是哪一份。
  *
  * 继承 `secret` 尤其要紧:漏了这一步,灵动岛的 diff 面板查不到密钥位,会把主人刚
  * 敲进去的 **API Key 明文**摊在面板上。
  */
 const PROVIDER_PREFIX = "ai.providers.";
 const PROVIDER_IDS: ReadonlySet<string> = new Set(AI_PROVIDER_IDS);
+
+/**
+ * 实例 id → 显示名。id 由 `addProfile` 生成,只有两种形状:`<家>`(头一份)与
+ * `<家>-<序号>`(后续)。字典这儿拿不到配置,解析不了主人起的名字,只能按 id
+ * 还原个能认的(「DeepSeek 2 · API Key」)。两种形状都不是的(手改配置)返回
+ * null,调用方照旧「老实说不认识」。
+ */
+function profileDisplayName(id: string): string | null {
+	if (PROVIDER_IDS.has(id)) return providerMeta(id as AIProviderId).label;
+	const m = /^(.+)-(\d+)$/.exec(id);
+	if (m?.[1] !== undefined && PROVIDER_IDS.has(m[1])) {
+		return `${providerMeta(m[1] as AIProviderId).label} ${m[2]}`;
+	}
+	return null;
+}
 
 export function getFieldLabel(code: string): FieldLabel | null {
 	const hit = (FIELD_LABELS as Record<string, FieldLabel | undefined>)[code];
@@ -658,14 +809,17 @@ export function getFieldLabel(code: string): FieldLabel | null {
 		const rest = code.slice(PROVIDER_PREFIX.length);
 		const cut = rest.indexOf(".");
 		const id = cut < 0 ? "" : rest.slice(0, cut);
-		// 认不出的家、或者认不出的字段,一律**老实说不认识** —— 兜一个半截标签
-		// (「undefined · 某字段」)比缺一行更难查。
-		if (PROVIDER_IDS.has(id)) {
+		// 认不出的**字段**才「老实说不认识」;认不出形状的**桶 id** 不行 ——
+		// providers 是 z.record,手改配置/备份恢复出的任意 id(「my-deepseek」)
+		// 合法可加载,返回 null 会把继承的 secret 标志一起丢掉,diff 面板就把
+		// 刚输入的 API Key 按明文摊开了。桶 id 本来就是主人写的,原样当显示名。
+		const display = profileDisplayName(id) ?? (id !== "" ? id : null);
+		if (display !== null) {
 			const base = (FIELD_LABELS as Record<string, FieldLabel | undefined>)[
 				`ai.${rest.slice(cut + 1)}`
 			];
 			if (base) {
-				return { ...base, label: `${providerMeta(id as AIProviderId).label} · ${base.label}` };
+				return { ...base, label: `${display} · ${base.label}` };
 			}
 		}
 	}

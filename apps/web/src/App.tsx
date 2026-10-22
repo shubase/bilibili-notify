@@ -1,11 +1,14 @@
 import { useQuery } from "@tanstack/react-query";
+import { lazy, Suspense } from "react";
 import { Route, Routes } from "react-router-dom";
 import { AuthGate } from "./components/AuthGate";
-import { AiChatDock } from "./components/ai-chat";
+import { AiChatDock, CHAT_PATH } from "./components/ai-chat";
 import { AlertShell } from "./components/alert-shell";
 import { DraftIsland } from "./components/draft-island";
 import { GlassHeader } from "./components/header";
+import { TourCompanion } from "./components/onboarding/tour-companion";
 import { ShellError, ShellLoading } from "./components/shell-states";
+import { SkinPreviewBar } from "./components/skin-preview-bar";
 import { ToastShell } from "./components/toast-shell";
 import { useAlertChannel } from "./hooks/useAlertChannel";
 import { useAuthChannel } from "./hooks/useAuthChannel";
@@ -13,11 +16,17 @@ import { useAuthHydrate } from "./hooks/useAuthHydrate";
 import { HEALTH_QUERY_KEY, HEALTH_QUERY_OPTIONS } from "./hooks/useBackendReachable";
 import { usePushEventsChannel } from "./hooks/usePushEventsChannel";
 import { useStateChannel } from "./hooks/useStateChannel";
+import { useUpdateCheckOnOpen } from "./hooks/useUpdateCheckOnOpen";
+import { useUpdateTransitionNotice } from "./hooks/useUpdateTransitionNotice";
 import About from "./pages/About";
 import Ai from "./pages/Ai";
+import CardSkinEditor from "./pages/CardSkinEditor";
 import Cards from "./pages/Cards";
+import Chat from "./pages/Chat";
 import Commands from "./pages/Commands";
 import Dashboard from "./pages/Dashboard";
+import ExtensionDetail from "./pages/ExtensionDetail";
+import Extensions from "./pages/Extensions";
 import History from "./pages/History";
 import Logs from "./pages/Logs";
 import Rules from "./pages/Rules";
@@ -26,6 +35,17 @@ import Subs from "./pages/Subs";
 import System from "./pages/System";
 import Targets from "./pages/Targets";
 import { api } from "./services/api";
+
+/**
+ * devtools 只在开发期存在:`import.meta.env.DEV` 是编译期常量,生产构建里这一句折成 `null`,
+ * 动态 import 随死枝一起被摇掉 —— dist 里连 devtools 这个 chunk 都没有(2026-09-06 对着
+ * 构建产物 grep 过,带对照项)。让这句话继续成立的是
+ * `src/__tests__/devtools-isolation.test.ts`:它钉住「除了这一处没人提 devtools」和
+ * 「这一处包在 DEV 三元里」。服务端那半另有自己的门,两边各自挡。
+ */
+const DevDock = import.meta.env.DEV
+	? lazy(() => import("./devtools/dock").then((m) => ({ default: m.DevDock })))
+	: null;
 
 interface HealthSnapshot {
 	status: string;
@@ -52,6 +72,10 @@ function AuthedApp() {
 	useStateChannel();
 	usePushEventsChannel();
 	useAlertChannel();
+	// 打开面板就查一次更新(不定时)。放在这里同样是被登录门挡着的:没会话不查。
+	useUpdateCheckOnOpen();
+	// 后台下载收尾时把那张「正在下载」换成「已就绪 / 下载失败」。挂在壳层,人在哪一页都订阅着。
+	useUpdateTransitionNotice();
 
 	// Detect when the backend is genuinely unreachable so the shell can show
 	// the design's error state instead of letting individual pages render
@@ -91,22 +115,40 @@ function AuthedApp() {
 						<Route path="/" element={<Dashboard />} />
 						<Route path="/subs" element={<Subs />} />
 						<Route path="/targets" element={<Targets />} />
+						<Route path="/extensions" element={<Extensions />} />
+						<Route path="/extensions/:id" element={<ExtensionDetail />} />
 						<Route path="/history" element={<History />} />
 						<Route path="/stats" element={<Stats />} />
 						<Route path="/rules" element={<Rules />} />
 						<Route path="/cards" element={<Cards />} />
+						{/* 皮肤编辑器自铺 fixed inset-0(同聊天页):三栏并排要整个视口宽,
+						    挤在站内顶栏与两侧内边距里会两边都不够(ADR-0014 决策 20)。 */}
+						<Route path="/cards/skins/:id" element={<CardSkinEditor />} />
 						<Route path="/ai" element={<Ai />} />
+						{/* 聊天页自带 fixed inset-0 的整页底,视觉上盖过 header 与 main 的
+						    留白 —— 放在健康门里是刻意的:后端断了就该看到统一的错误壳,
+						    而不是一个每问必挂的聊天。 */}
+						<Route path={CHAT_PATH} element={<Chat />} />
 						<Route path="/system" element={<System />} />
 						<Route path="/commands" element={<Commands />} />
 						<Route path="/logs" element={<Logs />} />
-						<Route path="/about" element={<About />} />
+						{/* 新手指引并进关于页(五轮定稿):/about/guide/:chapter? 深链直达教程章节 */}
+						<Route path="/about/:section?/:chapter?" element={<About />} />
 					</Routes>
 				</main>
 			)}
 			<AiChatDock />
 			<DraftIsland />
+			<SkinPreviewBar />
 			<ToastShell />
 			<AlertShell />
+			{/* 「带我做」导览伴随窗:左下角(右下 toast/右上告警/底部灵动岛都有主了) */}
+			<TourCompanion />
+			{DevDock ? (
+				<Suspense fallback={null}>
+					<DevDock />
+				</Suspense>
+			) : null}
 		</div>
 	);
 }

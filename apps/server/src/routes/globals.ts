@@ -3,6 +3,8 @@ import { Hono } from "hono";
 import { z } from "zod";
 import { ConfigValidationError } from "../config/store.js";
 import type { StandalonePuppeteer } from "../runtime/puppeteer.js";
+import { checkCommandAliases } from "./command-alias-guard.js";
+import { checkApprovalReachable } from "./roast-approval-guard.js";
 import type { RouteDeps } from "./types.js";
 
 /**
@@ -95,6 +97,16 @@ export function createGlobalsRoute(deps: RouteDeps): Hono {
 				);
 			}
 		}
+		// 别名冲突:撞了就静默失灵一条指令,主人根本查不到是别名干的。堵在保存这一刻,
+		// 并说清跟谁撞了。(dispatcher 重建时还有第二道,但那道只能记日志。)
+		const aliasCheck = checkCommandAliases({
+			current: deps.store.getGlobals(),
+			patch,
+			commands: deps.commands ?? [],
+		});
+		if (!aliasCheck.ok) {
+			return c.json({ error: "alias_conflict", message: aliasCheck.message }, 400);
+		}
 		// Enable-check pre-flight. Runs against the *merged* view so a request
 		// that only toggles `enabled=true` without restating apiKey still works
 		// (we read the still-persisted value as the effective field).
@@ -102,6 +114,7 @@ export function createGlobalsRoute(deps: RouteDeps): Hono {
 			current: deps.store.getGlobals(),
 			patch,
 			puppeteer: deps.puppeteer,
+			targets: deps.store.getTargets(),
 		});
 		if (!enableCheck.ok) {
 			return c.json(
@@ -128,12 +141,48 @@ export function createGlobalsRoute(deps: RouteDeps): Hono {
 // Enable check
 // ---------------------------------------------------------------------------
 
-type EnableCheckResult = { ok: true } | { ok: false; scope: "cardStyle" | "ai"; message: string };
+type EnableCheckResult =
+	| { ok: true }
+	| { ok: false; scope: "cardStyle" | "ai" | "roastSchedule"; message: string };
 
 interface EnableCheckArgs {
 	current: import("@bilibili-notify/internal").GlobalConfig;
 	patch: Record<string, unknown>;
 	puppeteer: StandalonePuppeteer | null;
+	targets: readonly import("@bilibili-notify/internal").PushTarget[];
+}
+
+/**
+ * 审批开关的前置检查。
+ *
+ * 审批靠主人在 IM 里回一句 `y` 才走得下去,而独立端的推送通道**大多只出不进**
+ * —— webhook 更是天生没有回程(它就是个出站 HTTP POST)。在一个收不到回复的通道
+ * 上把审批打开,结果是每期周报都生成、都私聊、然后 48 小时后全部超时作废,一份
+ * 也发不出去,而配置页上看着一切正常。所以宁可不给开,并说清该去改什么。
+ *
+ * 判据是**主人那条私聊通道**所在的平台 —— 草稿预览就是发给他的。
+ */
+export function checkApprovalEnable(
+	current: import("@bilibili-notify/internal").GlobalConfig,
+	patch: Record<string, unknown>,
+	targets: readonly import("@bilibili-notify/internal").PushTarget[],
+): EnableCheckResult {
+	// 同 per-scope gating:这次 patch 没碰 roastSchedule 就别插手,
+	// 否则存别的 tab 会被一个早就存在的 approval=true 拦住。
+	if (pluck(patch, ["roastSchedule"]) === undefined) return { ok: true };
+	const approval = mergedFlag(
+		current.roastSchedule.approval,
+		pluck(patch, ["roastSchedule", "approval"]),
+	);
+	if (!approval) return { ok: true };
+
+	// 判据与话术住在 roast-approval-guard —— per-UP 那条(subs PATCH)用的是同一份。
+	const r = checkApprovalReachable({
+		approvalOn: true,
+		masterTargetId: current.master.targetId,
+		targets,
+	});
+	return r.ok ? { ok: true } : { ok: false, scope: "roastSchedule", message: r.message };
 }
 
 async function runEnableCheck(args: EnableCheckArgs): Promise<EnableCheckResult> {
@@ -154,20 +203,25 @@ async function runEnableCheck(args: EnableCheckArgs): Promise<EnableCheckResult>
 		}
 	}
 
+	const approvalCheck = checkApprovalEnable(args.current, args.patch, args.targets);
+	if (!approvalCheck.ok) return approvalCheck;
+
 	if (shouldRunAiEnableCheck(args.current, args.patch)) {
-		// 探活要打的是**本次保存之后**生效的那家:provider 指针本身可能就在这个
-		// patch 里被换掉了。拿旧指针去取连接字段,会用 A 家的 key 打 B 家的接口。
-		const id = aiProviderAfterPatch(args.current, args.patch);
+		// 探活要打的是**本次保存之后**生效的那份实例:activeProfile 指针本身可能
+		// 就在这个 patch 里被换掉了。拿旧指针去取连接字段,会用 A 家的 key 打 B 家的接口。
+		const id = aiActiveProfileAfterPatch(args.current, args.patch);
 		const cur = args.current.defaults.ai.providers[id];
 		const at = (field: string) =>
 			mergedString(
-				cur?.[field as "apiKey" | "baseUrl" | "model"],
+				cur?.[field as "apiKey" | "baseUrl" | "model" | "apiFlavor"],
 				pluck(args.patch, ["defaults", "ai", "providers", id, field]),
 			);
 		const r = await checkAiEnable({
 			apiKey: at("apiKey"),
 			baseUrl: at("baseUrl"),
 			model: at("model"),
+			// 风味也可能就在这个 patch 里被切换 —— 与连接字段同一套 merged 取法。
+			apiFlavor: at("apiFlavor") || "chat",
 		});
 		if (!r.ok) return r;
 	}
@@ -175,21 +229,19 @@ async function runEnableCheck(args: EnableCheckArgs): Promise<EnableCheckResult>
 	return { ok: true };
 }
 
-/** 本次 patch 生效后当前用哪家 —— 指针可能就在这个 patch 里被换掉。 */
-export function aiProviderAfterPatch(
+/** 本次 patch 生效后当前用哪份实例 —— 指针可能就在这个 patch 里被换掉。 */
+export function aiActiveProfileAfterPatch(
 	current: import("@bilibili-notify/internal").GlobalConfig,
 	patch: Record<string, unknown>,
-): import("@bilibili-notify/internal").AIProviderId {
-	const inPatch = pluck(patch, ["defaults", "ai", "provider"]);
-	return typeof inPatch === "string"
-		? (inPatch as import("@bilibili-notify/internal").AIProviderId)
-		: current.defaults.ai.provider;
+): string {
+	const inPatch = pluck(patch, ["defaults", "ai", "activeProfile"]);
+	return typeof inPatch === "string" ? inPatch : current.defaults.ai.activeProfile;
 }
 
 /**
  * AI 连接探活(checkAiEnable,会真打一次 chat/completions 请求)是否该跑。三种情况:
- *  1. 本次 patch 把当前那家的连接字段 apiKey / baseUrl / model **改成跟 current 不同的新值**;
- *  2. 本次 patch **换了服务商** —— 换家就是换连接,新那家的 key 还没验过;
+ *  1. 本次 patch 把当前那份实例的连接字段 apiKey / baseUrl / model **改成跟 current 不同的新值**;
+ *  2. 本次 patch **换了实例** —— 换实例就是换连接,新那份的 key 还没验过;
  *  3. 本次 patch 把 ai.enabled 从 false 翻成 true(启用动作本身要验)。
  * 改 persona / prompt / temperature 不触发探活;AI 最终为禁用态时一律不跑。
  *
@@ -208,8 +260,8 @@ export function shouldRunAiEnableCheck(
 	);
 	if (!aiEnabled) return false;
 
-	const id = aiProviderAfterPatch(current, patch);
-	const switchedProvider = id !== current.defaults.ai.provider;
+	const id = aiActiveProfileAfterPatch(current, patch);
+	const switchedProfile = id !== current.defaults.ai.activeProfile;
 	const cur = current.defaults.ai.providers[id];
 	const changed = (field: "apiKey" | "baseUrl" | "model") => {
 		const inPatch = pluck(patch, ["defaults", "ai", "providers", id, field]);
@@ -217,7 +269,7 @@ export function shouldRunAiEnableCheck(
 	};
 	const touchesConnection = changed("apiKey") || changed("baseUrl") || changed("model");
 	const enabling = !current.defaults.ai.enabled && aiEnabled;
-	return switchedProvider || touchesConnection || enabling;
+	return switchedProfile || touchesConnection || enabling;
 }
 
 // ── Image / puppeteer probe ────────────────────────────────────────────────
@@ -255,9 +307,11 @@ interface AiProbeFields {
 	apiKey: string;
 	baseUrl: string;
 	model: string;
+	apiFlavor: string;
 }
 
-async function checkAiEnable(fields: AiProbeFields): Promise<EnableCheckResult> {
+/** exported for tests —— 端点必须跟实例的接口风味走,这条契约要能被钉住。 */
+export async function checkAiEnable(fields: AiProbeFields): Promise<EnableCheckResult> {
 	if (!fields.apiKey) {
 		return { ok: false, scope: "ai", message: "apiKey 字段为空，启用 AI 前请先填写。" };
 	}
@@ -268,7 +322,27 @@ async function checkAiEnable(fields: AiProbeFields): Promise<EnableCheckResult> 
 		return { ok: false, scope: "ai", message: "model 字段为空，启用 AI 前请先填写。" };
 	}
 
-	const url = `${fields.baseUrl.replace(/\/+$/, "")}/chat/completions`;
+	// 探活打的端点跟实例的接口风味走 —— responses-only 的模型(o1-pro 这类)在
+	// /chat/completions 上是 404,打错端点等于把用户永久挡在自己的探活门外,
+	// 而真正的聊天路径本来能通。responses 的 ping 不带 temperature:o 系推理
+	// 模型会 400 拒掉它,探活自己不能先踩雷。
+	const base = fields.baseUrl.replace(/\/+$/, "");
+	const responses = fields.apiFlavor === "responses";
+	const url = responses ? `${base}/responses` : `${base}/chat/completions`;
+	const body = responses
+		? {
+				model: fields.model,
+				input: [{ role: "user", content: "ping" }],
+				max_output_tokens: 16,
+				stream: false,
+			}
+		: {
+				model: fields.model,
+				messages: [{ role: "user", content: "ping" }],
+				max_tokens: 5,
+				temperature: 0,
+				stream: false,
+			};
 	const controller = new AbortController();
 	const timer = setTimeout(() => controller.abort(), 10_000);
 	try {
@@ -278,13 +352,7 @@ async function checkAiEnable(fields: AiProbeFields): Promise<EnableCheckResult> 
 				"Content-Type": "application/json",
 				Authorization: `Bearer ${fields.apiKey}`,
 			},
-			body: JSON.stringify({
-				model: fields.model,
-				messages: [{ role: "user", content: "ping" }],
-				max_tokens: 5,
-				temperature: 0,
-				stream: false,
-			}),
+			body: JSON.stringify(body),
 			signal: controller.signal,
 		});
 		if (res.ok) return { ok: true };
@@ -364,7 +432,9 @@ export function redactGlobals(
 	g: import("@bilibili-notify/internal").GlobalConfig,
 ): import("@bilibili-notify/internal").GlobalConfig {
 	const entries = Object.entries(g.defaults.ai.providers);
-	if (!entries.some(([, p]) => p && (p.apiKey || p.vision.apiKey))) return g;
+	const search = g.defaults.ai.search;
+	const searchHasKey = Object.values(search.keys).some(Boolean);
+	if (!entries.some(([, p]) => p && (p.apiKey || p.vision.apiKey)) && !searchHasKey) return g;
 	return {
 		...g,
 		defaults: {
@@ -381,6 +451,13 @@ export function redactGlobals(
 						},
 					]),
 				),
+				// 联网搜索的 key 同一纪律:非空换占位,空保持空。
+				search: {
+					...search,
+					keys: Object.fromEntries(
+						Object.entries(search.keys).map(([b, v]) => [b, v ? REDACTED_API_KEY : ""]),
+					) as typeof search.keys,
+				},
 			},
 		},
 	};
@@ -398,40 +475,65 @@ export function stripRedactedSecrets(patch: Record<string, unknown>): Record<str
 	if (!defaults || typeof defaults !== "object") return patch;
 	const ai = (defaults as Record<string, unknown>).ai;
 	if (!ai || typeof ai !== "object") return patch;
-	const providers = (ai as Record<string, unknown>).providers;
-	if (!providers || typeof providers !== "object") return patch;
 
 	let touched = false;
-	const cleaned = Object.fromEntries(
-		Object.entries(providers as Record<string, unknown>).map(([id, raw]) => {
-			if (!raw || typeof raw !== "object") return [id, raw];
-			let bucket = raw as Record<string, unknown>;
+	let aiOut = ai as Record<string, unknown>;
 
-			if (bucket.apiKey === REDACTED_API_KEY) {
-				const { apiKey: _drop, ...rest } = bucket;
-				bucket = rest;
+	const providers = aiOut.providers;
+	if (providers && typeof providers === "object") {
+		let touchedProviders = false;
+		const cleaned = Object.fromEntries(
+			Object.entries(providers as Record<string, unknown>).map(([id, raw]) => {
+				if (!raw || typeof raw !== "object") return [id, raw];
+				let bucket = raw as Record<string, unknown>;
+
+				if (bucket.apiKey === REDACTED_API_KEY) {
+					const { apiKey: _drop, ...rest } = bucket;
+					bucket = rest;
+					touchedProviders = true;
+				}
+
+				const vision = bucket.vision;
+				if (vision && typeof vision === "object") {
+					const v = vision as Record<string, unknown>;
+					if (v.apiKey === REDACTED_API_KEY) {
+						const { apiKey: _drop, ...vRest } = v;
+						bucket = { ...bucket, vision: vRest };
+						touchedProviders = true;
+					}
+				}
+				return [id, bucket];
+			}),
+		);
+		if (touchedProviders) {
+			aiOut = { ...aiOut, providers: cleaned };
+			touched = true;
+		}
+	}
+
+	// 联网搜索的 key 同一纪律:回传的占位剥掉,别让它覆盖真 key。
+	const search = aiOut.search;
+	if (search && typeof search === "object") {
+		const keys = (search as Record<string, unknown>).keys;
+		if (keys && typeof keys === "object") {
+			const entries = Object.entries(keys as Record<string, unknown>);
+			const kept = entries.filter(([, v]) => v !== REDACTED_API_KEY);
+			if (kept.length !== entries.length) {
+				aiOut = {
+					...aiOut,
+					search: { ...(search as Record<string, unknown>), keys: Object.fromEntries(kept) },
+				};
 				touched = true;
 			}
-
-			const vision = bucket.vision;
-			if (vision && typeof vision === "object") {
-				const v = vision as Record<string, unknown>;
-				if (v.apiKey === REDACTED_API_KEY) {
-					const { apiKey: _drop, ...vRest } = v;
-					bucket = { ...bucket, vision: vRest };
-					touched = true;
-				}
-			}
-			return [id, bucket];
-		}),
-	);
+		}
+	}
 
 	if (!touched) return patch;
 	return {
 		...patch,
 		defaults: {
 			...(defaults as Record<string, unknown>),
-			ai: { ...(ai as Record<string, unknown>), providers: cleaned },
+			ai: aiOut,
 		},
 	};
 }

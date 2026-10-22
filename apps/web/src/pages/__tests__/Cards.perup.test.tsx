@@ -5,12 +5,13 @@
  *
  * 验证:① 全局作用域以 pageKey "cards" 注册灵动岛;② 点已定制 UP 的 tab 切到
  * pageKey "cards-perup";③ per-UP 保存只下发卡片三片(cardStyle + cardStyleByKind
- * + cardLayout),不碰该 sub 的其它 overrides slice;④ 已有按类型覆盖往返不丢;
+ * + cardSkin),不碰该 sub 的其它 overrides slice;④ 已有按类型覆盖往返不丢;
  * ⑤ 全局 tab 右侧铺四卡全家福(四种 kind 各发一次预览)。
  */
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import { useDraftStore } from "../../store/draft";
 import { makeEmptySubscription, type Subscription } from "../../types/domain";
@@ -25,12 +26,12 @@ vi.mock("../../services/api", () => ({
 
 import { api } from "../../services/api";
 
-// 已定制 UP:只有 cardStyle 覆盖(无 cardLayout),并带一个无关 slice(imageGroup)
+// 已定制 UP:只有 cardStyle 覆盖(无 cardSkin),并带一个无关 slice(imageGroup)
 // 用来确认 per-UP 保存不会动它。
 const CUSTOMIZED: Subscription = {
 	...makeEmptySubscription("123456"),
 	overrides: {
-		cardStyle: { cardColorStart: "#123456" },
+		cardStyle: { font: "PerUP Sans" },
 		imageGroup: { enable: false },
 	},
 };
@@ -41,6 +42,15 @@ const GLOBALS = {
 	defaults: makeDefaults(),
 } as unknown as GlobalConfig;
 
+/** 皮肤库列表(GET /api/card-skins):内置那份 + 一套自制的。 */
+const SKINS = {
+	skins: [
+		{ id: "default", name: "默认皮肤", builtin: true, updatedAt: 0 },
+		{ id: "aurora", name: "极光", builtin: false, updatedAt: 1 },
+	],
+	active: "default",
+};
+
 function resetStore(): void {
 	useDraftStore.setState({
 		current: null,
@@ -50,12 +60,15 @@ function resetStore(): void {
 	});
 }
 
+// 皮肤库那节的「编辑」钮要跳编辑器路由,所以这一页现在吃 router context。
 function renderCards() {
 	const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
 	return render(
-		<QueryClientProvider client={qc}>
-			<Cards />
-		</QueryClientProvider>,
+		<MemoryRouter>
+			<QueryClientProvider client={qc}>
+				<Cards />
+			</QueryClientProvider>
+		</MemoryRouter>,
 	);
 }
 
@@ -65,6 +78,7 @@ beforeEach(() => {
 	vi.mocked(api.get).mockImplementation((url: string) => {
 		if (url.includes("/api/subs")) return Promise.resolve([CUSTOMIZED]);
 		if (url.includes("/api/targets")) return Promise.resolve([]);
+		if (url.includes("/api/card-skins")) return Promise.resolve(SKINS);
 		return Promise.resolve(GLOBALS);
 	});
 	// 预览走 puppeteer 路由,测试里给个假数据 URL 即可。
@@ -101,43 +115,6 @@ describe("Cards per-UP 作用域接线", () => {
 			},
 			{ timeout: 2000 },
 		);
-	});
-
-	it("全局直播数据只认基准:残留的全局 per-kind show 不泄漏到预览", async () => {
-		// 基准关粉丝;全局 per-kind live 残留 showFans=true(旧配置/历史快照)→ 应被忽略。
-		const defaults = makeDefaults() as unknown as {
-			cardStyle: { showFans: boolean };
-			cardStyleByKind?: unknown;
-		};
-		defaults.cardStyle.showFans = false;
-		defaults.cardStyleByKind = { live: { showFans: true } };
-		const globals = { app: {}, master: {}, defaults } as unknown as GlobalConfig;
-		vi.mocked(api.get).mockImplementation((url: string) => {
-			if (url.includes("/api/subs")) return Promise.resolve([]);
-			if (url.includes("/api/targets")) return Promise.resolve([]);
-			return Promise.resolve(globals);
-		});
-
-		renderCards();
-		await waitFor(() => expect(useDraftStore.getState().current?.pageKey).toBe("cards"));
-
-		// 全家福 live 预览取基准 showFans=false(剥掉全局 per-kind 的 show)。
-		await waitFor(
-			() => {
-				const ok = vi.mocked(api.post).mock.calls.find(([url, body]) => {
-					const b = body as { kind?: string; style?: { showFans?: boolean } };
-					return url === "/api/cards/preview" && b?.kind === "live" && b.style?.showFans === false;
-				});
-				expect(ok).toBeTruthy();
-			},
-			{ timeout: 2000 },
-		);
-		// 反向:不应有 live 预览带 showFans=true(证明 per-kind 残留没泄漏)。
-		const leaked = vi.mocked(api.post).mock.calls.find(([url, body]) => {
-			const b = body as { kind?: string; style?: { showFans?: boolean } };
-			return url === "/api/cards/preview" && b?.kind === "live" && b.style?.showFans === true;
-		});
-		expect(leaked).toBeFalsy();
 	});
 
 	it("点已定制 UP 的 tab → 灵动岛切到 pageKey 'cards-perup'", async () => {
@@ -191,7 +168,59 @@ describe("Cards per-UP 作用域接线", () => {
 		);
 	});
 
-	it("per-UP 保存 → 只 PATCH cardStyle + cardLayout(cardLayout 未覆盖 = null)", async () => {
+	/**
+	 * **皮肤要跟着请求走**(ADR-0014)。服务端对「没指皮肤」的解释是「全局在用的那套」,
+	 * 所以全局作用域一个字都不用传;但 per-UP 单独指了一套时不传就永远看不到它 ——
+	 * 选择器上写着「单独指定」、预览里却是全局那张,两边对不上。
+	 */
+	it("per-UP 指了皮肤 → 预览请求带上它", async () => {
+		const skinned: Subscription = {
+			...makeEmptySubscription("123456"),
+			overrides: { cardSkin: "aurora" },
+		};
+		vi.mocked(api.get).mockImplementation((url: string) => {
+			if (url.includes("/api/subs")) return Promise.resolve([skinned]);
+			if (url.includes("/api/targets")) return Promise.resolve([]);
+			if (url.includes("/api/card-skins")) return Promise.resolve(SKINS);
+			return Promise.resolve(GLOBALS);
+		});
+
+		renderCards();
+		await waitFor(() => expect(useDraftStore.getState().current?.pageKey).toBe("cards"));
+		fireEvent.click(await screen.findByText("UID 123456"));
+		await waitFor(() => expect(useDraftStore.getState().current?.pageKey).toBe("cards-perup"));
+
+		await waitFor(
+			() => {
+				const call = vi.mocked(api.post).mock.calls.find(([url, body]) => {
+					const b = body as { cardSkin?: string };
+					return url === "/api/cards/preview" && b?.cardSkin === "aurora";
+				});
+				expect(call).toBeTruthy();
+			},
+			{ timeout: 2000 },
+		);
+	});
+
+	it("全局作用域不传皮肤 —— 缺省只归服务端解释,面板别再抄一份", async () => {
+		renderCards();
+		await waitFor(() => expect(useDraftStore.getState().current?.pageKey).toBe("cards"));
+		await waitFor(
+			() => {
+				expect(
+					vi.mocked(api.post).mock.calls.filter(([url]) => url === "/api/cards/preview").length,
+				).toBeGreaterThan(0);
+			},
+			{ timeout: 2000 },
+		);
+		const withSkin = vi.mocked(api.post).mock.calls.find(([url, body]) => {
+			const b = body as { cardSkin?: string };
+			return url === "/api/cards/preview" && b?.cardSkin !== undefined;
+		});
+		expect(withSkin).toBeFalsy();
+	});
+
+	it("per-UP 保存 → 只 PATCH cardStyle + cardSkin(cardSkin 未覆盖 = null)", async () => {
 		renderCards();
 		await waitFor(() => expect(useDraftStore.getState().current?.pageKey).toBe("cards"));
 		fireEvent.click(await screen.findByText("UID 123456"));
@@ -204,12 +233,12 @@ describe("Cards per-UP 作用域接线", () => {
 		const [url, body] = vi.mocked(api.patch).mock.calls.at(-1) as [string, { overrides: unknown }];
 		expect(url).toBe(`/api/subs/${CUSTOMIZED.id}`);
 		const overrides = body.overrides as Record<string, unknown>;
-		// 只含卡片三片:cardStyle 为完整快照、cardLayout 未覆盖故 null、cardStyleByKind 无
+		// 只含卡片三片:cardStyle 为完整快照、cardSkin 未覆盖故 null、cardStyleByKind 无
 		// 按类型覆盖故 null;不带 imageGroup(不动该 UP 其它 slice)。
-		expect(Object.keys(overrides).sort()).toEqual(["cardLayout", "cardStyle", "cardStyleByKind"]);
-		expect(overrides.cardLayout).toBeNull();
+		expect(Object.keys(overrides).sort()).toEqual(["cardSkin", "cardStyle", "cardStyleByKind"]);
+		expect(overrides.cardSkin).toBeNull();
 		expect(overrides.cardStyleByKind).toBeNull();
-		expect((overrides.cardStyle as { cardColorStart: string }).cardColorStart).toBe("#123456");
+		expect((overrides.cardStyle as { font: string }).font).toBe("PerUP Sans");
 	});
 
 	it("per-UP 已有按类型覆盖 → 保存原样下发 cardStyleByKind(不丢)", async () => {
@@ -218,13 +247,14 @@ describe("Cards per-UP 作用域接线", () => {
 		const byKindSub: Subscription = {
 			...makeEmptySubscription("654321"),
 			overrides: {
-				cardStyleByKind: { sc: { cardColorStart: "#abcdef" } },
+				cardStyleByKind: { sc: { font: "SC Sans" } },
 				imageGroup: { enable: false },
 			},
 		};
 		vi.mocked(api.get).mockImplementation((url: string) => {
 			if (url.includes("/api/subs")) return Promise.resolve([byKindSub]);
 			if (url.includes("/api/targets")) return Promise.resolve([]);
+			if (url.includes("/api/card-skins")) return Promise.resolve(SKINS);
 			return Promise.resolve(GLOBALS);
 		});
 
@@ -242,48 +272,20 @@ describe("Cards per-UP 作用域接线", () => {
 		// 有覆盖的类型原样带上,没覆盖过的**不**凭空发 null —— 删除哨兵只发给「基线
 		// 里有、草稿里没了」的键(见 buildPatch)。关掉已保存的类型会发 null,那条在
 		// Cards.bykind-off.test.tsx。
-		expect(overrides.cardStyleByKind).toEqual({ sc: { cardColorStart: "#abcdef" } });
+		expect(overrides.cardStyleByKind).toEqual({ sc: { font: "SC Sans" } });
 	});
 
-	it("per-UP 直播数据区覆盖 → 进生效样式 / 预览请求(showFans=false)", async () => {
-		const dataSub: Subscription = {
-			...makeEmptySubscription("777888"),
-			overrides: { cardStyleByKind: { live: { showFans: false } } },
-		};
-		vi.mocked(api.get).mockImplementation((url: string) => {
-			if (url.includes("/api/subs")) return Promise.resolve([dataSub]);
-			if (url.includes("/api/targets")) return Promise.resolve([]);
-			return Promise.resolve(GLOBALS);
-		});
-
-		renderCards();
-		await waitFor(() => expect(useDraftStore.getState().current?.pageKey).toBe("cards"));
-		fireEvent.click(await screen.findByText("UID 777888"));
-		await waitFor(() => expect(useDraftStore.getState().current?.pageKey).toBe("cards-perup"));
-		// 切到「直播开播」类型 tab(单卡预览用 effStyle = 基准 + 该 UP live 覆盖)。
-		fireEvent.click(screen.getAllByRole("button", { name: "直播开播" })[0]);
-
-		await waitFor(
-			() => {
-				const call = vi.mocked(api.post).mock.calls.find(([url, body]) => {
-					const b = body as { kind?: string; style?: { showFans?: boolean } };
-					return url === "/api/cards/preview" && b?.kind === "live" && b.style?.showFans === false;
-				});
-				expect(call).toBeTruthy();
-			},
-			{ timeout: 2000 },
-		);
-	});
-
-	it("per-UP live 颜色 + 数据区共存于 cardStyleByKind.live,保存两者都不丢", async () => {
-		// 字段不相交(颜色 omitShow、数据区 pickShow)→ seed 同时含两类覆盖时往返保留。
+	it("per-UP live 外观 + 封面共存于 cardStyleByKind.live,保存两者都不丢", async () => {
+		// 字段不相交(外观 omitCover、封面 pickCover)→ seed 同时含两类覆盖时往返保留。
+		// 从前的第三族「数据区 show」2026-09-14 随三个开关一起退役。
 		const mixedSub: Subscription = {
 			...makeEmptySubscription("555666"),
-			overrides: { cardStyleByKind: { live: { cardColorStart: "#abc123", showFans: false } } },
+			overrides: { cardStyleByKind: { live: { font: "Abc Sans", liveCoverImages: ["c1"] } } },
 		};
 		vi.mocked(api.get).mockImplementation((url: string) => {
 			if (url.includes("/api/subs")) return Promise.resolve([mixedSub]);
 			if (url.includes("/api/targets")) return Promise.resolve([]);
+			if (url.includes("/api/card-skins")) return Promise.resolve(SKINS);
 			return Promise.resolve(GLOBALS);
 		});
 
@@ -296,7 +298,10 @@ describe("Cards per-UP 作用域接线", () => {
 		await waitFor(() => expect(api.patch).toHaveBeenCalled());
 		const [, body] = vi.mocked(api.patch).mock.calls.at(-1) as [string, { overrides: unknown }];
 		const overrides = body.overrides as { cardStyleByKind?: { live?: Record<string, unknown> } };
-		expect(overrides.cardStyleByKind?.live).toEqual({ cardColorStart: "#abc123", showFans: false });
+		expect(overrides.cardStyleByKind?.live).toEqual({
+			font: "Abc Sans",
+			liveCoverImages: ["c1"],
+		});
 	});
 
 	it("per-UP 动态 → 选「第几条」,offset 进预览请求", async () => {
@@ -332,5 +337,66 @@ describe("Cards per-UP 作用域接线", () => {
 			},
 			{ timeout: 2000 },
 		);
+	});
+	// ── per-UP 卡片皮肤(ADR-0014 决策 17)───────────────────────────────────
+	//
+	// 「选一套」与「选回跟随全局」是两条不同的线:前者要把 id 写进 overrides,后者
+	// 要把这个键**清掉**。后者尤其容易写成「键消失」——JSON 里表达不出 undefined,
+	// 服务端读作「不改」,于是选回跟随全局永远不生效(本仓「配置 PATCH 的删除语义」)。
+
+	it("per-UP 选一套皮肤 → PATCH 的 overrides 带 cardSkin", async () => {
+		const { container } = renderCards();
+		await waitFor(() => expect(useDraftStore.getState().current?.pageKey).toBe("cards"));
+		fireEvent.click(await screen.findByText("UID 123456"));
+		await waitFor(() => expect(useDraftStore.getState().current?.pageKey).toBe("cards-perup"));
+
+		const select = await waitFor(() => {
+			const el = container.querySelector('[data-code="cardSkin"] select');
+			if (!el) throw new Error("cardSkin select not rendered");
+			return el as HTMLSelectElement;
+		});
+		// 列表里的那套自制皮肤要真的是个选项 —— 下拉只有「跟随全局」的话下面这一步
+		// 会把 value 设成空串,断言反而看不出问题。
+		expect([...select.options].map((o) => o.value)).toContain("aurora");
+		fireEvent.change(select, { target: { value: "aurora" } });
+
+		useDraftStore.getState().current?.onSave();
+		await waitFor(() => expect(api.patch).toHaveBeenCalled());
+		const [, body] = vi.mocked(api.patch).mock.calls.at(-1) as [string, { overrides: unknown }];
+		expect((body.overrides as { cardSkin?: unknown }).cardSkin).toBe("aurora");
+	});
+
+	it("per-UP 选回「跟随全局」→ PATCH 把 cardSkin 清成 null(不是键消失)", async () => {
+		const skinned: Subscription = {
+			...makeEmptySubscription("999000"),
+			overrides: { cardSkin: "aurora" },
+		};
+		vi.mocked(api.get).mockImplementation((url: string) => {
+			if (url.includes("/api/subs")) return Promise.resolve([skinned]);
+			if (url.includes("/api/targets")) return Promise.resolve([]);
+			if (url.includes("/api/card-skins")) return Promise.resolve(SKINS);
+			return Promise.resolve(GLOBALS);
+		});
+
+		const { container } = renderCards();
+		await waitFor(() => expect(useDraftStore.getState().current?.pageKey).toBe("cards"));
+		fireEvent.click(await screen.findByText("UID 999000"));
+		await waitFor(() => expect(useDraftStore.getState().current?.pageKey).toBe("cards-perup"));
+
+		const select = await waitFor(() => {
+			const el = container.querySelector('[data-code="cardSkin"] select');
+			if (!el) throw new Error("cardSkin select not rendered");
+			return el as HTMLSelectElement;
+		});
+		// 先确认存量覆盖 seed 进了下拉(否则「清掉」测的是一个本来就空的值)。
+		expect(select.value).toBe("aurora");
+		fireEvent.change(select, { target: { value: "" } });
+
+		useDraftStore.getState().current?.onSave();
+		await waitFor(() => expect(api.patch).toHaveBeenCalled());
+		const [, body] = vi.mocked(api.patch).mock.calls.at(-1) as [string, { overrides: unknown }];
+		const overrides = body.overrides as Record<string, unknown>;
+		expect("cardSkin" in overrides).toBe(true);
+		expect(overrides.cardSkin).toBeNull();
 	});
 });

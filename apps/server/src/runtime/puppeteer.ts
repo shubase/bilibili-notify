@@ -11,18 +11,19 @@
  */
 
 import { existsSync } from "node:fs";
+import type { BrowserProcessState } from "@bilibili-notify/contract";
 import type {
 	BoundingBox,
 	ElementHandleLike,
 	PageLike,
+	PageOptions,
 	PuppeteerLike,
 	ScreenshotOptions,
 	SetContentOptions,
 	WaitForFunctionOptions,
 } from "@bilibili-notify/image";
-import type { Logger } from "@bilibili-notify/internal";
+import { createSerialGate, type Logger } from "@bilibili-notify/internal";
 import puppeteer from "puppeteer-core";
-import { createSerialGate } from "./serial-gate.js";
 
 export interface ResolveChromePathOptions {
 	/** 路径存在性判定,默认 `fs.existsSync`;注入以便单测。 */
@@ -96,6 +97,8 @@ export interface BrowserHandle {
 	newPage(): Promise<PageHandle>;
 	close(): Promise<void>;
 	disconnect(): void | Promise<void>;
+	/** 本地 launch 出来的浏览器进程;远程连接回 null。资源卡量子树 RSS 要拿它当根。 */
+	process?(): { pid?: number | null } | null;
 }
 
 export interface BrowserLaunchOptions {
@@ -149,8 +152,31 @@ export interface PuppeteerAdapterOptions {
 	launcher?: BrowserLauncher;
 }
 
+/** 浏览器进程现在处于什么状态 —— 资源卡「浏览器」那一行照它说话。 */
+export interface BrowserProcessInfo {
+	state: BrowserProcessState;
+	/** 本地跑着才有;其余三态都是 null。 */
+	pid: number | null;
+}
+
 export interface StandalonePuppeteer extends PuppeteerLike {
 	dispose(): Promise<void>;
+	/**
+	 * 浏览器进程的状态与 pid。四态各有各的话要说:`none` 没配 / 没起过、`running` 本地跑着、
+	 * `closed` 空闲省内存关了(下次渲染自动重启)、`remote` 进程在别人机器上量不到。
+	 * 合成一个「有没有」会把后两者说成「没有」,那正是最容易让人误会的两种。
+	 */
+	browserProcess(): BrowserProcessInfo;
+	/**
+	 * 把空闲关闭提前到现在(devtools「Chrome 空闲计时器提前到期」)。有活跃页或压根没
+	 * 浏览器在跑就不动、回 false;关了回 true。下次渲染照常重启。
+	 */
+	closeIdleNow(): Promise<boolean>;
+	/**
+	 * 还在排队等渲染的数量。`/status` 拿它回答「是不是卡住了」——
+	 * 所有渲染都串行经过同一把闸,这个数持续不为 0 就是推送在堆积。
+	 */
+	renderQueueDepth(): number;
 }
 
 export function createPuppeteerAdapter(opts: PuppeteerAdapterOptions): StandalonePuppeteer {
@@ -158,12 +184,14 @@ export function createPuppeteerAdapter(opts: PuppeteerAdapterOptions): Standalon
 	const idleTimeoutMs = opts.idleTimeoutMs ?? DEFAULT_CHROME_IDLE_MS;
 	let browser: BrowserHandle | null = null;
 	let launching: Promise<BrowserHandle> | null = null;
+	/** 这个进程里起过一次没有 —— 用来分「空闲关掉了」与「压根没配」。 */
+	let launchedOnce = false;
 	// 在渲染中的页面数。归零才允许空闲计时器把浏览器关掉。
 	let activePages = 0;
 	let idleTimer: NodeJS.Timeout | null = null;
 	// 串行闸:所有渲染(预览 screenshotHtml + 推送 ImageRenderer)经同一浏览器,冷启动
-	// 窗口期并发截图会触发 CDP 竞态把卡片平铺成 2×2(见 serial-gate.ts)。串起来即根除。
-	const acquire = createSerialGate();
+	// 窗口期并发截图会触发 CDP 竞态把卡片平铺成 2×2(见 internal 的 serial-gate)。串起来即根除。
+	const renderGate = createSerialGate();
 
 	function cancelIdleTimer(): void {
 		if (idleTimer) {
@@ -253,6 +281,7 @@ export function createPuppeteerAdapter(opts: PuppeteerAdapterOptions): Standalon
 				);
 			}
 			browser = b;
+			launchedOnce = true;
 			launching = null;
 			return b;
 		})();
@@ -265,9 +294,39 @@ export function createPuppeteerAdapter(opts: PuppeteerAdapterOptions): Standalon
 	}
 
 	return {
-		async page(): Promise<PageLike> {
-			// 进闸:等上一个渲染(页面 close)后才继续,保证全程并发度为 1。
-			const release = await acquire();
+		renderQueueDepth: () => renderGate.waiting(),
+		browserProcess(): BrowserProcessInfo {
+			// 远程那台的进程不在我们机器上,pid 无从谈起 —— 状态先于「有没有 browser」判,
+			// 否则断开重连的间隙会被说成「已关」。
+			if (remote) return { state: "remote", pid: null };
+			if (!browser) {
+				// 起过又关掉 ≠ 没配。前者是省内存的正常行为(下次渲染自动重启),后者是没装
+				// / 没配 chrome;资源卡那一行要说的话完全不同。
+				return { state: launchedOnce ? "closed" : "none", pid: null };
+			}
+			const pid = browser.process?.()?.pid;
+			return typeof pid === "number" ? { state: "running", pid } : { state: "running", pid: null };
+		},
+		async closeIdleNow(): Promise<boolean> {
+			if (activePages > 0 || !browser) return false;
+			// 光看 `activePages` 不够:它是在 `await b.newPage()` **之后**才 +1 的,渲染的开场
+			// 那一段(进闸 → ensure → newPage)里它还是 0。卡在那一段里关掉浏览器,那次渲染
+			// 会以 Target closed 失败 —— 一张该发的卡就没了。进闸再关:闸保证同一时刻只有一个
+			// 临界区,拿到闸就说明没有哪次渲染正在开场。
+			const release = await renderGate.acquire();
+			try {
+				if (activePages > 0 || !browser) return false;
+				cancelIdleTimer();
+				await closeIdleBrowser();
+				return true;
+			} finally {
+				release();
+			}
+		},
+		async page(options?: PageOptions): Promise<PageLike> {
+			// 进闸:等上一个渲染(页面 close)后才继续,保证全程并发度为 1。低优先级
+			// (链接卡)在正常车道排空之前不放行。
+			const release = await renderGate.acquire({ priority: options?.priority });
 			cancelIdleTimer();
 			try {
 				const b = await ensure();

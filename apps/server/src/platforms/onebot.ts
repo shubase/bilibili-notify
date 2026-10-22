@@ -1,23 +1,33 @@
 import type { IncomingMessage } from "node:http";
 import type {
+	Connection,
+	ConnectionCapabilities,
 	DeliveryResult,
+	DirectConnection,
 	Disposable,
+	InboundSinks,
 	Logger,
+	MiniAppCardSupport,
 	NotificationPayload,
-	OnebotAdapterConfig,
-	OnebotSession,
+	OnebotConnectionConfig,
 	PayloadSegment,
-	PushAdapter,
+	PlatformAdapter,
+	ProbeResult,
 	PushTarget,
 	ServiceContext,
 } from "@bilibili-notify/internal";
+import { connectionDispatchKey, isConnectionOn } from "@bilibili-notify/internal";
+import {
+	ONEBOT_FORWARD_MIN_TIMEOUT_MS,
+	ONEBOT_IMAGE_MIN_TIMEOUT_MS,
+} from "@bilibili-notify/internal/constants";
 import { type RawData, WebSocket, WebSocketServer } from "ws";
-import type { PlatformAdapter, ProbeResult } from "./types.js";
+import { routeInboundFrame } from "./onebot-inbound.js";
 
 /**
  * OneBot v11 adapter — HTTP / 正向 WS(ws)/ 反向 WS(ws-reverse)三种连接方式。
  *
- * 由 adapter config 的 `transport` 字段区分(见 `OnebotAdapterConfigSchema`):
+ * 由 adapter config 的 `transport` 字段区分(见 `OnebotConnectionConfigSchema`):
  * - `http`:独立端 fetch POST 到 bot 的 HTTP API(无状态,沿用原实现)。
  * - `ws`:独立端作 WS 客户端主动连 bot,长连接 + 自动重连。
  * - `ws-reverse`:独立端按 adapter 各自的 `port` 监听,bot 主动连入(端口即身份)。
@@ -34,17 +44,41 @@ import type { PlatformAdapter, ProbeResult } from "./types.js";
 export interface OnebotPlatformAdapterOptions {
 	logger: Logger;
 	serviceCtx: ServiceContext;
+	/**
+	 * 入站消息的两路出口(私聊 → 指令分发,群 → 链接解析)。都不传 = 这个 adapter 保持
+	 * 纯 push-only。帧在这里就归一化成平台中立的形状(见 `onebot-inbound.ts`),与官机
+	 * 网关交出来的一模一样;附上收到这一帧的 adapter id —— 帧里只有 self_id(bot 的号),
+	 * 对不上配置里的 adapter,而「回到消息来的那个群」得知道该用哪条连接。
+	 */
+	onInboundPrivate?: InboundSinks["onInboundPrivate"];
+	onInboundGroup?: InboundSinks["onInboundGroup"];
 	/** Fallback timeout (ms) when adapter.config.timeoutMs is missing. Defaults to 15s. */
 	timeoutMs?: number;
 	/**
-	 * 合并转发动作(send_*_forward_msg)的超时下限(ms),默认 60s。NapCat 组装多图
-	 * forward 要逐张下载再上传,常规 15s 几乎必超 —— 单独放宽,让慢成功等得到真响应,
-	 * 推送历史不再谎报失败。取 `max(cfg.timeoutMs, 此值)`。测试注入用。
+	 * 合并转发动作(send_*_forward_msg)的超时下限(ms)**兜底值**,默认 60s。NapCat
+	 * 组装多图 forward 要逐张下载再上传,常规 15s 几乎必超 —— 单独放宽,让慢成功等得
+	 * 到真响应,推送历史不再谎报失败。取 `max(cfg.timeoutMs, 下限)`。
+	 *
+	 * 真正生效的下限来自 adapter config 的同名字段(界面上「合并转发超时下限」那栏);
+	 * 本项只在配置里没这个字段时才用得上 —— 测试注入,以及未过 schema 的裸配置。
 	 */
 	forwardMinTimeoutMs?: number;
 	/** Optional standalone inbound event hook. Used by group chat commands. */
 	onInboundEvent?: OnebotInboundEventHandler;
+	/**
+	 * **带图**普通消息(send_group_msg / send_private_msg 里含 image 段)的超时下限
+	 * (ms)**兜底值**,默认 30s。与 forward 同一个道理,只是当初只想到了合并转发:带图
+	 * 消息在 OneBot 实现那侧要先落盘、传腾讯图床、拿 fileid 才回响应,15s 常不够(用户
+	 * 实测 LLOneBot,词云 / 动态卡每条都恰好卡在 15000ms 死线,而同时段纯文字全部秒回)。
+	 *
+	 * 比 forward 的 60s 短:单图只有一次上传往返,而 forward 要逐张来一遍。同上,配置
+	 * 里的同名字段优先,本项只是兜底。
+	 */
+	imageMinTimeoutMs?: number;
 }
+
+/** 同一条连接的能力最多这么久重探一次 —— 探不出来时别让每个调用方各赔一次超时。 */
+const CAPABILITY_REPROBE_MS = 60_000;
 
 export interface OnebotInboundEventContext {
 	adapterId: string;
@@ -61,7 +95,10 @@ const DEFAULT_TIMEOUT_MS = 15_000;
 const DEFAULT_RETRY_INTERVAL_MS = 1_000;
 const RECONNECT_BASE_MS = 1_000;
 const RECONNECT_MAX_MS = 30_000;
-const DEFAULT_FORWARD_MIN_TIMEOUT_MS = 60_000;
+// 两个下限与前端共用一个数(见 `@bilibili-notify/internal/constants` 的说明),否则
+// 界面上写着 30s、这边实际按别的数放宽,主人对不上账。
+const DEFAULT_FORWARD_MIN_TIMEOUT_MS = ONEBOT_FORWARD_MIN_TIMEOUT_MS;
+const DEFAULT_IMAGE_MIN_TIMEOUT_MS = ONEBOT_IMAGE_MIN_TIMEOUT_MS;
 
 /**
  * 「结果未知」类发送失败:action 帧 / HTTP 请求**已经发出去之后**才失败(响应超时、
@@ -83,12 +120,68 @@ function isForwardAction(action: string): boolean {
 	return action === "send_group_forward_msg" || action === "send_private_forward_msg";
 }
 
-type OnebotHttpConfig = Extract<OnebotAdapterConfig, { transport: "http" }>;
-type OnebotWsConfig = Extract<OnebotAdapterConfig, { transport: "ws" }>;
-type OnebotWsReverseConfig = Extract<OnebotAdapterConfig, { transport: "ws-reverse" }>;
+/**
+ * 这条消息带不带图 —— 带图的 OneBot 实现要先把图落盘再传腾讯图床才回响应,耗时与
+ * 图多大关系不大(卡片图只有 0.1MB 量级),但稳定压在十几秒。
+ *
+ * 按**最终要发出去的 message 段**判,不按 payload.kind:段才是真正决定 bot 侧干多少
+ * 活的东西。`forward-images` 且 `forward:false` 就是活例 —— 它 kind 看着像图集,却被
+ * buildSegments 并成了普通多图 send_group_msg,照 kind 判会漏掉最该放宽的那一类。
+ */
+function hasImageSegment(params: Record<string, unknown>): boolean {
+	const message = params.message;
+	if (!Array.isArray(message)) return false;
+	return message.some((seg) => (seg as OnebotMessageSegment | null)?.type === "image");
+}
+
+/**
+ * 这次动作该等多久的**下限**(0 = 不放宽,照配置走)。HTTP 与 WS 两条路共用,免得
+ * 两边各判一次、日后漂移成「WS 放宽了 HTTP 没有」。
+ *
+ * 只给真的慢的活放宽:纯文字消息不动 —— bot 真挂了的场景,每条文本都多等几十秒
+ * 只会让失败来得更晚,并拖住串行发送的后续目标。
+ */
+function minTimeoutFor(
+	action: string,
+	params: Record<string, unknown>,
+	limits: { forward: number; image: number },
+): number {
+	if (isForwardAction(action)) return limits.forward;
+	if (hasImageSegment(params)) return limits.image;
+	return 0;
+}
+
+/**
+ * 这条连接实际生效的两档下限。**adapter 配置里的值优先** —— 界面上那两栏就是主人的
+ * 意思,内建默认只是「没配过」时的兜底(schema 会给解析过的配置补 default,所以回落
+ * 这条路只在测试注入和未过 schema 的裸配置上走到)。
+ *
+ * 配 `0` 就是关掉放宽:为快速故障转移特意把 `timeoutMs` 调小的用户,不该被下限静默
+ * 无视 —— 串行扇出下,每个目标多等的那几十秒是要累加的。
+ */
+function minTimeoutLimits(
+	cfg: { forwardMinTimeoutMs?: number; imageMinTimeoutMs?: number },
+	fallbacks: { forward: number; image: number },
+): { forward: number; image: number } {
+	return {
+		forward: cfg.forwardMinTimeoutMs ?? fallbacks.forward,
+		image: cfg.imageMinTimeoutMs ?? fallbacks.image,
+	};
+}
+
+/**
+ * 这个 adapter 认的那一档连接 —— `isConnectionOn(c, "onebot")` 收窄之后的形状,`config`
+ * 跟着窄成 {@link OnebotConnectionConfig}。内部那些 helper 一律收它,于是「这是条 OneBot
+ * 连接」只在几个入口各判一次,底下不用再一路 `as` 下去。
+ */
+type OnebotConnection = Extract<DirectConnection, { platform: "onebot" }>;
+
+type OnebotHttpConfig = Extract<OnebotConnectionConfig, { transport: "http" }>;
+type OnebotWsConfig = Extract<OnebotConnectionConfig, { transport: "ws" }>;
+type OnebotWsReverseConfig = Extract<OnebotConnectionConfig, { transport: "ws-reverse" }>;
 
 export interface OnebotMessageSegment {
-	type: "text" | "image" | "at";
+	type: "text" | "image" | "at" | "json";
 	data: Record<string, string>;
 }
 
@@ -142,10 +235,13 @@ function buildSegments(payload: NotificationPayload): OnebotMessageSegment[] {
 		case "forward-images":
 			// payload.forward === true 时 buildSendAction 会单独走 send_group_forward_msg
 			// 路径,这里返回 []。forward === false 时把多个 URL 转为多 image segment 合并
-			// 到一条普通 send_group_msg(对齐 koishi onebot adapter 多图默认行为,避开
+			// 到一条普通 send_group_msg(对齐上游 koishi 框架 onebot adapter 的多图默认行为,避开
 			// NapCat 长消息 SsoSendLongMsg 通道的潜在超时)。
 			if (payload.forward) return [];
 			return payload.images.map((img) => ({ type: "image", data: { file: img.url } }));
+		case "miniapp-card":
+			// 要先向腾讯签 ark 才有段可发,send() 单独走 sendMiniAppCard;这里没有现成的段。
+			return [];
 	}
 }
 
@@ -182,7 +278,7 @@ function buildSendAction(
 	// 的 SsoSendLongMsg trpc 在某些部署不稳,故默认 false)。
 	if (payload.kind === "forward-images" && payload.forward) {
 		// node.name + node.uin 决定客户端展示的发送人头像 / 昵称。用机器人真身
-		// (botInfo)→ 收件人看到的是"机器人发的",对齐 koishi onebot adapter
+		// (botInfo)→ 收件人看到的是"机器人发的",对齐上游 koishi 框架的 onebot adapter
 		// (它在 src/bot/message.ts 用 `bot.user.name` / `bot.userId` 当 fallback)。
 		const nodes = payload.images.map((img) => ({
 			type: "node",
@@ -192,41 +288,54 @@ function buildSendAction(
 				content: [{ type: "image", data: { file: img.url } }],
 			},
 		}));
-		const session = target.session as OnebotSession;
-		const isPrivate = opts.private === true || target.scope === "private";
-		if (isPrivate) {
-			if (!session.userId) return { err: "private: userId missing" };
-			const uid = Number(session.userId);
-			if (!Number.isFinite(uid)) return { err: `private: userId 非数字 (${session.userId})` };
-			return { action: "send_private_forward_msg", params: { user_id: uid, messages: nodes } };
-		}
-		if (!session.groupId) return { err: "group: groupId missing" };
-		const gid = Number(session.groupId);
-		if (!Number.isFinite(gid)) return { err: `group: groupId 非数字 (${session.groupId})` };
-		return { action: "send_group_forward_msg", params: { group_id: gid, messages: nodes } };
+		const to = onebotNumericAddress(target, opts);
+		if ("err" in to) return to;
+		return to.private
+			? { action: "send_private_forward_msg", params: { user_id: to.id, messages: nodes } }
+			: { action: "send_group_forward_msg", params: { group_id: to.id, messages: nodes } };
 	}
-	const segments = buildSegments(payload);
+	return buildSendActionFromSegments(target, buildSegments(payload), opts);
+}
+
+/** 普通消息(send_group_msg / send_private_msg)的 action + params;段已经翻好了。 */
+function buildSendActionFromSegments(
+	target: PushTarget,
+	segments: OnebotMessageSegment[],
+	opts: { private?: boolean },
+): { action: string; params: Record<string, unknown> } | { err: string } {
 	if (segments.length === 0) return { err: "empty payload" };
-	const session = target.session as OnebotSession;
-	// `opts.private` 是「强制私聊」覆盖标志,仅 `=== true` 时覆盖 target.scope。
-	// 旧写法 `opts.private ?? scope==="private"` 的坑:caller(MultiplexSink.send)
-	// 恒传 `{ private: false }`,??（nullish coalescing）不替换 false,导致
-	// scope==="private" 的 target 永远走 group 分支并返回 "group: groupId missing"。
-	const isPrivate = opts.private === true || target.scope === "private";
+	const to = onebotNumericAddress(target, opts);
+	if ("err" in to) return to;
 	const params: Record<string, unknown> = { message: segments };
-	if (isPrivate) {
-		if (!session.userId) return { err: "private: userId missing" };
-		const uid = Number(session.userId);
-		// 非数字 userId → Number()=NaN → 序列化成 null,OneBot 端静默错投。提前拒。
-		if (!Number.isFinite(uid)) return { err: `private: userId 非数字 (${session.userId})` };
-		params.user_id = uid;
+	if (to.private) {
+		params.user_id = to.id;
 		return { action: "send_private_msg", params };
 	}
-	if (!session.groupId) return { err: "group: groupId missing" };
-	const gid = Number(session.groupId);
-	if (!Number.isFinite(gid)) return { err: `group: groupId 非数字 (${session.groupId})` };
-	params.group_id = gid;
+	params.group_id = to.id;
 	return { action: "send_group_msg", params };
+}
+
+/**
+ * 目标的地址 → OneBot 要的那个数字 id,外加「这一发是不是私聊」。
+ *
+ * `opts.private` 是「强制私聊」覆盖标志,**仅 `=== true` 时**覆盖 `target.scope`。
+ * 旧写法 `opts.private ?? scope==="private"` 的坑:caller(MultiplexSink.send)恒传
+ * `{ private: false }`,`??` 不替换 false,于是 scope==="private" 的 target 永远走
+ * group 分支并返回 "group: groupId missing"。
+ *
+ * 非数字地址 → `Number()` 得 NaN → 序列化成 null,OneBot 端静默错投。提前拒。
+ */
+function onebotNumericAddress(
+	target: PushTarget,
+	opts: { private?: boolean },
+): { private: boolean; id: number } | { err: string } {
+	const isPrivate = opts.private === true || target.scope === "private";
+	const what = isPrivate ? "private: userId" : "group: groupId";
+	if (target.kind !== "session") return { err: `${what} missing` };
+	if (!target.address) return { err: `${what} missing` };
+	const id = Number(target.address);
+	if (!Number.isFinite(id)) return { err: `${what} 非数字 (${target.address})` };
+	return { private: isPrivate, id };
 }
 
 /**
@@ -415,9 +524,12 @@ class WsChannel {
 			return; // 非 JSON,丢弃
 		}
 		const echo = typeof frame.echo === "string" ? frame.echo : undefined;
-		// 无 echo = 入站事件 / heartbeat。交给上层命令处理器；未匹配命令时自然 no-op。
 		if (!echo) {
-			this.onEvent?.(frame, this);
+			try {
+				this.onEvent?.(frame as Record<string, unknown>, this);
+			} catch {
+				// 上层解析炸了不该影响这条 WS 的收发 —— 它还担着推送。
+			}
 			return;
 		}
 		const p = this.pending.get(echo);
@@ -443,6 +555,19 @@ class WsChannel {
 	}
 }
 
+/**
+ * 通道只知道帧;归一化与来源 adapter 由这一层补上。两种连法(正向 / 反向)都要补,
+ * 而交出去的形状是适配器与消费者之间的契约 —— 各写一份的话,往里加字段时另一种连法
+ * 就悄悄少了那个字段。
+ */
+function inboundSink(
+	sinks: InboundSinks,
+	connectionId: string,
+): ((frame: Record<string, unknown>) => void) | undefined {
+	if (!sinks.onInboundPrivate && !sinks.onInboundGroup) return undefined;
+	return (frame) => routeInboundFrame(frame, { connectionId, platform: "onebot" }, sinks);
+}
+
 /** 正向 WS:独立端作客户端主动连 bot,断线指数退避重连。 */
 class ForwardConn {
 	private ws: WebSocket | null = null;
@@ -453,7 +578,7 @@ class ForwardConn {
 	lastError: string | null = null;
 
 	constructor(
-		readonly adapterId: string,
+		readonly connectionId: string,
 		readonly fingerprint: string,
 		private readonly url: string,
 		private readonly headers: Record<string, string>,
@@ -461,7 +586,10 @@ class ForwardConn {
 		private readonly log: Logger,
 		private readonly eventTimeoutMs: number,
 		private readonly forwardTimeoutMs: number,
+		private readonly sinks: InboundSinks,
 		private readonly onInboundEvent?: OnebotInboundEventHandler,
+		/** 通道就绪(连上 / bot 连入)时叫一声 —— 能力探测挂在这里,连上就探。 */
+		private readonly onChannelReady?: () => void,
 	) {
 		this.connect();
 	}
@@ -481,10 +609,14 @@ class ForwardConn {
 		ws.on("open", () => {
 			this.attempt = 0;
 			this.lastError = null;
-			this.channel = new WsChannel(ws, `fwd:${this.adapterId}`, this.serviceCtx, (frame, channel) =>
-				this.handleEvent(frame, channel),
+			this.channel = new WsChannel(
+				ws,
+				`fwd:${this.connectionId}`,
+				this.serviceCtx,
+				(frame, channel) => this.handleEvent(frame, channel),
 			);
-			this.log.info(`[onebot] 正向 WS 已连接 adapter=${this.adapterId} url=${this.url}`);
+			this.log.info(`[onebot] 正向 WS 已连接 adapter=${this.connectionId} url=${this.url}`);
+			this.onChannelReady?.();
 		});
 		ws.on("error", (err: Error) => {
 			this.lastError = err.message;
@@ -525,16 +657,17 @@ class ForwardConn {
 	}
 
 	private handleEvent(frame: unknown, channel: WsChannel): void {
+		inboundSink(this.sinks, this.connectionId)?.(frame as Record<string, unknown>);
 		if (!this.onInboundEvent) return;
 		const ctx = makeInboundContext(
-			this.adapterId,
+			this.connectionId,
 			frame,
 			channel,
 			this.eventTimeoutMs,
 			this.forwardTimeoutMs,
 		);
 		void Promise.resolve(this.onInboundEvent(ctx)).catch((err) => {
-			this.log.warn(`[onebot] 入站事件处理失败 adapter=${this.adapterId}: ${String(err)}`);
+			this.log.warn(`[onebot] 入站事件处理失败 adapter=${this.connectionId}: ${String(err)}`);
 		});
 	}
 }
@@ -547,14 +680,17 @@ class ReverseListener {
 	private readonly bots = new Set<{ ws: WebSocket; channel: WsChannel }>();
 
 	constructor(
-		readonly adapterId: string,
+		readonly connectionId: string,
 		readonly port: number,
 		private readonly accessToken: string | undefined,
 		private readonly serviceCtx: ServiceContext,
 		private readonly log: Logger,
 		private readonly eventTimeoutMs: number,
 		private readonly forwardTimeoutMs: number,
+		private readonly sinks: InboundSinks,
 		private readonly onInboundEvent?: OnebotInboundEventHandler,
+		/** 同 ForwardConn:bot 连入就探一次能力。 */
+		private readonly onChannelReady?: () => void,
 	) {
 		this.start();
 	}
@@ -570,7 +706,7 @@ class ReverseListener {
 		this.wss = wss;
 		wss.on("listening", () => {
 			this.bindError = null;
-			this.log.info(`[onebot] 反向 WS 监听就绪 adapter=${this.adapterId} port=${this.port}`);
+			this.log.info(`[onebot] 反向 WS 监听就绪 adapter=${this.connectionId} port=${this.port}`);
 		});
 		wss.on("error", (err: Error) => {
 			const code = (err as NodeJS.ErrnoException).code;
@@ -583,22 +719,27 @@ class ReverseListener {
 	private onConnection(ws: WebSocket, req: IncomingMessage): void {
 		if (!this.checkAuth(req)) {
 			this.log.warn(
-				`[onebot] 反向 WS 鉴权失败 adapter=${this.adapterId} port=${this.port},拒绝连接`,
+				`[onebot] 反向 WS 鉴权失败 adapter=${this.connectionId} port=${this.port},拒绝连接`,
 			);
 			ws.close(1008, "unauthorized");
 			return;
 		}
-		const channel = new WsChannel(ws, `rev:${this.adapterId}`, this.serviceCtx, (frame, ch) =>
-			this.handleEvent(frame, ch),
+		const channel = new WsChannel(
+			ws,
+			`rev:${this.connectionId}`,
+			this.serviceCtx,
+			(frame, channel) => this.handleEvent(frame, channel),
 		);
 		const entry = { ws, channel };
 		this.bots.add(entry);
-		this.log.info(`[onebot] 反向 WS bot 已连入 adapter=${this.adapterId}(在线 ${this.bots.size})`);
+		this.log.info(
+			`[onebot] 反向 WS bot 已连入 adapter=${this.connectionId}(在线 ${this.bots.size})`,
+		);
 		if (this.bots.size > 1) {
 			// 一个反向 WS 端口正常只对应一个 bot;多个时推送只发往最近连入的那个,
 			// 其余静默闲置 —— 大概率是把多个 bot 误指到同一端口,告警提示。
 			this.log.warn(
-				`[onebot] 反向 WS adapter=${this.adapterId} 端口 ${this.port} 有 ${this.bots.size} 个 bot 连入,` +
+				`[onebot] 反向 WS adapter=${this.connectionId} 端口 ${this.port} 有 ${this.bots.size} 个 bot 连入,` +
 					"推送只发往最近连入的那个;通常一个端口应只对应一个 bot",
 			);
 		}
@@ -606,6 +747,7 @@ class ReverseListener {
 			channel.rejectAll(new Error("bot 连接已断开"));
 			this.bots.delete(entry);
 		});
+		this.onChannelReady?.();
 		ws.on("error", () => {
 			/* close 事件会随后到达,统一在 close 清理 */
 		});
@@ -654,16 +796,17 @@ class ReverseListener {
 	}
 
 	private handleEvent(frame: unknown, channel: WsChannel): void {
+		inboundSink(this.sinks, this.connectionId)?.(frame as Record<string, unknown>);
 		if (!this.onInboundEvent) return;
 		const ctx = makeInboundContext(
-			this.adapterId,
+			this.connectionId,
 			frame,
 			channel,
 			this.eventTimeoutMs,
 			this.forwardTimeoutMs,
 		);
 		void Promise.resolve(this.onInboundEvent(ctx)).catch((err) => {
-			this.log.warn(`[onebot] 入站事件处理失败 adapter=${this.adapterId}: ${String(err)}`);
+			this.log.warn(`[onebot] 入站事件处理失败 adapter=${this.connectionId}: ${String(err)}`);
 		});
 	}
 }
@@ -779,8 +922,12 @@ export function createOnebotAdapter(opts: OnebotPlatformAdapterOptions): Platfor
 	const log = opts.logger;
 	const serviceCtx = opts.serviceCtx;
 	const fallbackTimeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-	const forwardMinTimeoutMs = opts.forwardMinTimeoutMs ?? DEFAULT_FORWARD_MIN_TIMEOUT_MS;
 	const onInboundEvent = opts.onInboundEvent;
+	// 「adapter 配置里没写」时才用得上的兜底;真正生效的值见 minTimeoutLimits()。
+	const minTimeoutFallbacks = {
+		forward: opts.forwardMinTimeoutMs ?? DEFAULT_FORWARD_MIN_TIMEOUT_MS,
+		image: opts.imageMinTimeoutMs ?? DEFAULT_IMAGE_MIN_TIMEOUT_MS,
+	};
 
 	const forwardConns = new Map<string, ForwardConn>();
 	const reverseListeners = new Map<string, ReverseListener>();
@@ -803,6 +950,9 @@ export function createOnebotAdapter(opts: OnebotPlatformAdapterOptions): Platfor
 		for (const l of reverseListeners.values()) l.close();
 		reverseListeners.clear();
 		botIdentityCache.clear();
+		miniAppCardSupport.clear();
+		knownConnections.clear();
+		capabilityFingerprints.clear();
 	}
 	// 兜底:即便 engines.dispose 没显式调到,serviceCtx 结束时也关干净。
 	serviceCtx.onDispose(disposeAll);
@@ -835,8 +985,8 @@ export function createOnebotAdapter(opts: OnebotPlatformAdapterOptions): Platfor
 	 *
 	 * 失败统一返回 null,buildSendAction 兜到 FALLBACK_BOT_IDENTITY,保推送可达。
 	 */
-	async function fetchBotIdentity(adapter: PushAdapter): Promise<BotIdentity | null> {
-		const cfg = adapter.config as OnebotAdapterConfig;
+	async function fetchBotIdentity(connection: OnebotConnection): Promise<BotIdentity | null> {
+		const cfg = connection.config;
 		try {
 			if (cfg.transport === "http") {
 				const res = await postOnebot(cfg, "/get_login_info", {}, fallbackTimeoutMs);
@@ -844,17 +994,14 @@ export function createOnebotAdapter(opts: OnebotPlatformAdapterOptions): Platfor
 				if (!verdict.ok) return null;
 				return parseLoginInfo(res.data);
 			}
-			const channel =
-				cfg.transport === "ws"
-					? (forwardConns.get(adapter.id)?.getChannel() ?? null)
-					: (reverseListeners.get(adapter.id)?.getChannel() ?? null);
+			const channel = channelOf(connection.id, cfg);
 			if (!channel) return null;
 			const res = await channel.call("get_login_info", {}, cfg.timeoutMs ?? fallbackTimeoutMs);
 			const verdict = interpretResponse(res);
 			if (!verdict.ok) return null;
 			return parseLoginInfo(res.data);
 		} catch (e) {
-			log.warn(`[onebot] adapter=${adapter.id} get_login_info 失败: ${String(e)}`);
+			log.warn(`[onebot] adapter=${connection.id} get_login_info 失败: ${String(e)}`);
 			return null;
 		}
 	}
@@ -870,23 +1017,246 @@ export function createOnebotAdapter(opts: OnebotPlatformAdapterOptions): Platfor
 	 * 续 send 命中缓存(此时 Promise 还未 resolve),不会重复发请求;Promise resolve
 	 * 后若是 null,后续来的 send 会重新发起 fetch。
 	 */
-	function getBotIdentity(adapter: PushAdapter): Promise<BotIdentity | null> {
-		const cached = botIdentityCache.get(adapter.id);
+	function getBotIdentity(connection: OnebotConnection): Promise<BotIdentity | null> {
+		const cached = botIdentityCache.get(connection.id);
 		if (cached) return cached;
-		const p = fetchBotIdentity(adapter);
-		botIdentityCache.set(adapter.id, p);
+		const p = fetchBotIdentity(connection);
+		botIdentityCache.set(connection.id, p);
 		p.then((result) => {
 			// 失败结果不留缓存,允许下次 send 重新探测。已被新 fetch 覆盖时不动。
-			if (result === null && botIdentityCache.get(adapter.id) === p) {
-				botIdentityCache.delete(adapter.id);
+			if (result === null && botIdentityCache.get(connection.id) === p) {
+				botIdentityCache.delete(connection.id);
 			}
 		});
 		return p;
 	}
 
+	// ------------------------------------------------------------------
+	// 平台能力:能不能签 QQ 小程序卡
+	// ------------------------------------------------------------------
+
+	/** 探测结果按 adapter 缓存;reconcile 清。没探过 = unknown。 */
+	const miniAppCardSupport = new Map<string, MiniAppCardSupport>();
+	/** 最近一次 reconcile 看到的 adapter 表 —— 通道就绪的回调只拿得到 id,探测要配置。 */
+	const knownConnections = new Map<string, OnebotConnection>();
+	/** 每个 adapter 上次 reconcile 时的配置指纹:没变就不丢它的能力缓存。 */
+	const capabilityFingerprints = new Map<string, string>();
+	/** 上次探能力的时刻 —— 探不出来的连接不该被反复问,见 {@link CAPABILITY_REPROBE_MS}。 */
+	const lastCapabilityProbeAt = new Map<string, number>();
+	const NOT_PROBED: MiniAppCardSupport = { state: "unknown" };
+
+	function channelOf(connectionId: string, cfg: OnebotWsConfig | OnebotWsReverseConfig) {
+		return cfg.transport === "ws"
+			? (forwardConns.get(connectionId)?.getChannel() ?? null)
+			: (reverseListeners.get(connectionId)?.getChannel() ?? null);
+	}
+
+	/**
+	 * 调一次 action、不重试 —— 探测与签卡用;真正的发送仍走各自带重试的路。
+	 * 三种 transport 在这里汇成一条:http 直接 POST,ws / ws-reverse 从 channel 发 echo 帧。
+	 */
+	async function callOnce(
+		connection: OnebotConnection,
+		action: string,
+		params: Record<string, unknown>,
+	): Promise<OneBotResponse> {
+		const cfg = connection.config;
+		const timeoutMs = cfg.timeoutMs ?? fallbackTimeoutMs;
+		if (cfg.transport === "http") return postOnebotOnce(cfg, `/${action}`, params, timeoutMs);
+		const channel = channelOf(connection.id, cfg);
+		if (!channel) {
+			throw new Error(cfg.transport === "ws" ? "正向 WS 未连接" : "无 bot 连入(反向 WS)");
+		}
+		return channel.call(action, params, timeoutMs);
+	}
+
+	/** 「这个实现没有 get_mini_app_ark」:OneBot 11 的 1404,或把 action 当路径的实现回 HTTP 404。 */
+	function isActionMissing(r: OneBotResponse): boolean {
+		return r.retcode === 1404 || r.retcode === 404;
+	}
+
+	/**
+	 * 空参数探测的判读。1400「参数错」正说明接口在;真成功(0)也算在 —— 有的实现对空参不挑。
+	 * 别的都是没探出来:连不上、鉴权失败、实现自己的错误码,原因带出去给面板。
+	 */
+	function interpretArkProbe(r: OneBotResponse): MiniAppCardSupport {
+		const checkedAt = Date.now();
+		if (isActionMissing(r)) {
+			return { state: "unsupported", reason: "这个 OneBot 实现没有 get_mini_app_ark", checkedAt };
+		}
+		if (r.retcode === 1400 || (r.status === "ok" && (r.retcode ?? 0) === 0)) {
+			return { state: "supported", checkedAt };
+		}
+		return { state: "unknown", reason: r.wording ?? r.message ?? r.msg ?? `retcode=${r.retcode}` };
+	}
+
+	/**
+	 * 探不出来的连接(连不上 / 回自己的错误码)会一直停在「未探测」,而问一次要赔满一个
+	 * 超时。节流住在这里而不是各个调用方那边:缓存与失效规则都在这个文件,再让链接解析、
+	 * 健康探测各维护一张时间戳表,「什么时候该重探」就会摊成三份。
+	 */
+	async function probeMiniAppCard(connection: OnebotConnection): Promise<MiniAppCardSupport> {
+		const cachedBefore = miniAppCardSupport.get(connection.id);
+		const last = lastCapabilityProbeAt.get(connection.id) ?? Number.NEGATIVE_INFINITY;
+		if (cachedBefore !== undefined && Date.now() - last < CAPABILITY_REPROBE_MS) {
+			return cachedBefore;
+		}
+		lastCapabilityProbeAt.set(connection.id, Date.now());
+		let result: MiniAppCardSupport;
+		try {
+			result = interpretArkProbe(await callOnce(connection, "get_mini_app_ark", {}));
+		} catch (e) {
+			result = { state: "unknown", reason: e instanceof Error ? e.message : String(e) };
+		}
+		// 探不出来不推翻已经探实的答案:反向 WS 的 bot 断一次连一次就探一次,那一趟撞上实现
+		// 还没初始化完就超时,面板会莫名其妙地退回「未探测」、发卡前又要白探一趟。降级只认
+		// 一种证据 —— 真发时收到 1404(见 sendMiniAppCard)。
+		const cached = miniAppCardSupport.get(connection.id);
+		if (result.state === "unknown" && cached !== undefined && cached.state !== "unknown") {
+			log.debug(
+				`[onebot] adapter=${connection.id} 这次没探出小程序卡能力(${result.reason ?? "?"}),沿用上次的 ${cached.state}`,
+			);
+			return cached;
+		}
+		miniAppCardSupport.set(connection.id, result);
+		// 与 get_login_info 同一条规矩:探成了不出声。发不了才留一行 —— 主人选了小程序卡却
+		// 收到图片卡时,这是唯一能解释原因的地方;没探出来多半是还没连上,健康探测每五分钟
+		// 会再试,放 debug 免得刷屏。
+		if (result.state === "unsupported") {
+			log.info(`[onebot] adapter=${connection.id} 发不了小程序卡:${result.reason}`);
+		} else if (result.state === "unknown") {
+			log.debug(`[onebot] adapter=${connection.id} 小程序卡能力还没探出来:${result.reason ?? "?"}`);
+		}
+		return result;
+	}
+
+	/** 通道就绪(正向连上 / 反向 bot 连入)→ 探一次。拿不到配置(已被 reconcile 移除)就算了。 */
+	function probeOnReady(connectionId: string): void {
+		const connection = knownConnections.get(connectionId);
+		if (connection && !disposed) void probeMiniAppCard(connection);
+	}
+
+	/**
+	 * 发一张小程序卡:先向腾讯签 ark(bili 模板),再把 ark 当 `json` 段走普通发送。
+	 * 签卡收到 1404 → 翻成不支持、不发;别的失败只报这一条,缓存不动(可能只是暂时的)。
+	 *
+	 * 签卡请求的两个链接字段别看名字:`jumpUrl` 是**小程序页面路径**,`webUrl` 才是网页链接。
+	 * QQ 客户端源码里(MiniProgramOpenSdkUtil)前者接的是 OpenSDK 的 `mini_program_path`,
+	 * 后者接的是 `url`、签回来落到卡的 `qqdocurl`。NapCat 文档把前者写成「跳转 URL」,照着
+	 * 填网址签出来的卡点开是「页面不存在」;`webUrl` 不填则卡上压根没有 `qqdocurl`。
+	 */
+	async function sendMiniAppCard(
+		connection: OnebotConnection,
+		target: PushTarget,
+		card: Extract<NotificationPayload, { kind: "miniapp-card" }>,
+		opts: { private?: boolean },
+	): Promise<DeliveryResult> {
+		const t0 = Date.now();
+		let ark: unknown;
+		try {
+			const r = await callOnce(connection, "get_mini_app_ark", {
+				type: "bili",
+				title: card.title,
+				desc: card.desc,
+				picUrl: card.picUrl,
+				jumpUrl: card.path,
+				webUrl: card.jumpUrl,
+			});
+			if (isActionMissing(r)) {
+				const reason = "这个 OneBot 实现没有 get_mini_app_ark,发不了小程序卡";
+				miniAppCardSupport.set(connection.id, {
+					state: "unsupported",
+					reason,
+					checkedAt: Date.now(),
+				});
+				return { ok: false, latencyMs: Date.now() - t0, err: reason };
+			}
+			const verdict = interpretResponse(r);
+			if (!verdict.ok) {
+				return { ok: false, latencyMs: Date.now() - t0, err: `签小程序卡失败: ${verdict.err}` };
+			}
+			ark = r.data;
+		} catch (e) {
+			const err = e instanceof Error ? e.message : String(e);
+			return { ok: false, latencyMs: Date.now() - t0, err: `签小程序卡失败: ${err}` };
+		}
+		const data = arkToSegmentData(ark);
+		if (data === null) {
+			return { ok: false, latencyMs: Date.now() - t0, err: "签小程序卡失败: 返回的不是 ark" };
+		}
+		miniAppCardSupport.set(connection.id, { state: "supported", checkedAt: Date.now() });
+		const built = buildSendActionFromSegments(target, [{ type: "json", data: { data } }], opts);
+		if ("err" in built) return { ok: false, latencyMs: Date.now() - t0, err: built.err };
+		return dispatch(connection, target, built, t0);
+	}
+
+	/**
+	 * 把 `get_mini_app_ark` 交出来的东西整理成 `json` 段的 `data`(一个 ark 的 JSON 字符串)。
+	 *
+	 * NapCat 的 handler 返回 `{ data: ark }`,OneBot 帧再包一层 `data`,于是响应里是
+	 * `data.data` 才是 ark —— 真机踩到过:把外面那层整个发出去,腾讯认不出、直接吞掉,NapCat
+	 * 等不到上屏回调才报超时,日志里只有一句「NapCat 可能掉线」。别家实现可能不套这一层,
+	 * 也可能交字符串:看到 `app` 字段就是 ark 本体,只有 `data` 就剥一层,怎么看都不像的
+	 * 不发(发出去也是被吞)。
+	 */
+	function arkToSegmentData(raw: unknown): string | null {
+		let value: unknown = raw;
+		if (typeof value === "string") {
+			try {
+				value = JSON.parse(value);
+			} catch {
+				return null;
+			}
+		}
+		for (let depth = 0; depth < 2; depth++) {
+			if (typeof value !== "object" || value === null) return null;
+			const obj = value as Record<string, unknown>;
+			if (typeof obj.app === "string") return JSON.stringify(obj);
+			if (!("data" in obj)) return null;
+			value = obj.data;
+		}
+		return null;
+	}
+
+	/** 一条已经翻好的 action 走 transport 发出去(带各自的重试与超时规则)。 */
+	async function dispatch(
+		connection: OnebotConnection,
+		target: PushTarget,
+		built: { action: string; params: Record<string, unknown> },
+		t0: number,
+	): Promise<DeliveryResult> {
+		const cfg = connection.config;
+		if (cfg.transport === "http") {
+			try {
+				const result = await postOnebot(cfg, `/${built.action}`, built.params, fallbackTimeoutMs, {
+					nonIdempotent: true,
+					minTimeoutMs: minTimeoutFor(
+						built.action,
+						built.params,
+						minTimeoutLimits(cfg, minTimeoutFallbacks),
+					),
+				});
+				const verdict = interpretResponse(result);
+				if (!verdict.ok) {
+					log.warn(`[onebot] target=${target.id} send failed: ${verdict.err}`);
+					return { ok: false, latencyMs: Date.now() - t0, err: verdict.err };
+				}
+				return { ok: true, latencyMs: Date.now() - t0 };
+			} catch (e) {
+				const err =
+					e instanceof IndeterminateActionError
+						? e.message + INDETERMINATE_NOTE
+						: describeFetchError(e);
+				log.warn(`[onebot] target=${target.id} send threw: ${err} (baseUrl=${cfg.baseUrl})`);
+				return { ok: false, latencyMs: Date.now() - t0, err };
+			}
+		}
+		return sendOverWs(connection.id, cfg, built.action, built.params, target.id, t0);
+	}
+
 	/** WS / WS-reverse 共用的发送(echo 帧 + 重试)。 */
 	async function sendOverWs(
-		adapterId: string,
+		connectionId: string,
 		cfg: OnebotWsConfig | OnebotWsReverseConfig,
 		action: string,
 		params: Record<string, unknown>,
@@ -894,17 +1264,18 @@ export function createOnebotAdapter(opts: OnebotPlatformAdapterOptions): Platfor
 		t0: number,
 	): Promise<DeliveryResult> {
 		const baseTimeoutMs = cfg.timeoutMs ?? fallbackTimeoutMs;
-		const timeoutMs = isForwardAction(action)
-			? Math.max(baseTimeoutMs, forwardMinTimeoutMs)
-			: baseTimeoutMs;
+		const timeoutMs = Math.max(
+			baseTimeoutMs,
+			minTimeoutFor(action, params, minTimeoutLimits(cfg, minTimeoutFallbacks)),
+		);
 		const retryTimes = cfg.retryTimes ?? 0;
 		const retryIntervalMs = cfg.retryIntervalMs ?? DEFAULT_RETRY_INTERVAL_MS;
 		let lastErr = "ws send failed";
 		for (let attempt = 0; attempt <= retryTimes; attempt++) {
 			const channel =
 				cfg.transport === "ws"
-					? (forwardConns.get(adapterId)?.getChannel() ?? null)
-					: (reverseListeners.get(adapterId)?.getChannel() ?? null);
+					? (forwardConns.get(connectionId)?.getChannel() ?? null)
+					: (reverseListeners.get(connectionId)?.getChannel() ?? null);
 			if (!channel) {
 				lastErr = cfg.transport === "ws" ? "正向 WS 未连接" : "无 bot 连入(反向 WS)";
 			} else {
@@ -934,18 +1305,20 @@ export function createOnebotAdapter(opts: OnebotPlatformAdapterOptions): Platfor
 	return {
 		platforms: ["onebot"],
 
-		isAvailable(adapter: PushAdapter, target: PushTarget): boolean {
-			if (adapter.platform !== "onebot" || target.platform !== "onebot") return false;
-			if (!adapter.enabled || !target.enabled) return false;
-			const cfg = adapter.config as OnebotAdapterConfig;
+		isAvailable(connection: Connection, target: PushTarget): boolean {
+			if (!isConnectionOn(connection, "onebot") || target.platform !== "onebot") return false;
+			if (!connection.enabled || !target.enabled) return false;
+			const cfg = connection.config;
 			if (cfg.transport === "http") return cfg.baseUrl.length > 0;
 			if (cfg.transport === "ws") return cfg.url.length > 0;
 			return true; // ws-reverse:运行期可达性由 send/probe 判断
 		},
 
-		reconcile(adapters: readonly PushAdapter[]): void {
+		reconcile(connections: readonly Connection[]): void {
 			if (disposed) return;
-			const onebots = adapters.filter((a) => a.platform === "onebot" && a.enabled);
+			const onebots = connections.filter(
+				(a): a is OnebotConnection => isConnectionOn(a, "onebot") && a.enabled,
+			);
 
 			// --- bot 身份缓存清理 ---
 			// reconcile 触发频率低(dashboard 改 adapter / target 配置才触发),
@@ -954,10 +1327,32 @@ export function createOnebotAdapter(opts: OnebotPlatformAdapterOptions): Platfor
 			// 每次 reconcile 后第一次 forward 多一次 get_login_info(15s 超时)。
 			botIdentityCache.clear();
 
+			// --- 能力缓存 ---
+			// 只在连接的配置真变了(指向另一个实现)或连接没了时丢;配置没变就留着。**不能全清**:
+			// 健康探测每五分钟写回 testStatus 也会触发一次 reconcile,而反向 ws 的 bot 早已连着、
+			// 不会再触发「连入」重探 —— 全清的话面板永远停在「未探测」(真机踩到)。
+			for (const id of [...knownConnections.keys()]) {
+				if (onebots.some((a) => a.id === id)) continue;
+				knownConnections.delete(id);
+				miniAppCardSupport.delete(id);
+				capabilityFingerprints.delete(id);
+				lastCapabilityProbeAt.delete(id);
+			}
+			for (const a of onebots) {
+				const fp = JSON.stringify(a.config);
+				const changed = capabilityFingerprints.get(a.id) !== fp;
+				capabilityFingerprints.set(a.id, fp);
+				knownConnections.set(a.id, a);
+				if (changed) miniAppCardSupport.delete(a.id);
+				// ws 的两种在通道就绪时探;http 没有「连上」这一刻,配置变了或还没探出来就在这儿探。
+				const cfg = a.config;
+				if (cfg.transport === "http" && !miniAppCardSupport.has(a.id)) void probeMiniAppCard(a);
+			}
+
 			// --- 正向 ws ---
 			const desiredFwd = new Map<string, OnebotWsConfig>();
 			for (const a of onebots) {
-				const cfg = a.config as OnebotAdapterConfig;
+				const cfg = a.config;
 				if (cfg.transport === "ws") desiredFwd.set(a.id, cfg);
 			}
 			for (const [id, conn] of forwardConns) {
@@ -981,8 +1376,13 @@ export function createOnebotAdapter(opts: OnebotPlatformAdapterOptions): Platfor
 						serviceCtx,
 						log,
 						cfg.timeoutMs ?? fallbackTimeoutMs,
-						Math.max(cfg.timeoutMs ?? fallbackTimeoutMs, forwardMinTimeoutMs),
+						Math.max(
+							cfg.timeoutMs ?? fallbackTimeoutMs,
+							minTimeoutLimits(cfg, minTimeoutFallbacks).forward,
+						),
+						opts,
 						onInboundEvent,
+						() => probeOnReady(id),
 					),
 				);
 			}
@@ -990,7 +1390,7 @@ export function createOnebotAdapter(opts: OnebotPlatformAdapterOptions): Platfor
 			// --- 反向 ws ---
 			const desiredRev = new Map<string, OnebotWsReverseConfig>();
 			for (const a of onebots) {
-				const cfg = a.config as OnebotAdapterConfig;
+				const cfg = a.config;
 				if (cfg.transport === "ws-reverse") desiredRev.set(a.id, cfg);
 			}
 			for (const [id, lis] of reverseListeners) {
@@ -1013,8 +1413,13 @@ export function createOnebotAdapter(opts: OnebotPlatformAdapterOptions): Platfor
 						serviceCtx,
 						log,
 						cfg.timeoutMs ?? fallbackTimeoutMs,
-						Math.max(cfg.timeoutMs ?? fallbackTimeoutMs, forwardMinTimeoutMs),
+						Math.max(
+							cfg.timeoutMs ?? fallbackTimeoutMs,
+							minTimeoutLimits(cfg, minTimeoutFallbacks).forward,
+						),
+						opts,
 						onInboundEvent,
+						() => probeOnReady(id),
 					),
 				);
 			}
@@ -1024,13 +1429,16 @@ export function createOnebotAdapter(opts: OnebotPlatformAdapterOptions): Platfor
 			disposeAll();
 		},
 
-		async probe(adapter: PushAdapter): Promise<ProbeResult> {
-			if (adapter.platform !== "onebot") {
-				return { ok: false, latencyMs: 0, err: `wrong platform: ${adapter.platform}` };
+		async probe(connection: Connection): Promise<ProbeResult> {
+			if (!isConnectionOn(connection, "onebot")) {
+				return {
+					ok: false,
+					latencyMs: 0,
+					err: `wrong platform: ${connectionDispatchKey(connection)}`,
+				};
 			}
-			const cfg = adapter.config as OnebotAdapterConfig;
+			const cfg = connection.config;
 			const t0 = Date.now();
-
 			if (cfg.transport === "http") {
 				try {
 					const result = await postOnebotOnce(
@@ -1049,7 +1457,7 @@ export function createOnebotAdapter(opts: OnebotPlatformAdapterOptions): Platfor
 			}
 
 			if (cfg.transport === "ws") {
-				const conn = forwardConns.get(adapter.id);
+				const conn = forwardConns.get(connection.id);
 				const channel = conn?.getChannel() ?? null;
 				if (!channel) {
 					return {
@@ -1075,7 +1483,7 @@ export function createOnebotAdapter(opts: OnebotPlatformAdapterOptions): Platfor
 			}
 
 			// ws-reverse
-			const lis = reverseListeners.get(adapter.id);
+			const lis = reverseListeners.get(connection.id);
 			if (!lis) {
 				return { ok: false, latencyMs: Date.now() - t0, err: "反向 WS 监听未启动" };
 			}
@@ -1111,19 +1519,20 @@ export function createOnebotAdapter(opts: OnebotPlatformAdapterOptions): Platfor
 		},
 
 		async send(
-			adapter: PushAdapter,
+			connection: Connection,
 			target: PushTarget,
 			payload: NotificationPayload,
 			opts: { private?: boolean } = {},
 		): Promise<DeliveryResult> {
-			if (adapter.platform !== "onebot" || target.platform !== "onebot") {
+			if (!isConnectionOn(connection, "onebot") || target.platform !== "onebot") {
 				return {
 					ok: false,
 					latencyMs: 0,
-					err: `wrong platform: adapter=${adapter.platform} target=${target.platform}`,
+					err: `wrong platform: adapter=${connectionDispatchKey(connection)} target=${target.platform}`,
 				};
 			}
-			const cfg = adapter.config as OnebotAdapterConfig;
+			if (payload.kind === "miniapp-card")
+				return sendMiniAppCard(connection, target, payload, opts);
 			// 先用 fallback botInfo 跑一遍 buildSendAction 做 target 校验 ——
 			// session.groupId / userId 缺失等"配错"立即 err 返回,不浪费 get_login_info
 			// 往返(可能 15s 超时)在一条注定发不出去的消息上。非 forward 路径直接复用
@@ -1137,7 +1546,7 @@ export function createOnebotAdapter(opts: OnebotPlatformAdapterOptions): Platfor
 			// 完整端到端开销 —— 用户视角 latency = 这条消息真发出来花了多久,bot 身份
 			// 探测是发它必经的一步。getBotIdentity 内部 lazy 缓存,大多数情况下命中走 O(1)。
 			if (payload.kind === "forward-images" && payload.forward) {
-				const botInfo = (await getBotIdentity(adapter)) ?? undefined;
+				const botInfo = (await getBotIdentity(connection)) ?? undefined;
 				const rebuilt = buildSendAction(target, payload, opts, botInfo);
 				// rebuilt 与首次同 target/payload/opts;target 校验已过,此处 err 分支
 				// 理论不会触达。守一手保类型收敛。
@@ -1147,35 +1556,18 @@ export function createOnebotAdapter(opts: OnebotPlatformAdapterOptions): Platfor
 				built = rebuilt;
 			}
 
-			if (cfg.transport === "http") {
-				try {
-					const result = await postOnebot(
-						cfg,
-						`/${built.action}`,
-						built.params,
-						fallbackTimeoutMs,
-						{
-							nonIdempotent: true,
-							minTimeoutMs: isForwardAction(built.action) ? forwardMinTimeoutMs : undefined,
-						},
-					);
-					const verdict = interpretResponse(result);
-					if (!verdict.ok) {
-						log.warn(`[onebot] target=${target.id} send failed: ${verdict.err}`);
-						return { ok: false, latencyMs: Date.now() - t0, err: verdict.err };
-					}
-					return { ok: true, latencyMs: Date.now() - t0 };
-				} catch (e) {
-					const err =
-						e instanceof IndeterminateActionError
-							? e.message + INDETERMINATE_NOTE
-							: describeFetchError(e);
-					log.warn(`[onebot] target=${target.id} send threw: ${err} (baseUrl=${cfg.baseUrl})`);
-					return { ok: false, latencyMs: Date.now() - t0, err };
-				}
-			}
+			return dispatch(connection, target, built, t0);
+		},
 
-			return sendOverWs(adapter.id, cfg, built.action, built.params, target.id, t0);
+		capabilities(connection: Connection): ConnectionCapabilities {
+			return { miniAppCard: miniAppCardSupport.get(connection.id) ?? NOT_PROBED };
+		},
+
+		async probeCapabilities(connection: Connection): Promise<ConnectionCapabilities> {
+			// 这个方法是唯一**没有**自带那句「不是我的就退回去」的入口(契约上它不返回错,
+			// 只返回能力)。矩阵按分发键派活,派到这儿的必是 onebot 直连 —— 那句保证在这里
+			// 记一次,底下的 helper 就都收窄类型、不用一路 `as` 下去。
+			return { miniAppCard: await probeMiniAppCard(connection as OnebotConnection) };
 		},
 	};
 }

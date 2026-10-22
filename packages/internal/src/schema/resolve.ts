@@ -1,5 +1,4 @@
-import { resolveAIProfile } from "../constants";
-import { type CardLayout, normalizeCardLayout } from "./card-layout";
+import { resolveActivePersona, resolveAIProfile } from "../constants";
 import type {
 	AIPersona,
 	AISettings,
@@ -7,6 +6,7 @@ import type {
 	CardStyle,
 	ContentFilters,
 	FeatureFlags,
+	FeatureFlagsPartial,
 	ImageGroupSettings,
 	ScheduleConfig,
 	TemplateBundle,
@@ -16,8 +16,7 @@ import { type MessageLayout, normalizeMessageLayout } from "./message-layout";
 import type {
 	AIOverride,
 	Subscription,
-	SubscriptionAtAll,
-	SubscriptionAtAllDefaults,
+	SubscriptionExtras,
 	SubscriptionOverrides,
 	SubscriptionRouting,
 } from "./subscriptions";
@@ -34,8 +33,8 @@ export interface EffectiveSubscription {
 	groups: string[];
 	notes: string | undefined;
 	routing: SubscriptionRouting;
-	atAllDefaults: SubscriptionAtAllDefaults;
-	atAll: SubscriptionAtAll;
+	/** 附加项的 per-目标 三态表(原样带过来,没有可合并的上一层)。 */
+	extras: SubscriptionExtras;
 	specialUsers: Subscription["specialUsers"];
 
 	features: FeatureFlags;
@@ -44,7 +43,8 @@ export interface EffectiveSubscription {
 	templates: TemplateBundle;
 	ai: ResolvedAI;
 	cardStyle: CardStyle;
-	cardLayout: CardLayout;
+	/** 生效的卡片皮肤 id(per-UP 指了就用它,否则全局)。 */
+	cardSkin: string;
 	messageLayout: MessageLayout;
 	imageGroup: ImageGroupSettings;
 }
@@ -58,8 +58,6 @@ export interface ResolvedAI {
 	persona: AIPersona;
 	dynamicPrompt: string;
 	liveSummaryPrompt: string;
-	/** per-UP AstrBot 人格 id 直通(AstrBot 端消费;其它端忽略)。 */
-	personaId?: string;
 }
 
 /** 浅合并：override 中存在的字段覆盖 base，undefined / 缺失则保留 base。 */
@@ -73,41 +71,50 @@ function merge<T extends object>(base: T, override: Partial<T> | undefined): T {
 	return out;
 }
 
+/**
+ * features 的合并比别的多一层:附加项是个小对象,per-UP 只关词云时不该把总结
+ * 一起盖掉 —— 七把开关浅合并,`extras` 再往里合一层。
+ */
+function mergeFeatures(
+	base: FeatureFlags,
+	override: FeatureFlagsPartial | undefined,
+): FeatureFlags {
+	if (!override) return base;
+	const { extras, ...flags } = override;
+	return {
+		...merge(base, flags),
+		extras: merge(base.extras, extras),
+	};
+}
+
 function resolveAI(globals: AISettings, override: AIOverride | undefined): ResolvedAI {
 	// 连接与生成参数按家分桶存,先取出当前生效的那一套。per-UP override 覆盖的是
 	// **解析后**的值(它只动 temperature 与人格),不关心图来自哪个桶。
 	const profile = resolveAIProfile(globals);
-	// 全局此刻用的是哪份人格。`activePreset` 不填 = 用 `ai.persona`(老配置一字不变);
-	// 填了就用那份预设 —— 且**不改写** `ai.persona`,切回「默认」时主人手写的那份
-	// 原封不动地回来。指向一份已不存在的预设(刚删掉 / 备份换了一批)时静静回落。
-	const active = globals.activePreset
-		? globals.presets.find((p) => p.id === globals.activePreset)
-		: undefined;
+	// 全局此刻用的是哪份人格 —— 读法只有一处(`resolveActivePersona`),各端共用。
+	// 这里曾经自己展开过那三行,于是别的消费方(常驻 generator、试一句、锐评、聊天窗
+	// 抬头)照着 `ai.persona` 各写各的,换了人格全都不跟着变。
+	const active = resolveActivePersona(globals);
 	const base: ResolvedAI = {
 		enabled: globals.enabled,
 		baseUrl: profile.baseUrl,
 		apiKey: profile.apiKey,
 		model: profile.model,
 		temperature: profile.temperature,
-		persona: active?.persona ?? globals.persona,
-		dynamicPrompt: active?.dynamicPrompt ?? globals.dynamicPrompt,
-		liveSummaryPrompt: active?.liveSummaryPrompt ?? globals.liveSummaryPrompt,
+		persona: active.persona,
+		dynamicPrompt: active.dynamicPrompt,
+		liveSummaryPrompt: active.liveSummaryPrompt,
 	};
 
-	// personaId 是 per-UP 直通,与 preset 无关 —— 即便 preset=inherit 也要带出去。
-	const personaId = override?.personaId;
-
-	if (!override) return { ...base, personaId };
+	if (!override) return base;
 
 	/*
 	 * per-UP 只做一件事:**从 `globals.presets` 里挑一份**。挑不着就是全局那份。
 	 *
-	 * `override` 上的 `persona` / `dynamicPrompt` / `liveSummaryPrompt` **一概不读**
-	 * —— 设置页曾经给过一档「完全自定义」能就地写死一套人设,那一档撤掉了(人格一律
-	 * 在「智能女仆」页里写),但盘上还留着当年写下的字段。继续读它们就成了界面上
-	 * 看不见、实际仍在生效的鬼配置。字段本身留在 schema 里没删 —— **koishi 端在用**:
-	 * 那一侧压根不暴露 preset 选择,`enable` 即「我自己填」,恒写 `preset:"custom"`
-	 * 外加整份 persona,并且走自己的 `buildAiOverride` 读回去,不经过这里。
+	 * 设置页曾经给过一档「完全自定义」能就地写死一套人设(`persona` / `dynamicPrompt` /
+	 * `liveSummaryPrompt`),那一档撤掉了(人格一律在「智能女仆」页里写),那三个字段也已
+	 * 从 schema 里删掉 —— 盘上残留的值在解析时就被丢弃,不会成为界面上看不见、实际仍在
+	 * 生效的鬼配置。
 	 *
 	 * 于是三种取值在这里殊途同归、都落到全局:老的 `'inherit'`(当年那档「继承全局」)、
 	 * 老的 `'custom'`、以及指向一份已被删掉的人格。三者的实际行为本来就都是「继承
@@ -121,7 +128,7 @@ function resolveAI(globals: AISettings, override: AIOverride | undefined): Resol
 	// temperature 不在撤掉之列 —— 它本来就是独立一格,与挑哪份人格无关。
 	const temperature = override.temperature ?? base.temperature;
 
-	return { ...base, persona, dynamicPrompt, liveSummaryPrompt, temperature, personaId };
+	return { ...base, persona, dynamicPrompt, liveSummaryPrompt, temperature };
 }
 
 /**
@@ -144,7 +151,7 @@ export function resolveCardStyleForKind(
 export function resolve(sub: Subscription, defaults: GlobalDefaults): EffectiveSubscription {
 	const ov = sub.overrides;
 	// P2:merge() 在 override 缺失时直接返回 base 引用,且 {...base} 仅浅拷贝 ——
-	// routing/atAll/specialUsers 又是 sub 的直接引用,filters.blockKeywords
+	// routing/extras/specialUsers 又是 sub 的直接引用,filters.blockKeywords
 	// 等嵌套数组与 defaults 共享。任一消费方就地改 EffectiveSubscription 即污染
 	// 全局默认 / 原始 sub。structuredClone 整体深隔离(schema 全为纯数据,无函数)。
 	return structuredClone<EffectiveSubscription>({
@@ -155,21 +162,19 @@ export function resolve(sub: Subscription, defaults: GlobalDefaults): EffectiveS
 		groups: sub.groups,
 		notes: sub.notes,
 		routing: sub.routing,
-		atAllDefaults: sub.atAllDefaults,
-		atAll: sub.atAll,
+		extras: sub.extras,
 		specialUsers: sub.specialUsers,
 
-		features: merge(defaults.features, ov.features),
+		features: mergeFeatures(defaults.features, ov.features),
 		filters: merge(defaults.filters, ov.filters),
 		schedule: merge(defaults.schedule, ov.schedule),
 		templates: merge(defaults.templates, ov.templates),
 		ai: resolveAI(defaults.ai, ov.ai),
 		cardStyle: merge(defaults.cardStyle, ov.cardStyle),
-		// 卡片版式整份覆盖:有 per-UP override 则用它(并 normalize 做向前兼容),
-		// 否则继承全局。数组型描述符不走 merge() 的浅合并。
-		cardLayout: ov.cardLayout
-			? normalizeCardLayout(ov.cardLayout, defaults.cardLayout)
-			: defaults.cardLayout,
+		// 皮肤是整份引用,没有合并可言:指了就是它。旧的 `cardLayout` 不再折进来 ——
+		// 出图只认皮肤,而那个键连同折它进来的开机迁移已一并删掉(ADR-0014 决策 17 的
+		// 2026-09-18 🔗:没选过皮肤的一律用出厂默认)。
+		cardSkin: ov.cardSkin ?? defaults.cardSkin,
 		// 消息版式同 cardLayout:per-UP 整份覆盖(带 normalize 向前兼容),否则继承全局。
 		messageLayout: ov.messageLayout
 			? normalizeMessageLayout(ov.messageLayout, defaults.messageLayout)

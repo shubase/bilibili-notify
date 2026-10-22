@@ -1,9 +1,4 @@
-import type {
-	GlobalConfig,
-	PushAdapter,
-	PushTarget,
-	Subscription,
-} from "@bilibili-notify/internal";
+import type { Connection, GlobalConfig, PushTarget, Subscription } from "@bilibili-notify/internal";
 import type { EncryptedSecrets } from "./crypto.js";
 
 /**
@@ -18,7 +13,7 @@ import type { EncryptedSecrets } from "./crypto.js";
  *     (cookie / apiKey / bot tokens). See the `secrets` slice for that shape.
  *
  * `sections` carries the platform-neutral config scopes verbatim (the same
- * shapes `ConfigStore` reads/writes). Secret-bearing residue (apiKey, adapter
+ * shapes `ConfigStore` reads/writes). Secret-bearing residue (apiKey, connection
  * credentials) is stripped from these plaintext sections and, for `full`
  * backups, re-homed into the encrypted block — never left in the clear here.
  */
@@ -32,7 +27,7 @@ export type BackupKind = "full" | "sanitized";
 export interface BackupSections {
 	globals?: GlobalConfig;
 	subscriptions?: Subscription[];
-	adapters?: PushAdapter[];
+	connections?: Connection[];
 	targets?: PushTarget[];
 }
 
@@ -77,6 +72,12 @@ export function buildBackup(input: BuildBackupInput): BackupEnvelope {
  *     silently down-migrate). Older versions are accepted and would run through
  *     a forward migration once one exists (v1 is the floor, so none yet).
  *
+ * It is also where the plaintext sections get their **key** normalised: the
+ * connections section used to be called `adapters`. Folding it here rather than
+ * at each reader means the rest of the import path — plan, migrate, apply —
+ * only ever sees one name, and a full backup's encrypted block is folded the
+ * same way where it is opened.
+ *
  * Use this on the JSON body of an import request (already parsed by the HTTP
  * layer); {@link parseBackup} is the string convenience wrapper.
  */
@@ -97,7 +98,15 @@ export function validateBackup(raw: unknown): BackupEnvelope {
 				`(max ${BACKUP_SCHEMA_VERSION}); please update bilibili-notify before restoring`,
 		);
 	}
-	return o as BackupEnvelope;
+	return foldLegacySectionKeys(o as BackupEnvelope);
+}
+
+/** 连接那一段从前叫 `adapters`。老备份里只有老键,新的只写新键。 */
+function foldLegacySectionKeys(env: BackupEnvelope): BackupEnvelope {
+	const sections = env.sections as (BackupSections & { adapters?: Connection[] }) | undefined;
+	if (!sections?.adapters) return env;
+	const { adapters, ...rest } = sections;
+	return { ...env, sections: { ...rest, connections: rest.connections ?? adapters } };
 }
 
 /** Parse a backup document from JSON text, then {@link validateBackup} it. */

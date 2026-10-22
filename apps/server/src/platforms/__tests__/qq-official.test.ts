@@ -10,35 +10,31 @@ import {
 	qqPayloadToParts,
 } from "../qq-official";
 
-describe("qqMessageEndpoint — target scope → 发消息 REST 路径", () => {
+describe("qqMessageEndpoint — target scope + 地址 → 发消息 REST 路径", () => {
 	it("channel → /channels/{channelId}/messages", () => {
-		expect(qqMessageEndpoint("channel", { channelId: "c1" })).toEqual({
-			path: "/channels/c1/messages",
-		});
+		expect(qqMessageEndpoint("channel", "c1")).toEqual({ path: "/channels/c1/messages" });
 	});
 
 	it("group → /v2/groups/{groupOpenid}/messages", () => {
-		expect(qqMessageEndpoint("group", { groupOpenid: "G123" })).toEqual({
-			path: "/v2/groups/G123/messages",
-		});
+		expect(qqMessageEndpoint("group", "G123")).toEqual({ path: "/v2/groups/G123/messages" });
 	});
 
 	it("private(C2C) → /v2/users/{userOpenid}/messages", () => {
-		expect(qqMessageEndpoint("private", { userOpenid: "U456" })).toEqual({
-			path: "/v2/users/U456/messages",
-		});
+		expect(qqMessageEndpoint("private", "U456")).toEqual({ path: "/v2/users/U456/messages" });
 	});
 
-	it("channel 缺 channelId → err(运行期校验,不发注定失败的 REST)", () => {
-		expect(qqMessageEndpoint("channel", {})).toEqual({ err: "channel: channelId missing" });
+	// 地址收成一格之后这三条缺失只有一个来源(address 空),但**报错还得说清缺的是哪一格**
+	// —— 主人在面板上看到的是「群 openid」「子频道 ID」,报「address missing」等于没说。
+	it("channel 缺地址 → err(运行期校验,不发注定失败的 REST)", () => {
+		expect(qqMessageEndpoint("channel", "")).toEqual({ err: "channel: channelId missing" });
 	});
 
-	it("group 缺 groupOpenid → err", () => {
-		expect(qqMessageEndpoint("group", {})).toEqual({ err: "group: groupOpenid missing" });
+	it("group 缺地址 → err", () => {
+		expect(qqMessageEndpoint("group", "")).toEqual({ err: "group: groupOpenid missing" });
 	});
 
-	it("private 缺 userOpenid → err", () => {
-		expect(qqMessageEndpoint("private", {})).toEqual({ err: "private: userOpenid missing" });
+	it("private 缺地址 → err", () => {
+		expect(qqMessageEndpoint("private", "")).toEqual({ err: "private: userOpenid missing" });
 	});
 });
 
@@ -110,6 +106,20 @@ describe("qqPayloadToParts — NotificationPayload → 有序发送片段", () =
 		expect(qqPayloadToParts(payload)).toEqual([
 			{ kind: "image-url", url: "https://i0.hdslb.com/a.jpg" },
 			{ kind: "image-url", url: "https://i0.hdslb.com/b.jpg" },
+		]);
+	});
+
+	it("miniapp-card(官机签不了 ark)→ 降级成标题 + 链接,不是空片段", () => {
+		const payload: NotificationPayload = {
+			kind: "miniapp-card",
+			title: "示例标题",
+			desc: "简介",
+			picUrl: "https://i0.hdslb.com/cover.jpg",
+			path: "pages/video/video?bvid=BV1zMtU6uEEb",
+			jumpUrl: "https://www.bilibili.com/video/BV1zMtU6uEEb",
+		};
+		expect(qqPayloadToParts(payload)).toEqual([
+			{ kind: "text", text: "示例标题\nhttps://www.bilibili.com/video/BV1zMtU6uEEb" },
 		]);
 	});
 

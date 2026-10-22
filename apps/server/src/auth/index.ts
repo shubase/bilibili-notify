@@ -4,12 +4,11 @@ import type { Disposable, MessageBus, ServiceContext } from "@bilibili-notify/in
 import { type CookieData, type KeyProvider, StorageManager } from "@bilibili-notify/storage";
 import type { BootstrapConfig } from "../config/schema.js";
 
-/** Default health-probe cadence — matches the koishi shell's "30 minutes" default. */
+/** Default health-probe cadence: 30 minutes. */
 const DEFAULT_HEALTH_CHECK_MS = 30 * 60 * 1000;
 
 /**
- * Standalone auth subsystem. Mirrors the koishi side's
- * `koishi/src/runtime/lifecycle.ts#bringUp` boot order, minus the koishi adapter.
+ * Standalone auth subsystem. Boot order: load cookies → LoginFlow → health probe.
  *
  * Construction order (must remain stable for cookie-load → api.start → flow.reportAccountInfo):
  *   1. StorageManager (with `paths` under <dataDir>/secrets/) → init() loads-or-creates master.key
@@ -28,15 +27,17 @@ export interface AuthSystem extends Disposable {
 	beginLogin(): Promise<void>;
 	/** Force a cookie refresh check against bilibili. */
 	refreshCookies(): Promise<void>;
-	/** Wipe secrets (cookies + master.key); caller must initiate a fresh login. */
-	resetCookies(): Promise<void>;
 	/**
 	 * Re-load cookies from disk into the live api jar and re-probe account info.
 	 * Called after a backup restore writes new cookies, to live-swap the login
 	 * without a process restart.
 	 */
 	reloadCookiesFromStore(): Promise<void>;
-	/** Mark the session logged-out client-side. */
+	/**
+	 * Forget the bilibili login: delete the cookie file, clear the live jar, report
+	 * logged-out. Safe when not logged in (clears a cookie file that no longer
+	 * decrypts). Never touches master.key — it also encrypts the config secrets.
+	 */
 	logout(): Promise<void>;
 	/** Current snapshot — proxy to `flow.current()`. */
 	status(): LoginSnapshot;
@@ -119,8 +120,7 @@ export async function createAuthSystem(opts: CreateAuthSystemOptions): Promise<A
 
 	// Load cookies from disk into the live api jar, then probe account info.
 	// Extracted (steps 5-6) so a backup restore can re-run the exact boot
-	// sequence and live-swap the login without a process restart. Mirrors
-	// koishi/src/runtime/bootstrap-helpers.ts#loadInitialCookies.
+	// sequence and live-swap the login without a process restart.
 	const reloadCookiesFromStore = async (): Promise<void> => {
 		let cookieData: CookieData | null = null;
 		try {
@@ -169,15 +169,9 @@ export async function createAuthSystem(opts: CreateAuthSystemOptions): Promise<A
 		await flowFinal.reportAccountInfo();
 	};
 
-	const resetCookies = async (): Promise<void> => {
-		await storage.cookieStore.resetKey();
-		// P0-2:不清内存 jar 则 api 仍以 stale 已认证 cookie 发请求至进程重启。
-		await api.clearCookies();
-		flowFinal.reportLoggedOut("keyReset");
-	};
-
 	const logout = async (): Promise<void> => {
 		await storage.cookieStore.clear();
+		// P0-2:不清内存 jar 则 api 仍以 stale 已认证 cookie 发请求至进程重启。
 		await api.clearCookies();
 		flowFinal.reportLoggedOut("notLogin");
 	};
@@ -195,7 +189,6 @@ export async function createAuthSystem(opts: CreateAuthSystemOptions): Promise<A
 		flow: flowFinal,
 		beginLogin,
 		refreshCookies,
-		resetCookies,
 		reloadCookiesFromStore,
 		logout,
 		status,
@@ -203,7 +196,7 @@ export async function createAuthSystem(opts: CreateAuthSystemOptions): Promise<A
 	};
 }
 
-/** Mirror of `koishi/src/runtime/bootstrap-helpers.ts#hasLoginCookie`. */
+/** 是否已有登录 cookie(SESSDATA 在场)。 */
 function hasLoginCookie(api: BilibiliAPI): boolean {
 	const cookiesJson = api.getCookiesJson();
 	if (!cookiesJson || cookiesJson === "[]") return false;

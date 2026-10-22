@@ -15,10 +15,11 @@
  * - panel 内字段级 diff list(按 section 分组),单行 click 跳转对应 Field
  * - 左下「丢弃全部更改」按钮
  *
- * 位置 / 层级:fixed 居中底部,bottom = 1rem + safe-area。z-100 故意低于
- * ToastShell(z-200)与 Dialog(z-300)— toast/dialog 弹出时不被遮挡。
+ * 位置 / 层级:fixed 居中底部,bottom = 1rem + safe-area。z-bn-island 故意低于
+ * ToastShell(z-bn-notify)与 Dialog(z-bn-modal)— toast/dialog 弹出时不被遮挡。
  */
 
+import { EmptyNote, Icon, IconButton, useDismiss } from "@bilibili-notify/ui";
 import { AnimatePresence, motion } from "motion/react";
 import { type ReactNode, useEffect, useRef, useState } from "react";
 import type { DraftRegistration, DraftUiState } from "../store/draft";
@@ -26,7 +27,6 @@ import { useDraftStore } from "../store/draft";
 import { formatDiffValue } from "../utils/formatDiffValue";
 import { type DiffSection, groupDiffsBySection } from "../utils/groupDiffs";
 import type { FieldDiff } from "../utils/walkTreeDiff";
-import { Icon } from "./icons";
 
 const SHELL_SPRING = { type: "spring" as const, stiffness: 380, damping: 28 };
 const PANEL_SPRING = { type: "spring" as const, stiffness: 320, damping: 30 };
@@ -35,7 +35,7 @@ const PANEL_SPRING = { type: "spring" as const, stiffness: 320, damping: 30 };
  * 曾经这里有一段「跟 FloatingAiBar 垂直堆叠避让」的位移(上移 64px)。
  * 那条 AI 建议条是**贴底全宽**的,不让位就会跟灵动岛叠在一起;换成现在的
  * AiChatDock 之后,收起态只是右下角一颗胶囊,与居中的灵动岛井水不犯河水,
- * 展开态则是整页覆盖层(z-40 在灵动岛之下也无所谓 —— 那时看不到页面了)。
+ * 展开态则是整页覆盖层(z-bn-scrim 在灵动岛之下也无所谓 —— 那时看不到页面了)。
  * 所以避让连同它依赖的 aiBar store 一起删掉,而不是留个恒为 0 的位移。
  */
 
@@ -64,19 +64,8 @@ export function DraftIsland(): ReactNode {
 	const containerRef = useRef<HTMLElement>(null);
 	const leaveTimerRef = useRef<number | null>(null);
 
-	// 外部 click → 关闭 locked panel。仅 panelLocked 为 true 时才挂监听,
-	// 减少全局事件流量。
-	useEffect(() => {
-		if (!panelLocked) return;
-		function handleOutsideClick(e: MouseEvent) {
-			const node = containerRef.current;
-			if (node !== null && e.target instanceof Node && !node.contains(e.target)) {
-				togglePanelLocked(false);
-			}
-		}
-		document.addEventListener("mousedown", handleOutsideClick);
-		return () => document.removeEventListener("mousedown", handleOutsideClick);
-	}, [panelLocked, togglePanelLocked]);
+	// 外部 click → 关闭 locked panel。
+	useDismiss(containerRef, () => togglePanelLocked(false), { enabled: panelLocked });
 
 	// 鼠标从 chip 跨 panel 的 8px gap 时,motion.section 会瞬间触发 mouseleave
 	// → setHovered(false) → panel 退场 → 鼠标到 panel 又 mouseenter → 入场,
@@ -124,7 +113,7 @@ export function DraftIsland(): ReactNode {
 			aria-label="草稿状态"
 			aria-live="polite"
 			data-testid="draft-island"
-			className="pointer-events-none fixed left-1/2 z-100 flex -translate-x-1/2 flex-col items-center"
+			className="pointer-events-none fixed left-1/2 z-bn-island flex -translate-x-1/2 flex-col items-center"
 			style={{ bottom: "calc(1rem + env(safe-area-inset-bottom))" }}
 			onMouseEnter={handleMouseEnter}
 			onMouseLeave={handleMouseLeave}
@@ -161,7 +150,8 @@ function ChipShell({
 			exit={{ opacity: 0, y: 16, scale: 0.92 }}
 			transition={SHELL_SPRING}
 			onClick={onClick}
-			className={`pointer-events-auto relative flex items-center gap-2.5 rounded-full bg-black/85 px-4 py-2 text-white shadow-[0_8px_24px_rgba(0,0,0,0.3)] backdrop-blur-xl ${className}`}
+			data-bn="glass-strong"
+			className={`bn-glass-strong pointer-events-auto relative flex items-center gap-2.5 rounded-bn-pill px-4 py-2 text-bn-text-primary shadow-bn-elev ${className}`}
 		>
 			{aura ? <span aria-hidden className="bn-anim-aura" data-testid="draft-island-aura" /> : null}
 			{children}
@@ -183,14 +173,14 @@ function DirtyContent({ current }: { current: DraftRegistration }) {
 	return (
 		<ChipShell onClick={handleChipClick} className="cursor-pointer select-none" aura>
 			<span className="block h-1.5 w-1.5 rounded-full bg-bn-pink" aria-hidden />
-			<span className="text-[12px] font-medium">{current.pageLabel}</span>
+			<span className="text-bn-sm font-medium">{current.pageLabel}</span>
 			{/* 数字徽章:diff.length 变化时通过 key 强制重 mount,触发 initial→animate 的 pop。 */}
 			<motion.span
 				key={current.diff.length}
 				initial={{ scale: 0.6, opacity: 0 }}
 				animate={{ scale: 1, opacity: 1 }}
 				transition={{ type: "spring", stiffness: 500, damping: 22 }}
-				className="rounded-full bg-bn-pink px-1.5 py-px text-[10.5px] font-bold leading-3.5"
+				className="rounded-bn-pill bg-bn-pink px-1.5 py-px text-bn-2xs font-bold leading-3.5"
 				aria-label={`${current.diff.length} 项未保存`}
 			>
 				{current.diff.length}
@@ -202,7 +192,9 @@ function DirtyContent({ current }: { current: DraftRegistration }) {
 					e.stopPropagation();
 					current.onSave();
 				}}
-				className="rounded-full bg-white px-3 py-1 text-[11.5px] font-bold text-black transition hover:bg-white/90 active:scale-95"
+				data-bn="btn"
+				// 实心面压在玻璃胶囊上 —— 对比来自「实 vs 半透明」,不来自写死的白。
+				className="rounded-bn-pill bg-bn-surface px-3 py-1 text-bn-xs font-bold text-bn-text-primary transition hover:bg-bn-hover-muted active:scale-95"
 			>
 				保存
 			</button>
@@ -223,7 +215,7 @@ function SavingContent() {
 			>
 				<Icon.refresh size={14} />
 			</motion.span>
-			<span className="text-[12px]">保存中…</span>
+			<span className="text-bn-sm">保存中…</span>
 		</ChipShell>
 	);
 }
@@ -237,12 +229,12 @@ function SavedContent() {
 				initial={{ scale: 0.4, opacity: 0 }}
 				animate={{ scale: 1, opacity: 1 }}
 				transition={{ type: "spring", stiffness: 500, damping: 18 }}
-				className="grid h-4 w-4 place-items-center rounded-full bg-emerald-500 text-white"
+				className="grid h-4 w-4 place-items-center rounded-full bg-bn-success-soft text-bn-success-text"
 				aria-hidden
 			>
 				<Icon.check size={11} />
 			</motion.span>
-			<span className="text-[12px]">已保存</span>
+			<span className="text-bn-sm">已保存</span>
 		</ChipShell>
 	);
 }
@@ -271,26 +263,25 @@ function ErrorContent({ message }: { message: string | null }) {
 					},
 				},
 			}}
-			className="border border-red-400/60"
+			className="border border-bn-danger/60"
 		>
 			{/* 圆底徽章里必须放 SVG,不能放文本 `!` —— 理由见 Icon.exclaim 的注释。 */}
 			<span
-				className="grid h-4 w-4 shrink-0 place-items-center rounded-full bg-red-500 text-white"
+				className="grid h-4 w-4 shrink-0 place-items-center rounded-full bg-bn-danger-soft text-bn-danger-text"
 				aria-hidden
 			>
 				<Icon.exclaim size={12} />
 			</span>
-			<span className="max-w-65 truncate text-[12px]" title={message ?? undefined}>
+			<span className="max-w-65 truncate text-bn-sm" title={message ?? undefined}>
 				{message ?? "保存失败"}
 			</span>
-			<button
-				type="button"
+			<IconButton
+				icon={<Icon.close size={12} />}
+				label="关闭"
+				tone="neutral"
+				shape="pill"
 				onClick={() => setUiState("dirty")}
-				aria-label="关闭"
-				className="grid h-5 w-5 place-items-center rounded-full text-white/70 transition hover:bg-bn-inverse-hover hover:text-white"
-			>
-				<Icon.close size={12} />
-			</button>
+			/>
 		</ChipShell>
 	);
 }
@@ -325,15 +316,18 @@ function ExpandPanel({ current }: { current: DraftRegistration }) {
 			animate={{ opacity: 1, y: 0, scale: 1 }}
 			exit={{ opacity: 0, y: 12, scale: 0.96 }}
 			transition={PANEL_SPRING}
-			className="pointer-events-auto mb-2 w-105 max-w-[calc(100vw-2rem)] overflow-hidden rounded-2xl border border-white/10 bg-black/85 text-white shadow-[0_12px_36px_rgba(0,0,0,0.4)] backdrop-blur-xl"
+			data-bn="glass-strong"
+			className="bn-glass-strong pointer-events-auto mb-2 w-105 max-w-[calc(100vw-2rem)] overflow-hidden rounded-bn-card text-bn-text-primary shadow-bn-elev"
 		>
 			<div className="flex max-h-[60vh] flex-col">
-				<div className="border-b border-white/10 px-4 py-2.5 text-[11.5px] font-semibold tracking-wide text-white/70">
+				<div className="border-b border-bn-border px-4 py-2.5 text-bn-xs font-semibold tracking-wide text-bn-text-secondary">
 					{current.pageLabel} · {current.diff.length} 项未保存
 				</div>
 				<div className="flex-1 overflow-y-auto px-2 py-2">
 					{sections.length === 0 ? (
-						<div className="px-2 py-4 text-center text-[12px] text-white/50">无字段变更</div>
+						<EmptyNote size="sm" className="mx-1 my-1">
+							无字段变更
+						</EmptyNote>
 					) : (
 						sections.map((s) => <DiffSectionView key={s.section} section={s} />)
 					)}
@@ -347,7 +341,7 @@ function ExpandPanel({ current }: { current: DraftRegistration }) {
 function DiffSectionView({ section }: { section: DiffSection }) {
 	return (
 		<div className="mb-1.5 last:mb-0">
-			<div className="px-2 pb-1 pt-1.5 text-[10.5px] font-bold uppercase tracking-wider text-white/40">
+			<div className="px-2 pb-1 pt-1.5 text-bn-2xs font-bold uppercase tracking-wider text-bn-text-tertiary">
 				{section.label}
 			</div>
 			<div className="flex flex-col gap-0.5">
@@ -366,13 +360,15 @@ function DiffRow({ row }: { row: FieldDiff }) {
 		<button
 			type="button"
 			onClick={() => scrollToFieldByCode(row.code)}
-			className="flex w-full flex-col gap-0.5 rounded-md px-2 py-1.5 text-left transition hover:bg-bn-inverse-muted"
+			// 候选行:点一行跳到那个字段。不是按钮 —— 走 option。
+			data-bn="option"
+			className="flex w-full flex-col gap-0.5 rounded-md px-2 py-1.5 text-left transition hover:bg-bn-hover-muted"
 			title={`跳转到 ${row.code}`}
 		>
-			<code className="font-mono text-[10.5px] text-white/50">{row.code}</code>
-			<div className="flex items-center gap-1.5 text-[12px]">
+			<code className="font-mono text-bn-2xs text-bn-text-tertiary">{row.code}</code>
+			<div className="flex items-center gap-1.5 text-bn-sm">
 				<ValueChip value={before} muted />
-				<span className="text-white/40">→</span>
+				<span className="text-bn-text-tertiary">→</span>
 				<ValueChip value={after} />
 			</div>
 		</button>
@@ -386,32 +382,33 @@ function ValueChip({
 	value: { display: string; swatch?: string };
 	muted?: boolean;
 }) {
-	const tone = muted ? "text-white/60" : "text-white";
+	const tone = muted ? "text-bn-text-secondary" : "text-bn-text-primary";
 	return (
 		<span className={`inline-flex min-w-0 items-center gap-1 ${tone}`}>
 			{value.swatch ? (
 				<span
-					className="inline-block h-3 w-3 shrink-0 rounded-sm border border-white/30"
+					className="inline-block h-3 w-3 shrink-0 rounded-sm border border-bn-border"
 					style={{ backgroundColor: value.swatch }}
 					aria-hidden
 				/>
 			) : null}
-			<span className="truncate font-mono text-[11.5px]">{value.display}</span>
+			<span className="truncate font-mono text-bn-xs">{value.display}</span>
 		</span>
 	);
 }
 
 function PanelFooter({ onDiscard }: { onDiscard: () => void }) {
 	return (
-		<div className="flex items-center justify-between border-t border-white/10 px-4 py-2">
+		<div className="flex items-center justify-between border-t border-bn-border px-4 py-2">
 			<button
 				type="button"
 				onClick={onDiscard}
-				className="rounded-full px-2.5 py-1 text-[11px] text-white/60 transition hover:bg-bn-inverse-hover hover:text-white"
+				data-bn="btn"
+				className="rounded-bn-pill px-2.5 py-1 text-bn-xs text-bn-text-secondary transition hover:bg-bn-hover-muted hover:text-bn-text-primary"
 			>
 				丢弃全部更改
 			</button>
-			<span className="text-[10.5px] text-white/40">click 行跳转字段</span>
+			<span className="text-bn-2xs text-bn-text-tertiary">click 行跳转字段</span>
 		</div>
 	);
 }

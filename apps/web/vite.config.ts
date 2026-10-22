@@ -11,6 +11,10 @@ const webVersion = process.env.BN_STANDALONE_VERSION || webPkg.version;
 
 // 测试走 vitest 默认 node 环境 + 默认 include — 4 个 channel hook 的事件分发已拆
 // 成纯 handler 函数,不渲染 React,无需 jsdom。
+// 这里的 `vite` 经 pnpm-workspace.yaml 的作用域 override 解析到 Vite+ core;
+// scripts/vite-alias.test.mjs 钉住「每个前端的 vite 都是同一份 core」那条不变量。
+// (hoisted 年代这里的 plugins 必须 `as PluginOption[]`:同一份 core 在磁盘上有多份
+// 副本,TS 把它们当成两个身份而撑爆递归上限。isolated 布局下只有一份,断言撤了。)
 export default defineConfig({
 	// __WEB_VERSION__ 编译期替换为字面量;声明见 src/vite-env.d.ts。
 	define: {
@@ -41,6 +45,13 @@ export default defineConfig({
 				},
 			},
 			"/ws": { target: "ws://127.0.0.1:8787", ws: true },
+			// 🔴 拓展的挂载点。**开发时不转它,面板印的那条地址就是假的** —— 拓展页把桥的接入
+			// 地址算成 `ws://<当前页面 host>/ext/<id>`(生产同源,算得对),主人照抄下来会打到
+			// Vite 自己身上,只得到一句「WebSocket was closed before the connection was
+			// established」。`ws: true` 一条同时管那条长连接与取图口那些普通 HTTP。
+			// 🔴 写成正则、带上斜杠:裸的 `"/ext"` 是前缀匹配,会把 SPA 自己的 `/extensions` 页也
+			// 转给 server —— 停在拓展页时一次整页重载就是一句 `{"error":"not_found"}`。
+			"^/ext/": { target: "http://127.0.0.1:8787", ws: true },
 		},
 	},
 });

@@ -1,9 +1,8 @@
 /**
- * Standalone-side engine wiring. Mirrors what koishi/dynamic + koishi/live do
- * for the koishi shell, but driven by the file-backed ConfigStore + MultiplexSink
- * instead of koishi's Service / Context plumbing.
+ * Standalone-side engine wiring: the engines from packages/dynamic + packages/live,
+ * driven by the file-backed ConfigStore + MultiplexSink.
  *
- * Construction order (same constraints as the koishi side):
+ * Construction order:
  *
  *   1. Bind SubscriptionStore to ConfigStore
  *   2. Build MultiplexNotificationSink (subscribers: HistoryStore via onDelivery)
@@ -21,35 +20,51 @@
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { CommentaryCallOverride } from "@bilibili-notify/ai";
-import { CommentaryGenerator } from "@bilibili-notify/ai";
+import { CommentaryGenerator, webSearchExecutorFromSettings } from "@bilibili-notify/ai";
 import type { BilibiliAPI } from "@bilibili-notify/api";
 import type { LiveListenerSnapshot } from "@bilibili-notify/contract";
 import {
-	atAllOptsForDynamicKind,
+	broadcastOptsForDynamicKind,
 	DynamicEngine,
 	type DynamicEngineConfig,
 	type PushLike as DynamicPushLike,
 	type SubscriptionOpView as DynamicSubOp,
 	type SubscriptionsView as DynamicSubsView,
 	type PushSegment,
+	resolveDynamicColorOptions,
 } from "@bilibili-notify/dynamic";
-import { ImageRenderer, type PuppeteerLike } from "@bilibili-notify/image";
+import { type CardColorOptions, ImageRenderer, type PuppeteerLike } from "@bilibili-notify/image";
 import type {
 	CardKind,
+	CardSkinKind,
+	CardSkinManifest,
+	ConnectionCapabilities,
 	Disposable,
+	ExtraKey,
 	FeatureKey,
 	GlobalConfig,
 	GlobalDefaults,
-	HistorySource,
+	GuardBundle,
+	LinkParsingConfig,
+	LinkParsingPolicy,
 	NotificationPayload,
 	PayloadSegment,
+	ProbeResult,
+	PushKind,
 	PushTarget,
 	Subscription,
 	SubscriptionOp,
 	SubscriptionOverrides,
 } from "@bilibili-notify/internal";
-import { resolve, resolveAIProfile, resolveCardStyleForKind } from "@bilibili-notify/internal";
 import {
+	featureToPushKind,
+	isReachabilityEvidence,
+	resolve,
+	resolveAIProfile,
+	resolveCardStyleForKind,
+} from "@bilibili-notify/internal";
+import {
+	type CustomGuardBuyLike,
 	LiveEngine,
 	type LiveEngineConfig,
 	type PushLike as LivePushLike,
@@ -57,19 +72,23 @@ import {
 	type SubscriptionsView as LiveSubsView,
 	type SubItemView as LiveSubView,
 } from "@bilibili-notify/live";
-import { BilibiliPush } from "@bilibili-notify/push";
+import { BilibiliPush, type BroadcastOptions } from "@bilibili-notify/push";
 import type { SubscriptionStore } from "@bilibili-notify/subscription";
 import { attachReadOnlyTools } from "../ai/read-only-tools.js";
 import { commandHelpHintFromGlobals } from "../commands/bili-onebot.js";
 import type { ConfigStore } from "../config/store.js";
 import type { HistoryStore } from "../history/store.js";
-import type { PlatformAdapter, ProbeResult } from "../platforms/types.js";
+import type { AdapterRegistry } from "../platforms/registry.js";
 import { createMultiplexSink } from "../sink/multiplex.js";
+import { toGeneratorConfig } from "./ai-config.js";
 import { makeExistingCardBgPicker, readCardBgDataUrl } from "./card-assets.js";
 import { type CardBgRotator, createCardBgRotator } from "./card-bg-rotation.js";
 import { segmentToPayload, standaloneContentBuilder } from "./content-builder.js";
 import { syncFollows } from "./follow-sync.js";
+import { resolveLinkParsingPolicies } from "./link-scope.js";
 import { MasterNotifier } from "./master-notifier.js";
+import { createMuteState, type MuteState } from "./mute-state.js";
+import { historyRecordFromSend } from "./push-history.js";
 import type { NodeServiceContext } from "./service-context.js";
 import type { SubRuntimeStore } from "./sub-runtime-store.js";
 
@@ -88,6 +107,11 @@ export interface EnginesRuntime extends Disposable {
 	readonly dynamic: DynamicEngine;
 	readonly live: LiveEngine;
 	readonly push: BilibiliPush;
+	/**
+	 * 全局静音。`push` 已经接了闸(订阅推送在 `broadcastToFeature` 处被挡),
+	 * 这里暴露出来是给指令与面板改状态用的。
+	 */
+	readonly muteState: MuteState;
 	readonly subscriptionStore: SubscriptionStore;
 	readonly commentary: CommentaryGenerator | null;
 	/** Started BilibiliAPI; consumed by routes that need ad-hoc B-station calls (e.g. subs lookup). */
@@ -104,8 +128,28 @@ export interface EnginesRuntime extends Disposable {
 	readonly imageRenderer: ImageRenderer | null;
 	/** Currently-broadcasting rooms; powers /api/live/listening. */
 	listLiveRooms(): LiveListenerSnapshot[];
-	/** Out-of-band reachability probe for `/api/adapters/:id/test`. */
-	probeAdapter(adapterId: string): Promise<ProbeResult>;
+	/** 链接解析的开关与冷却 —— 随 config-changed 刷新的快照;群里每句话都会问它。 */
+	linkParsing(): LinkParsingConfig;
+	/**
+	 * 链接解析里某个群的答案:解不解析、回什么(键与表见 `link-scope.ts`)。表随 globals /
+	 * targets / connections 三种 config-changed 重算 —— 例外引用的是目标,目标或连接停用、
+	 * 删掉都会改变答案,只盯 globals 的话面板上开着、实际却还在按旧目标表解析。
+	 */
+	linkPolicyFor(key: string): LinkParsingPolicy;
+	/**
+	 * 链接卡的呈现 = 推送的动态卡在没有 per-UP 覆盖时的呈现:全局「动态」样式(含图廊
+	 * 轮换,**每调一次推进一次游标**)+ 全局那套皮肤。每张卡调一次,别攥着。
+	 */
+	linkCardPresentation(): { colors: CardColorOptions | undefined; cardSkin: string };
+	/**
+	 * Out-of-band reachability probe for `/api/connections/:id/test`. 顺路把还没探出来的平台
+	 * 能力再探一次(与定时健康探测同一条路)。
+	 */
+	probeConnection(connectionId: string): Promise<ProbeResult>;
+	/** 这条连接所在平台的能力快照(能不能签小程序卡);没有能力概念的平台是 undefined。 */
+	connectionCapabilities(connectionId: string): ConnectionCapabilities | undefined;
+	/** 主动探一次平台能力(还没探出来时)。与上一条同源,都走 sink 的连接寻址。 */
+	probeConnectionCapabilities(connectionId: string): Promise<ConnectionCapabilities | undefined>;
 	/** Per-module readiness snapshot exposed via `/api/health`. */
 	getModuleStatus(): ModuleStatus;
 	/**
@@ -133,6 +177,11 @@ export interface CreateEnginesOptions {
 	 * runtime constructs the parent context once at boot.
 	 */
 	serviceCtx: NodeServiceContext;
+	/**
+	 * 自带字体的读取口(`AppRuntime.loadFontFace`)。刻意由外面传进来而不是自建:
+	 * 缓存里留的就是那条几十兆的 `@font-face`,建两个就在堆里存两遍。
+	 */
+	loadFontFace: (id: string) => Promise<string>;
 	api: BilibiliAPI;
 	/**
 	 * Auth subsystem 的 LoginFlow 实例。engines.ts 用它在 config-changed 时
@@ -149,7 +198,7 @@ export interface CreateEnginesOptions {
 	 */
 	subRuntimeStore: SubRuntimeStore;
 	bus: import("@bilibili-notify/internal").MessageBus;
-	adapters: PlatformAdapter[];
+	adapters: AdapterRegistry;
 	/**
 	 * Optional puppeteer adapter. When provided the engines spin up a shared
 	 * {@link ImageRenderer} so live / dynamic cards render to JPEG instead of
@@ -157,6 +206,23 @@ export interface CreateEnginesOptions {
 	 * as the engines' text-only fallback path.
 	 */
 	puppeteer?: PuppeteerLike | null;
+	/**
+	 * 推送免扰按哪一刻判。缺省真时钟;devtools 用它做「当作现在是 xx:xx」的单点覆盖,
+	 * 原样交给 `BilibiliPush.quietHoursNow`。
+	 */
+	quietHoursNow?: () => Date;
+	/**
+	 * 卡片皮肤(ADR-0014)的三口。由接线层从 `CardSkinStore` 接过来 —— engines 不认识
+	 * 皮肤库,店也不认识引擎,中间就这三个函数。缺省(没接)= 只有内置默认皮肤。
+	 */
+	cardSkins?: {
+		/** 皮肤 id → 清单;取不到 → 渲染器回落默认皮肤。 */
+		get: (id: string) => CardSkinManifest | undefined;
+		/** 包内资产名 → data URL。 */
+		asset: (skinId: string, name: string) => Promise<string | undefined>;
+		/** 出图回落了。宿主负责去重与「怎么让主人看见」。 */
+		onFallback: (info: { skinId: string; kind: CardSkinKind; reason: string }) => void;
+	};
 }
 
 export function createEngines(opts: CreateEnginesOptions): EnginesRuntime {
@@ -202,6 +268,9 @@ export function createEngines(opts: CreateEnginesOptions): EnginesRuntime {
 		adapters: opts.adapters,
 		logger: log,
 		onDelivery: (target, _payload, result) => {
+			// 没真出网的投递(devtools 截流)不是可达性证据 —— 写回去会把一个发不出去的目标
+			// 标成绿的,而且落盘、活得比截流本身还久。
+			if (!isReachabilityEvidence(result)) return;
 			const prev = target.testStatus;
 			if (!prev || prev.ok !== result.ok) {
 				const nextStatus = {
@@ -220,14 +289,22 @@ export function createEngines(opts: CreateEnginesOptions): EnginesRuntime {
 	});
 
 	// 有状态 adapter(OneBot ws / ws-reverse)—— boot 时按当前 adapter 集合建立
-	// 正向连接 / 反向监听器。后续每次 config-changed:adapters 再 reconcile(见下)。
-	for (const ad of opts.adapters) ad.reconcile?.(opts.configStore.getAdapters());
+	// 正向连接 / 反向监听器。后续每次 config-changed:connections 再 reconcile(见下)。
+	for (const ad of opts.adapters.list()) ad.reconcile?.(opts.configStore.getConnections());
 
 	const masterTarget = (): PushTarget | undefined => {
 		const id = globals().master.targetId;
 		if (!id) return undefined;
 		return opts.configStore.getTargets().find((t) => t.id === id);
 	};
+
+	// 全局静音。到期时刻存在 globals 里 —— 重启不解除,网页上也看得见。
+	const muteState = createMuteState({
+		read: () => globals().mutedUntil,
+		write: async (until) => {
+			await opts.configStore.patchGlobals({ mutedUntil: until });
+		},
+	});
 
 	const push = new BilibiliPush({
 		sink,
@@ -236,31 +313,21 @@ export function createEngines(opts: CreateEnginesOptions): EnginesRuntime {
 		logger: log,
 		serviceCtx: opts.serviceCtx,
 		defaults: () => globals().defaults,
+		muted: () => muteState.isMuted(),
+		quietHoursNow: opts.quietHoursNow,
 		onSend: (info) => {
-			// 私聊不走 history(语义上是给主人的运行状态通知,不是订阅推送)。
-			if (info.private) return;
-			const sub = opts.subscriptionStore.findByUid(info.uid);
-			const rt = sub ? opts.subRuntimeStore.get(sub.id) : undefined;
+			// 一次推送 × 一个目标 = 历史一行;无目标那次也记(面板上才看得见)。
+			const input = historyRecordFromSend(info, {
+				subscriptionOf: (uid) => {
+					const sub = opts.subscriptionStore.findByUid(uid);
+					if (!sub) return undefined;
+					return { id: sub.id, profile: opts.subRuntimeStore.get(sub.id)?.cachedProfile };
+				},
+			});
+			if (!input) return;
 			void opts.historyStore
-				.append({
-					source: featureToHistorySource(info.feature),
-					uid: info.uid,
-					subscriptionId: sub?.id ?? info.target.id,
-					targets: [
-						{
-							targetId: info.target.id,
-							ok: info.result.ok,
-							latencyMs: info.result.latencyMs,
-							err: info.result.err,
-						},
-					],
-					payload: info.payload,
-					// Snapshot UP 主当时的名字 / 头像。订阅以后被删除,Dashboard 的
-					// timeline / history 仍能正确显示「当时是谁」,不退化成 UID 占位。
-					unameSnapshot: rt?.cachedProfile?.name,
-					uavatarSnapshot: rt?.cachedProfile?.avatar,
-				})
-				.catch((e) => log.warn(`[history] append failed: ${String(e)}`));
+				.record(input)
+				.catch((e) => log.warn(`[history] record failed: ${String(e)}`));
 		},
 	});
 	push.start();
@@ -276,51 +343,11 @@ export function createEngines(opts: CreateEnginesOptions): EnginesRuntime {
 	// 的 aiEnabled flag 在每次推送前热判断。这样用户在 dashboard 把 AI 开关切关再切开
 	// 不需要重启服务。完整字段变更则走下方 `rebuildCommentary` 重建实例。
 	//
-	// 字段名映射:schema 用 `baseRole` / `extraSystemPrompt` (面向用户的字段名),
-	// CommentaryGenerator 的 PersonaConfig 用 `customBase` / `extraPrompt` (历史
-	// 命名,与 koishi 端的 PersonaConfig 一致)。在这里做一次性翻译,引擎层不感知差异。
-	const buildAiConfig = () => {
-		const a = globals().defaults.ai;
-		// 连接与生成参数按服务商分桶存 —— 取出当前选中那家的那一套。
-		// 指针指向一个还没添加的家时 resolveAIProfile 兜一套空值回来,下方
-		// buildCommentary 的 `!p.apiKey || !p.baseUrl` 就会照既有规矩停用 AI。
-		const p = resolveAIProfile(a);
-		return {
-			apiKey: p.apiKey,
-			baseURL: p.baseUrl,
-			model: p.model,
-			// `temperature` 是 CommentaryGeneratorConfig 的 optional 字段;dashboard 滑块
-			// 改值后,config-changed 路径下方 `commentary.updateConfig(buildAiConfig())` 会把
-			// 新值推到引擎,下次 chat.completions.create 即生效。
-			temperature: p.temperature,
-			persona: {
-				preset: "custom" as const,
-				name: a.persona.name,
-				addressUser: a.persona.addressUser,
-				addressSelf: a.persona.addressSelf,
-				traits: a.persona.traits,
-				catchphrase: a.persona.catchphrase,
-				customBase: a.persona.baseRole,
-				extraPrompt: a.persona.extraSystemPrompt,
-			},
-			dynamicPrompt: a.dynamicPrompt,
-			liveSummaryPrompt: a.liveSummaryPrompt,
-			enableConversation: false,
-			maxHistory: 6,
-			provider: a.provider,
-			enableThinking: p.enableThinking,
-			thinkingLevel: p.thinkingLevel,
-			extraParams: p.extraParams,
-			// 主模型自己支持视觉时开它,图直接下挂,省一次往返也不掉保真度。
-			// 配了下面的副模型则副模型优先(见 CommentaryGenerator#resolveImages)。
-			enableVision: p.enableVision,
-			vision: {
-				baseURL: p.vision.baseUrl,
-				apiKey: p.vision.apiKey,
-				model: p.vision.model,
-			},
-		};
-	};
+	// `AISettings` → CommentaryGeneratorConfig 的翻译(含字段改名与「人格看指针」)
+	// 本体在 `./ai-config.ts` —— 「试一句」与统计页的锐评用的是同一份映射,人格该
+	// 从哪儿读只能有一个答案。指针指向一个还没添加的服务商时 resolveAIProfile 兜一套
+	// 空值回来,下方 buildCommentary 的 `!p.apiKey || !p.baseUrl` 就会照既有规矩停用 AI。
+	const buildAiConfig = () => toGeneratorConfig(globals().defaults.ai);
 
 	let commentary: CommentaryGenerator | null = null;
 	const buildCommentary = (): CommentaryGenerator | null => {
@@ -339,6 +366,10 @@ export function createEngines(opts: CreateEnginesOptions): EnginesRuntime {
 				subscriptionStore: opts.subscriptionStore,
 				subRuntimeStore: opts.subRuntimeStore,
 			});
+			// 联网搜索的执行器**每次工具调用现取** —— 后端 / key 是运行期随时改的
+			// 配置,快照会让「刚填的 key 不生效,重启才行」。没填 key 时取到 null,
+			// 生成器那侧静默不挂 web_search。
+			c.setWebSearchSource(() => webSearchExecutorFromSettings(globals().defaults.ai.search));
 			c.start();
 			return c;
 		} catch (err) {
@@ -356,23 +387,26 @@ export function createEngines(opts: CreateEnginesOptions): EnginesRuntime {
 	// the engines bypass the renderer and emit text-only payloads, so we keep the
 	// instance alive rather than hot-swapping on the user toggling the switch.
 	let imageRenderer: ImageRenderer | null = null;
+	// 字体读取口由 runtime 建好传进来,**全进程只有那一个** —— 从前这儿自建一个、
+	// 预览路由再自建一个,同一份几十兆的 `@font-face` 就在 512MB 的堆里存了两遍。
+	// 热切换浏览器会重建渲染器,读取口跨重建复用,免得又从盘上搓一遍。
+	const loadFontFace = opts.loadFontFace;
+
 	const buildImageRenderer = (pup: PuppeteerLike): ImageRenderer => {
-		const cs = globals().defaults.cardStyle;
 		const renderer = new ImageRenderer({
 			serviceCtx: imageCtx,
 			puppeteer: pup,
 			config: {
-				cardColorStart: cs.cardColorStart,
-				cardColorEnd: cs.cardColorEnd,
-				font: cs.font,
-				showPopularity: cs.showPopularity,
-				showArea: cs.showArea,
-				showFans: cs.showFans,
-				glassOpacity: cs.glassOpacity,
-				glassClear: cs.glassClear,
-				backgroundImage: cs.backgroundImages[0] ?? "",
+				// 字体与背景图 2026-09-14 退役成皮肤旋钮:值住 `cardSkinKnobs`,由渲染器自己
+				// 读盘解析(见 `skin/knob-assets.ts`)。这里不再喂那两样。
+				cardSkinKnobs: globals().defaults.cardSkinKnobs,
 			},
 			resolveAsset: (id) => readCardBgDataUrl(opts.configStore.bootstrap.dataDir, id),
+			resolveFontFace: loadFontFace,
+			// 皮肤库那三口(接线层给);没给就是「只有内置默认皮肤」。
+			resolveCardSkin: opts.cardSkins?.get,
+			resolveCardSkinAsset: opts.cardSkins?.asset,
+			onCardSkinFallback: opts.cardSkins?.onFallback,
 		});
 		renderer.start();
 		return renderer;
@@ -384,7 +418,7 @@ export function createEngines(opts: CreateEnginesOptions): EnginesRuntime {
 	// ---------- 背景图轮换游标(每次推送轮换 + fs 持久化)----------
 	// 游标按 `uid:kind` 独立,落盘 `<dataDir>/card-bg-cursors.json`,重启续接不归零。
 	// pick 在推送点(room-session / DynamicEngine)同步推进;脏标记驱动定时 flush,避免每
-	// 推送写盘。注入给两端引擎;koishi 不注入即不轮换。
+	// 推送写盘。注入给两个引擎。
 	const cursorFile = join(opts.configStore.bootstrap.dataDir, "card-bg-cursors.json");
 	const loadCursors = (): Record<string, number> => {
 		try {
@@ -407,29 +441,15 @@ export function createEngines(opts: CreateEnginesOptions): EnginesRuntime {
 	const cursorFlushTimer = setInterval(flushCursors, 30_000);
 	cursorFlushTimer.unref?.();
 	// 轮换前过滤盘上已不存在的资产(配置里的悬空引用):死条目不占游标位、不会渲染成
-	// 渐变 / 原封面;全悬空返回 undefined → 推送点静态兜底。背景与直播封面同一选择器。
+	// 原封面;全悬空返回 undefined → 推送点静态兜底。今天只剩直播封面在轮 —— 卡片背景图
+	// 那条链 2026-09-20 删掉(背景图归皮肤的 `image` 旋钮)。
 	const pickExistingCardBg = makeExistingCardBgPicker(
 		opts.configStore.bootstrap.dataDir,
 		cardBgRotator.pick,
 	);
 
 	// ---------- DynamicEngine ----------
-	const dynamicPushLike: DynamicPushLike = {
-		async broadcastDynamic(uid, segments, kind) {
-			const payload = pushSegmentsToPayload(segments);
-			// kind="dynamic-images"(图集附图)是主卡片之后的附属推送,显式抑制 @全体 ——
-			// 否则一条 DRAW 动态会在主卡片和图集各 @ 一次(用户报告的「重复艾特全体」)。
-			await push.broadcastToFeature(uid, "dynamic", payload, atAllOptsForDynamicKind(kind));
-		},
-		async broadcastDynamicSequence(uid, messages, kind) {
-			// 消息版式分条:多条 payload 交给 BilibiliPush 的序列语义(同 target 顺序发、
-			// 某条失败中止该 target 后续条、@全体只跟首条之前)。
-			const payloads = messages.map(pushSegmentsToPayload);
-			await push.broadcastToFeature(uid, "dynamic", payloads, atAllOptsForDynamicKind(kind));
-		},
-		sendPrivateMsg: (text) => push.sendPrivateMsg(text),
-		sendErrorMsg: (text) => push.sendErrorMsg(text),
-	};
+	const dynamicPushLike = makeDynamicPushLike(push);
 
 	const dynamicConfig = (): DynamicEngineConfig => {
 		const g = globals();
@@ -451,6 +471,7 @@ export function createEngines(opts: CreateEnginesOptions): EnginesRuntime {
 			imageGroup: g.defaults.imageGroup,
 			imageEnabled: g.defaults.cardStyle.enabled,
 			aiEnabled: g.defaults.ai.enabled,
+			aiWebSearch: g.defaults.ai.search.engines.dynamic,
 			dynamicTemplate: g.defaults.templates.dynamic,
 			videoTemplate: g.defaults.templates.dynamicVideo,
 			filter: {
@@ -466,8 +487,6 @@ export function createEngines(opts: CreateEnginesOptions): EnginesRuntime {
 				whitelistRegex: f.whitelistRegex.join("|"),
 				whitelistKeywords: f.whitelistKeywords,
 			},
-			// 无 per-UP 背景覆盖的 UP 靠它轮换全局默认图廊(见 pickDynamicColorOptions)。
-			defaultBackgroundImages: g.defaults.cardStyle.backgroundImages,
 			helpHint: commandHelpHintFromGlobals(g),
 		};
 		return config;
@@ -482,13 +501,12 @@ export function createEngines(opts: CreateEnginesOptions): EnginesRuntime {
 		ai: commentary ?? undefined,
 		config: dynamicConfig(),
 		getSubs: () => buildDynamicSubsView(opts.subscriptionStore, opts.subRuntimeStore, globals()),
-		pickCardBackground: pickExistingCardBg,
 	});
 	dynamic.start();
 
 	/**
 	 * 确保所有订阅的 UP 都已在 B 站被关注 —— 动态走 `feed/all`(关注流),没关注就一条
-	 * 都收不到。独立端此前**从不** follow(只有 koishi 端做),所以存量订阅全是收不到
+	 * 都收不到。独立端此前**从不** follow(只有当年的 koishi 插件做),所以存量订阅全是收不到
 	 * 动态的哑订阅。见 `follow-sync.ts`。
 	 *
 	 * best-effort:失败不阻断引擎启动,状态会落进 SubRuntimeStore 让前端显示「未关注」,
@@ -508,27 +526,7 @@ export function createEngines(opts: CreateEnginesOptions): EnginesRuntime {
 	runFollowSync("boot");
 
 	// ---------- LiveEngine ----------
-	const livePushLike: LivePushLike = {
-		async broadcastToTargets(uid, content, type) {
-			const feature = liveTypeToFeature(type as number);
-			const segments = segmentToPayload(content);
-			const payload = collapseSegments(segments);
-			// 仅开播(StartBroadcasting)可 @全体;周期「正在直播」等也翻译成 feature
-			// "live",必须显式抑制,否则每条直播推送都 @全体。
-			await push.broadcastToFeature(uid, feature, payload, {
-				allowAtAll: liveTypeAllowsAtAll(type as number),
-			});
-		},
-		async broadcastSequenceToTargets(uid, contents, type) {
-			// 消息版式分条(目前仅开播):语义同 dynamic 端 broadcastDynamicSequence。
-			const feature = liveTypeToFeature(type as number);
-			const payloads = contents.map((c) => collapseSegments(segmentToPayload(c)));
-			await push.broadcastToFeature(uid, feature, payloads, {
-				allowAtAll: liveTypeAllowsAtAll(type as number),
-			});
-		},
-		sendPrivateMsg: (text) => push.sendPrivateMsg(text),
-	};
+	const livePushLike = makeLivePushLike(push);
 
 	const liveConfig = (): LiveEngineConfig => {
 		const g = globals();
@@ -541,13 +539,8 @@ export function createEngines(opts: CreateEnginesOptions): EnginesRuntime {
 			wordcloudStopWords: g.defaults.templates.wordcloudStopWords,
 			imageEnabled: g.defaults.cardStyle.enabled,
 			aiEnabled: g.defaults.ai.enabled,
-			customGuardBuy: {
-				enable: g.defaults.templates.guardBuy.enable,
-				guardBuyMsg: g.defaults.templates.guardBuy.captain.template,
-				captainImgUrl: g.defaults.templates.guardBuy.captain.imageUrl,
-				supervisorImgUrl: g.defaults.templates.guardBuy.commander.imageUrl,
-				governorImgUrl: g.defaults.templates.guardBuy.governor.imageUrl,
-			},
+			aiWebSearch: g.defaults.ai.search.engines.live,
+			customGuardBuy: toCustomGuardBuy(g.defaults.templates.guardBuy),
 			// 直播消息模板与动态模板一致:无开关,全局模板始终下发(默认值 ==
 			// DEFAULT_LIVE_TEMPLATES,未编辑时输出不变;编辑后即生效)。renderer 走
 			// subCustom ?? globalCustom ?? DEFAULT_LIVE_TEMPLATES,enable 仅占位、不被读。
@@ -557,8 +550,6 @@ export function createEngines(opts: CreateEnginesOptions): EnginesRuntime {
 				customLive: g.defaults.templates.liveOngoing,
 				customLiveEnd: g.defaults.templates.liveEnd,
 			},
-			// 无 per-UP / per-kind 背景覆盖的 UP 靠它轮换全局默认图廊(见 resolvedCardStyle)。
-			defaultBackgroundImages: g.defaults.cardStyle.backgroundImages,
 			// 无覆盖的 UP 靠它轮换全局默认直播封面(独立端专属,见 resolvedCardStyle)。
 			defaultLiveCoverImages: g.defaults.cardStyle.liveCoverImages,
 		};
@@ -637,23 +628,39 @@ export function createEngines(opts: CreateEnginesOptions): EnginesRuntime {
 			live.teardown();
 		}),
 	);
-	// ---------- Adapter probe scheduler ----------
+	// ---------- Connection probe scheduler ----------
 	// Background reachability check. Plan §"系统不要主动测试" excludes message-
 	// sending probes; this one only calls platformAdapter.probe (no side
-	// effects) and writes the result back to adapter.testStatus so the dashboard
-	// reflects reality without the user having to click "测试" on every adapter.
-	const ADAPTER_PROBE_INTERVAL_MS = 5 * 60 * 1000;
+	// effects) and writes the result back to the connection's testStatus so the
+	// dashboard reflects reality without the user clicking "测试" on every one.
+	const CONNECTION_PROBE_INTERVAL_MS = 5 * 60 * 1000;
 	let probeInFlight = false;
-	async function probeAllAdapters(): Promise<void> {
+	/**
+	 * 健康探测 + 顺路补探能力:连上那一刻没探到(反向 ws 的 bot 是后来才连入的)、或探的
+	 * 时候没连上,能力会停在「未探测」;开机、每五分钟、主人点「测试」都从这儿再给一次机会。
+	 * 只补「未探测」的,已经有答案的不重探 —— 那是 reconcile 的事。
+	 */
+	async function probeConnectionAndCapabilities(connectionId: string): Promise<ProbeResult> {
+		const result = await sink.probeConnection(connectionId);
+		// 连都连不上的连接,能力必然也探不出来 —— 再问一次只是白等满一整个超时,
+		// 而这条路是每五分钟一轮、逐个 await 的,离线的连接会把整轮时间翻倍。
+		if (result.ok === false) return result;
+		if (sink.connectionCapabilities(connectionId)?.miniAppCard.state === "unknown") {
+			await sink.probeConnectionCapabilities(connectionId);
+		}
+		return result;
+	}
+
+	async function probeAllConnections(): Promise<void> {
 		if (probeInFlight) return;
 		probeInFlight = true;
 		try {
-			for (const adapter of opts.configStore.getAdapters()) {
-				if (!adapter.enabled) continue;
+			for (const connection of opts.configStore.getConnections()) {
+				if (!connection.enabled) continue;
 				try {
-					const result = await sink.probeAdapter(adapter.id);
+					const result = await probeConnectionAndCapabilities(connection.id);
 					if (result.ok === null) continue; // platform doesn't support probe (e.g. webhook)
-					await opts.configStore.patchAdapter(adapter.id, {
+					await opts.configStore.patchConnection(connection.id, {
 						testStatus: {
 							ok: result.ok,
 							lastCheckedAt: new Date().toISOString(),
@@ -662,7 +669,7 @@ export function createEngines(opts: CreateEnginesOptions): EnginesRuntime {
 						},
 					});
 				} catch (e) {
-					log.warn(`[probe] adapter ${adapter.id} update failed: ${String(e)}`);
+					log.warn(`[probe] connection ${connection.id} update failed: ${String(e)}`);
 				}
 			}
 		} finally {
@@ -671,12 +678,12 @@ export function createEngines(opts: CreateEnginesOptions): EnginesRuntime {
 	}
 
 	// Kick off an immediate probe after engines come up, then poll on a timer.
-	// `config-changed` for 'adapters' scope triggers an extra immediate probe so
-	// the UI reflects new adapters / edits without waiting up to 5 min.
-	void probeAllAdapters();
+	// `config-changed` for the 'connections' scope triggers an extra immediate probe
+	// so the UI reflects new connections / edits without waiting up to 5 min.
+	void probeAllConnections();
 	const probeTimer = setInterval(() => {
-		void probeAllAdapters();
-	}, ADAPTER_PROBE_INTERVAL_MS);
+		void probeAllConnections();
+	}, CONNECTION_PROBE_INTERVAL_MS);
 	// Allow process exit without waiting for the next tick.
 	probeTimer.unref?.();
 
@@ -685,29 +692,54 @@ export function createEngines(opts: CreateEnginesOptions): EnginesRuntime {
 	// 健康检查定时器(无谓扇出 + 日志噪音)。
 	let prevGlobals = initialGlobals;
 
+	// 链接卡(群里贴链接自动出的那张)的呈现与开关。呈现与推送的动态卡问同一处:全局
+	// 「动态」样式 + 全局默认图廊轮换 + 全局版式。做成随 config-changed 刷新的快照 ——
+	// 群里每句带链接的话都要读开关,而 `globals()` 是整份深拷贝,不该按条付这个钱。
+	const linkCardViewOf = (g: GlobalConfig) => ({
+		config: g.linkParsing,
+		// 链接卡没有 UP 可言,吃的就是全局那套皮肤(与推送动态卡在没有 per-UP 覆盖时同源)。
+		cardSkin: g.defaults.cardSkin,
+		style: resolveDynamicCardStyle(g.defaults, null),
+	});
+	let linkCard = linkCardViewOf(initialGlobals);
+	// 逐群答案从默认行 + 例外 + 目标表 + 连接表算出来,三者任一变了都重算(见接口上的说明)。
+	const linkPoliciesOf = () =>
+		resolveLinkParsingPolicies({
+			config: linkCard.config,
+			targets: opts.configStore.getTargets(),
+			connections: opts.configStore.getConnections(),
+		});
+	let linkPolicies = linkPoliciesOf();
+
 	handles.push(
 		opts.bus.on("config-changed", (scope) => {
-			if (scope === "adapters") {
+			if (scope === "connections") {
+				linkPolicies = linkPoliciesOf();
 				// 有状态 adapter(OneBot ws / ws-reverse)按新 adapter 集合 reconcile
 				// 连接 / 监听器。reconcile 幂等、不写 config、不调 probe → 不会 emit
 				// config-changed,无成环。
 				//
-				// 刻意不在这里触发 probeAllAdapters:probe 经 patchAdapter 写回
-				// testStatus 会再 emit config-changed:adapters → 死循环。adapter
+				// 刻意不在这里触发 probeAllConnections:probe 经 patchConnection 写回
+				// testStatus 会再 emit config-changed:connections → 死循环。adapter
 				// 连通状态由 5 分钟轮询刷新(或用户点"测试"立即刷)。
-				for (const ad of opts.adapters) ad.reconcile?.(opts.configStore.getAdapters());
+				for (const ad of opts.adapters.list()) ad.reconcile?.(opts.configStore.getConnections());
 				return;
 			}
 			if (scope === "globals" || scope === "targets") {
 				// targets 也可能影响 master 解析(被引用的 target 删了 / 改了元数据)。
 				// 单独一行先 push,避免后续 globals-only 路径未执行时漏掉。
 				push.setMaster(masterTarget() ?? null);
-				if (scope === "targets") return;
+				if (scope === "targets") {
+					linkPolicies = linkPoliciesOf();
+					return;
+				}
 			}
 			if (scope === "globals") {
 				const g = globals();
 				const prev = prevGlobals;
 				prevGlobals = g;
+				linkCard = linkCardViewOf(g);
+				linkPolicies = linkPoliciesOf();
 				// 只热更本次真正改了的 section,避免编辑一个模块扇出到其它模块。
 				//
 				// `eq` 用 JSON.stringify 比较,**键序敏感** —— 它依赖「globals 永远是 zod
@@ -725,9 +757,14 @@ export function createEngines(opts: CreateEnginesOptions): EnginesRuntime {
 				const filtersChanged = !eq(prev.defaults.filters, g.defaults.filters);
 				const templatesChanged = !eq(prev.defaults.templates, g.defaults.templates);
 				const featuresChanged = !eq(prev.defaults.features, g.defaults.features);
-				const layoutChanged = !eq(prev.defaults.cardLayout, g.defaults.cardLayout);
+				// 皮肤换了 = 出图整个换一副样子,与旧的「版式变了」同一档热更需求:两个引擎的
+				// per-sub 快照都得刷,否则要等重启才生效(ADR-0014 决策 15 起版式住皮肤里)。
+				const skinChanged = prev.defaults.cardSkin !== g.defaults.cardSkin;
+				// 旋钮拧一格与换皮肤同一档:出图立刻变个样。只喂渲染器的 config(旋钮不
+				// 参与 per-sub 快照 —— 它按皮肤 id 存,全局一份)。
+				const skinKnobsChanged = !eq(prev.defaults.cardSkinKnobs, g.defaults.cardSkinKnobs);
 				const messageLayoutChanged = !eq(prev.defaults.messageLayout, g.defaults.messageLayout);
-				const commandsChanged = !eq(prev.commands, g.commands);
+				const groupCommandsChanged = !eq(prev.groupCommands, g.groupCommands);
 
 				// `app` 是一个 section,但里面装着三件互不相干的事(日志等级 / User-Agent /
 				// 健康检查间隔)。以整个 section 为门会让它们互相牵连 —— 改个 dynamicCron
@@ -747,23 +784,15 @@ export function createEngines(opts: CreateEnginesOptions): EnginesRuntime {
 					// healthCheck → LoginFlow:dispose 旧 setInterval + 按新间隔重 arm。
 					opts.loginFlow.setHealthCheckMs(g.app.healthCheckMinutes * 60_000);
 				}
-				// ImageRenderer 配色 / 字体 / 显示项热更(仅在已构造时有意义)。
-				if (cardStyleChanged && imageRenderer) {
-					const cs = g.defaults.cardStyle;
+				// ImageRenderer 热更(仅在已构造时有意义)。配色 / 字体 / 数据区显示项都已经
+				// 退役成皮肤旋钮,这里只剩旋钮那一份要送下去。
+				if ((cardStyleChanged || skinKnobsChanged) && imageRenderer) {
 					imageRenderer.updateConfig({
-						cardColorStart: cs.cardColorStart,
-						cardColorEnd: cs.cardColorEnd,
-						font: cs.font,
-						showPopularity: cs.showPopularity,
-						showArea: cs.showArea,
-						showFans: cs.showFans,
-						glassOpacity: cs.glassOpacity,
-						glassClear: cs.glassClear,
-						backgroundImage: cs.backgroundImages[0] ?? "",
+						cardSkinKnobs: g.defaults.cardSkinKnobs,
 					});
 				}
 				// dynamicConfig() 的完整输入集:app.dynamicCron + defaults.{filters,
-				// imageGroup,cardStyle.enabled/backgroundImages,ai.enabled,
+				// imageGroup,cardStyle.enabled,ai.enabled,
 				// templates.dynamic/dynamicVideo}。这道门必须**逐项覆盖**该集合 ——
 				// 少一项就是漏热更(用户以为保存生效了,其实要重启;`imageGroup` 就曾经
 				// 整个漏在门外),多一项则是无谓扇出(此前用整个 `appChanged` 当门,
@@ -775,7 +804,7 @@ export function createEngines(opts: CreateEnginesOptions): EnginesRuntime {
 					cardStyleChanged ||
 					aiChanged ||
 					templatesChanged ||
-					commandsChanged
+					groupCommandsChanged
 				) {
 					dynamic.updateConfig(dynamicConfig());
 				}
@@ -794,8 +823,8 @@ export function createEngines(opts: CreateEnginesOptions): EnginesRuntime {
 					// 引擎构造时 ai 字段是 snapshot,新建/置空后必须通过 setAi/setCommentary
 					// 把引用同步过去,否则永远沿用启动时的 null。
 					const a = g.defaults.ai;
-					// 当前选中那家的连接是否配齐 —— 换家也会走到这里(provider 指针
-					// 本身就在 defaults.ai 里,变了就算 aiChanged)。
+					// 当前选中那份实例的连接是否配齐 —— 换实例也会走到这里(activeProfile
+					// 指针本身就在 defaults.ai 里,变了就算 aiChanged)。
 					const ap = resolveAIProfile(a);
 					const needsCommentary = Boolean(ap.apiKey && ap.baseUrl);
 					if (!needsCommentary && commentary) {
@@ -813,9 +842,12 @@ export function createEngines(opts: CreateEnginesOptions): EnginesRuntime {
 						live.setCommentary(commentary);
 						if (commentary) log.info("[ai] commentary 已激活");
 					} else if (commentary) {
-						commentary.updateConfig(buildAiConfig());
+						const next = buildAiConfig();
+						commentary.updateConfig(next);
+						// 报**真正推给引擎的那份人格**(指针指的那份),不是 `a.persona` ——
+						// 后者永远冻在老值上,照它打日志等于给排查的人指错方向。
 						log.info(
-							`[ai] commentary 配置已更新: provider=${a.provider}, model=${ap.model}, persona.name=${a.persona.name}, traits=${a.persona.traits}`,
+							`[ai] commentary 配置已更新: profile=${a.activeProfile}(${ap.provider}), model=${ap.model}, persona.name=${next.persona.name}, traits=${next.persona.traits}`,
 						);
 					}
 				}
@@ -832,7 +864,7 @@ export function createEngines(opts: CreateEnginesOptions): EnginesRuntime {
 					filtersChanged ||
 					templatesChanged ||
 					featuresChanged ||
-					layoutChanged ||
+					skinChanged ||
 					messageLayoutChanged
 				) {
 					const refreshOps = subscriptionOpsToLive(
@@ -850,7 +882,7 @@ export function createEngines(opts: CreateEnginesOptions): EnginesRuntime {
 				// 全局默认版式变化不会自动传播 —— 借道 applyOps 的 update 分支强制刷新每个已跟踪
 				// UID 的完整 SubItemView(startDynamicForUid 内部只在 UID 首次出现时初始化时间戳,
 				// 已跟踪 UID 不会被当成新订阅重推旧动态,见 dynamic-engine.ts stillSubscribed 注释)。
-				if (layoutChanged || messageLayoutChanged) {
+				if (skinChanged || messageLayoutChanged) {
 					dynamic.applyOps(
 						subscriptionOpsToDynamic(
 							opts.subscriptionStore.list().map((sub) => ({ type: "update" as const, sub })),
@@ -914,7 +946,7 @@ export function createEngines(opts: CreateEnginesOptions): EnginesRuntime {
 			log.warn(`[engines] masterNotifier.dispose failed: ${String(e)}`);
 		}
 		// 有状态 adapter:关正向连接 / 反向监听器 / 定时器。best-effort 同步触发。
-		for (const ad of opts.adapters) {
+		for (const ad of opts.adapters.list()) {
 			try {
 				void ad.dispose?.();
 			} catch (e) {
@@ -928,15 +960,34 @@ export function createEngines(opts: CreateEnginesOptions): EnginesRuntime {
 		dynamic,
 		live,
 		push,
+		muteState,
 		subscriptionStore: opts.subscriptionStore,
-		commentary,
+		// getter,理由同下面的 `imageRenderer` —— 这也是个会被热重载重新赋值的 let。
+		// 写成普通属性的话它就是**启动那一刻的值拷贝**:没配 AI 起的服务永远是 null,
+		// 主人在设置页补上 apiKey 后热重载确实把实例建起来了(`dynamic`/`live` 靠
+		// setAi/setCommentary 拿到了新引用),可读这个字段的聊天路由还是拿到 null,
+		// 于是「保存成功却照样报『还没填齐』,重启才好」。反向亦然:撤掉密钥后它会
+		// 攥着已 stop 的旧实例继续答话。
+		get commentary() {
+			return commentary;
+		},
 		api: opts.api,
 		// getter:`imageRenderer` 是个会被热切换重新赋值的 let,取值必须每次现读。
 		get imageRenderer() {
 			return imageRenderer;
 		},
 		listLiveRooms: () => listLiveRooms(live),
-		probeAdapter: (adapterId: string) => sink.probeAdapter(adapterId),
+		probeConnection: (connectionId: string) => probeConnectionAndCapabilities(connectionId),
+		connectionCapabilities: (connectionId: string) => sink.connectionCapabilities(connectionId),
+		probeConnectionCapabilities: (connectionId: string) =>
+			sink.probeConnectionCapabilities(connectionId),
+		linkParsing: () => linkCard.config,
+		linkPolicyFor: (key: string) => linkPolicies.policyFor(key),
+		linkCardPresentation: () => ({
+			// 链接卡就是「全局那张动态卡」:吃全局那份动态样式(主人定的:它跟着全局走)。
+			colors: resolveDynamicColorOptions(linkCard.style),
+			cardSkin: linkCard.cardSkin,
+		}),
 		getModuleStatus: (): ModuleStatus => {
 			const g = globals();
 			// "live ready" = at least one enabled subscription has any live-related
@@ -951,8 +1002,6 @@ export function createEngines(opts: CreateEnginesOptions): EnginesRuntime {
 					"liveEnd",
 					"liveGuardBuy",
 					"superchat",
-					"wordcloud",
-					"liveSummary",
 					"specialDanmaku",
 					"specialUserEnter",
 				];
@@ -992,36 +1041,6 @@ export function createEngines(opts: CreateEnginesOptions): EnginesRuntime {
 // Helpers
 // ----------------------------------------------------------------------------
 
-/**
- * BilibiliPush 的 FeatureKey(或 master notify 走的 "private")映射到 history
- * schema 的 7 个分类 source 值。dynamic-engine / live-engine 在 push 时只携带
- * 一个 feature 字段,这里集中翻译,避免每个调用点散列。
- */
-function featureToHistorySource(feature: string): HistorySource {
-	switch (feature) {
-		case "dynamic":
-		case "dynamicAtAll":
-			return "dynamic";
-		case "live":
-		case "liveAtAll":
-		case "liveEnd":
-			return "live";
-		case "liveGuardBuy":
-			return "guard";
-		case "superchat":
-			return "sc";
-		case "wordcloud":
-		case "liveSummary":
-			return "live-summary";
-		case "specialDanmaku":
-			return "special-danmaku";
-		case "specialUserEnter":
-			return "special-enter";
-		default:
-			return "dynamic";
-	}
-}
-
 function pushSegmentsToPayload(segments: PushSegment[]): NotificationPayload {
 	if (segments.length === 1 && segments[0]?.type === "text") {
 		return { kind: "text", text: segments[0].text };
@@ -1034,7 +1053,7 @@ function pushSegmentsToPayload(segments: PushSegment[]): NotificationPayload {
 	}
 	if (segments.length === 1 && segments[0]?.type === "image-group") {
 		// segment.forward 由 dynamic engine config 的 imageGroupForward 决定:
-		//   true  → adapter 走 send_group_forward_msg / koishi forward 容器
+		//   true  → adapter 走 send_group_forward_msg 合并转发
 		//   false → adapter 走多 image segment 合并到一条普通 send_group_msg
 		return {
 			kind: "forward-images",
@@ -1067,6 +1086,76 @@ function collapseSegments(segments: PayloadSegment[]): NotificationPayload {
 	return { kind: "composite", segments };
 }
 
+/**
+ * 引擎→推送层的两个适配器。**提成工厂是为了让这一跳自己有守卫** ——
+ * 它们原本编在 `createEngines` 里、测试够不着，于是把
+ * `liveBroadcastOpts(...)` 整个换掉也没一条测试会红（2026-09-19 剪线实测：219 个
+ * 文件全绿）。而那一句里揣着三样东西，掉了都是静默的：附加项的键（掉了按目标收窄
+ * 全失效）、`allowAtAll`（掉了「每条直播推送都 @全体」那个修过的 bug 直接回归）、
+ * `kind`（掉了历史把周期复推记成开播）。
+ */
+type PushForEngines = Pick<BilibiliPush, "broadcastToFeature" | "sendPrivateMsg" | "sendErrorMsg">;
+
+/** 动态引擎那侧的 PushLike。 */
+export function makeDynamicPushLike(push: PushForEngines): DynamicPushLike {
+	return {
+		async broadcastDynamic(uid, segments, kind, o) {
+			const payload = pushSegmentsToPayload(segments);
+			// kind="dynamic-images"(图集附图)是主卡片之后的附加项:同一个 pushId 追加到历史
+			// 同一行,并显式抑制 @全体 —— 否则一条 DRAW 动态会在主卡片和图集各 @ 一次。
+			await push.broadcastToFeature(
+				uid,
+				"dynamic",
+				payload,
+				broadcastOptsForDynamicKind(kind, o?.pushId),
+			);
+		},
+		async broadcastDynamicSequence(uid, messages, kind, o) {
+			// 消息版式分条:多条 payload 交给 BilibiliPush 的序列语义(同 target 顺序发、
+			// 某条失败中止该 target 后续条、@全体只跟首条之前)。
+			const payloads = messages.map(pushSegmentsToPayload);
+			await push.broadcastToFeature(
+				uid,
+				"dynamic",
+				payloads,
+				broadcastOptsForDynamicKind(kind, o?.pushId),
+			);
+		},
+		sendPrivateMsg: (text) => push.sendPrivateMsg(text),
+		sendErrorMsg: (text) => push.sendErrorMsg(text),
+	};
+}
+
+/** 直播引擎那侧的 PushLike。 */
+export function makeLivePushLike(push: PushForEngines): LivePushLike {
+	return {
+		async broadcastToTargets(uid, content, type, o) {
+			const payload = collapseSegments(segmentToPayload(content));
+			await push.broadcastToFeature(
+				uid,
+				liveTypeToFeature(type as number),
+				payload,
+				liveBroadcastOpts(type as number, o),
+			);
+		},
+		async broadcastSequenceToTargets(uid, contents, type, o) {
+			// 消息版式分条(目前仅开播):语义同 dynamic 端 broadcastDynamicSequence。
+			const payloads = contents.map((c) => collapseSegments(segmentToPayload(c)));
+			await push.broadcastToFeature(
+				uid,
+				liveTypeToFeature(type as number),
+				payloads,
+				liveBroadcastOpts(type as number, o),
+			);
+		},
+		sendPrivateMsg: (text) => push.sendPrivateMsg(text),
+	};
+}
+
+/**
+ * LivePushType → 特性键(管开关与路由)。词云(5)/ 总结(10)是下播的附加项,跟着
+ * 下播那把键走;开播(3)与周期「正在直播」(0)共用 live。
+ */
 export function liveTypeToFeature(type: number): FeatureKey {
 	switch (type) {
 		case 0:
@@ -1075,28 +1164,72 @@ export function liveTypeToFeature(type: number): FeatureKey {
 		case 4:
 			return "liveGuardBuy";
 		case 5:
-			return "wordcloud";
+		case 9:
+		case 10:
+			return "liveEnd";
 		case 6:
 			return "superchat";
 		case 7:
 			return "specialDanmaku";
 		case 8:
 			return "specialUserEnter";
-		case 9:
-			return "liveEnd";
-		case 10:
-			return "liveSummary";
 		default:
 			return "live";
 	}
 }
 
 /**
+ * LivePushType → **附加项键**(管按目标收窄),ADR-0016 决策 5:紧挨着上面那张
+ * 「翻成哪把特性」的表产出,推送层据它在主特性的目标列表上再筛一道。
+ *
+ * 只有词云(5)与 AI 总结(10)两档是附加项;下播卡本体(9)必须留 `undefined` ——
+ * 它要是也带上键,整张卡就会被附加项的三态表收窄掉。@全体 不在这里:它是推送层
+ * 内部那条自己的分支(单独一条消息 + 平台能力判定),不经广播选项。
+ */
+export function liveTypeToExtra(type: number): ExtraKey | undefined {
+	switch (type) {
+		case 5:
+			return "wordcloud";
+		case 10:
+			return "liveSummary";
+		default:
+			return undefined;
+	}
+}
+
+/**
+ * LivePushType → 推送类型(管历史怎么记)。与上面那张表只差一处:周期「正在直播」
+ * 单列一类 —— 它跟开播共用开关与目标(所以 feature 是 live),历史上却是两种推送。
+ * 其余每一档都由「特性 → 推送类型」定死,别在这儿再抄一张会飘的表。
+ */
+export function liveTypeToPushKind(type: number): PushKind {
+	return type === 0 ? "live-ongoing" : featureToPushKind(liveTypeToFeature(type));
+}
+
+/**
+ * 直播端一次广播交给推送层的选项:引擎给的 pushId / role 原样带上,再补三样引擎不知道
+ * 的 —— 只有开播允许 @全体(周期复推等也翻译成 feature "live",不显式抑制就每条都 @)、
+ * 历史里记成哪一类,以及这是哪个附加项(有键推送层才按目标收窄)。
+ */
+export function liveBroadcastOpts(
+	type: number,
+	o: { pushId?: string; role?: "main" | "extra" } | undefined,
+): BroadcastOptions {
+	return {
+		pushId: o?.pushId,
+		role: o?.role,
+		allowAtAll: liveTypeAllowsAtAll(type),
+		kind: liveTypeToPushKind(type),
+		extra: liveTypeToExtra(type),
+	};
+}
+
+/**
  * 一条 LivePushType 是否允许 @全体成员。仅 `StartBroadcasting`(=3,开播)允许;
  * 周期「正在直播」复推(`Live`=0)及其它都翻译成 `feature === "live"`,光看
  * feature 区分不出开播 vs 复推 —— push 层据本结果决定是否进 atAll 分支,否则
- * 每条直播推送都 @全体(已修 bug)。必须与 `koishi/live/src/live-type-map.ts`
- * 的同名函数保持一致(裸数字 3 = LivePushType.StartBroadcasting)。
+ * 每条直播推送都 @全体(已修 bug)。裸数字 3 = LivePushType.StartBroadcasting,与
+ * packages/live 的 LivePushType 保持一致。
  */
 export function liveTypeAllowsAtAll(type: number): boolean {
 	return type === 3;
@@ -1177,41 +1310,37 @@ function buildDynamicFilter(eff: ReturnType<typeof resolve>) {
 
 /**
  * 把一份解析后的 CardStyle(或 per-UP 覆盖切片)映射成引擎消费的 colorOptions 形状
- * (`enable:true` + `backgroundImage` 取列表首张作为静态兜底,`backgroundImages`
- * 透传完整列表给推送点做「每次推送轮换」——见 `resolvedCardStyle` / `pickDynamicColorOptions`)。
+ * (`enable:true` + `liveCoverImage` 取列表首张作为静态兜底,`liveCoverImages` 透传完整
+ * 列表给推送点做「每次推送轮换」——见 `RoomSessionBase.resolvedCardStyle`)。
  *
- * 无背景图时 `backgroundImage` 留 undefined(**不是** `""`)—— generate* 用
- * `colorOptions.backgroundImage ?? this.config.backgroundImage` 兜底,`""` 非 nullish
- * 会把背景抹空而非回退全局,故只设颜色/玻璃的 per-UP 覆盖必须让背景透传 undefined。
+ * 无封面时 `liveCoverImage` 留 undefined(**不是** `""`)—— generate* 用
+ * `colorOptions.liveCoverImage` 兜底,`""` 非 nullish 会把封面抹空而非回退 B 站原图,
+ * 故只设字体之类的 per-UP 覆盖必须让封面透传 undefined。
+ *
+ * 从前这里还映射一对 `backgroundImage` / `backgroundImages`;整条链 2026-09-20 删掉
+ * (背景图归皮肤自己的 `image` 旋钮)。
  */
 function cardStyleToColorOptions(s: {
-	cardColorStart?: string;
-	cardColorEnd?: string;
-	glassOpacity?: number;
-	glassClear?: boolean;
-	backgroundImages?: string[];
 	liveCoverImages?: string[];
-	showPopularity?: boolean;
-	showArea?: boolean;
-	showFans?: boolean;
 }): LiveSubView["customCardStyle"] {
 	return {
 		enable: true,
-		cardColorStart: s.cardColorStart,
-		cardColorEnd: s.cardColorEnd,
-		glassOpacity: s.glassOpacity,
-		glassClear: s.glassClear,
-		backgroundImage: s.backgroundImages?.[0],
-		// 完整列表透传给推送点;>1 张时「每次推送轮换」(见 RoomSession.resolvedCardStyle /
-		// DynamicEngine)。单图 / 缺省即用 backgroundImage,不轮换。
-		backgroundImages: s.backgroundImages,
-		// 直播封面同款语义(独立端专属,仅 live 卡消费)。
+		// 🪦 字体两项(`font` / `fontAsset`)2026-09-20 从这里摘掉。它们 09-14 退役成皮肤
+		// 自己的字体旋钮,卡片页上那几栏入口也一并删了 —— 而这一步还在读盘上的老值往下喂,
+		// 于是给某位 UP / 某类卡单独设过字体的人**改不动它、它却还在生效**,面板上连看都
+		// 看不到。全局那一份早就断了(见上面 createImageRenderer 那儿的注释),漏的是
+		// per-UP 与 per-kind 这两层。
+		//
+		// ⚠️ 这里从前写的是反向的注释(「此前整个漏在这里…选了等于没选」)。那句话在入口
+		// 还在的时候是对的:收不到才是 bug。入口没了之后,继续读它才是 bug。别照着旧版本
+		// 把这两行加回来 —— 守卫在 `__tests__/sub-views.test.ts`,它也跟着翻了向。
+		//
+		// 字段本身留在 schema 里(退役字段不删,`.strict()` 会让老配置装不进来),只是再没有
+		// 读者;想换字体请拧那套皮肤的字体旋钮。
+		//
+		// 直播封面(独立端专属,仅 live 卡消费)。
 		liveCoverImage: s.liveCoverImages?.[0],
 		liveCoverImages: s.liveCoverImages,
-		// 直播卡数据区显示项(live 才用);经 colorOptions 透传,缺省回退渲染器全局 config。
-		showPopularity: s.showPopularity,
-		showArea: s.showArea,
-		showFans: s.showFans,
 	};
 }
 
@@ -1225,34 +1354,15 @@ function buildCardStyleByKind(
 	overrides: SubscriptionOverrides,
 	kinds: readonly CardKind[],
 ): LiveSubView["customCardStyleByKind"] {
-	// 数据区 show 字段是直播内容语义,全局只认基准 cardStyle(→渲染器全局 config)。解析 per-kind
-	// 时剥掉**全局 kind 层**的 show 字段,避免旧配置里残留的全局 cardStyleByKind.live.show 盖过
-	// 基准、让数据区开关失效;per-UP(overrides)层的 show 仍保留 = 该 UP 的数据区覆盖。
-	const resolveDefaults = stripGlobalKindShowFlags(defaults);
 	const out: NonNullable<LiveSubView["customCardStyleByKind"]> = {};
 	for (const kind of kinds) {
 		const hasKindOverride =
 			defaults.cardStyleByKind?.[kind] !== undefined ||
 			overrides.cardStyleByKind?.[kind] !== undefined;
 		if (!hasKindOverride) continue;
-		out[kind] = cardStyleToColorOptions(resolveCardStyleForKind(resolveDefaults, overrides, kind));
+		out[kind] = cardStyleToColorOptions(resolveCardStyleForKind(defaults, overrides, kind));
 	}
 	return Object.keys(out).length > 0 ? out : undefined;
-}
-
-/** 数据区显示开关字段(直播内容,全局基准管;不应从全局 per-kind 层生效)。 */
-const DATA_SHOW_KEYS = ["showPopularity", "showArea", "showFans"] as const;
-/** 复制一份 defaults,把全局 cardStyleByKind 各项里的 show 字段去掉(基准 cardStyle 不动)。 */
-function stripGlobalKindShowFlags(defaults: GlobalDefaults): GlobalDefaults {
-	const byKind = defaults.cardStyleByKind;
-	if (!byKind) return defaults;
-	const cleaned: Record<string, Record<string, unknown>> = {};
-	for (const [k, v] of Object.entries(byKind)) {
-		const o: Record<string, unknown> = { ...(v as Record<string, unknown>) };
-		for (const sk of DATA_SHOW_KEYS) delete o[sk];
-		cleaned[k] = o;
-	}
-	return { ...defaults, cardStyleByKind: cleaned as GlobalDefaults["cardStyleByKind"] };
 }
 
 export function buildDynamicSubsView(
@@ -1280,22 +1390,34 @@ export function buildDynamicSubsView(
  * 全局值合进 eff 伪装成 per-UP,而 dynamicSubManager 快照不刷 → 全局改了 dynamic 端
  * 永远沿用旧值。
  */
+/**
+ * 动态卡的生效样式:有 dynamic per-kind 覆盖(全局或 UP)→ 用完整解析样式;否则维持
+ * 原行为(per-UP 基准折算 ? styled : enable:false → 引擎走渲染器全局兜底,保持热更)。
+ * `overrides` 传 null = 全局作用域。
+ *
+ * 推送的动态卡(per-UP 视图)与群里贴链接出的那张卡都从这里拿 —— 各算一份的话,主人在
+ * 卡片页给「动态」这一类调的样式只有推送卡认,版式那半边就曾经这样漏过一回。
+ */
+export function resolveDynamicCardStyle(
+	defaults: GlobalDefaults,
+	overrides: SubscriptionOverrides | null,
+): NonNullable<DynamicSubsView[string]["customCardStyle"]> {
+	const hasDynamicKind =
+		defaults.cardStyleByKind?.dynamic !== undefined ||
+		overrides?.cardStyleByKind?.dynamic !== undefined;
+	if (hasDynamicKind) {
+		return cardStyleToColorOptions(resolveCardStyleForKind(defaults, overrides, "dynamic"));
+	}
+	return overrides?.cardStyle ? cardStyleToColorOptions(overrides.cardStyle) : { enable: false };
+}
+
 export function buildDynamicSubViewSingle(
 	sub: Subscription,
 	subRuntimeStore: SubRuntimeStore,
 	globals: GlobalConfig,
 ): DynamicSubsView[string] {
 	const eff = resolve(sub, globals.defaults);
-	// dynamic 卡的生效样式:有 dynamic per-kind 覆盖(全局或 UP)→ 用完整解析样式;否则维持
-	// 原行为(per-UP base 折算 ? styled : enable:false → 引擎走 this.config 全局兜底,保持热更)。
-	const hasDynamicKind =
-		globals.defaults.cardStyleByKind?.dynamic !== undefined ||
-		sub.overrides.cardStyleByKind?.dynamic !== undefined;
-	const dynamicCardStyle: DynamicSubsView[string]["customCardStyle"] = hasDynamicKind
-		? cardStyleToColorOptions(resolveCardStyleForKind(globals.defaults, sub.overrides, "dynamic"))
-		: sub.overrides.cardStyle
-			? cardStyleToColorOptions(sub.overrides.cardStyle)
-			: { enable: false };
+	const dynamicCardStyle = resolveDynamicCardStyle(globals.defaults, sub.overrides);
 	return {
 		uid: sub.uid,
 		uname: subRuntimeStore.get(sub.id)?.cachedProfile?.name ?? sub.uid,
@@ -1310,11 +1432,24 @@ export function buildDynamicSubViewSingle(
 		imageGroupForward: sub.overrides.imageGroup?.forward,
 		customDynamicTemplate: sub.overrides.templates?.dynamic,
 		customVideoTemplate: sub.overrides.templates?.dynamicVideo,
-		// per-UP 解析后的动态卡版式切片(eff = 整份覆盖 ?? 全局)。全局默认版式即复刻现状。
-		dynamicLayout: eff.cardLayout.dynamic,
-		// per-UP 解析后的消息版式动态切片。独立端恒有值(默认 = 复刻现状:卡片+文本+
-		// 链接合并一条);koishi 端不填该字段,引擎走旧路径。
+		// per-UP 解析后的卡片皮肤 id(eff = per-UP 指了就是它,否则全局)。
+		cardSkin: eff.cardSkin,
+		// per-UP 解析后的消息版式动态切片,恒有值(默认 = 复刻现状:卡片+文本+链接合并一条)。
 		messageLayout: eff.messageLayout.dynamic,
+	};
+}
+
+/**
+ * 配置的上舰提示 → 引擎视图。三档(总督 / 提督 / 舰长)的文案与图片**各自**下发,
+ * room-session 按事件的 guard_level 取同一档。全局(`liveConfig`)与 per-UP
+ * (`buildLiveSubViewSingle`)共用这一处,别在两边各抄一份映射。
+ */
+function toCustomGuardBuy(b: GuardBundle): CustomGuardBuyLike {
+	return {
+		enable: b.enable,
+		governor: { ...b.governor },
+		commander: { ...b.commander },
+		captain: { ...b.captain },
 	};
 }
 
@@ -1354,8 +1489,8 @@ export function buildLiveSubViewSingle(
 		liveEnd: feat("liveEnd"),
 		liveGuardBuy: feat("liveGuardBuy"),
 		superchat: feat("superchat"),
-		wordcloud: feat("wordcloud"),
-		liveSummary: feat("liveSummary"),
+		// 四把附加项整份下发(ADR-0016);引擎只读下播那两把,@全体 归推送层。
+		extras: eff.features.extras,
 		target: eff.routing,
 		// customCardStyle / aiOverride 只在真有 per-UP override 时生成(对齐 dynamic
 		// 端 buildDynamicSubsView 同名字段)。无 override → enable:false / undefined →
@@ -1394,13 +1529,7 @@ export function buildLiveSubViewSingle(
 			customLive: eff.templates.liveOngoing,
 			customLiveEnd: eff.templates.liveEnd,
 		},
-		customGuardBuy: {
-			enable: eff.templates.guardBuy.enable,
-			guardBuyMsg: eff.templates.guardBuy.captain.template,
-			captainImgUrl: eff.templates.guardBuy.captain.imageUrl,
-			supervisorImgUrl: eff.templates.guardBuy.commander.imageUrl,
-			governorImgUrl: eff.templates.guardBuy.governor.imageUrl,
-		},
+		customGuardBuy: toCustomGuardBuy(eff.templates.guardBuy),
 		customLiveSummary: {
 			enable: true,
 			liveSummary: eff.templates.liveSummary,
@@ -1408,11 +1537,10 @@ export function buildLiveSubViewSingle(
 		// per-UP 解析后的弹幕词云额外停用词(eff = per-UP override ?? 全局)。room-session
 		// 在下播 dispatch 时对 sortedWords 过滤,使该 UP 的词云 / 总结热词额外生效。
 		wordcloudStopWords: eff.templates.wordcloudStopWords,
-		// per-UP 解析后的卡片版式(eff = per-UP 整份覆盖 ?? 全局)。room-session 渲染
-		// live/sc/guard 时取对应切片透传给 generate*;全局默认版式即复刻现状。
-		cardLayout: eff.cardLayout,
-		// per-UP 解析后的消息版式直播切片(覆盖开播 / 直播中 / 下播)。独立端恒有值;
-		// koishi 端不填,room-session 走旧路径。
+		// per-UP 解析后的卡片皮肤 id(eff = per-UP 指了就是它,否则全局)。room-session
+		// 渲染 live/sc/guard/词云时原样透传给 generate*。
+		cardSkin: eff.cardSkin,
+		// per-UP 解析后的消息版式直播切片(覆盖开播 / 直播中 / 下播),恒有值。
 		messageLayout: eff.messageLayout.live,
 		customSpecialDanmakuUsers:
 			danmakuUsers.length > 0
@@ -1513,8 +1641,7 @@ function subscriptionOpsToLive(
 						liveEnd: view.liveEnd,
 						liveGuardBuy: view.liveGuardBuy,
 						superchat: view.superchat,
-						wordcloud: view.wordcloud,
-						liveSummary: view.liveSummary,
+						extras: view.extras,
 						minScPrice: view.minScPrice,
 						minGuardLevel: view.minGuardLevel,
 						pushTime: view.pushTime,
@@ -1530,7 +1657,7 @@ function subscriptionOpsToLive(
 						customLiveSummary: view.customLiveSummary,
 						customSpecialDanmakuUsers: view.customSpecialDanmakuUsers,
 						customSpecialUsersEnterTheRoom: view.customSpecialUsersEnterTheRoom,
-						cardLayout: view.cardLayout,
+						cardSkin: view.cardSkin,
 						messageLayout: view.messageLayout,
 					},
 				],

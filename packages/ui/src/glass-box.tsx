@@ -1,0 +1,138 @@
+/**
+ * GlassBox — heavier alternative to GlassPanel from .bn-design's
+ * variation-ac-plugins.jsx. Used by Rules / Cards / AI pages where each
+ * sub-section has an icon chip + accent color + optional badge + right
+ * actions slot.
+ */
+
+import type { CSSProperties, ReactNode } from "react";
+import { accentChip, accentRadial } from "./accent-surface";
+import { Pill, Toggle } from "./atoms";
+
+export interface GlassBoxProps {
+	title: ReactNode;
+	subtitle?: ReactNode;
+	accent?: string;
+	/** 图标位上那枚 accent 渐变芯片里的图形。 */
+	icon?: ReactNode;
+	/**
+	 * **自绘**的图标位 —— 整块由调用方给,不套 accent 芯片。
+	 *
+	 * 桥接页的接入卡是这么用的:卡的角光跟连接状态走(绿 / 黄 / 灰),而左上那枚方块
+	 * 印的是「哪一种桥」(灰底两个字母),两者**不该是同一种颜色**。有 `mark` 时 `icon` 不画。
+	 */
+	mark?: ReactNode;
+	/** 标题旁那枚 accent 色的小徽章。 */
+	badge?: ReactNode;
+	/**
+	 * 徽章之后、同一行里再摆的东西(状态点 + 一句「已连接」那种)—— 它们不是 accent 色,
+	 * 所以进不了 `badge`。
+	 */
+	aside?: ReactNode;
+	right?: ReactNode;
+	dense?: boolean;
+	children: ReactNode;
+	className?: string;
+}
+
+export function GlassBox({
+	title,
+	subtitle,
+	accent = "var(--color-bn-pink)",
+	icon,
+	mark,
+	badge,
+	aside,
+	right,
+	dense,
+	children,
+	className,
+}: GlassBoxProps) {
+	const radial = accentRadial(accent);
+	const iconChip = accentChip(accent);
+	return (
+		<div
+			// flex-col + 下面那个 flex-1 的正文:卡被摆进等高的 grid 行时(概览页「系统资源」
+			// 与「各模块」并排),给它 `h-full` 正文就跟着长满,不会在底下留一大片空玻璃。
+			// 不给高度时 flex-col 与块级排布完全等价,存量调用点一处不受影响。
+			className={`bn-glass relative flex flex-col overflow-hidden rounded-bn-card shadow-bn-card ${className ?? ""}`}
+		>
+			<div className="pointer-events-none absolute right-0 top-0 h-40 w-40" style={radial} />
+			<div className="relative flex items-center gap-3 border-b border-bn-border-subtle px-[18px] pb-3 pt-3.5">
+				{mark ? (
+					mark
+				) : icon ? (
+					<div
+						className="grid h-8 w-8 place-items-center rounded-bn-sm text-bn-base font-bold text-bn-on-solid"
+						style={iconChip}
+					>
+						{icon}
+					</div>
+				) : null}
+				<div className="min-w-0 flex-1">
+					<div className="flex items-center gap-2">
+						<span className="text-bn-base font-bold tracking-tight text-bn-text-primary">
+							{title}
+						</span>
+						{badge ? (
+							<Pill color={accent} subtle size="sm">
+								{badge}
+							</Pill>
+						) : null}
+						{aside}
+					</div>
+					{subtitle ? (
+						<div className="mt-0.5 text-bn-xs text-bn-text-secondary">{subtitle}</div>
+					) : null}
+				</div>
+				{right}
+			</div>
+			<div
+				className={`relative flex-1 ${dense ? "px-[18px] pb-3.5 pt-2" : "px-[18px] pb-4 pt-2.5"}`}
+			>
+				{children}
+			</div>
+		</div>
+	);
+}
+
+export interface CollapseBlockProps {
+	label: ReactNode;
+	enabled: boolean;
+	onToggle: (next: boolean) => void;
+	accent?: string;
+	children?: ReactNode;
+}
+
+export function CollapseBlock({
+	label,
+	enabled,
+	onToggle,
+	accent = "var(--color-bn-pink)",
+	children,
+}: CollapseBlockProps) {
+	const style: CSSProperties = enabled
+		? {
+				background: `color-mix(in srgb, ${accent} 4%, transparent)`,
+				borderColor: `color-mix(in srgb, ${accent} 20%, transparent)`,
+			}
+		: { background: "var(--color-bn-hover-muted)", borderColor: "var(--color-bn-border)" };
+	return (
+		<div className="mt-2.5 rounded-lg border px-3 py-2.5" style={style}>
+			<div className="flex items-center justify-between">
+				<span
+					className={`text-bn-sm font-bold ${enabled ? "text-bn-text-primary" : "text-bn-text-secondary"}`}
+				>
+					{label}
+				</span>
+				<Toggle
+					size="sm"
+					value={enabled}
+					onChange={onToggle}
+					ariaLabel={typeof label === "string" ? label : undefined}
+				/>
+			</div>
+			{enabled ? <div className="mt-2">{children}</div> : null}
+		</div>
+	);
+}

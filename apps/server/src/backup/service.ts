@@ -1,9 +1,10 @@
 import type { ImportResult } from "@bilibili-notify/contract";
-import type {
-	GlobalConfig,
-	PushAdapter,
-	PushTarget,
-	Subscription,
+import {
+	type Connection,
+	type GlobalConfig,
+	migrateConfigSections,
+	type PushTarget,
+	type Subscription,
 } from "@bilibili-notify/internal";
 import { assembleFullBackup, openFullBackup } from "./assemble.js";
 import {
@@ -12,18 +13,20 @@ import {
 	type BackupSections,
 	buildBackup,
 } from "./envelope.js";
-import { type ImportMode, planImport } from "./restore.js";
-import { redactSecretKeys } from "./sanitize.js";
+import { foldPlan, type ImportMode, planImport } from "./restore.js";
+import { type ExtensionSecretCodes, redactBackupSections } from "./sanitize.js";
 
 /**
  * BackupService — the IO seam wiring the pure backup core to the running
  * standalone end.
  *
  * Export reads the four config scopes (and, for a full backup, the cookie
- * store) and assembles an envelope. Import runs the pure {@link planImport} and
- * then applies each write through the config store's normal methods — which
- * already emit `config-changed` on the bus, so subscriptions/targets/adapters
- * hot-reload for free. Restoring cookies additionally calls
+ * store) and assembles an envelope. Import runs the pure {@link planImport},
+ * folds it into the end state with {@link foldPlan} and hands that to
+ * `replaceSections` in **one** call — restore is a wholesale state replacement,
+ * not a sequence of user edits, and pretending otherwise cost us both a guard
+ * meant for humans (webhook targets cannot be hand-created) and any chance of
+ * rolling back a half-applied import. Restoring cookies additionally calls
  * {@link BackupServiceDeps.onCookiesRestored} so the auth layer can re-activate
  * the login without a process restart (the one genuinely live-swapped piece).
  */
@@ -32,15 +35,14 @@ import { redactSecretKeys } from "./sanitize.js";
 export interface BackupStore {
 	getGlobals(): GlobalConfig;
 	getSubscriptions(): Subscription[];
-	getAdapters(): PushAdapter[];
+	getConnections(): Connection[];
 	getTargets(): PushTarget[];
-	setGlobals(next: GlobalConfig): Promise<void>;
-	upsertSubscription(sub: Subscription): Promise<void>;
-	deleteSubscription(id: string): Promise<boolean>;
-	upsertAdapter(adapter: PushAdapter): Promise<void>;
-	deleteAdapter(id: string): Promise<boolean>;
-	upsertTarget(target: PushTarget): Promise<void>;
-	deleteTarget(id: string): Promise<boolean>;
+	replaceSections(next: {
+		globals?: GlobalConfig;
+		subscriptions?: Subscription[];
+		connections?: Connection[];
+		targets?: PushTarget[];
+	}): Promise<unknown>;
 }
 
 interface BackupCookieStore {
@@ -52,7 +54,7 @@ interface BackupCookieStore {
 export interface SectionSelection {
 	globals?: boolean;
 	subscriptions?: boolean;
-	adapters?: boolean;
+	connections?: boolean;
 	targets?: boolean;
 }
 
@@ -63,6 +65,14 @@ export interface BackupServiceDeps {
 	onCookiesRestored?: () => void | Promise<void>;
 	/** Injectable ISO clock (keeps exports deterministic in tests). */
 	now?: () => string;
+	/**
+	 * 拓展在字段表里声明 `secret: true` 的那些 config 键,**按拓展 id 分格**。
+	 * **现取**:拓展会被拨开关加载 / 卸载。
+	 *
+	 * 不在表里的拓展 = 没跑起来 = 问不出来,脱敏那边把它那两格整片当密钥
+	 * (见 {@link ExtensionSecretCodes})。
+	 */
+	extensionSecretCodes?: () => ExtensionSecretCodes;
 }
 
 interface ExportOptions {
@@ -94,7 +104,7 @@ export interface BackupService {
 const ALL_SECTIONS: Required<SectionSelection> = {
 	globals: true,
 	subscriptions: true,
-	adapters: true,
+	connections: true,
 	targets: true,
 };
 
@@ -106,7 +116,7 @@ export function createBackupService(deps: BackupServiceDeps): BackupService {
 		const picked: BackupSections = {};
 		if (sel.globals) picked.globals = deps.configStore.getGlobals();
 		if (sel.subscriptions) picked.subscriptions = deps.configStore.getSubscriptions();
-		if (sel.adapters) picked.adapters = deps.configStore.getAdapters();
+		if (sel.connections) picked.connections = deps.configStore.getConnections();
 		if (sel.targets) picked.targets = deps.configStore.getTargets();
 		const createdAt = opts.createdAt ?? now();
 
@@ -117,15 +127,20 @@ export function createBackupService(deps: BackupServiceDeps): BackupService {
 				{
 					globals: picked.globals,
 					subscriptions: picked.subscriptions,
-					adapters: picked.adapters,
+					connections: picked.connections,
 					targets: picked.targets,
 					cookies,
 				},
 				opts.pin,
 				createdAt,
+				deps.extensionSecretCodes?.(),
 			);
 		}
-		return buildBackup({ kind: "sanitized", createdAt, sections: redactSecretKeys(picked) });
+		return buildBackup({
+			kind: "sanitized",
+			createdAt,
+			sections: redactBackupSections(picked, deps.extensionSecretCodes?.()),
+		});
 	}
 
 	async function importBackup(opts: ImportOptions): Promise<ImportResult> {
@@ -140,10 +155,34 @@ export function createBackupService(deps: BackupServiceDeps): BackupService {
 			sections = opts.envelope.sections;
 		}
 
+		// 盘上那份连接表 —— 迁移的补位与 planImport 的「现状」都读它。取两次拿到的是两份
+		// 深拷贝,而中间没有任何写入:一次取完共用,省掉一次整表克隆。
+		const currentConnections = deps.configStore.getConnections();
+
+		// 形状迁移 —— 与启动路径同一个纯函数。备份的明文段是**原样带过来的**,没过任何
+		// schema,所以一份三个月前导出的备份和一份三个月前的磁盘状态是同一个形状问题。
+		// 放在 planImport 之前:计划要按迁移后的形状算,否则 overwrite 的删除集会对不上。
+		if (sections.connections || sections.targets) {
+			const migrated = migrateConfigSections({
+				// 🔴 只勾了 targets 那一段导出的老备份:v1 的 `platform: "webhook"` 得跟着
+				// **它那条连接**降格(飞书 / 钉钉 / 企微),而连接不在这份备份里 —— 查不到表
+				// 就整份落成 `generic`,落地时被 `assertTargetOwner` 判「平台对不上」,整份
+				// 恢复被拒(托管目标的归一化排在那道校验之后,救不回来)。备份没带的那一段,
+				// 拿**现在盘上那份**补位。
+				connections: sections.connections ?? currentConnections,
+				targets: sections.targets,
+			});
+			sections = {
+				...sections,
+				...(sections.connections ? { connections: migrated.connections as Connection[] } : {}),
+				...(sections.targets ? { targets: migrated.targets as PushTarget[] } : {}),
+			};
+		}
+
 		const current = {
 			globals: deps.configStore.getGlobals(),
 			subscriptions: deps.configStore.getSubscriptions(),
-			adapters: deps.configStore.getAdapters(),
+			connections: currentConnections,
 			targets: deps.configStore.getTargets(),
 		};
 		const plan = planImport(current, sections, opts.mode);
@@ -151,16 +190,9 @@ export function createBackupService(deps: BackupServiceDeps): BackupService {
 		let globalsApplied = false;
 		let cookiesRestored = false;
 		if (!opts.dryRun) {
-			if (plan.setGlobals) {
-				await deps.configStore.setGlobals(plan.setGlobals);
-				globalsApplied = true;
-			}
-			for (const s of plan.subscriptions.upsert) await deps.configStore.upsertSubscription(s);
-			for (const id of plan.subscriptions.delete) await deps.configStore.deleteSubscription(id);
-			for (const a of plan.adapters.upsert) await deps.configStore.upsertAdapter(a);
-			for (const id of plan.adapters.delete) await deps.configStore.deleteAdapter(id);
-			for (const t of plan.targets.upsert) await deps.configStore.upsertTarget(t);
-			for (const id of plan.targets.delete) await deps.configStore.deleteTarget(id);
+			// 一次落地:校验全过才写,任何一处不合法都不会留下半新半旧的配置。
+			await deps.configStore.replaceSections(foldPlan(current, plan));
+			globalsApplied = Boolean(plan.setGlobals);
 
 			if (cookies?.cookiesJson) {
 				await deps.cookieStore.save({
@@ -180,7 +212,10 @@ export function createBackupService(deps: BackupServiceDeps): BackupService {
 				upserted: plan.subscriptions.upsert.length,
 				deleted: plan.subscriptions.delete.length,
 			},
-			adapters: { upserted: plan.adapters.upsert.length, deleted: plan.adapters.delete.length },
+			connections: {
+				upserted: plan.connections.upsert.length,
+				deleted: plan.connections.delete.length,
+			},
 			targets: { upserted: plan.targets.upsert.length, deleted: plan.targets.delete.length },
 			globalsApplied,
 			cookiesRestored,

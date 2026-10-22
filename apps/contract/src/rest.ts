@@ -5,15 +5,250 @@
  */
 
 import type {
+	ExtensionBotView,
+	ExtensionConfigField,
+	ExtensionDescriptor,
+} from "@bilibili-notify/extension/wire";
+import type {
 	CachedProfile,
+	CardSkinKind,
+	ConnectionCapabilities,
+	ExtensionProvides,
+	ExtensionRunState,
 	FansRefreshEntry,
-	HistorySource,
+	HistoryMessageRole,
+	PushKind,
+	PushStatus,
 	Subscription,
 	SubscriptionState,
 } from "@bilibili-notify/internal";
+import type { RestartAbility } from "./system";
 import type { LogLevel } from "./ws";
 
-export type { FansRefreshEntry, HistorySource };
+export type { MiniAppCardSupport } from "@bilibili-notify/internal";
+export type {
+	ConnectionCapabilities,
+	// 面板按「它开的是哪一口」分节,而 web 只认 contract —— 同 MiniAppCardSupport 那条。
+	ExtensionProvides,
+	FansRefreshEntry,
+	HistoryMessageRole,
+	PushKind,
+	PushStatus,
+};
+
+// ---- /api/connections/capabilities ------------------------------------------
+
+/**
+ * `GET /api/connections/capabilities`:平台能力快照,索引是**两级** ——
+ * 连接 id → 平台名 → 能力。
+ *
+ * 一条连接只驮一个平台的今天,第二级看着是多余的一层。但能力是**平台**的属性不是连接的:
+ * 桥接那档一条 koishi 连接底下可能同时挂着 QQ 与 telegram,扁平表存不下,而两边读它的地方
+ * (一个推送目标 / 一条连接)本来就带着平台名。第二级的键是**开放词表**,别拿闭集去索引它。
+ *
+ * 只有有能力概念的平台在表里;官机 / webhook 不在,面板据此写「这个平台不支持」。
+ */
+export type ConnectionCapabilitiesMap = Record<string, Record<string, ConnectionCapabilities>>;
+
+// ---- /api/extensions ------------------------------------------------------
+
+/**
+ * 一个拓展现在处于什么状态 —— 与主人按的那个开关是**两件事**。
+ *
+ * 开关开着而它没跑,恰恰是最需要看见的那一格(连败自动停用、清单坏了、版本不合)。
+ */
+export type ExtensionStateDTO = ExtensionRunState;
+
+/**
+ * 拓展挂载点的前缀 —— `/ext/<id>/*`。
+ *
+ * 🔴 **住契约是因为两头都要拼这条路**:服务端在这儿挂路由,面板要把桥该连的地址印给主人
+ * 抄进插件里。各写各的话,改了一头就是「桥连过来 404、而两边都不报错」。
+ * (URL 面用短词 `ext`,代码面照旧全称 —— ADR-0012 决策 38。)
+ */
+export const EXTENSION_MOUNT_PREFIX = "/ext";
+
+/**
+ * 拓展页那张卡。**没跑起来的也在这儿** —— 消失的东西没法排查。
+ *
+ * 清单读得出来的字段才有;读不出来时 `name` 退回目录名,`detail` 说明为什么。
+ */
+export interface ExtensionDTO {
+	id: string;
+	/** 清单里的名字;清单读不出来时是目录名。 */
+	name: string;
+	/** 一句话说清它是干嘛的 —— 卡片上就印这句。 */
+	description?: string;
+	version?: string;
+	/** 它开的是哪一口:推送源 / 订阅源。 */
+	provides?: ExtensionProvides[];
+	/**
+	 * 它注册推送源时交的那份面板元信息。**只有跑着的拓展有** —— 那是 `activate` 里报的。
+	 * 面板拿它给这一档画脸(推送目标卡上的短名与标识色),不许再手抄一份。
+	 */
+	descriptor?: ExtensionDescriptorDTO;
+	/**
+	 * 它注册推送源时交的 config **字段表**(ADR-0012 决策 33)—— 推送目标页照它画「新建连接」
+	 * 的表单。**只有跑着的拓展有**,与 `descriptor` 同一个来路。
+	 */
+	configFields?: readonly ExtensionConfigField[];
+	/** 卡片图标,一段 SVG —— **服务端已经过过白名单**(决策 20)。没有就退回灰方章。 */
+	icon?: string;
+	/** 它自己那个目录,绝对路径(`<dataDir>/extensions/<id>`)。 */
+	dir: string;
+	/**
+	 * 那个目录要是条**软链**,它指到哪去。
+	 *
+	 * 🔴 开发版就是这么装的:devtools 把仓里的 `dist` 链进装载目录。跑的代码到底是哪一份,
+	 * 只有这一格答得了 —— 少了它,面板上写着 `<dataDir>/extensions/bridge`,而那其实是
+	 * 主人正在改的工作树。
+	 */
+	linkedTo?: string;
+	/** 主人按的那个开关(`globals.extensions.<id>.enabled`)。 */
+	enabled: boolean;
+	state: ExtensionStateDTO;
+	/** 没跑起来时那句「为什么」。 */
+	detail?: string;
+}
+
+/**
+ * 拓展**自己报**的那份面板元信息(短名 / 标识色 / 目标形态 / 会话种类…)。
+ *
+ * 就是拓展契约里的 `ExtensionDescriptor`(三格:全名 / 短名 / 颜色,ADR-0012 决策 46)——
+ * **直接引用,不另抄一份**:抄的那份与契约漂开时两边各自都合法,没有门会红。**它是那份元信息唯一的出处**:面板不许再手抄短名或颜色,手抄的
+ * 副本会跟拓展自己报的悄悄漂开,而门禁一片绿。
+ */
+export type ExtensionDescriptorDTO = ExtensionDescriptor;
+
+/** `GET /api/ext/:id/bots` —— 这个拓展现在能借来当连接的 bot(ADR-0012 决策 45)。 */
+export interface ExtensionBotsResponse {
+	bots: readonly ExtensionBotView[];
+}
+
+/**
+ * `POST /api/ext/install` 装完之后的回话。
+ *
+ * ⛔ 面板上**没有**常驻的「重启」按钮(ADR-0005 决策 22)—— 要不要给那颗按钮,由这份回话
+ * 说了算:只有刚做完一件确实需要重启的事,才就地提示一次。
+ */
+export interface ExtensionInstallResponse {
+	id: string;
+	name: string;
+	version: string;
+	/**
+	 * 盖掉了一份**已经装着**的 → 那份代码在这个进程里换不掉(ADR-0012 决策 10),
+	 * 要重启一次才会换成新的。全新装进来的是热的 —— `false`。
+	 */
+	needsRestart: boolean;
+	/**
+	 * 装完这一刻它的开关是开是关。
+	 *
+	 * **头一回装进来的一律是关的** —— `enabled` 缺失即关(`isExtensionEnabled` 只认
+	 * `=== true`),开关是用户按的,不该因为装了一下就自己开起来。重装一份从前开过的
+	 * 则仍是开的(配置里那一格不随目录删掉)。
+	 *
+	 * 装完那句话要照这一格说:一律说「已经在跑」的话,主人转头在卡片上看到「已停用」,
+	 * 两句话当场打架。
+	 */
+	enabled: boolean;
+	/** 需要重启时,这台机器上按下去回不回得来。判据见 ADR-0005 决策 22。 */
+	restart: RestartAbility;
+	/**
+	 * 这个包里带没带那两份说明 —— **拆包时就知道**,所以直接说,别让界面去猜或者再拉一次。
+	 * 装完那句话后面要不要挂一句「看看说明 / 看看更新了什么」,凭的就是这一格。
+	 */
+	/**
+	 * 🔴 **可选**:这个 app 能应用内自更新,面板与服务端在那几秒里版本可能对不上,老服务端
+	 * 的回应里压根没有这一格。写成必填的话,下一个人照契约写 `done.docs.readme` 会一路绿到
+	 * 用户那里当场 TypeError —— 少一颗钮是小事,把整块「装好了」炸掉是大事。
+	 */
+	docs?: { readme: boolean; changelog: boolean };
+}
+
+export interface ExtensionsResponse {
+	extensions: ExtensionDTO[];
+}
+
+/**
+ * `GET /api/ext/:id/docs` —— 拓展自己带的那两份说明。
+ *
+ * **两格都可选**:没写不是错,面板据此整块不画(空的 README 和没有 README 在屏幕上是
+ * 两回事)。拓展没装才是 404。
+ *
+ * 这条读的是**装载目录里的文件**,与拓展跑没跑起来无关 —— 关着的、加载失败的照样给得
+ * 出来,而那正是人最想读它的时候。
+ */
+export interface ExtensionDocsResponse {
+	readme?: string;
+	changelog?: string;
+}
+
+// ---- /api/ext/marketplace(ADR-0013)--------------------------------------------
+
+/** 一个源:内置的官方源(`id: "official"`)或主人自己加的第三方源。 */
+export interface MarketplaceSourceDTO {
+	id: string;
+	name: string;
+	official: boolean;
+	/** 第三方源的地址;官方源不下发(它是内置常量)。 */
+	url?: string;
+	/** 第三方源声明的命名空间;它列的每个 id 都在这底下。 */
+	namespace?: string;
+	/** 索引拿到了、验过了。不 ok 时 `err` 是那句要原样给主人看的原因。 */
+	ok: boolean;
+	err?: string;
+}
+
+/**
+ * 一条条目在**这台机器上**的状态 —— 面板上那颗钮画什么全看它:
+ * - `installable`:没装,能装;
+ * - `installed`:从这个源装的,就是这一版;
+ * - `updatable`:从这个源装的,索引里有更新的版本;
+ * - `installed-elsewhere`:装着,但不是从这个源装的(手放的 / devtools 链的 / 别的源)—— 不提示更新;
+ * - `incompatible`:它要的宿主契约版本对不上,先升级 BN;
+ * - `revoked`:装着的那一版被这个源撤回了(或索引里这一版本身就在撤回名单上)。
+ */
+export type MarketplaceEntryState =
+	| "installable"
+	| "installed"
+	| "updatable"
+	| "installed-elsewhere"
+	| "incompatible"
+	| "revoked";
+
+export interface MarketplaceEntryDTO {
+	/** 来自哪个源(`MarketplaceSourceDTO.id`)。 */
+	source: string;
+	official: boolean;
+	id: string;
+	name: string;
+	description: string;
+	/** 索引里列的(最新)版本。 */
+	version: string;
+	apiVersion: number;
+	prerelease: boolean;
+	notes?: string;
+	releaseUrl?: string;
+	/** 包多大(字节)。 */
+	size: number;
+	/** 这台机器上装着的那份(没装就没有)。`source` 缺 = 不是从市场装的。 */
+	installed?: { version?: string; source?: string };
+	state: MarketplaceEntryState;
+}
+
+export interface MarketplaceResponse {
+	/** 这个构建有没有官方源(fork 出去没有信任公钥的构建没有)。 */
+	available: boolean;
+	sources: MarketplaceSourceDTO[];
+	extensions: MarketplaceEntryDTO[];
+	/** 索引是什么时候拉的(epoch 毫秒)。 */
+	fetchedAt: number;
+}
+
+export interface MarketplaceInstallRequest {
+	source: string;
+	id: string;
+}
 
 // ---- /api/subs ------------------------------------------------------------
 
@@ -35,20 +270,82 @@ export type SubscriptionDTO = Subscription & {
 
 // ---- /api/history ----------------------------------------------------------
 
-export interface HistoryEntryView {
-	id: string;
-	ts: string;
-	source: HistorySource;
-	uid: string;
-	subscriptionId: string;
-	targetIds: string[];
-	ok: boolean;
+/** 一行历史里的一条消息:文案 / 图 / 这条对这个目标的结果。无目标行没有 `ok`。 */
+export interface HistoryMessageView {
 	text?: string;
 	imageRef?: string;
+	role: HistoryMessageRole;
+	ok?: boolean;
+	err?: string;
+	/**
+	 * 这条是**哪一条的重投**(人工重推补的):值是被补的那条在本行 `messages` 里的下标。
+	 * 缺省 = 这条不是重投。面板拿它标「第 N 次尝试」。
+	 */
+	retryOf?: number;
+}
+
+/**
+ * 推送历史的一行 = 一次推送 × 一个目标。`GET /api/history` 与 WS `push-events` 的
+ * `history-recorded` / `history-updated` 共用这一个形状;后者是同一行追加消息后的整行,
+ * 前端按 `id` 换缓存。
+ */
+export interface HistoryEntryView {
+	id: string;
+	/** 同一次推送落到几个目标就有几行,它们共用这一个。 */
+	pushId: string;
+	ts: string;
+	kind: PushKind;
+	status: PushStatus;
+	uid: string;
+	subscriptionId: string;
+	/** null = 无目标行(这类推送没配目标,或配的全停用)。 */
+	targetId: string | null;
+	/** 首条本体是面板上显示的文案;其余展开看。 */
+	messages: HistoryMessageView[];
 	/** 写入时 snapshot 的 UP 主名称 / 头像;老 entry 无此字段。 */
 	unameSnapshot?: string;
 	uavatarSnapshot?: string;
+	/**
+	 * 这一行能不能人工补一次(ADR-0017)。**缺省 = 没问过** —— 列表只为失败 / 部分失败
+	 * 的行问(每问一次是一次 stat),而 WS 推来的新行一律不带;面板对缺省按「能补」
+	 * 处理,那总是对的:一条刚刚失败的推送,它的原件必然还在。
+	 */
+	repush?: HistoryRepushInfo;
 }
+
+/**
+ * 能不能补,以及补几条。**条数由服务端算**(`originalCount` / `unsentIndices`,按身份号
+ * 而不是按消息条数)—— 面板自己再算一遍就是第二份实现,判定规则一改两边就漂。
+ */
+export type HistoryRepushInfo =
+	| {
+			can: true;
+			/** 整行**本来**有几条(重投不算)——「重推全部」发这么多。 */
+			total: number;
+			/** 还有几条没到 ——「只补没到的」发这么多。 */
+			missing: number;
+	  }
+	/** 不能补,**这就是原因**(面板把按钮灰掉并写上它,决策 9)。 */
+	| { can: false; reason: string };
+
+/**
+ * `POST /api/history/:id/repush` 请求 —— 人工把一行没送到的推送补一遍。
+ *
+ * 回 **202** 表示「收下了」:消息一条都还没发出去(发送层光退避就可能走 190s),真正的
+ * 结果随后经 WS 的 `history-updated` 一条条回来。
+ */
+export interface HistoryRepushRequest {
+	/** 这一行的 `ts` —— 服务端拿它定位日文件。 */
+	ts: string;
+	/** `all` = 整行从头再发一遍(含已经送达的);`missing` = 只补没到的。 */
+	mode: "all" | "missing";
+}
+
+export type HistoryRepushResponse =
+	/** 收下了(202)。`count` = 这一趟要补几条 —— 回来时一条都还没发出去。 */
+	| { ok: true; count: number }
+	/** 拒了。`err` **直接显示给用户** —— 自编一句「重推失败」等于让人对着黑盒猜。 */
+	| { ok: false; err: string };
 
 export interface HistoryResponse {
 	entries: HistoryEntryView[];
@@ -58,7 +355,7 @@ export interface HistoryResponse {
 export interface DailyHistoryCount {
 	/** 按 tzOffsetMin 口径的本地日 YYYY-MM-DD。 */
 	d: string;
-	counts: Record<HistorySource, number>;
+	counts: Record<PushKind, number>;
 	total: number;
 	failures: number;
 }
@@ -225,6 +522,37 @@ export interface StatsRoastPushResponse {
 	mode?: "image" | "text";
 }
 
+/**
+ * 一轮定时周报跑完的结局。与服务端 `RoastRunOutcome` 同构 —— 那边是权威定义,
+ * 这里是过 wire 的那份契约。
+ *
+ * **业务性失败不是 HTTP 失败**:生成不出来、没配目标都是 200 + 这里的 kind。
+ * 用 4xx 表达的话,前端 error 分支只拿得到一句 HTTP 错误,原因就丢了。
+ */
+export type StatsRoastRunOutcome =
+	/** 一个推送目标都没配,连模型都没调。 */
+	| { kind: "no-targets" }
+	/** 生成这一步就没过去(AI 没开、数据不够、模型报错…)。 */
+	| { kind: "gen-failed"; why: string }
+	/** 审批开着:已经生成并私聊给主人了,群里还没发,等主人回 y。 */
+	| { kind: "pending-approval"; draftId: string }
+	/** 发了。`failed` 非空 = 部分目标没成,那也算发过了,不是整轮失败。 */
+	| {
+			kind: "sent";
+			mode: "text" | "image";
+			sent: number;
+			/** 因停用而跳过的目标 id —— 不算失败,面板单独说一句「跳过 N 个已停用」。 */
+			skipped: string[];
+			failed: Array<{ targetId: string; err: string }>;
+	  };
+
+/** `POST /api/stats/roast/run-now` 响应。`ok:false` 只用于服务没就绪 / 这一轮抛了异常。 */
+export interface StatsRoastRunNowResponse {
+	ok: boolean;
+	err?: string;
+	outcome?: StatsRoastRunOutcome;
+}
+
 export interface StatsOverviewResponse {
 	/** 实际使用的窗口天数(服务端会 clamp)。 */
 	days: number;
@@ -239,7 +567,7 @@ export interface FansResponse {
 
 // ---- 测试推送类端点(/api/push /api/cards /api/ai) --------------------------
 
-/** `POST /api/push/:targetId/test` 响应;cards/test-push 与它同形。 */
+/** `POST /api/push/test` 响应(targetId 在 body 里);cards/test-push 与它同形。 */
 export interface TestResponse {
 	ok: boolean;
 	latencyMs: number;
@@ -277,6 +605,11 @@ export interface AiToolTraceDTO {
 	args: Record<string, string>;
 	/** 执行成没成。失败的那次也留着 —— 「查了但没查到」和「压根没查」不一样。 */
 	ok: boolean;
+	/**
+	 * `web_search` 专属:这次搜到的来源(标题 + 链接),给消息里的「来源」折叠
+	 * 列表用。别的工具没有这个字段。
+	 */
+	sources?: Array<{ title: string; url: string; siteName?: string }>;
 }
 
 /** 一条聊天消息。`id` 供前端当列表 key,`ts` 是服务端落盘时刻(ISO)。 */
@@ -288,10 +621,26 @@ export interface AiChatMessageDTO {
 	/** 助手消息专有:答这一句时调过的工具。没调过就整个字段缺席。 */
 	tools?: AiToolTraceDTO[];
 	/**
+	 * 助手消息专有:答这一句之前的思考过程(思考模型的那段草稿)。前端折叠展示,
+	 * 永不回传给模型。没思考就整个字段缺席。
+	 */
+	reasoning?: string;
+	/**
 	 * 用户消息专有:这一问带的图片资产 id。前端拿它拼
 	 * `/api/ai/assets/<id>` 显示缩略图。没带图就整个字段缺席。
 	 */
 	images?: string[];
+	/**
+	 * 助手消息专有:卡片工坊里这条回复碰过的皮肤,按先后。消息末尾的预览块照它画
+	 * (ADR-0015 决策 20 的 🔗)。没碰过就整个字段缺席。
+	 */
+	cardSkins?: AiCardSkinTouchDTO[];
+}
+
+/** 一条回复碰过的一套卡片皮肤。`kinds` 是这条回复写过的卡种,按先后;只改了名字时为空。 */
+export interface AiCardSkinTouchDTO {
+	id: string;
+	kinds: CardSkinKind[];
 }
 
 /**
@@ -300,12 +649,67 @@ export interface AiChatMessageDTO {
  * 列表与详情分开是刻意的:侧栏一次要列几十个会话,把每个会话的整段对话都带上,
  * 光为了显示一行标题就要传几百 KB。点进某个会话时再 `GET /:id` 取全文。
  */
+/**
+ * 一场对话的**面孔**:`chat` = 日常聊天(女仆人格 + B 站只读工具),
+ * `skin` = 皮肤工坊(人格与只读工具全收,只留 create_skin)。
+ *
+ * 它是**会话级且锁定**的:开局定下,整场不再改 —— 聊到一半换面孔,前半段的
+ * 上下文与后半段的工具表对不上,主人也说不清自己在跟谁说话。
+ */
+export type AiChatMode = "chat" | "skin";
+
+/**
+ * 皮肤工坊做的是哪种皮肤(ADR-0015 决策 11 / 12):`dashboard` = 面板皮肤(`create_skin`),
+ * `card` = 推送卡片皮肤({@link AI_CARD_WORKSHOP_TOOLS})。与 {@link AiChatMode} 同样开局即锁;
+ * 只在 `mode: "skin"` 时有意义,日常聊天里它恒为 `dashboard`、没人读。
+ */
+export type AiSkinTarget = "dashboard" | "card";
+
+/**
+ * 「做一套皮肤」那把工具的名字 —— **三层共用的 wire 标识**,与 {@link AiChatMode}
+ * 同层。
+ *
+ * 服务端拿它建工具、拿它给没有 `mode` 的老会话认面孔;web 拿它判断「这轮跑完要不要
+ * 回灌皮肤状态」。三处各写一份字面量的话,改名会**静默**失效两处:侧栏的「工坊」
+ * 牌子和聊完的状态回灌都不报错,只是不生效。
+ */
+export const AI_TOOL_CREATE_SKIN = "create_skin";
+
+/**
+ * 卡片皮肤工坊的工具名(ADR-0015 决策 13 / 14 与它们的 🔗)—— 与 {@link AI_TOOL_CREATE_SKIN}
+ * 同理是**三层共用的 wire 标识**:服务端拿它建工具、给老会话认「做的是哪种皮肤」,web 拿它
+ * 配中文标签、判断这轮跑完要不要刷新卡片皮肤库。
+ */
+export const AI_CARD_WORKSHOP_TOOLS = {
+	listSkins: "list_skins",
+	readCard: "read_card",
+	readBlock: "read_block",
+	lookCard: "look_card",
+	writeCard: "write_card",
+	setBlock: "set_block",
+	removeBlock: "remove_block",
+	setSkinMeta: "set_skin_meta",
+} as const;
+
 export interface AiConversationMetaDTO {
 	id: string;
 	title: string;
 	createdAt: string;
 	updatedAt: string;
 	messageCount: number;
+	/**
+	 * 见 {@link AiChatMode}。**必填** —— 老会话文件里没有这个字段,但缺省是在读盘
+	 * 那一处补齐的(见 conversation-store),wire 上永远带着。契约描述的是线上真会
+	 * 出现的形状,把「可能缺」写进来只会让边界另一侧再各判一遍。
+	 */
+	mode: AiChatMode;
+	/** 见 {@link AiSkinTarget}。与 `mode` 同理,缺省在读盘那一处补齐,wire 上永远带着。 */
+	skinTarget: AiSkinTarget;
+	/**
+	 * 带不带女仆人格。同 `mode`,缺省在读盘那一处补齐(老会话按 `true` 算,那正是
+	 * 它们一直以来的样子)。皮肤工坊那一档本来就没有人格,这个字段在那儿不起作用。
+	 */
+	persona: boolean;
 	/**
 	 * 标题是否已由 AI 起过。缺失(旧会话)按 false 算 —— 前端据此决定要不要去要
 	 * 一个标题,所以「不知道」必须落在「还没起过」这一边,否则老会话一个都轮不上。
@@ -387,7 +791,7 @@ export interface EnableRenderingResponse {
 
 // ---- /api/qq ----------------------------------------------------------------
 
-/** `GET /api/qq/sessions/:adapterId` 单条 —— 网关入站事件捞到的群/C2C 会话。 */
+/** `GET /api/qq/sessions/:connectionId` 单条 —— 网关入站事件捞到的群/C2C 会话。 */
 export interface QQDiscoveredEntry {
 	scope: "group" | "private";
 	/** group_openid(群)或用户 openid(C2C)。 */
@@ -398,12 +802,38 @@ export interface QQDiscoveredEntry {
 	lastSeenMs: number;
 }
 
+/** `POST /api/qq/bind/start` 响应 —— 扫码一键建 bot(借道腾讯 lite 通道)。 */
+export interface QQBindStartResponse {
+	/** 轮询用的任务号(腾讯侧生成)。 */
+	taskId: string;
+	/** 二维码图片,data: URI。 */
+	qr: string;
+	/** 建议轮询间隔,秒。消费方**必须**夹一道再用,见 web 的 pollDelayMs。 */
+	interval: number;
+}
+
+/**
+ * `POST /api/qq/bind/poll` 响应。
+ *
+ * web 端按它做**穷尽** switch(default 里 `never` 兜底):这里将来多一条 status,
+ * 前端会直接编译不过,而不是静静地当 pending 接着轮询。
+ *
+ * server 那边的 `QQBindTask` 刻意不在这份契约里 —— 它带着解 AppSecret 的
+ * `bindKey`,只活在 server 内存,不出响应也不落盘。
+ */
+export type QQBindPollResult =
+	| { status: "pending" }
+	| { status: "expired" }
+	| { status: "created"; appId: string; appSecret: string }
+	/** 扫码侧完成但凭据缺失/解不开 —— 业务态错误,与上游故障(抛错)区分。 */
+	| { status: "error"; message: string };
+
 // ---- /api/backup ------------------------------------------------------------
 
 /** What an import did — or, under `dryRun`, what it *would* do. */
 export interface ImportResult {
 	subscriptions: { upserted: number; deleted: number };
-	adapters: { upserted: number; deleted: number };
+	connections: { upserted: number; deleted: number };
 	targets: { upserted: number; deleted: number };
 	globalsApplied: boolean;
 	cookiesRestored: boolean;

@@ -1,17 +1,17 @@
-import type { CustomGuardBuyLike, CustomLiveMsgLike, SubItemView } from "./push-like";
+import type { CustomLiveMsgLike, SubItemView } from "./push-like";
 import type { MasterInfo } from "./types";
 
 /**
  * Plain string-substitution based template renderer for live-related notification
- * text. Mirrors the per-occurrence templates supported in the koishi schema:
+ * text. Mirrors the per-occurrence templates of the live push:
  *
  * - `customLiveStart` / `customLive` / `customLiveEnd`
- * - `customGuardBuy.guardBuyMsg`
+ * - `customGuardBuy.<governor|commander|captain>.template`(按上舰档位取)
  * - `customSpecialDanmakuUsers.msgTemplate`
  * - `customSpecialUsersEnterTheRoom.msgTemplate`
  *
  * 占位符统一 `{name}` / `{time}` / `{watched}` 语法(与 `@bilibili-notify/internal`
- * 的 `interpolate` 同源)。`applyTemplate` 同时接受 koishi 旧存档里的 legacy
+ * 的 `interpolate` 同源)。`applyTemplate` 同时接受旧存档里的 legacy
  * `-name` / `-time` 写法 —— 老用户已保存的 `-key` 模板继续生效,新默认与文档
  * 一律走 `{key}`,二者不冲突(单遍正则,longest-first)。
  */
@@ -82,6 +82,9 @@ export function buildRoomLink(info: { short_id: number; room_id: number }): stri
 /**
  * Resolve the effective template string for a sub at a given occurrence,
  * preferring per-sub override → global config → built-in default.
+ *
+ * 链接独立成版式部件,模板里没有链接变量(2026-09 起不再替旧模板剥 `{link}` / `-link`:
+ * 写了就原样出现,请从模板里删掉)。
  */
 function resolveCustomLive(
 	subCustom: CustomLiveMsgLike,
@@ -100,27 +103,17 @@ export class LiveTemplateRenderer {
 		master: MasterInfo;
 		diffTime: string;
 		followerNum: string;
-		roomLink: string;
-		/**
-		 * 消息版式路径:链接独立成部件,模板里的 `{link}`(与 legacy `-link`)连同前导
-		 * 空白 / 字面 `\n` 一起剥离,避免行尾孤行或双链接。旧路径不传,现状不变。
-		 */
-		omitLink?: boolean;
 	}): string {
-		let tmpl = resolveCustomLive(
+		const tmpl = resolveCustomLive(
 			params.sub.customLiveMsg,
 			params.globalCustom,
 			"customLiveStart",
 			DEFAULT_LIVE_TEMPLATES.liveStart,
 		);
-		if (params.omitLink) {
-			tmpl = tmpl.replace(/(?:\s|\\n)*(?:\{link\}|-link)/g, "");
-		}
 		return applyTemplate(tmpl, {
 			name: params.master.username,
 			time: params.diffTime,
 			follower: params.followerNum,
-			link: params.omitLink ? "" : params.roomLink,
 		});
 	}
 
@@ -131,24 +124,17 @@ export class LiveTemplateRenderer {
 		master: MasterInfo;
 		diffTime: string;
 		watched: string;
-		roomLink: string;
-		/** 消息版式路径:同 {@link LiveTemplateRenderer.renderLiveStart} 的 omitLink。 */
-		omitLink?: boolean;
 	}): string {
-		let tmpl = resolveCustomLive(
+		const tmpl = resolveCustomLive(
 			params.sub.customLiveMsg,
 			params.globalCustom,
 			"customLive",
 			DEFAULT_LIVE_TEMPLATES.liveOngoing,
 		);
-		if (params.omitLink) {
-			tmpl = tmpl.replace(/(?:\s|\\n)*(?:\{link\}|-link)/g, "");
-		}
 		return applyTemplate(tmpl, {
 			name: params.master.username,
 			time: params.diffTime,
 			watched: params.watched,
-			link: params.omitLink ? "" : params.roomLink,
 		});
 	}
 
@@ -159,38 +145,31 @@ export class LiveTemplateRenderer {
 		master: MasterInfo;
 		diffTime: string;
 		followerChange: number;
-		roomLink: string;
-		/** 消息版式路径:同 {@link LiveTemplateRenderer.renderLiveStart} 的 omitLink。 */
-		omitLink?: boolean;
 	}): string {
-		let tmpl = resolveCustomLive(
+		const tmpl = resolveCustomLive(
 			params.sub.customLiveMsg,
 			params.globalCustom,
 			"customLiveEnd",
 			DEFAULT_LIVE_TEMPLATES.liveEnd,
 		);
-		if (params.omitLink) {
-			tmpl = tmpl.replace(/(?:\s|\\n)*(?:\{link\}|-link)/g, "");
-		}
 		return applyTemplate(tmpl, {
 			name: params.master.username,
 			time: params.diffTime,
 			follower_change: formatFollowerChange(params.followerChange),
-			link: params.omitLink ? "" : params.roomLink,
 		});
 	}
 
 	/**
-	 * Compose the "上舰" notification text using the effective custom-guard
-	 * config (resolved by listener-manager).
+	 * Compose the "上舰" notification text. `template` 是事件那一档(总督 / 提督 / 舰长)
+	 * 的自定义文案,由 room-session 按 guard_level 取好 —— 与图片取的是同一档。
 	 */
 	renderGuardBuy(params: {
-		guardBuyConfig: CustomGuardBuyLike;
+		template: string;
 		uname: string;
 		master: MasterInfo | undefined;
 		giftName: string;
 	}): string {
-		return applyTemplate(params.guardBuyConfig.guardBuyMsg ?? "", {
+		return applyTemplate(params.template, {
 			uname: params.uname,
 			mname: params.master?.username ?? "",
 			guard: params.giftName,

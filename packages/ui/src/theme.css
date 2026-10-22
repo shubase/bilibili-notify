@@ -1,0 +1,450 @@
+/**
+ * Design tokens + 基础皮肤 —— @bilibili-notify/ui 组件的样式底座。
+ *
+ * 消费方入口 CSS 用法(Tailwind v4):
+ *     @import "tailwindcss";
+ *     @import "@bilibili-notify/ui/theme.css";
+ *     @source "../../../packages/ui/src";   ← 相对入口 CSS,让 Tailwind 扫到本包组件里的 class
+ *
+ * Source-of-truth note: the canonical brand palette also lives in
+ * packages/image/src/styles.ts (image renderer SSR). Keep those in sync.
+ */
+
+@theme {
+	--color-bn-pink: #fb7299;
+	--color-bn-blue: #00aeec;
+	--color-bn-purple: #a29bfe;
+	--color-bn-text-primary: #18191c;
+	/* 三档必须同向:亮色越往下越浅(暗色在 [data-theme="dark"] 里越往下越深),
+	   secondary 恒重于 tertiary —— 调用点是按名字语义挑档的,`text-bn-text-tertiary
+	   hover:text-bn-text-secondary` 这种「悬停变亮」的写法把顺序写死了。原值照抄
+	   `.bn-design` 设计稿(secondary=#999 / tertiary=#666)是**反的**,正文按 2.85:1
+	   渲染、悬停反而变淡,且只有亮色默认装这一套如此(暗色与全部皮肤都正确)。
+	   `theme-conformance.test.ts` 拦回归。 */
+	--color-bn-text-secondary: #4a4f57;
+	--color-bn-text-tertiary: #666666;
+	--color-bn-surface: #ffffff;
+	--color-bn-surface-strong: #ffffff;
+	--color-bn-surface-muted: #f8fafc;
+	/* 玻璃卡内数据列表行的底/描边:默认全透明(iOS 26 式,内容直接画在玻璃上,
+	   区块玻璃卡是唯一一层 —— 主人拍板的全站方向)。皮肤想要行条底/描边可配
+	   listRow / listRowBorder 两键,这是刻意保留的口子而非默认。 */
+	--color-bn-list-row: transparent;
+	--color-bn-list-row-border: transparent;
+	--color-bn-field: #ffffff;
+	--color-bn-border: #e5e7eb;
+	--color-bn-border-subtle: #f1f5f9;
+	--color-bn-hover-muted: #f8fafc;
+	--color-bn-code-bg: rgba(0, 0, 0, 0.05);
+	--color-bn-overlay: rgba(0, 0, 0, 0.35);
+	/* 压在**饱和实底 / 渐变**上的前景色 —— 主按钮的字、徽章里的数字、hero 图标、
+	   状态圆点里的勾。这些位置此前一律写死 `text-white`,而它们脚下的底(accent /
+	   danger / success / 各种渐变)全都是皮肤改得动的:底能变、字不能变,皮肤把
+	   accent 调浅一档,上面的字就整片消失。给它一个键,底与字才是可以一起调的。
+
+	   刻意只给**一个**键而不是 onAccent / onDanger / onSuccess 各来一个:站里这些
+	   底清一色是饱和语义色,白字是它们共同的解;真出现某一档需要单独反色,再拆不迟。 */
+	--color-bn-on-solid: #ffffff;
+
+	/* ── 控制台面 ────────────────────────────────────────────────────────────
+	   日志流与代码块那块**恒暗**的终端面。四个值在深浅两色下都不变,也**不进皮肤词表**
+	   —— 行内三档字色是照着这个底配出来的,皮肤把底调亮,日志就没法读了。
+
+	   恒定 ≠ 写死:收编前 `Logs.tsx` 与 `About.tsx` 各写死一份 `bg-[#0f1115]`,圆角
+	   一个 sm 一个 xl,正文一个 gray-300 一个 gray-200 —— 同一个面漂成两副样子。
+	   `danger` 单独一档是因为亮色主题下 `--color-bn-danger-text` 是深红,压在这个底上
+	   读不出来;这一档挑的是暗底上够亮的那一支。 */
+	--color-bn-console-bg: #0f1115;
+	--color-bn-console-text: #d1d5db;
+	--color-bn-console-dim: #6b7280;
+	--color-bn-console-danger: #f87171;
+	--color-bn-danger: #ef4444;
+	--color-bn-success: #10b981;
+	--color-bn-warning: #d97706;
+	--color-bn-text-disabled: #d1d5db;
+	/* 「这一项现在是关着的 / 没选中」那一档灰 —— 用在**强调色位**上(未选中胶囊的
+	   色、未启用分区的角光),不是字色。刻意比 textTertiary 淡、比 textDisabled 重:
+	   它要还看得清,只是不该抢戏。收编前站里写死成 `#888` 与 `#94a3b8` 两份。 */
+	--color-bn-inactive: #888888;
+	--color-bn-success-soft: #dcfce7;
+	--color-bn-success-text: #047857;
+	--color-bn-success-border: #bbf7d0;
+	--color-bn-warning-soft: #fffbeb;
+	--color-bn-warning-text: #92400e;
+	--color-bn-warning-border: #fde68a;
+	--color-bn-danger-soft: #fee2e2;
+	--color-bn-danger-text: #dc2626;
+	--color-bn-danger-border: #fecaca;
+
+	--font-cjk:
+		"Noto Sans SC", "Microsoft YaHei", "Source Han Sans", "Noto Sans CJK", system-ui, sans-serif;
+	--font-mono: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+
+	--radius-bn-card: 14px;
+	--radius-bn-pill: 999px;
+	/* 小控件的圆角阶梯,**全部从 --radius-bn-card 派生**。
+	   皮肤的 schema 只有 card / pill 两个字段(加档就要动契约 + 校验 + 编辑器滑杆
+	   + 两份 AI 提示词),而站内真正用到的圆角有六七种。写死字面值的后果真机上
+	   见过:整站换成 radius.card=0 的像素皮肤,只有这些小控件还是圆的,散成一片
+	   孤岛(2026-08-20 主人指出)。按比例派生就两头都占 —— 契约不动,阶梯跟随。
+	   系数是照现有字面值反推的:card=14 时 xs≈5、sm≈9.5、lg≈20、xl=28,
+	   与替换掉的那些值最多差 1.5px。 */
+	--radius-bn-xs: calc(var(--radius-bn-card) * 0.36);
+	--radius-bn-sm: calc(var(--radius-bn-card) * 0.68);
+	--radius-bn-lg: calc(var(--radius-bn-card) * 1.43);
+	--radius-bn-xl: calc(var(--radius-bn-card) * 2);
+
+	/* ── 字号阶梯 ───────────────────────────────────────────────────────────
+	   收编前站里 454 处写死的 `text-[Npx]`,漂成 21 个值 —— 9 / 9.5 / 10 / 10.5 /
+	   11 / 11.5 / 12 / 12.5 / 13 / 13.5 / 14 / 14.5 / 15 / 15.5 / 16.5 / 17 / 18 /
+	   20 / 24 / 28 / 32。半档之间肉眼分不出,却各写各的:同样是配 `text-tertiary`
+	   的小字注脚,10 / 10.5 / 11 / 11.5 四个档都有人用。
+
+	   **不像圆角那样接成一根派生轴**,两个原因:字号派生出小数会糊(圆角 11.43px
+	   没人看得出,字号有);而且 9 档之间不是等比 —— 下半段 10→11→12→13 是 +1 的
+	   密排,上半段 13→15→17→20→28 越拉越开,一根系数表达不了。 */
+	--text-bn-micro: 9px; /* 角标里的数字、极密的计数 */
+	--text-bn-2xs: 10px; /* 等宽的 UID / 时间戳、胶囊里的小字 */
+	--text-bn-xs: 11px; /* 说明、注脚、次级标签 —— 站里用得最多的一档 */
+	--text-bn-sm: 12px; /* 正文小号:列表行、表单标签、tab 文字 */
+	--text-bn-base: 13px; /* 正文:消息流、代码块、表格 */
+	--text-bn-md: 15px; /* 小标题、弹窗标题 */
+	--text-bn-lg: 17px; /* 区块标题 */
+	--text-bn-xl: 20px; /* 页面标题 */
+	--text-bn-hero: 28px; /* 数字大卡那种主角字号 */
+
+	/* Tailwind 自带的圆角 scale 也接到同一根轴上。
+	   v4 对 radius 族是**保留 var() 引用**的(产物就是 `.rounded-lg{border-radius:
+	   var(--radius-lg)}`,与 shadow 族的编译期内联相反 —— 那条坑见下方注释),所以
+	   在这儿重定义就能让站内 149 处 `rounded-md/lg/xl/...` 全部跟着皮肤走,一行
+	   代码都不用改。系数是照 v4 默认值反推的(默认根字号 16px):算出来与原值
+	   相差不到 0.01px,没装皮肤时观感完全不动。
+	   注:`rounded`(无后缀)与 `rounded-full` 在 v4 里是**字面值**、没有 token 可换,
+	   前者已在代码里换成等值的 `rounded-sm`,后者留着 —— 「完全圆」是语义(状态灯、
+	   圆点、头像),不该被皮肤的圆角档拉直。 */
+	--radius-xs: calc(var(--radius-bn-card) * 0.143);
+	--radius-sm: calc(var(--radius-bn-card) * 0.286);
+	--radius-md: calc(var(--radius-bn-card) * 0.429);
+	--radius-lg: calc(var(--radius-bn-card) * 0.571);
+	--radius-xl: calc(var(--radius-bn-card) * 0.857);
+	--radius-2xl: calc(var(--radius-bn-card) * 1.143);
+	--radius-3xl: calc(var(--radius-bn-card) * 1.714);
+	--radius-4xl: calc(var(--radius-bn-card) * 2.286);
+}
+
+/* ── 两栏骨架 ───────────────────────────────────────────────────────────────
+   `SectionNav` 那五页共用的「左侧竖栏 + 右侧内容」。收编前每页各写一遍
+   `xl:grid-cols-[220px_1fr]`,六处逐字节相同 —— `section-nav.tsx` 的注释里还得
+   三次把这串类名抄出来解释自己跟谁配对,那就是它本该是一件东西的信号。
+
+   只管栏宽:`grid` 与 `gap-4` 留在调用方,那两样各页真的可能不同。 */
+:root {
+	--bn-rail-width: 220px;
+}
+
+@utility grid-bn-rail {
+	grid-template-columns: var(--bn-rail-width) 1fr;
+}
+
+/* ── 叠放层级 ───────────────────────────────────────────────────────────────
+   **一张表定死谁盖谁。** 收编前 12 个层级散在十来个文件里,加一层浮层只能翻别处
+   的 className 猜一个不撞的数字;`header.tsx` 与 `draft-island.tsx` 的注释里各存
+   了半张手写的对照表,还得靠 `header-stacking.test.tsx` 拦着别漂。
+
+   **数值一个没动** —— 这次只是给现有层级起名字。叠放顺序是已经调好的事实,
+   `header-stacking.test.tsx` 钉着它,归并数字等于拿视觉换整齐。
+
+   层级不进皮肤词表:皮肤重排叠放顺序只会把弹窗压到遮罩底下去。
+
+   z-index 没有 Tailwind theme namespace(不像 --color-* / --text-* / --radius-*),
+   所以和 shadow 族一样手写 @utility。 */
+:root {
+	--z-bn-raised: 10; /* 卡内抬升:时间轴圆点、拖拽中的行、边缘渐隐、就地浮钮 */
+	--z-bn-local: 20; /* 局部弹层:卡内下拉、侧栏浮层、吸顶的分区导航 */
+	--z-bn-nav: 30; /* 页面级导航:tab 条、AI 悬浮球、页头下拉 */
+	--z-bn-header: 35; /* 全站吸顶栏 —— 压得住页面内容,让开一切浮层 */
+	--z-bn-scrim: 40; /* 整页遮罩:AI 抽屉、草稿岛展开态 */
+	--z-bn-dock: 45; /* devtools 底边 dock(药丸 + 面板):压住页面与遮罩,让开一切弹层 */
+	--z-bn-overlay: 50; /* 压在遮罩之上的弹层:登录框、统计页下拉 */
+	--z-bn-menu: 60; /* 贴着目标定位的右键菜单 */
+	--z-bn-toast-base: 80; /* Toast 组件默认档(调用方可覆盖) */
+	--z-bn-island: 100; /* 草稿岛 */
+	--z-bn-notify: 200; /* toast 那一摞与组件告警条 */
+	--z-bn-modal: 300; /* 弹窗与抽屉 */
+	--z-bn-tour-panel: 330; /* 导览小卡与左缘标签 —— 步骤文案是指令来源,任何暗幕/弹窗都不许压它 */
+	--z-bn-preview: 500; /* 皮肤预览条 —— 试穿时它必须始终看得见 */
+}
+
+@utility z-bn-raised {
+	z-index: var(--z-bn-raised);
+}
+@utility z-bn-local {
+	z-index: var(--z-bn-local);
+}
+@utility z-bn-nav {
+	z-index: var(--z-bn-nav);
+}
+@utility z-bn-header {
+	z-index: var(--z-bn-header);
+}
+@utility z-bn-scrim {
+	z-index: var(--z-bn-scrim);
+}
+@utility z-bn-dock {
+	z-index: var(--z-bn-dock);
+}
+@utility z-bn-overlay {
+	z-index: var(--z-bn-overlay);
+}
+@utility z-bn-menu {
+	z-index: var(--z-bn-menu);
+}
+@utility z-bn-toast-base {
+	z-index: var(--z-bn-toast-base);
+}
+@utility z-bn-island {
+	z-index: var(--z-bn-island);
+}
+@utility z-bn-notify {
+	z-index: var(--z-bn-notify);
+}
+@utility z-bn-modal {
+	z-index: var(--z-bn-modal);
+}
+@utility z-bn-tour-panel {
+	z-index: var(--z-bn-tour-panel);
+}
+@utility z-bn-preview {
+	z-index: var(--z-bn-preview);
+}
+
+/* shadow-bn-card / shadow-bn-elev 特意不放 @theme:Tailwind v4 对 shadow 族
+   token 是编译期内联 —— utility 产物里只有拆好的字面值(颜色替换成
+   var(--tw-shadow-color, #…) 以支持 shadow-color 修饰符),没有
+   var(--shadow-bn-card) 引用,运行时改变量(皮肤注入、[data-theme="dark"]
+   覆盖)全部失效。手写 @utility 显式引用 var() 才能换肤;保留 --tw-* 合成链
+   (选中态 ring-2 也走 box-shadow,不合成会互踩),var() 带 0 0 #0000 兜底,
+   消费端产物缺原生 shadow/ring utility 的 @property 注册时也不至于整条失效。 */
+@utility shadow-bn-card {
+	--tw-shadow: var(--shadow-bn-card);
+	box-shadow:
+		var(--tw-inset-shadow, 0 0 #0000), var(--tw-inset-ring-shadow, 0 0 #0000),
+		var(--tw-ring-offset-shadow, 0 0 #0000), var(--tw-ring-shadow, 0 0 #0000), var(--tw-shadow);
+}
+
+/* 强调色光晕两档。与 shadow-bn-card/elev 同理由手写 @utility(shadow 族进 @theme
+   会被编译期内联,换肤失效)。此前是散在各处的 rgba(251,114,153,…) 字面值 ——
+   那串数字就是 --color-bn-pink 的 #fb7299,皮肤换了强调色,光晕还留在原地。 */
+@utility shadow-bn-accent {
+	--tw-shadow: 0 2px 8px color-mix(in oklab, var(--color-bn-pink) 35%, transparent);
+	box-shadow:
+		var(--tw-inset-shadow, 0 0 #0000), var(--tw-inset-ring-shadow, 0 0 #0000),
+		var(--tw-ring-offset-shadow, 0 0 #0000), var(--tw-ring-shadow, 0 0 #0000), var(--tw-shadow);
+}
+
+@utility shadow-bn-accent-lg {
+	--tw-shadow: 0 6px 18px color-mix(in oklab, var(--color-bn-pink) 30%, transparent);
+	box-shadow:
+		var(--tw-inset-shadow, 0 0 #0000), var(--tw-inset-ring-shadow, 0 0 #0000),
+		var(--tw-ring-offset-shadow, 0 0 #0000), var(--tw-ring-shadow, 0 0 #0000), var(--tw-shadow);
+}
+
+@utility shadow-bn-elev {
+	--tw-shadow: var(--shadow-bn-elev);
+	box-shadow:
+		var(--tw-inset-shadow, 0 0 #0000), var(--tw-inset-ring-shadow, 0 0 #0000),
+		var(--tw-ring-offset-shadow, 0 0 #0000), var(--tw-ring-shadow, 0 0 #0000), var(--tw-shadow);
+}
+
+:root {
+	/* 原版也是磨砂玻璃材质:背景要有色斑层次、玻璃留足透明度,blur 才读得出来
+	   (纯素渐变 + 高不透明度白 = 磨砂完全不可见,和实底没区别)。 */
+	--bn-page-bg:
+		radial-gradient(circle at 12% 10%, rgba(251, 114, 153, 0.16), transparent 30%),
+		radial-gradient(circle at 88% 6%, rgba(0, 174, 236, 0.14), transparent 28%),
+		radial-gradient(circle at 75% 88%, rgba(162, 155, 254, 0.15), transparent 30%),
+		linear-gradient(135deg, #fef0f4 0%, #f0f7fd 50%, #faf2ff 100%);
+	--bn-glass-bg: rgba(255, 255, 255, 0.7);
+	--bn-glass-strong-bg: rgba(255, 255, 255, 0.92);
+	--bn-glass-blur: 12px;
+	--bn-glass-strong-blur: 16px;
+	/* 玻璃卡无描边后层次全靠影 —— 亮色三层:顶缘 inset 高光(苹果材质语法,
+	   「光打在玻璃上缘」)+ 贴身 contact 影给「厚度」+ 远影给「悬浮」。
+	   高光并进变量而不是写进 .bn-glass:box-shadow 是单属性,分开写会互相顶掉,
+	   且类里写死会压死 utilities 层的阴影梯度(如 UpCard 常态轻影 → hover 加深)。
+	   远影带负 spread 收拢在卡片正下方:无 spread 的浓影在密集网格里会让相邻卡
+	   的影子在窄间隙叠加、整片发灰(真机验过「脏」)。
+	   暗色值在下方 [data-theme="dark"] 覆盖;皮肤经 skin.ts 运行时注入同名变量。 */
+	--shadow-bn-card:
+		inset 0 1px 0 rgba(255, 255, 255, 0.55), 0 1px 2px rgba(0, 0, 0, 0.04),
+		0 5px 14px -6px rgba(0, 0, 0, 0.1);
+	--shadow-bn-elev:
+		inset 0 1px 0 rgba(255, 255, 255, 0.65), 0 2px 6px rgba(0, 0, 0, 0.05),
+		0 12px 32px -8px rgba(0, 0, 0, 0.15);
+}
+
+:root[data-theme="dark"] {
+	--color-bn-text-primary: #f8fafc;
+	--color-bn-text-secondary: #cbd5e1;
+	--color-bn-text-tertiary: #94a3b8;
+	/* 暗色 elevation 阶梯:卡片表面必须明显亮于页面背景(#0b1020~#1e1733),否则卡片与背景同色融掉。
+	   关系沿用浅色:muted(次级/凹陷) < field(输入) < surface(卡片) < strong(弹窗)。 */
+	--color-bn-surface: #1e2738;
+	--color-bn-surface-strong: #26314a;
+	--color-bn-surface-muted: #182030;
+	--color-bn-list-row: transparent;
+	--color-bn-list-row-border: transparent;
+	--color-bn-field: #161d2b;
+	--color-bn-border: rgba(148, 163, 184, 0.28);
+	--color-bn-border-subtle: rgba(148, 163, 184, 0.16);
+	--color-bn-hover-muted: rgba(255, 255, 255, 0.07);
+	/* 禁用文字暗色下必须暗于 secondary(#cbd5e1),否则「禁用」反而比正常字亮。 */
+	--color-bn-text-disabled: rgba(148, 163, 184, 0.45);
+	--color-bn-inactive: #94a3b8;
+	--color-bn-code-bg: rgba(255, 255, 255, 0.08);
+	--color-bn-overlay: rgba(2, 6, 23, 0.62);
+	/* 同亮色:实底上的前景不随深浅切换 —— 底本身就是饱和色,不是主题背景。 */
+	--color-bn-on-solid: #ffffff;
+	--color-bn-success-soft: rgba(34, 197, 94, 0.14);
+	--color-bn-success-text: #86efac;
+	--color-bn-success-border: rgba(34, 197, 94, 0.32);
+	--color-bn-warning-soft: rgba(251, 191, 36, 0.24);
+	--color-bn-warning-text: #fde68a;
+	--color-bn-warning-border: rgba(251, 191, 36, 0.55);
+	--color-bn-danger-soft: rgba(239, 68, 68, 0.16);
+	--color-bn-danger-text: #fca5a5;
+	--color-bn-danger-border: rgba(248, 113, 113, 0.32);
+	--bn-page-bg:
+		radial-gradient(circle at 12% 12%, rgba(251, 114, 153, 0.22), transparent 28%),
+		radial-gradient(circle at 88% 4%, rgba(0, 174, 236, 0.2), transparent 26%),
+		linear-gradient(135deg, #0b1020 0%, #111827 48%, #1e1733 100%);
+	--bn-glass-bg: rgba(30, 41, 59, 0.72);
+	--bn-glass-strong-bg: rgba(30, 41, 59, 0.85);
+	/* 暗色同走双层(contact + 收拢远影);深底上要读出层次得比浅色更浓。 */
+	--shadow-bn-card: 0 1px 3px rgba(0, 0, 0, 0.28), 0 10px 28px -8px rgba(0, 0, 0, 0.42);
+	--shadow-bn-elev: 0 2px 8px rgba(0, 0, 0, 0.32), 0 20px 48px -10px rgba(0, 0, 0, 0.5);
+}
+
+/* Page background — pink → blue → lavender gradient mirrors variation-ac's app shell */
+html,
+body,
+#root {
+	min-height: 100%;
+	font-family: var(--font-cjk);
+	color: var(--color-bn-text-primary);
+}
+
+/* 预留滚动条槽:切到内容更长的 Tab(如「更新日志」)垂直滚动条出现时,页面不再横向跳一下。 */
+html {
+	scrollbar-gutter: stable;
+}
+
+body {
+	background: var(--bn-page-bg) fixed;
+	-webkit-font-smoothing: antialiased;
+}
+
+/* Glass surface — used by the GlassPanel / GlassHeader atoms.
+   默认装无描边(卡片风):立体感交给消费方的 shadow-bn-card / shadow-bn-elev
+   工具类。阴影不写在这里:这是无层 CSS,写了会压死 utilities 层的阴影梯度
+   (如 UpCard 的常态轻影 → hover 加深)。描边位保留但默认透明 ——
+   --bn-glass(-strong)-border 变量只由皮肤注入(skin.ts),默认装不定义它。 */
+.bn-glass {
+	background: var(--bn-glass-bg);
+	backdrop-filter: blur(var(--bn-glass-blur));
+	-webkit-backdrop-filter: blur(var(--bn-glass-blur));
+	border: 1px solid var(--bn-glass-border, transparent);
+}
+
+.bn-glass-strong {
+	background: var(--bn-glass-strong-bg);
+	backdrop-filter: blur(var(--bn-glass-strong-blur));
+	-webkit-backdrop-filter: blur(var(--bn-glass-strong-blur));
+	border: 1px solid var(--bn-glass-strong-border, transparent);
+}
+
+/* Animations */
+@keyframes bn-pulse {
+	0%,
+	100% {
+		opacity: 1;
+		transform: scale(1);
+	}
+	50% {
+		opacity: 0.6;
+		transform: scale(0.85);
+	}
+}
+
+@keyframes bn-spin {
+	to {
+		transform: rotate(360deg);
+	}
+}
+
+@keyframes bn-fade-in {
+	from {
+		opacity: 0;
+		transform: translateY(6px);
+	}
+	/* `to` 故意不声明 transform:动画期间从 translateY(6px) 平滑插值到基础值(无位移)。
+	   .bn-anim-fade-in 不用 filling(原因见其注释),结束后整段效果移除、回归基础样式,
+	   所以不会再有残留 transform 去改写内部 position:sticky / fixed 的包含块。 */
+	to {
+		opacity: 1;
+	}
+}
+
+.bn-anim-pulse {
+	animation: bn-pulse 1.6s ease-in-out infinite;
+}
+.bn-anim-spin {
+	animation: bn-spin 1s linear infinite;
+}
+.bn-anim-fade-in {
+	/* 淡入。只许挂在**不含玻璃卡**的元素上(toast / alert / 预览图等):opacity 动画
+	   会让元素在动画期间成为 backdrop root,其内部 .bn-glass 的 backdrop-filter
+	   采样不到 body 壁纸,磨砂瞬时熄灭。页面根一律用下面的 .bn-anim-page-in。
+	   fill-mode 也千万别写 both/forwards:结束后仍在 filling 的 opacity 动画会让
+	   Chromium 长期保持合成层,磨砂就永久失效了(曾经整站只有统计页有磨砂)。 */
+	animation: bn-fade-in 0.35s ease-out;
+}
+
+/* 页面根的入场动画:只做位移、绝不碰 opacity/filter/mask —— 那些属性的动画会把
+   页面根变成 backdrop root,切页就会出现「先透明、动画一停突然磨砂」的钝感。 */
+@keyframes bn-page-in {
+	from {
+		transform: translateY(10px);
+	}
+}
+.bn-anim-page-in {
+	animation: bn-page-in 0.3s ease-out;
+}
+
+/* 抽屉(DrawerShell)的滑入:同 bn-page-in 的纪律,纯位移保磨砂。 */
+@keyframes bn-drawer-in {
+	from {
+		transform: translateX(28px);
+	}
+}
+.bn-anim-drawer-in {
+	animation: bn-drawer-in 0.25s ease-out;
+}
+
+/* 底边 dock(DockPill / DockPanel)的升起:同一条纪律,纯位移。 */
+@keyframes bn-dock-in {
+	from {
+		transform: translateY(24px);
+	}
+}
+.bn-anim-dock-in {
+	animation: bn-dock-in 0.25s ease-out;
+}
+
+/* 隐藏滚动条但保留滚动行为(容器内滚动、不想露出滚动条破坏卡片视觉时用)。 */
+.bn-no-scrollbar {
+	scrollbar-width: none;
+}
+.bn-no-scrollbar::-webkit-scrollbar {
+	display: none;
+}

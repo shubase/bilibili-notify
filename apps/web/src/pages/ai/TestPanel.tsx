@@ -9,12 +9,10 @@
  */
 
 import type { AiTestPushResponse as TestPushResponse } from "@bilibili-notify/contract";
+import { Btn, ErrorNote, GlassBox, Icon } from "@bilibili-notify/ui";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { useEffect, useState } from "react";
-import { Btn } from "../../components/atoms";
 import { Field, TArea, TSelect } from "../../components/forms";
-import { GlassBox } from "../../components/glass-box";
-import { Icon } from "../../components/icons";
 import { api } from "../../services/api";
 import type { PushTarget } from "../../types/domain";
 import type { AISettings } from "../../types/globals";
@@ -60,7 +58,7 @@ export function AiTestPanel({ draft }: { draft: AISettings }) {
 		<GlassBox
 			title="试一句"
 			subtitle="拿当前人格(含未保存的改动)问女仆一句 · 回复会真实推到选定目标"
-			accent="#FB7299"
+			accent="var(--color-bn-pink)"
 			icon={<Icon.sparkle size={14} />}
 			badge="test-push"
 		>
@@ -86,22 +84,18 @@ export function AiTestPanel({ draft }: { draft: AISettings }) {
 					{test.isPending ? "女仆思考中…" : "试一句"}
 				</Btn>
 				{test.isSuccess && reply !== null && (
-					<span className="text-[11px] text-bn-text-tertiary">
+					<span className="text-bn-xs text-bn-text-tertiary">
 						已送达 · {test.data?.latencyMs}ms
 					</span>
 				)}
 			</div>
 
 			{reply !== null && (
-				<div className="mt-2 rounded-md border border-bn-border-subtle bg-bn-surface/60 px-3 py-2 text-[13px] leading-relaxed text-bn-text-primary">
+				<div className="mt-2 rounded-md border border-bn-border-subtle bg-bn-surface/60 px-3 py-2 text-bn-base leading-relaxed text-bn-text-primary">
 					{reply}
 				</div>
 			)}
-			{err !== null && (
-				<div className="mt-2 rounded-md border border-bn-danger-border bg-bn-danger-soft px-3 py-2 text-[12px] leading-relaxed text-bn-danger-text">
-					{err}
-				</div>
-			)}
+			{err !== null && <ErrorNote className="mt-2">{err}</ErrorNote>}
 		</GlassBox>
 	);
 }

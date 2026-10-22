@@ -1,10 +1,10 @@
 import { describe, expect, it } from "vite-plus/test";
 import { resolveAIProfile } from "../constants";
-import { DEFAULT_CARD_LAYOUT } from "./card-layout";
+import { DEFAULT_CARD_SKIN_ID } from "./card-skin";
 import { makeDefaultGlobalConfig } from "./globals";
 import { DEFAULT_MESSAGE_LAYOUT } from "./message-layout";
 import { resolve } from "./resolve";
-import { makeEmptySubscription, type Subscription } from "./subscriptions";
+import { type AIOverride, makeEmptySubscription, type Subscription } from "./subscriptions";
 
 const SUB_BASE: Subscription = makeEmptySubscription({
 	id: "11111111-1111-1111-1111-111111111111",
@@ -108,13 +108,14 @@ describe("resolve()", () => {
 		const sub: Subscription = {
 			...SUB_BASE,
 			overrides: {
+				// persona / 两段 prompt 已不在 schema 里 —— 这里模拟的是盘上残留的旧字段。
 				ai: {
 					preset: "custom",
 					persona: customPersona,
 					dynamicPrompt: "老的动态模板",
 					liveSummaryPrompt: "老的总结模板",
 					temperature: 1.5,
-				},
+				} as unknown as AIOverride,
 			},
 		};
 		const eff = resolve(sub, globals.defaults);
@@ -124,27 +125,6 @@ describe("resolve()", () => {
 		expect(eff.ai.liveSummaryPrompt).toBe(globals.defaults.ai.liveSummaryPrompt);
 		// temperature 不在撤掉之列 —— 它本来就是独立一格,与人格无关。
 		expect(eff.ai.temperature).toBe(1.5);
-	});
-
-	it("AI override personaId 直通(与 preset 无关,inherit 时也生效;AstrBot 端用,其它端忽略)", () => {
-		const globals = makeDefaultGlobalConfig();
-
-		// preset=inherit 时 personaId 仍直通(它不是 persona 字段,不受 inherit 早返回影响)
-		const subInherit: Subscription = {
-			...SUB_BASE,
-			overrides: { ai: { preset: "inherit", personaId: "凛子" } },
-		};
-		expect(resolve(subInherit, globals.defaults).ai.personaId).toBe("凛子");
-
-		// preset=custom 时也直通
-		const subCustom: Subscription = {
-			...SUB_BASE,
-			overrides: { ai: { preset: "custom", personaId: "分析师" } },
-		};
-		expect(resolve(subCustom, globals.defaults).ai.personaId).toBe("分析师");
-
-		// 不设 → undefined(继承全局,由 sidecar 兜到 --ai-persona-id)
-		expect(resolve(SUB_BASE, globals.defaults).ai.personaId).toBeUndefined();
 	});
 
 	it("AI named preset takes priority over base; missing preset falls back gracefully", () => {
@@ -211,7 +191,12 @@ describe("resolve()", () => {
 		const sub: Subscription = {
 			...SUB_BASE,
 			overrides: {
-				ai: { preset: "tsundere", persona: overridePersona, dynamicPrompt: "残留模板" },
+				// 同上:模拟盘上残留的旧字段。
+				ai: {
+					preset: "tsundere",
+					persona: overridePersona,
+					dynamicPrompt: "残留模板",
+				} as unknown as AIOverride,
 			},
 		};
 		const eff = resolve(sub, globals.defaults);
@@ -221,32 +206,21 @@ describe("resolve()", () => {
 		expect(eff.ai.dynamicPrompt).toBe("P 模板");
 	});
 
-	it("inherits global cardLayout when no per-UP override", () => {
+	it("inherits the global card skin when the UP has no override", () => {
 		const globals = makeDefaultGlobalConfig();
+		expect(globals.defaults.cardSkin).toBe(DEFAULT_CARD_SKIN_ID);
 		const eff = resolve(SUB_BASE, globals.defaults);
-		expect(eff.cardLayout).toEqual(globals.defaults.cardLayout);
+		expect(eff.cardSkin).toBe(DEFAULT_CARD_SKIN_ID);
 	});
 
-	it("replaces cardLayout wholesale on per-UP override and normalizes it", () => {
+	it("a per-UP card skin replaces the global one outright", () => {
 		const globals = makeDefaultGlobalConfig();
+		globals.defaults.cardSkin = "k1abc-deadbeef";
 		const sub: Subscription = {
 			...SUB_BASE,
-			overrides: {
-				cardLayout: {
-					...DEFAULT_CARD_LAYOUT,
-					live: [
-						{ id: "title", type: "title", visible: true },
-						{ id: "cover", type: "cover", visible: false },
-					],
-				},
-			},
+			overrides: { ...SUB_BASE.overrides, cardSkin: "k2xyz-cafebabe" },
 		};
-		const eff = resolve(sub, globals.defaults);
-		// 整份覆盖:override 的 live 顺序生效
-		expect(eff.cardLayout.live.slice(0, 2).map((b) => b.id)).toEqual(["title", "cover"]);
-		expect(eff.cardLayout.live.find((b) => b.id === "cover")?.visible).toBe(false);
-		// normalize:缺失的已知块仍被追加(向前兼容;data 为合并后的数据区块)
-		expect(eff.cardLayout.live.map((b) => b.id)).toContain("data");
+		expect(resolve(sub, globals.defaults).cardSkin).toBe("k2xyz-cafebabe");
 	});
 
 	it("inherits global messageLayout when no per-UP override", () => {

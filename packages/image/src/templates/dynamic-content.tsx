@@ -1,6 +1,37 @@
 /** @jsxImportSource vue */
+
+/**
+ * 一条动态的「呈现态」构建器。
+ *
+ * 这里画出来的东西最终落在卡片皮肤的块里(ADR-0014 决策 9),所以部件上挂着那些块的
+ * 挂点(`data-bn="<挂点>"`,名字取自 `CARD_SKIN_BUILTIN_BLOCKS.dynamic`):
+ * - `node.text` / `node.media` 是同一份正文**拆开的两半**(决策 8 的 2026-09-18 🔗),分别进
+ *   `text` / `media` 原子块:文字那半带着 `body` 挂点(挂在 `rich-text.tsx` 的根 div 上),
+ *   媒体那半是主视频卡(`video` / `videoCover` / `videoTitle`)或图廊(`pics` / `pic`)。
+ * - `node.additional` 进 `additional` 块 —— 四种附加卡的外壳(`card`)、封面(`cover`)与
+ *   按钮(`button`)。`cover` 一律挂在**封面 img** 上(与 `videoCover` 同口径),不挂外面那层定
+ *   宽框:框是版式,图才是「封面」。
+ *
+ * 挂点集合由 `__tests__/card-hooks.test.ts` 两头钉着:块里出现的挂点必须都在目录里,目录里
+ * 声明的挂点也必须真被挂上。
+ *
+ * **这里暴露的 CSS 变量**(ADR-0014 决策 13 的 🔗,与 `blocks/dynamic.tsx` 同一张表):颜色的
+ * **值**留在 inline 的 `--bn-*` 自定义属性里,颜色**属性**写到 class 上 —— 皮肤 CSS 的
+ * `!important` 被清洗器摘掉,inline 声明永远压不过,写成 class 皮肤才染得动。
+ *
+ * | 变量 | 含义 | 挂在哪 |
+ * | --- | --- | --- |
+ * | `--bn-accent` | 强调色(充电专属块是 B 站粉,正文里的话题行是 B 站蓝) | 充电专属占位的标题 |
+ * | `--bn-ink-faint` | 最弱的文字色 | 充电专属占位的说明行 |
+ * | `--bn-inset-bg` | 淡底内嵌块的背景 | 主视频卡的外壳 |
+ *
+ * 写法用 UnoCSS 的**任意属性** `[color:var(--bn-x)]`,不用 `text-[var(--bn-x)]`:preset-wind4 的
+ * 颜色工具类会编成 `color-mix(in oklab, … , transparent)`,那趟色彩空间往返**会动像素**
+ * (本机 Chrome 实测,14 个颜色里 12 个栅格字节变了),像素门当场红。
+ */
+
 import type { VNode } from "vue";
-import { SVG_BELL, SVG_DANMAKU, SVG_GOODS, SVG_LOTTERY, SVG_VIEW } from "../icons";
+import { SVG_BELL, SVG_GOODS, SVG_LOTTERY } from "../icons";
 import { parseRichText } from "../rich-text";
 import type { Dynamic } from "../types";
 
@@ -23,6 +54,7 @@ const DYNAMIC_TYPE_UGC_SEASON = "DYNAMIC_TYPE_UGC_SEASON";
 const ADDITIONAL_TYPE_RESERVE = "ADDITIONAL_TYPE_RESERVE";
 const ADDITIONAL_TYPE_GOODS = "ADDITIONAL_TYPE_GOODS";
 const ADDITIONAL_TYPE_COMMON = "ADDITIONAL_TYPE_COMMON";
+const ADDITIONAL_TYPE_UGC = "ADDITIONAL_TYPE_UGC";
 
 /** 时间戳 / 数字的格式化器(由 image-renderer 注入,保持模版层纯净)。 */
 export type NodeFormatters = {
@@ -35,7 +67,22 @@ export type NodeFormatters = {
  * 转发动态的内部原动态是 `forward`(同样是 DynamicNode),由卡片模版用**同一套版式**
  * 递归渲染。`body` 只含正文 + 主媒体(无附加内容、无转发框);`additional` 是拆出来的
  * 附加内容块(预约 / 商品 / 通用卡);`stats` 仅外层有(内部转发不展示互动数)。
+ *
+ * `text` 与 `media` 是正文的两半,各进一个原子块。从前还有第三份 `body`(两半粘在一起,
+ * 喂 `content` 复合块)—— 复合块退役之后它只写不读,已经删掉(决策 8 的 2026-09-18 🔗)。
+ * 两份仍**各是各的 VNode 实例**:Vue 文档明说一棵组件树里的 vnode 必须各不相同(客户端
+ * 挂载会往 vnode 上写 `el` / `component`,后一处盖掉前一处),而皮肤可以把同一块摆两回。
  */
+/** 投稿视频那张卡的数据。播放 / 弹幕数接口可能已给成 "6.5万",原样转文本,不做算术。 */
+export type DynamicVideo = {
+	cover: string;
+	duration: string;
+	title: string;
+	desc: string;
+	views: string;
+	danmaku: string;
+};
+
 export type DynamicNode = {
 	avatarUrl: string;
 	upName: string;
@@ -44,7 +91,22 @@ export type DynamicNode = {
 	/** 作为内部转发渲染时,附在作者名后的类型标签(如「投稿了视频」)。 */
 	headerLabel?: string;
 	topic?: string;
-	body: VNode;
+	/**
+	 * 正文文字,进 `text` 原子块:desc / opus 摘要的富文本(专栏连标题),转发是转发语,充电专属
+	 * 是那块占位,渲染不了的是那句提示。一个字都没有(只发了图)时为空。
+	 */
+	text?: VNode | null;
+	/**
+	 * 投稿视频那张卡的**数据**,不是画好的 VNode —— 视频卡拆成了五块(封面 / 时长 / 标题 /
+	 * 简介 / 播放·弹幕数),每块自己取自己那一份(决策 8 的 2026-09-18 🔗)。不是投稿视频
+	 * 就为空;转发的原视频在 `forward.video` 里,不往外层提。
+	 */
+	video?: DynamicVideo | null;
+	/**
+	 * 图廊(图文 / 专栏)。张数是动态的,拆不开,所以仍是一整块画好的 VNode。**不带**
+	 * 「跟在文字后面」的那层间距,单独摆时由皮肤 CSS 管。
+	 */
+	pics?: VNode | null;
 	additional?: VNode | null;
 	forward?: DynamicNode;
 	stats?: { forward: string; comment: string; like: string };
@@ -69,7 +131,6 @@ export async function buildDynamicNode(
 		upIsVip: author.vip.type !== 0,
 		pubTime: fmt.time(author.pub_ts),
 		topic: dynamic.modules.module_dynamic.topic?.name || undefined,
-		body: <></>,
 		additional: buildAdditionalContent(dynamic),
 		// 内部转发不展示互动数(与原行为一致,版式上 stats 块自动收起)。
 		stats: isForward
@@ -86,7 +147,7 @@ export async function buildDynamicNode(
 	// 落进下面任何一个分支都只会渲染出空白正文。在类型分发之前短路,渲染占位
 	// 提示而非空白——递归到内部转发(orig)时同样生效,无需额外处理。
 	if (isChargeOnlyLocked(dynamic)) {
-		node.body = buildChargeOnlyBody(author);
+		node.text = buildChargeOnlyText(author);
 		return node;
 	}
 
@@ -96,78 +157,80 @@ export async function buildDynamicNode(
 		else node.pubTime += ` · ${text}`;
 	};
 
+	// 「我暂时无法渲染」那一类:正文只有一句提示。
+	const notice = (v: VNode) => {
+		node.text = v;
+	};
+
 	switch (dynamic.type) {
 		case DYNAMIC_TYPE_WORD:
 		case DYNAMIC_TYPE_DRAW: {
-			node.body = buildBasicContent(dynamic, false);
+			node.text = buildBasicText(dynamic, false);
+			node.pics = buildOpusPics(dynamic);
 			return node;
 		}
 
 		case DYNAMIC_TYPE_FORWARD: {
-			const selfContent = buildBasicContent(dynamic, false);
+			// 转发本身不带图(接口给的 major 是空的),照样取一遍,真有也不丢。
+			node.pics = buildOpusPics(dynamic);
 			if (!dynamic.orig) {
-				node.body = (
+				// 没有转发框可装这句说明,它跟着转发语走。
+				node.text = (
 					<>
-						{selfContent}
+						{buildBasicText(dynamic, false)}
 						<p>{upName}转发了一条动态，但原动态已不可见</p>
 					</>
 				);
 				return node;
 			}
-			node.body = selfContent;
+			node.text = buildBasicText(dynamic, false);
 			node.forward = await buildDynamicNode(dynamic.orig, true, fmt);
 			return node;
 		}
 
 		case DYNAMIC_TYPE_AV: {
-			const selfContent = buildBasicContent(dynamic, false);
 			const archive = dynamic.modules.module_dynamic?.major?.archive;
-			node.body = archive ? (
-				<>
-					{selfContent}
-					{buildVideoContent(archive)}
-				</>
-			) : (
-				selfContent
-			);
+			node.text = buildBasicText(dynamic, false);
+			node.video = archive ? videoOf(archive) : null;
 			if (archive?.badge.text === "投稿视频") label("投稿了视频");
 			return node;
 		}
 
 		case DYNAMIC_TYPE_ARTICLE: {
-			node.body = buildBasicContent(dynamic, true);
+			node.text = buildBasicText(dynamic, true);
+			node.pics = buildOpusPics(dynamic);
 			label("投稿了专栏");
 			return node;
 		}
 
 		case DYNAMIC_TYPE_LIVE:
-			node.body = <p>{upName}发起了直播预约，我暂时无法渲染，请自行查看</p>;
+			notice(<p>{upName}发起了直播预约，我暂时无法渲染，请自行查看</p>);
 			break;
 		case DYNAMIC_TYPE_MEDIALIST:
-			node.body = <p>{upName}分享了收藏夹，我暂时无法渲染，请自行查看</p>;
+			notice(<p>{upName}分享了收藏夹，我暂时无法渲染，请自行查看</p>);
 			break;
 		case DYNAMIC_TYPE_PGC:
-			node.body = <p>{upName}发布了剧集（番剧、电影、纪录片），我暂时无法渲染，请自行查看</p>;
+			notice(<p>{upName}发布了剧集（番剧、电影、纪录片），我暂时无法渲染，请自行查看</p>);
 			break;
 		case DYNAMIC_TYPE_MUSIC:
-			node.body = <p>{upName}发行了新歌，我暂时无法渲染，请自行查看</p>;
+			notice(<p>{upName}发行了新歌，我暂时无法渲染，请自行查看</p>);
 			break;
 		case DYNAMIC_TYPE_COMMON_SQUARE:
-			node.body = <p>{upName}发布了装扮｜剧集｜点评｜普通分享，我暂时无法渲染，请自行查看</p>;
+			notice(<p>{upName}发布了装扮｜剧集｜点评｜普通分享，我暂时无法渲染，请自行查看</p>);
 			break;
 		case DYNAMIC_TYPE_COURSES_SEASON:
-			node.body = <p>{upName}发布了新课程，我暂时无法渲染，请自行查看</p>;
+			notice(<p>{upName}发布了新课程，我暂时无法渲染，请自行查看</p>);
 			break;
 		case DYNAMIC_TYPE_UGC_SEASON:
-			node.body = <p>{upName}更新了合集，我暂时无法渲染，请自行查看</p>;
+			notice(<p>{upName}更新了合集，我暂时无法渲染，请自行查看</p>);
 			break;
 		case DYNAMIC_TYPE_NONE:
-			node.body = <p>{upName}发布了一条无效动态</p>;
+			notice(<p>{upName}发布了一条无效动态</p>);
 			break;
 		case DYNAMIC_TYPE_LIVE_RCMD:
 			throw new Error("直播开播动态，不做处理");
 		default:
-			node.body = <p>{upName}发布了一条我无法识别的动态，请自行查看</p>;
+			notice(<p>{upName}发布了一条我无法识别的动态，请自行查看</p>);
 	}
 	// 「无法渲染」类动态没有可拆的附加内容,清掉以免空块占位。
 	node.additional = null;
@@ -189,15 +252,15 @@ function isChargeOnlyLocked(dynamic: Dynamic): boolean {
 }
 
 /** 充电专属占位正文:优先用接口带的徽标图 / 文案,缺席时用固定文案兜底。 */
-function buildChargeOnlyBody(author: Dynamic["modules"]["module_author"]) {
+function buildChargeOnlyText(author: Dynamic["modules"]["module_author"]) {
 	const badge = author.icon_badge;
 	return (
 		<div class="flex flex-col items-center justify-center gap-[8px] py-[20px] text-center">
 			{badge?.icon ? <img class="w-[28px] h-[28px]" src={badge.icon} alt="" /> : null}
-			<div class="text-[14px] font-bold" style="color: #FB7299;">
+			<div class="text-[14px] font-bold [color:var(--bn-accent)]" style="--bn-accent: #FB7299;">
 				{badge?.text || "充电专属内容"}
 			</div>
-			<div class="text-[12px]" style="color: #999;">
+			<div class="text-[12px] [color:var(--bn-ink-faint)]" style="--bn-ink-faint: #999;">
 				为 {author.name} 充电即可查看完整内容
 			</div>
 		</div>
@@ -206,67 +269,151 @@ function buildChargeOnlyBody(author: Dynamic["modules"]["module_author"]) {
 
 // ── 私有辅助函数 ──────────────────────────────────────────────────────────────
 
-function buildBasicContent(dynamic: Dynamic, isArticle: boolean) {
+/**
+ * 正文文字:desc 富文本 + opus 摘要富文本(专栏带标题)。两件都有时才包 Fragment,只有
+ * 一件就直接给它 —— 少一对 `<!--[-->` 锚点。
+ */
+function buildBasicText(dynamic: Dynamic, isArticle: boolean): VNode | null {
 	const mod = dynamic.modules.module_dynamic;
-	return (
-		<>
-			{mod?.desc?.rich_text_nodes && parseRichText(mod.desc.rich_text_nodes, undefined, isArticle)}
-			{mod?.major?.opus?.summary?.rich_text_nodes &&
-				parseRichText(mod.major.opus.summary.rich_text_nodes, mod.major.opus.title, isArticle)}
-			{mod?.major?.opus?.pics && (
-				<div class="mt-[8px]">{buildPicsContent(mod.major.opus.pics)}</div>
-			)}
-		</>
-	);
+	const desc =
+		mod?.desc?.rich_text_nodes && parseRichText(mod.desc.rich_text_nodes, undefined, isArticle);
+	const summary =
+		mod?.major?.opus?.summary?.rich_text_nodes &&
+		parseRichText(mod.major.opus.summary.rich_text_nodes, mod.major.opus.title, isArticle);
+	if (desc && summary) {
+		return (
+			<>
+				{desc}
+				{summary}
+			</>
+		);
+	}
+	return desc || summary || null;
 }
 
-function buildPicsContent(pics: Array<{ height: number; url: string; width: number }>) {
+/**
+ * 图廊,给 `media` 原子块。空数组算没图 —— 画一个空的图廊壳不如整块收起。
+ */
+function buildOpusPics(dynamic: Dynamic): VNode | null {
+	const pics = dynamic.modules.module_dynamic?.major?.opus?.pics;
+	return pics?.length ? buildPicsContent(pics) : null;
+}
+
+/** 图廊最多铺几格 —— 与 B 站网页端一致,余下的折进最后一格的 `+N`。 */
+const MAX_GRID_PICS = 9;
+
+type DynamicPic = { height: number; url: string; width: number; live_url?: string };
+
+/**
+ * 这张图会不会动。
+ *
+ * 两条判据取并集:`live_url` 非空(B 站给动图带的播放地址)**或** URL 后缀是 `.gif`。
+ * 只认一条的话,万一它在某类动态里不成立就是整片漏标;两条都不满足才不标 —— 宁可漏
+ * 也不误标,把静图标成动图更让人费解。
+ */
+function isAnimatedPic(p: DynamicPic): boolean {
+	if (p.live_url) return true;
+	// 真实 URL 常带处理后缀和 query(`….gif@1280w_80q_1s.webp?from=dyn`),直接看结尾
+	// 会把 GIF 认成 webp 而漏标 —— 先把这两截削掉。
+	const path = p.url.split("?")[0].split("@")[0];
+	return path.toLowerCase().endsWith(".gif");
+}
+
+/**
+ * 右下角那个小角标的文案,都不满足则不出。
+ *
+ * 动图压过长图:「这张会动」是截图里绝对看不出来的信息(出图只截得到一帧),而「被裁
+ * 过」在缩略图上多少感觉得到。两者同时成立极罕见,不值得为它另设一个双标签位。
+ */
+function picBadgeText(p: DynamicPic, isLong: boolean): string | null {
+	if (isAnimatedPic(p)) return "动图";
+	return isLong ? "长图" : null;
+}
+
+function buildPicsContent(pics: DynamicPic[]) {
 	if (pics.length === 1) {
 		const pic = pics[0];
 		const isSuperLong = pic.height > pic.width * 2;
 		const isLong = !isSuperLong && pic.height > pic.width;
+		const badge = picBadgeText(pic, isSuperLong);
+		// 三种形态各自的图框宽高都不一样,角标就近挂在各自那层 —— 统一提到最外层的话,
+		// 竖图(width:auto)那支会把角标甩到图片右侧的空白里去。
+		const badgeEl = () =>
+			badge ? (
+				<div class="absolute bottom-2 right-2 bg-black/50 text-white text-[13px] px-[8px] py-[4px] rounded leading-none">
+					{badge}
+				</div>
+			) : null;
 		return (
-			<div class="relative overflow-hidden rounded-lg" style="max-width: 600px;">
+			// 单图时整个图廊就是那一格,两个挂点落在同一个元素上。
+			<div data-bn="pics pic" class="relative overflow-hidden rounded-lg" style="max-width: 600px;">
 				{isSuperLong ? (
 					<div class="relative" style="height: 400px; overflow: hidden;">
 						<img class="w-full h-full object-cover object-top block" src={pic.url} alt="" />
-						<div class="absolute bottom-2 right-2 bg-black/50 text-white text-[13px] px-[8px] py-[4px] rounded leading-none">
-							长图
-						</div>
+						{badgeEl()}
 					</div>
 				) : isLong ? (
-					<img
-						class="h-auto block rounded-lg"
-						style="max-height: 400px; width: auto;"
-						src={pic.url}
-						alt=""
-					/>
+					<div class="relative inline-block">
+						<img
+							class="h-auto block rounded-lg"
+							style="max-height: 400px; width: auto;"
+							src={pic.url}
+							alt=""
+						/>
+						{badgeEl()}
+					</div>
 				) : (
-					<img class="w-full h-auto block" src={pic.url} alt="" />
+					<>
+						<img class="w-full h-auto block" src={pic.url} alt="" />
+						{badgeEl()}
+					</>
 				)}
 			</div>
 		);
 	}
 
-	const is2col = pics.length === 2 || pics.length === 4;
+	// 超出 9 张的部分不铺格子,折进最后一格的 `+N`。以前是有几张铺几张,十几张图的
+	// 动态能把卡片拉出一米多长,推到群里就是一堵缩略图墙。
+	const shown = pics.slice(0, MAX_GRID_PICS);
+	const overflow = pics.length - shown.length;
+	const is2col = shown.length === 2 || shown.length === 4;
 	// 多图总宽与单图对齐（max 480px），图片在其中平分，gap 8px
 	const containerClass = is2col
 		? "relative w-[calc(50%-4px)] aspect-square shrink-0"
 		: "relative w-[calc(33.33%-6px)] aspect-square shrink-0";
 	return (
-		<div class="flex flex-wrap gap-[8px]" style="max-width: 600px;">
-			{pics.map((p, i) => {
+		<div data-bn="pics" class="flex flex-wrap gap-[8px]" style="max-width: 600px;">
+			{shown.map((p, i) => {
 				const isLong = p.height > p.width * 2;
+				const badge = picBadgeText(p, isLong);
+				// `+N` 盖在**第 9 张图上**,不另起一格 —— 另起就成了 10 格,末格空着,
+				// 三列也就散了。
+				const more = overflow > 0 && i === shown.length - 1 ? overflow : 0;
 				return (
-					<div key={i} class={containerClass}>
+					<div key={i} data-bn="pic" class={containerClass}>
 						<img
 							class={`w-full h-full object-cover ${isLong ? "object-top" : ""} rounded`}
 							src={p.url}
 							alt=""
 						/>
-						{isLong && (
+						{more > 0 && (
+							// 遮罩压到 40% —— 再深就成了整格纯黑,九宫格里凭空多出一块深色补丁,
+							// 比它盖住的那张图还抢眼。压浅之后白字在亮图上会发虚,靠一层文字投影兜住。
+							//
+							// 投影**属性写在 class 上、值留在 inline 的变量里**(与那 33 处颜色同一套,
+							// ADR-0014 决策 13 的 🔗):整条写成 inline 的话皮肤永远压不过它 —— 清洗器
+							// 一律摘 `!important`,而 inline 恒赢。类名里不写那串带逗号的值,是因为
+							// UnoCSS 的切词按分隔符走,`rgba(0,0,0,.55)` 进类名要赌它怎么切。
+							<div
+								class="absolute inset-0 flex items-center justify-center rounded bg-black/40 text-white text-[28px] font-bold leading-none [text-shadow:var(--bn-pics-more-shadow)]"
+								style="--bn-pics-more-shadow: 0 1px 4px rgba(0, 0, 0, 0.55);"
+							>
+								{`+${more}`}
+							</div>
+						)}
+						{badge && (
 							<div class="absolute bottom-1 right-1 bg-black/50 text-white text-[10px] px-[5px] py-[2px] rounded-sm leading-none">
-								长图
+								{badge}
 							</div>
 						)}
 					</div>
@@ -277,8 +424,8 @@ function buildPicsContent(pics: Array<{ height: number; url: string; width: numb
 }
 
 /**
- * 附加内容(预约 / 商品 / 通用卡)。返回内层 VNode(无外边距 —— 间距由 additional
- * 版式块的 marginTop 控制),无附加内容时返回 null(块自动收起)。
+ * 附加内容(预约 / 商品 / 通用卡 / 关联视频)。返回内层 VNode(无外边距 —— 间距由
+ * additional 版式块的 marginTop 控制),无附加内容时返回 null(块自动收起)。
  */
 function buildAdditionalContent(dynamic: Dynamic): VNode | null {
 	const additional = dynamic.modules.module_dynamic.additional;
@@ -290,6 +437,9 @@ function buildAdditionalContent(dynamic: Dynamic): VNode | null {
 			return buildGoodsAdditional(additional.goods);
 		case ADDITIONAL_TYPE_COMMON:
 			return buildCommonAdditional(additional.common);
+		case ADDITIONAL_TYPE_UGC:
+			// type 说是 UGC 但 ugc 缺席的情况真实存在(接口降级),没内容就当没附加块。
+			return additional.ugc ? buildUgcAdditional(additional.ugc) : null;
 		default:
 			return null;
 	}
@@ -299,7 +449,10 @@ function buildAdditionalContent(dynamic: Dynamic): VNode | null {
 function buildReserveAdditional(reserve: any) {
 	const isEnded = reserve.button.uncheck.text === "已结束";
 	return (
-		<div class="flex justify-between items-center gap-[10px] bg-black/4 rounded-lg p-[10px]">
+		<div
+			data-bn="card"
+			class="flex justify-between items-center gap-[10px] bg-black/4 rounded-lg p-[10px]"
+		>
 			<div class="flex-1 min-w-0">
 				<div class="text-[14px] font-bold text-[#18191C] mb-1">{reserve.title}</div>
 				<div class="flex gap-2 text-[12px] text-[#999]">
@@ -314,6 +467,7 @@ function buildReserveAdditional(reserve: any) {
 				)}
 			</div>
 			<div
+				data-bn="button"
 				class={`shrink-0 inline-flex items-center gap-1 px-3 py-[6px] rounded-[6px] text-[12px] font-bold leading-none ${
 					isEnded ? "bg-[#f5f5f5] text-[#999]" : "bg-[#FB7299] text-white"
 				}`}
@@ -334,11 +488,16 @@ function buildGoodsAdditional(goods: any) {
 				{SVG_GOODS}
 				{goods.head_text}
 			</div>
-			<div class="bg-black/4 rounded-lg p-[10px]">
+			<div data-bn="card" class="bg-black/4 rounded-lg p-[10px]">
 				{isSingle ? (
 					<div class="flex gap-[10px] items-center">
 						<div class="w-[72px] h-[72px] shrink-0 rounded-md overflow-hidden">
-							<img class="w-full h-full object-cover" src={goods.items[0].cover} alt="" />
+							<img
+								data-bn="cover"
+								class="w-full h-full object-cover"
+								src={goods.items[0].cover}
+								alt=""
+							/>
 						</div>
 						<div class="flex-1 min-w-0">
 							<div class="text-[13px] text-[#18191C] line-clamp-2 mb-[6px]">
@@ -349,7 +508,10 @@ function buildGoodsAdditional(goods: any) {
 								<span class="text-[12px] text-[#999]">起</span>
 							</div>
 						</div>
-						<div class="shrink-0 px-[14px] py-[6px] rounded-[6px] bg-[#FB7299] text-white text-[12px] font-bold leading-none">
+						<div
+							data-bn="button"
+							class="shrink-0 px-[14px] py-[6px] rounded-[6px] bg-[#FB7299] text-white text-[12px] font-bold leading-none"
+						>
 							{goods.items[0].jump_desc || "去看看"}
 						</div>
 					</div>
@@ -358,7 +520,7 @@ function buildGoodsAdditional(goods: any) {
 						{/* biome-ignore lint/suspicious/noExplicitAny: Bilibili goods API returns untyped items */}
 						{goods.items.map((item: any, i: number) => (
 							<div key={i} class="w-[72px] h-[72px] shrink-0 rounded-md overflow-hidden bg-black/8">
-								<img class="w-full h-full object-cover" src={item.cover} alt="" />
+								<img data-bn="cover" class="w-full h-full object-cover" src={item.cover} alt="" />
 							</div>
 						))}
 					</div>
@@ -375,10 +537,10 @@ function buildCommonAdditional(common: any) {
 	return (
 		<div>
 			<div class="flex items-center gap-1 text-[12px] text-[#999] mb-[6px]">{common.head_text}</div>
-			<div class="bg-black/4 rounded-lg p-[10px]">
+			<div data-bn="card" class="bg-black/4 rounded-lg p-[10px]">
 				<div class="flex gap-[10px] items-center">
 					<div class="w-[72px] h-[72px] shrink-0 rounded-md overflow-hidden">
-						<img class="w-full h-full object-cover" src={common.cover} alt="" />
+						<img data-bn="cover" class="w-full h-full object-cover" src={common.cover} alt="" />
 					</div>
 					<div class="flex-1 min-w-0">
 						<div class="text-[13px] font-bold text-[#18191C] mb-[4px]">{common.title}</div>
@@ -395,7 +557,10 @@ function buildCommonAdditional(common: any) {
 						{common.desc2 && <div class="text-[12px] text-[#999] truncate">{common.desc2}</div>}
 					</div>
 					{common.button?.jump_style?.text && (
-						<div class="shrink-0 px-[14px] py-[6px] rounded-[6px] bg-[#FB7299] text-white text-[12px] font-bold leading-none">
+						<div
+							data-bn="button"
+							class="shrink-0 px-[14px] py-[6px] rounded-[6px] bg-[#FB7299] text-white text-[12px] font-bold leading-none"
+						>
 							{common.button.jump_style.text}
 						</div>
 					)}
@@ -405,41 +570,69 @@ function buildCommonAdditional(common: any) {
 	);
 }
 
-function buildVideoContent(archive: {
-	cover: string;
-	duration_text: string;
-	title: string;
-	desc: string;
-	stat: { play: number; danmaku: number };
-}) {
+/**
+ * 关联视频卡 —— 图文/文字动态正文下方挂的那条投稿。
+ *
+ * 与 DYNAMIC_TYPE_AV 的主视频卡(拆成了五个原子块)是两套数据:那边 `stat.play` /
+ * `stat.danmaku` 是两个各自配图标的计数(接口给的是「6.5万」这种成品字符串;链接解析
+ * 拼出来的动态也照这个样子给),这边 `desc_second` 已经是接口拼好的一整句(「2654观看
+ * 102弹幕」),官方页面也是当纯文本灰字渲染的,别再套图标重排。
+ */
+// biome-ignore lint/suspicious/noExplicitAny: Bilibili API 返回的关联视频数据类型不固定
+function buildUgcAdditional(ugc: any) {
 	return (
-		<div
-			class="flex gap-[10px] rounded-lg overflow-hidden mt-1"
-			style="background: rgba(0,0,0,0.04); max-width: 600px;"
-		>
-			<div class="relative w-40 shrink-0">
-				<img class="w-full h-full object-cover block" src={archive.cover} alt="" />
-				<div class="absolute inset-0 bg-black/20" />
-				<span class="absolute bottom-1 right-[6px] text-white text-[11px] font-bold [text-shadow:0_1px_2px_rgba(0,0,0,.6)]">
-					{archive.duration_text}
-				</span>
-			</div>
-			<div class="flex-1 min-w-0 py-[10px] pr-[10px] flex flex-col justify-between">
-				<div>
-					<div class="text-[14px] font-bold text-[#18191C] line-clamp-2 mb-1">{archive.title}</div>
-					<div class="text-[12px] text-[#999] line-clamp-2">{archive.desc}</div>
-				</div>
-				<div class="flex gap-3 text-[12px] text-[#999] items-center">
-					<span class="flex items-center gap-[4px]">
-						{SVG_VIEW}
-						{archive.stat.play}
-					</span>
-					<span class="flex items-center gap-[4px]">
-						{SVG_DANMAKU}
-						{archive.stat.danmaku}
-					</span>
+		<div>
+			{/* head_text 在抓包里常为空串,空就整行不渲染,免得多出一条空白灰字。 */}
+			{ugc.head_text && (
+				<div class="flex items-center gap-1 text-[12px] text-[#999] mb-[6px]">{ugc.head_text}</div>
+			)}
+			<div data-bn="card" class="bg-black/4 rounded-lg p-[10px]">
+				<div class="flex gap-[10px] items-center">
+					<div class="relative w-[140px] h-[80px] shrink-0 rounded-md overflow-hidden bg-black/8">
+						<img data-bn="cover" class="w-full h-full object-cover block" src={ugc.cover} alt="" />
+						{/*
+						 * 角标衬一层深色底,不是只给文字加 text-shadow —— 封面右下角是什么颜色
+						 * 完全由 UP 决定,遇上亮底(放射光、白背景)白字加弱阴影就糊没了。
+						 * 主视频卡靠整张压暗 bg-black/20 兜住,这里封面小、压暗会让整卡发灰,
+						 * 改成只在角标下垫一块。
+						 */}
+						{ugc.duration && (
+							<span class="absolute bottom-[4px] right-[4px] px-[4px] py-[1px] rounded-[3px] bg-black/60 text-white text-[11px] font-bold leading-[1.4]">
+								{ugc.duration}
+							</span>
+						)}
+					</div>
+					<div class="flex-1 min-w-0">
+						<div class="text-[13px] font-bold text-[#18191C] line-clamp-2 mb-[6px]">
+							{ugc.title}
+						</div>
+						{ugc.desc_second && (
+							<div class="text-[12px] text-[#999] truncate">{ugc.desc_second}</div>
+						)}
+					</div>
 				</div>
 			</div>
 		</div>
 	);
+}
+
+/**
+ * 投稿视频那张卡的数据(决策 8 的 2026-09-18 🔗)。从前这里画的是一整张卡,现在只取数 ——
+ * 卡由 `blocks/dynamic.tsx` 的五个原子块各画一段、皮肤用网格与 CSS 拼回去。
+ */
+function videoOf(archive: {
+	cover: string;
+	duration_text: string;
+	title: string;
+	desc: string;
+	stat: { play: number | string; danmaku: number | string };
+}): DynamicVideo {
+	return {
+		cover: archive.cover,
+		duration: archive.duration_text,
+		title: archive.title,
+		desc: archive.desc,
+		views: String(archive.stat.play),
+		danmaku: String(archive.stat.danmaku),
+	};
 }

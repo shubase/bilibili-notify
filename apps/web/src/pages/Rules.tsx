@@ -5,12 +5,17 @@ import {
 	templateDefaultAt,
 	templateFingerprint,
 } from "@bilibili-notify/internal/template-defaults";
+import {
+	ConfirmDialog,
+	type FieldUpdate,
+	FieldUpdatesProvider,
+	LoadingBlock,
+	RailDot,
+	SectionNav,
+} from "@bilibili-notify/ui";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { ConfirmDialog } from "../components/dialog";
-import { type FieldUpdate, FieldUpdatesProvider } from "../components/field-updates";
 import { type Scope, ScopeTabs } from "../components/scope-tabs";
-import { RailDot, SectionNav } from "../components/section-nav";
 import { useDirtyDraft } from "../hooks/useDirtyDraft";
 import { api } from "../services/api";
 import type { Subscription } from "../types/domain";
@@ -85,7 +90,9 @@ function SectionList({
 				label: s.label,
 				desc: s.desc,
 				icon: s.icon,
-				badge: customizedIds?.has(s.id) ? <RailDot title="该 UP 主已设置该项覆盖" /> : undefined,
+				badge: customizedIds?.has(s.id) ? (
+					<RailDot title="该 UP 主已设置该项覆盖" active={s.id === current} />
+				) : undefined,
 			}))}
 		/>
 	);
@@ -264,7 +271,7 @@ export default function Rules() {
 	//
 	// 主人改了某条模板的默认,已装好的用户拿不到 —— 盘上写的是当初那一版。这里算出
 	// 哪几条该亮提示,经 context 广播下去:`Field` 拿自己的 code 去认领,于是十几个
-	// 模板字段的调用点**一个都不用改**(详见 components/field-updates.tsx)。
+	// 模板字段的调用点**一个都不用改**(详见 packages/ui 的 field-updates.tsx)。
 	const fieldUpdates = useMemo(() => {
 		const templates = draft?.defaults.templates;
 		const seen = draft?.defaults.templateDefaultsSeen ?? {};
@@ -396,15 +403,11 @@ export default function Rules() {
 			: undefined;
 
 	if (!draft) {
-		return (
-			<div className="bn-glass rounded-bn-card p-10 text-center text-sm text-bn-text-secondary shadow-bn-card">
-				加载全局配置中…
-			</div>
-		);
+		return <LoadingBlock label="正在读取全局配置" />;
 	}
 
 	return (
-		<div className="bn-anim-fade-in flex flex-col gap-4">
+		<div className="bn-anim-page-in flex flex-col gap-4">
 			{isGlobal && globalsQuery.data ? (
 				<GlobalDraftBinder
 					defaults={draft.defaults}
@@ -425,7 +428,7 @@ export default function Rules() {
 				overridesCountFor={(s) => overrideKeysOf(s).size + (s.specialUsers.length > 0 ? 1 : 0)}
 			/>
 
-			<div className="grid gap-4 xl:grid-cols-[220px_1fr]">
+			<div className="grid gap-4 xl:grid-bn-rail">
 				<SectionList
 					sections={sections}
 					current={section}

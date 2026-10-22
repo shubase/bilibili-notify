@@ -13,7 +13,6 @@ import {
 export type LoginStatusMsgKey =
 	| "loading"
 	| "notLogin"
-	| "keyReset"
 	| "authLost"
 	| "loggedIn"
 	| "loginJustSucceeded"
@@ -30,7 +29,6 @@ export type LoginStatusMsgKey =
 const MESSAGES: Record<LoginStatusMsgKey, string> = {
 	loading: "正在加载登录信息...",
 	notLogin: "账号未登录，请点击「扫码登录」",
-	keyReset: "密钥已重置，cookie 已清除，请重新扫码登录",
 	authLost: "账号登录已失效，请在控制台重新扫码登录",
 	loggedIn: "已登录",
 	loginJustSucceeded: "登录成功，正在加载订阅...",
@@ -48,7 +46,7 @@ const MESSAGES: Record<LoginStatusMsgKey, string> = {
 /** Snapshot of the current login state — alias of BiliDataServer for API consumers. */
 export type LoginSnapshot = BiliDataServer;
 
-/** Outcome of a single QR poll tick. The bridge does not need to act on this directly. */
+/** Outcome of a single QR poll tick. Callers do not need to act on this directly. */
 export type LoginPollResult =
 	| { kind: "pending"; reason: "waitScan" | "waitConfirm" }
 	| { kind: "success" }
@@ -459,12 +457,26 @@ export class LoginFlow {
 		this.healthTimer = undefined;
 	}
 
-	private async runHealthCheck(): Promise<void> {
-		const skip =
+	/**
+	 * 把心跳提前到现在(宿主 devtools「现在就跑」)。走的就是定时器到点跑的那次;登录着才查,
+	 * 没登录 / 扫码中跳过、回 false。定时器本身不动,下一次到点照旧。
+	 */
+	async healthCheckNow(): Promise<boolean> {
+		if (this.shouldSkipHealthCheck()) return false;
+		await this.runHealthCheck();
+		return true;
+	}
+
+	private shouldSkipHealthCheck(): boolean {
+		return (
 			this.snapshot.status === BiliLoginStatus.LOGIN_QR ||
 			this.snapshot.status === BiliLoginStatus.LOGGING_QR ||
-			this.snapshot.status === BiliLoginStatus.NOT_LOGIN;
-		if (skip) return;
+			this.snapshot.status === BiliLoginStatus.NOT_LOGIN
+		);
+	}
+
+	private async runHealthCheck(): Promise<void> {
+		if (this.shouldSkipHealthCheck()) return;
 		// skip 判据取的是**发请求之前**那一帧,答复回来时状态可能早就变了。
 		const gen = this.authGeneration;
 		try {

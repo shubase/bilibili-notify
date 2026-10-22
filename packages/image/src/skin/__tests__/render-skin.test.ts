@@ -1,0 +1,738 @@
+/**
+ * 皮肤渲染器的**逐条规矩**(ADR-0014 决策 6、10、11、12、13、15)。
+ *
+ * 验收门(`skin-gate.test.ts`)钉的是「默认皮肤画出来的块与今天逐字节一致」,走的全是
+ * **内置块 + 没有 showIf + 没有自定义块**那条主干;皮肤真正的口子(条件显示、自定义块的
+ * 占位符、挂点翻译、行压缩、变量注入)一条都碰不到 —— 它们改坏了门也不会红。这份补上:
+ * 每条规矩造一份最小皮肤,单独钉。
+ *
+ * props 一律借 `CARD_FIXTURES` 里现成的那几份(与基准、挂点对表同源),免得再造一套会
+ * 与真实形状漂移的假数据。
+ */
+
+import { type CardSkinCard, type CardSkinKnob, DEFAULT_CARD_SKIN } from "@bilibili-notify/internal";
+import { renderToString } from "@vue/server-renderer";
+import { JSDOM } from "jsdom";
+import { beforeAll, describe, expect, it } from "vite-plus/test";
+import { createSSRApp } from "vue";
+import { CARD_FIXTURES } from "../../__tests__/fixtures/card-fixtures";
+import type { LiveCardProps } from "../../templates/live-card";
+import {
+	BLOCKED_IMG_PLACEHOLDER,
+	renderCardWithSkin,
+	renderSkinnedCard,
+	type SkinRenderOptions,
+} from "../render-skin";
+
+/** live-streaming 那份 props(直播中、封面 / 分区 / 人气 / 粉丝全开、无粉丝变化)。 */
+let liveProps: LiveCardProps;
+
+beforeAll(async () => {
+	const fixture = CARD_FIXTURES.find((f) => f.name === "live-streaming");
+	if (!fixture) throw new Error("夹具表里没有 live-streaming");
+	liveProps = (await fixture.build()).props as unknown as LiveCardProps;
+});
+
+/** 一份只有指定块的 live 皮肤。 */
+function liveCard(blocks: CardSkinCard["blocks"], over: Partial<CardSkinCard> = {}): CardSkinCard {
+	return { width: 600, blocks, ...over };
+}
+
+const builtin = (
+	id: string,
+	name: string,
+	grid: CardSkinCard["blocks"][number]["grid"],
+	over: Record<string, unknown> = {},
+): CardSkinCard["blocks"][number] =>
+	({ id, kind: "builtin", builtin: name, grid, ...over }) as CardSkinCard["blocks"][number];
+
+const custom = (
+	id: string,
+	html: string,
+	grid = { row: 1, column: 1, span: 12 },
+): CardSkinCard["blocks"][number] =>
+	({ id, kind: "custom", html, grid }) as CardSkinCard["blocks"][number];
+
+async function render(
+	card: CardSkinCard,
+	over: Partial<SkinRenderOptions<"live">> = {},
+): Promise<{ html: string; css: string; doc: Document }> {
+	const { vnode, css } = renderSkinnedCard({ kind: "live", card, props: liveProps, ...over });
+	const html = await renderToString(createSSRApp({ render: () => vnode }));
+	return { html, css, doc: new JSDOM(html).window.document };
+}
+
+const labels = (doc: Document): string[] =>
+	[...doc.querySelectorAll("[data-block]")].map((el) => el.getAttribute("data-block") ?? "");
+
+// 行号住**格子层**(ADR-0018),不在皮肤那一层 —— 两层的分工整段在 `cell-layer.test.ts`。
+const rows = (doc: Document): string[] =>
+	[...doc.querySelectorAll("[data-cell]")].map(
+		(el) => /grid-row:(\d+)/.exec(el.getAttribute("style") ?? "")?.[1] ?? "?",
+	);
+
+describe("皮肤渲染器 — 块的 wrapper", () => {
+	// 两层各挂什么、哪些声明住哪一层,整组钉在 `cell-layer.test.ts`(ADR-0018 的常驻门)。
+	// 这里只问内层:皮肤要用的那两样(`data-block` 与 class)在不在。
+	it("内层带 data-block 与 bn-blk-<id> 的 class", async () => {
+		const { doc } = await render(liveCard([builtin("t", "title", { row: 2, column: 3, span: 4 })]));
+		const el = doc.querySelector("[data-block='title']");
+		expect(el?.className).toBe("bn-blk-t");
+		// 行号被压成 1(第 2 行是唯一一行);列与跨度原样 —— 都在外面那层格子上。
+		expect(doc.querySelector('[data-cell="t"]')?.getAttribute("style")).toBe(
+			"grid-row:1 / span 1;grid-column:3 / span 4;min-width:0;display:grid;place-self:stretch;place-items:inherit",
+		);
+	});
+
+	it("玻璃层是 12 列网格,gap 从皮肤来", async () => {
+		const { doc } = await render(
+			liveCard([builtin("t", "title", { row: 1, column: 1, span: 12 })], {
+				gap: { row: 8, column: 4 },
+			}),
+		);
+		const style = doc.querySelector("[data-bn~='glass']")?.getAttribute("style") ?? "";
+		expect(style).toContain("grid-template-columns:repeat(12, minmax(0, 1fr))");
+		expect(style).toContain("gap:8px 4px");
+	});
+
+	it("皮肤写了 columns 就逐列拼:定宽列原样、等分列走 minmax(0, nfr)", async () => {
+		const columns: CardSkinCard["columns"] = [
+			{ fr: 2 },
+			...Array.from({ length: 7 }, () => ({ fr: 1 }) as const),
+			...Array.from({ length: 4 }, () => ({ px: 43.75 }) as const),
+		];
+		const { doc } = await render(
+			liveCard([builtin("t", "title", { row: 1, column: 1, span: 12 })], { columns }),
+		);
+		const style = doc.querySelector("[data-bn~='glass']")?.getAttribute("style") ?? "";
+		expect(style).toContain(
+			`grid-template-columns:minmax(0, 2fr) ${"minmax(0, 1fr) ".repeat(7)}43.75px 43.75px 43.75px 43.75px;`,
+		);
+	});
+});
+
+describe("皮肤渲染器 — showIf", () => {
+	it("字段为真才画", async () => {
+		const { doc } = await render(
+			liveCard([
+				builtin("t", "title", { row: 1, column: 1, span: 12 }, { showIf: "live.hasCover" }),
+			]),
+		);
+		expect(labels(doc)).toEqual(["title"]);
+	});
+
+	it("字段为假整块不画", async () => {
+		const { doc } = await render(
+			liveCard([
+				builtin("t", "title", { row: 1, column: 1, span: 12 }, { showIf: "stats.hasFansChanged" }),
+			]),
+		);
+		expect(labels(doc)).toEqual([]);
+	});
+
+	it("取不到的字段当假", async () => {
+		const { doc } = await render(
+			liveCard([builtin("t", "title", { row: 1, column: 1, span: 12 }, { showIf: "live.nope" })]),
+		);
+		expect(labels(doc)).toEqual([]);
+	});
+});
+
+describe("皮肤渲染器 — 分割线的三条规矩", () => {
+	it("开头的分割线抑制、末尾的弹出、悬空的抑制", async () => {
+		const { doc } = await render(
+			liveCard([
+				builtin("d0", "divider", { row: 1, column: 1, span: 12 }),
+				builtin("t", "title", { row: 2, column: 1, span: 12 }),
+				builtin("d1", "divider", { row: 3, column: 1, span: 12 }),
+				// data 块三个开关全开、但这份夹具没有粉丝变化 —— 它照画;换成 showIf 假的块来造悬空。
+				builtin("h", "avatar", { row: 4, column: 1, span: 12 }, { showIf: "stats.hasFansChanged" }),
+				builtin("d2", "divider", { row: 5, column: 1, span: 12 }),
+				builtin("t2", "desc", { row: 6, column: 1, span: 12 }),
+			]),
+		);
+		// d0 开头被抑制;d1 前面是内容块 → 留;h 没画 → d2 悬空 → 抑制。
+		expect(labels(doc)).toEqual(["title", "divider", "desc"]);
+		expect(doc.querySelectorAll(".bn-blk-d1")).toHaveLength(1);
+	});
+
+	it("悬空与否按行号算,不按数组先后", async () => {
+		const { doc } = await render(
+			liveCard([
+				builtin("d", "divider", { row: 2, column: 1, span: 12 }),
+				builtin("t", "title", { row: 1, column: 1, span: 12 }),
+				builtin("t2", "desc", { row: 3, column: 1, span: 12 }),
+			]),
+		);
+		// 分割线排在数组第一个,但它的行号在 title 之后 —— 不是「开头的分割线」,该留。
+		expect(labels(doc)).toEqual(["divider", "title", "desc"]);
+		expect(rows(doc)).toEqual(["2", "1", "3"]);
+	});
+
+	it("末尾的分割线弹出", async () => {
+		const { doc } = await render(
+			liveCard([
+				builtin("t", "title", { row: 1, column: 1, span: 12 }),
+				builtin("d1", "divider", { row: 2, column: 1, span: 12 }),
+			]),
+		);
+		expect(labels(doc)).toEqual(["title"]);
+	});
+});
+
+describe("皮肤渲染器 — 行压缩", () => {
+	it("被收起的块不留空行,剩下的行号重编成 1..n", async () => {
+		const { doc } = await render(
+			liveCard([
+				builtin("a", "title", { row: 1, column: 1, span: 12 }),
+				builtin("b", "avatar", { row: 2, column: 1, span: 12 }, { showIf: "stats.hasFansChanged" }),
+				builtin("c", "desc", { row: 3, column: 1, span: 12 }),
+			]),
+		);
+		expect(labels(doc)).toEqual(["title", "desc"]);
+		expect(rows(doc)).toEqual(["1", "2"]);
+	});
+
+	it("同一行的两个块压成同一行(不各占一行)", async () => {
+		const { doc } = await render(
+			liveCard([
+				builtin("a", "title", { row: 3, column: 1, span: 6 }),
+				builtin("b", "desc", { row: 3, column: 7, span: 6 }),
+			]),
+		);
+		expect(rows(doc)).toEqual(["1", "1"]);
+	});
+
+	it("数组先后与行号不一致时,按行号排(编辑器里换行才看得见)", async () => {
+		const { doc } = await render(
+			liveCard([
+				builtin("a", "title", { row: 3, column: 1, span: 12 }),
+				builtin("b", "desc", { row: 1, column: 1, span: 12 }),
+			]),
+		);
+		// desc 的行号更小 → 画出来它在上面。DOM 先后照旧跟数组走(叠放的缺省档靠它),
+		// 位置整个由 grid-row 定:title 落第 2 行、desc 落第 1 行。
+		expect(labels(doc)).toEqual(["title", "desc"]);
+		expect(rows(doc)).toEqual(["2", "1"]);
+	});
+
+	it("跨行的块占掉的中间行不许被压掉(不然它会盖住下一块)", async () => {
+		const { doc } = await render(
+			liveCard([
+				builtin("a", "title", { row: 1, column: 1, span: 6, rowSpan: 3 }),
+				builtin("b", "desc", { row: 4, column: 1, span: 12 }),
+			]),
+		);
+		// 第 2、3 行没有块「起」在那儿,但 title 跨过去了 —— 压掉的话 desc 会落进 title 身上。
+		expect(rows(doc)).toEqual(["1", "4"]);
+	});
+
+	it("空白块占得住自己那一行(画布上「要留白就摆一个空白块」靠的就是它)", async () => {
+		const { doc } = await render(
+			liveCard([
+				builtin("a", "title", { row: 1, column: 1, span: 12 }),
+				custom("blank", "", { row: 2, column: 1, span: 12 }),
+				builtin("b", "desc", { row: 3, column: 1, span: 12 }),
+			]),
+		);
+		// 空的自定义块照样是块:压行不收它,下面那块也就不会被提上来。
+		expect(rows(doc)).toEqual(["1", "2", "3"]);
+	});
+
+	it("同一行内仍按数组先后(叠放的缺省档是数组顺序,排序不许把它打乱)", async () => {
+		const { doc } = await render(
+			liveCard([
+				builtin("a", "title", { row: 2, column: 1, span: 12 }),
+				builtin("b", "desc", { row: 2, column: 1, span: 12 }),
+			]),
+		);
+		expect(labels(doc)).toEqual(["title", "desc"]);
+	});
+});
+
+describe("皮肤渲染器 — 自定义块的占位符", () => {
+	it("文本位置的 {a.b} 换成字段值并转义", async () => {
+		const { html } = await render(liveCard([custom("c", "<div>{up.name} · {live.area}</div>")]), {
+			props: { ...liveProps, username: '<b>坏"名字</b>' },
+		});
+		expect(html).toContain("&lt;b&gt;坏&quot;名字&lt;/b&gt; · 虚拟主播");
+	});
+
+	it("取不到的字段给空串(不留 {xxx}、不出 undefined)", async () => {
+		const { html } = await render(liveCard([custom("c", "<div>[{live.nope}]</div>")]));
+		expect(html).toContain("<div>[]</div>");
+		expect(html).not.toContain("undefined");
+	});
+
+	it("src 的整值占位符:图片字段才替换", async () => {
+		const { html } = await render(
+			liveCard([custom("c", '<img src="{up.face}"><img src="{live.title}">')]),
+		);
+		expect(html).toContain(`src="${liveProps.userface}"`);
+		expect(html).toContain('<img src="">');
+		expect(html).not.toContain(liveProps.data.title);
+	});
+
+	it("src 的资产名走 resolveAsset;解析不出退透明占位 GIF", async () => {
+		const card = liveCard([custom("c", '<img src="asset:bg.png">')]);
+		const withAsset = await render(card, { resolveAsset: () => "data:image/png;base64,AAA" });
+		expect(withAsset.html).toContain('src="data:image/png;base64,AAA"');
+		const without = await render(card);
+		expect(without.html).toContain(`src="${BLOCKED_IMG_PLACEHOLDER}"`);
+	});
+
+	it("字面地址的 src 原样带过", async () => {
+		const { html } = await render(
+			liveCard([custom("c", '<img src="http://i0.hdslb.com/bfs/x.jpg">')]),
+		);
+		expect(html).toContain('src="http://i0.hdslb.com/bfs/x.jpg"');
+	});
+
+	/**
+	 * 内联 svg(2026-09-14 补的那一片)在渲染器这头**不需要任何特殊处理**:清洗过的
+	 * 节点树经 innerHTML 原样铺进去,`<text>` 里的占位符走同一条替换。这条钉的是
+	 * 「原样」—— 大小写敏感的 `linearGradient` / `viewBox` 与 `url(#g)` 引用一个都不许被
+	 * 渲染链路(Vue SSR / 模板字符串替换)动过,否则浏览器画不出来。
+	 */
+	it("内联 svg 原样铺进去,text 里的占位符照替换", async () => {
+		const svg =
+			'<svg viewBox="0 0 24 24"><defs><linearGradient id="g"><stop offset="0" stop-color="#fb7299"></stop></linearGradient></defs><path d="M2 2h20v20H2z" fill="url(#g)"></path><text x="12" y="23">{up.name}</text></svg>';
+		const { html } = await render(liveCard([custom("c", svg)]), {
+			props: { ...liveProps, username: "霓虹<up>" },
+		});
+		expect(html).toContain(
+			'<svg viewBox="0 0 24 24"><defs><linearGradient id="g"><stop offset="0" stop-color="#fb7299"></stop></linearGradient></defs><path d="M2 2h20v20H2z" fill="url(#g)"></path><text x="12" y="23">霓虹&lt;up&gt;</text></svg>',
+		);
+	});
+});
+
+/**
+ * **皮肤自定义旋钮**(ADR-0014 决策 16 的 🔗,2026-09-14)。渲染器这头只做一件事:
+ * 把**用户拧过的**旋钮注成外框上的 `--bn-knob-<key>`。
+ *
+ * 「没拧过就不注」是这一片的要害,不是省字节:默认皮肤的玻璃白纱各卡基线不同
+ * (直播 .82 / SC .75 / 锐评 .86),一注就只能注一个数、三档当场塌成一档。不注的时候
+ * 皮肤 CSS 里 `var(--bn-knob-glass-opacity,.75)` 的兜底生效,像素一个都不动。
+ */
+describe("皮肤渲染器 — 皮肤旋钮", () => {
+	const card = (): CardSkinCard =>
+		liveCard([builtin("t", "title", { row: 1, column: 1, span: 12 })]);
+	const KNOBS: readonly CardSkinKnob[] = [
+		{ key: "accent", label: "主色", type: "color", default: "#fb7299" },
+		{ key: "radius", label: "圆角", type: "number", default: 12, min: 0, max: 48, unit: "px" },
+		{ key: "glass-opacity", label: "白纱", type: "number", default: 0.82, min: 0, max: 1 },
+		{ key: "shadow", label: "阴影", type: "switch", default: true, on: "block", off: "none" },
+	];
+	const frameStyle = (doc: Document): string =>
+		doc.querySelector("[data-bn~='frame']")?.getAttribute("style") ?? "";
+
+	it("拧过的旋钮注成 --bn-knob-<key>", async () => {
+		const { doc } = await render(card(), {
+			knobs: KNOBS,
+			knobValues: { accent: "#00f0ff", radius: 20, shadow: false },
+		});
+		const style = frameStyle(doc);
+		expect(style).toContain("--bn-knob-accent:#00f0ff");
+		expect(style).toContain("--bn-knob-radius:20px");
+		expect(style).toContain("--bn-knob-shadow:none");
+	});
+
+	it("没拧过的旋钮一个字都不注 —— 声明里的默认值不进 CSS", async () => {
+		const { doc } = await render(card(), { knobs: KNOBS, knobValues: { accent: "#00f0ff" } });
+		const style = frameStyle(doc);
+		expect(style).toContain("--bn-knob-accent");
+		expect(style).not.toContain("--bn-knob-radius");
+		expect(style).not.toContain("--bn-knob-glass-opacity");
+		expect(style).not.toContain("--bn-knob-shadow");
+	});
+
+	it("皮肤没声明旋钮 / 用户没拧过 → 外框上没有 knob 变量", async () => {
+		expect(frameStyle((await render(card())).doc)).not.toContain("--bn-knob-");
+		expect(frameStyle((await render(card(), { knobs: KNOBS })).doc)).not.toContain("--bn-knob-");
+	});
+
+	/**
+	 * 存储里的值可能被手改,也可能是旧包换了旋钮类型留下的残值。这一条钉「脏值不注」——
+	 * 注进去的话,`--bn-knob-x:red;background:url(…)` 就是一次凭空多出来的取网。
+	 */
+	it("脏值 / 越界 / 对不上类型的值一律不注,合法的那些照注", async () => {
+		const { doc } = await render(card(), {
+			knobs: KNOBS,
+			knobValues: {
+				accent: "url(https://evil.example/x.png)",
+				radius: 999,
+				shadow: "block",
+				"glass-opacity": 0.5,
+			},
+		});
+		const style = frameStyle(doc);
+		expect(style).not.toContain("evil.example");
+		expect(style).not.toContain("--bn-knob-accent");
+		expect(style).not.toContain("--bn-knob-radius");
+		expect(style).not.toContain("--bn-knob-shadow");
+		expect(style).toContain("--bn-knob-glass-opacity:0.5");
+	});
+
+	it("声明里没有的 key 就算存了覆盖也不注 —— 注入面只认声明", async () => {
+		const { doc } = await render(card(), {
+			knobs: KNOBS,
+			knobValues: { "not-declared": "red" },
+		});
+		expect(frameStyle(doc)).not.toContain("--bn-knob-not-declared");
+	});
+});
+
+describe("皮肤渲染器 — CSS 翻译", () => {
+	it("块级:self → 该块的 class;内部挂点 → 该块内的 ~= 选择器", async () => {
+		const { css } = await render(
+			liveCard([
+				builtin(
+					"hd",
+					"avatar",
+					{ row: 1, column: 1, span: 12 },
+					{
+						// 清洗器的产物:每条选择器都以 self 起头(挂点在它后面),其余段随便写。
+						css: '[data-bn="self"]{padding-top:4px}[data-bn="self"] [data-bn="avatar"]{border-radius:0}[data-bn="self"] .hud > span{color:red}',
+					},
+				),
+			]),
+		);
+		expect(css).toContain(".bn-blk-hd{padding-top:4px}");
+		// `~=` 不是 `=`:图廊的单图容器挂的是 "pics pic" 双挂点,`=` 选不中。
+		// 挂点前面**不再**补 `.bn-blk-hd `:前缀由清洗器归一进 self,翻译只换写法。
+		expect(css).toContain('.bn-blk-hd [data-bn~="avatar"]{border-radius:0}');
+		expect(css).not.toContain(".bn-blk-hd .bn-blk-hd");
+		expect(css).toContain(".bn-blk-hd .hud > span{color:red}");
+	});
+
+	it("根级:frame / glass 原样落在 DOM 上的挂点(只换成 ~=)", async () => {
+		const { css } = await render(
+			liveCard([builtin("t", "title", { row: 1, column: 1, span: 12 })], {
+				css: '[data-bn="frame"]{padding:0}[data-bn="glass"]{height:190px}',
+			}),
+		);
+		expect(css).toContain('[data-bn~="frame"]{padding:0}');
+		expect(css).toContain('[data-bn~="glass"]{height:190px}');
+	});
+
+	it("没画出来的块不留 CSS", async () => {
+		const { css } = await render(
+			liveCard([
+				builtin(
+					"t",
+					"title",
+					{ row: 1, column: 1, span: 12 },
+					{ showIf: "stats.hasFansChanged", css: '[data-bn="self"]{color:red}' },
+				),
+			]),
+		);
+		expect(css).not.toContain("bn-blk-t");
+	});
+});
+
+describe("皮肤渲染器 — 皮肤变量", () => {
+	const card = (): CardSkinCard =>
+		liveCard([builtin("t", "title", { row: 1, column: 1, span: 12 })]);
+
+	/**
+	 * 玻璃两项已整个退成皮肤旋钮(2026-09-14):props 上不再带玻璃,外框也不再从 props 翻
+	 * 任何玻璃变量 —— 值只走 `knobValues` 那条路。**没拧过就一个字都不注**,各卡的白纱靠
+	 * 皮肤 CSS 里自己的兜底;注了就只能注一个数,三档基线当场塌成一档。
+	 */
+	it("玻璃不从 props 翻成变量 —— 外框上一个玻璃变量都没有", async () => {
+		const { doc } = await render(card());
+		const style = doc.querySelector("[data-bn~='frame']")?.getAttribute("style") ?? "";
+		expect(style).not.toContain("--bn-knob-glass-opacity");
+		expect(style).not.toContain("--bn-knob-glass-blur");
+		expect(style).not.toContain("--bn-card-glass");
+	});
+
+	// 决策 15 的 🔗:渐变起 / 止色退出变量表,外框上一个字都不该再注 —— 注了的话皮肤
+	// 作者会以为 `var(--bn-card-color-start)` 还能用,写出「本机好看、换台机器变色」的皮肤。
+	it("渐变起 / 止色不再注成变量", async () => {
+		const { doc } = await render(card());
+		const style = doc.querySelector("[data-bn~='frame']")?.getAttribute("style") ?? "";
+		expect(style).not.toContain("--bn-card-color-start");
+		expect(style).not.toContain("--bn-card-color-end");
+	});
+
+	it("皮肤路径的玻璃层不再 inline 白纱 / 模糊 / 阴影 / 内边距 —— 全由皮肤 CSS 的 glass 规则写", async () => {
+		const { doc } = await render(card());
+		const style = doc.querySelector("[data-bn~='glass']")?.getAttribute("style") ?? "";
+		for (const prop of ["background", "backdrop-filter", "box-shadow", "padding", "min-width"]) {
+			expect(style).not.toContain(`${prop}:`);
+		}
+		// 网格那几句还在(它们是皮肤路径自己注的)。
+		expect(style).toContain("display:grid");
+	});
+
+	it("皮肤路径的外框不再自画底色 —— 底色由皮肤 CSS 的 frame 规则写(决策 15 的 🔗)", async () => {
+		const { doc } = await render(card());
+		const style = doc.querySelector("[data-bn~='frame']")?.getAttribute("style") ?? "";
+		expect(style).not.toMatch(/(^|;)background:/);
+	});
+
+	/**
+	 * **这一条从前是反过来写的**(钉「用户背景图注成 `--bn-card-bg-image`」)。那是决策 15
+	 * 2026-09-13 设计稿阶段的形状;**2026-09-14 主人把背景图整个退役成皮肤自己的 `image`
+	 * 旋钮**之后,同一条 🔗 明写「旧皮肤里引用 `--bn-card-bg-image` 的那句**从此没人喂**」
+	 * —— 代码却一直还在喂,而全仓零条 CSS 读它(默认外框读的是
+	 * `var(--bn-knob-wallpaper, <渐变>)`)。2026-09-19 补上那最后一步。
+	 *
+	 * 为什么值得单独钉一条「**不**注」:留着它不是白费几个字节,而是会骗人 —— 主人正是
+	 * 看见这个变量,才把「背景图旋钮不生效」错怪到改名头上(真因在面板预览那条路)。
+	 * 判据:把 `frameVariables` 里那句注入加回去,这条红。
+	 *
+	 * `backgroundImage` 这个 props 字段 2026-09-20 已随整条链删掉(所以这里要 cast 才塞得
+	 * 进去)。**塞一个仍是有意的**:这条守的是「外框不许读它」,而不是「类型里没有它」——
+	 * 类型删了不妨碍谁把那句 `p.backgroundImage` 写回来,写回来这条就红。
+	 */
+	it("退役的 cardStyle 背景图不再注进外框 —— 背景图走 wallpaper 旋钮", async () => {
+		const { doc } = await render(card(), {
+			props: { ...liveProps, backgroundImage: "data:image/png;base64,AAAA" } as LiveCardProps,
+		});
+		const style = doc.querySelector("[data-bn~='frame']")?.getAttribute("style") ?? "";
+		expect(style).not.toContain("--bn-card-bg-image");
+		expect(style).not.toContain("data:image/png;base64,AAAA");
+		// 外框底色仍归皮肤 CSS 的 frame 规则写(决策 15 的 🔗),这一条顺带守着。
+		expect(style).not.toMatch(/(^|;)background:/);
+	});
+
+	it("SC / 上舰的档位色注成 --bn-card-tier-color / -end", async () => {
+		const fixture = CARD_FIXTURES.find((f) => f.name === "sc-high");
+		if (!fixture) throw new Error("夹具表里没有 sc-high");
+		const props = (await fixture.build()).props as unknown as SkinRenderOptions<"sc">["props"];
+		const { vnode } = renderSkinnedCard({
+			kind: "sc",
+			card: {
+				width: 290,
+				blocks: [
+					{ id: "a", kind: "builtin", builtin: "price", grid: { row: 1, column: 1, span: 12 } },
+				],
+			},
+			props,
+		});
+		const html = await renderToString(createSSRApp({ render: () => vnode }));
+		const style =
+			new JSDOM(html).window.document.querySelector("[data-bn~='frame']")?.getAttribute("style") ??
+			"";
+		expect(style).toContain(`--bn-card-tier-color:${props.bgColor[0]}`);
+		expect(style).toContain(`--bn-card-tier-color-end:${props.bgColor[1]}`);
+	});
+});
+
+describe("皮肤渲染器 — 整张一个块的卡种", () => {
+	it("词云:外框 + 网格 + 一个 body 块", async () => {
+		const fixture = CARD_FIXTURES.find((f) => f.name === "wordcloud");
+		if (!fixture) throw new Error("夹具表里没有 wordcloud");
+		const input = await fixture.build();
+		const wc = DEFAULT_CARD_SKIN.cards.wordcloud;
+		if (!wc) throw new Error("默认皮肤缺词云卡");
+		const { vnode } = renderSkinnedCard({
+			kind: "wordcloud",
+			card: wc,
+			props: input.props as never,
+		});
+		const html = await renderToString(createSSRApp({ render: () => vnode }));
+		const doc = new JSDOM(html).window.document;
+		expect(labels(doc)).toEqual(["body"]);
+		expect(doc.querySelector("#wordCloudCanvas")).not.toBeNull();
+	});
+});
+
+describe("皮肤渲染器 — 资产变量与皮肤字体(ADR-0014 决策 13 的 🔗)", () => {
+	const DATA = "data:image/png;base64,AAAA";
+	const resolveAsset = (name: string) => (name === "assets/tex.png" ? DATA : undefined);
+
+	it("块的 assets 表注成 wrapper 上的 --bn-asset-<名>,值是 data URL", async () => {
+		const { doc } = await render(
+			liveCard([
+				builtin(
+					"t",
+					"title",
+					{ row: 1, column: 1, span: 12 },
+					{ assets: { tex: "asset:assets/tex.png" } },
+				),
+			]),
+			{ resolveAsset },
+		);
+		const style = doc.querySelector(".bn-blk-t")?.getAttribute("style") ?? "";
+		expect(style).toContain(`--bn-asset-tex:url("${DATA}")`);
+	});
+
+	it("解析不出的资产不注变量(不留一个指向空的 url)", async () => {
+		const { doc } = await render(
+			liveCard([
+				builtin(
+					"t",
+					"title",
+					{ row: 1, column: 1, span: 12 },
+					{ assets: { nope: "asset:assets/nope.png" } },
+				),
+			]),
+			{ resolveAsset },
+		);
+		expect(doc.querySelector(".bn-blk-t")?.getAttribute("style") ?? "").not.toContain(
+			"--bn-asset-nope",
+		);
+	});
+
+	it("根的 assets 表注在 frame 上", async () => {
+		const { doc } = await render(
+			liveCard([builtin("t", "title", { row: 1, column: 1, span: 12 })], {
+				assets: { hud: "asset:assets/tex.png" },
+			}),
+			{ resolveAsset },
+		);
+		const style = doc.querySelector('[data-bn~="frame"]')?.getAttribute("style") ?? "";
+		expect(style).toContain(`--bn-asset-hud:url("${DATA}")`);
+	});
+
+	it("皮肤字体注成 @font-face;解析不出的那款跳过", async () => {
+		const FONT = "data:font/woff2;base64,BBBB";
+		const { css } = await render(
+			liveCard([builtin("t", "title", { row: 1, column: 1, span: 12 })]),
+			{
+				fonts: [
+					{ family: "Orbitron", asset: "asset:assets/orb.woff2" },
+					{ family: "Ghost", asset: "asset:assets/ghost.woff2" },
+				],
+				resolveAsset: (name) => (name === "assets/orb.woff2" ? FONT : undefined),
+			},
+		);
+		expect(css).toContain(`@font-face{font-family:"Orbitron";src:url("${FONT}")}`);
+		expect(css).not.toContain("Ghost");
+	});
+
+	it("skinAssetRefs 把 html 的 src、根与块的 assets 表、皮肤字体一起列出", async () => {
+		const { skinAssetRefs } = await import("../render-skin");
+		const card = liveCard(
+			[
+				custom("c", '<img src="asset:assets/pic.png">'),
+				builtin(
+					"t",
+					"title",
+					{ row: 2, column: 1, span: 12 },
+					{ assets: { tex: "asset:assets/tex.png" } },
+				),
+			],
+			{ assets: { hud: "asset:assets/hud.png" } },
+		);
+		const refs = skinAssetRefs(card, [{ family: "Orbitron", asset: "asset:assets/orb.woff2" }]);
+		expect(refs.sort()).toEqual(
+			["assets/hud.png", "assets/orb.woff2", "assets/pic.png", "assets/tex.png"].sort(),
+		);
+	});
+});
+
+describe("皮肤渲染器 — 出血(辉光的那圈余量)", () => {
+	/** 一份只有 live 一种卡的清单,好让 `renderCardWithSkin` 吃得下。 */
+	const manifestWith = (card: CardSkinCard) =>
+		({ ...DEFAULT_CARD_SKIN, cards: { ...DEFAULT_CARD_SKIN.cards, live: card } }) as never;
+
+	const fullHtml = async (over: Partial<CardSkinCard> = {}) =>
+		await renderCardWithSkin(
+			"live",
+			liveProps as never,
+			manifestWith(liveCard([builtin("cover", "cover", { row: 1, column: 1, span: 12 })], over)),
+		);
+
+	it("不写出血 = 页面一个字节都不多 —— 存量皮肤出的图不变", async () => {
+		const html = await fullHtml();
+		expect(html).not.toContain('data-bn="bleed"');
+		expect(html).toMatch(/html\s*\{\s*width:\s*600px/);
+	});
+
+	it("写了出血:html 宽 = 卡宽 + 两边的量,卡自己还是 600", async () => {
+		const html = await fullHtml({ bleed: { size: 28, color: "#07091a" } });
+		// 656 而不是 600 —— 外壳里 `* { box-sizing: border-box }`,html 宽度若不把出血
+		// 算进去,padding 会**从里面吃掉** 56px,卡当场被挤成 544。这一条就是那道守卫。
+		expect(html).toMatch(/html\s*\{\s*width:\s*656px/);
+		const doc = new JSDOM(html).window.document;
+		const bleed = doc.querySelector('[data-bn="bleed"]');
+		expect(bleed).not.toBeNull();
+		expect(bleed?.getAttribute("style")).toContain("padding:28px");
+		expect(bleed?.getAttribute("style")).toContain("#07091a");
+	});
+
+	it("出血在外框**外面**,不是里面 —— 在里面的话辉光照样被裁", async () => {
+		const html = await fullHtml({ bleed: { size: 12, color: "#123456" } });
+		const doc = new JSDOM(html).window.document;
+		const frame = doc.querySelector('[data-bn="frame"]');
+		expect(frame?.closest('[data-bn="bleed"]')).not.toBeNull();
+		expect(doc.querySelector('[data-bn="bleed"] [data-bn="bleed"]')).toBeNull();
+	});
+
+	it("出血 0 与不写同义 —— 不留一层没用的壳", async () => {
+		const html = await fullHtml({ bleed: { size: 0, color: "#07091a" } });
+		expect(html).not.toContain('data-bn="bleed"');
+		expect(html).toMatch(/html\s*\{\s*width:\s*600px/);
+	});
+});
+
+/**
+ * **块的层次**(ADR-0014,2026-09-15 主人拍板「重叠是特性,补层次控制」)。
+ *
+ * 网格本来就允许两个块的列区间相交,缺的是「叠了谁在上面」—— 不写层次时那只看块在
+ * 数组里的先后。`grid.z` 把它变成一个说得出口的数。
+ *
+ * 两条不肯让步的:
+ * 1. **不写就一个字节都不多**。存量皮肤(含出厂默认)一个 `z` 都没有,多注一句 `z-index:0`
+ *    就是 23 份字节基准与像素门一起红,而外观根本没变。
+ * 2. **写了才压过手写的 CSS**。`[data-bn="self"]{z-index:5}` 一直是放行的;这个字段不写
+ *    就不碰它,写了由 inline 接管(inline 恒赢,清洗器又一律摘 `!important`)。
+ */
+describe("皮肤渲染器 — 块的层次", () => {
+	// 层次住**格子层**:内层的 z-index 只在自己那一格里排序,压不过隔壁块(ADR-0018)。
+	const at = (doc: Document, id: string) =>
+		doc.querySelector(`[data-cell="${id}"]`)?.getAttribute("style") ?? "";
+
+	it("写了层次 → wrapper 上注 z-index", async () => {
+		const { doc } = await render(
+			liveCard([
+				builtin(
+					"t",
+					"title",
+					{ row: 1, column: 1, span: 6 },
+					{ grid: { row: 1, column: 1, span: 6, z: 3 } },
+				),
+			]),
+		);
+		expect(at(doc, "t")).toContain("z-index:3");
+	});
+
+	it("不写层次 → 样式里一个 z-index 都没有(存量皮肤出的图逐字节不变)", async () => {
+		const { doc } = await render(liveCard([builtin("t", "title", { row: 1, column: 1, span: 6 })]));
+		expect(at(doc, "t")).not.toContain("z-index");
+	});
+
+	it("层次 0 也不注 —— 面板把它调回 0 就是删键,等于「没声明」,交还给 CSS 与数组顺序", async () => {
+		const { doc } = await render(
+			liveCard([
+				builtin(
+					"t",
+					"title",
+					{ row: 1, column: 1, span: 6 },
+					{ grid: { row: 1, column: 1, span: 6, z: 0 } },
+				),
+			]),
+		);
+		expect(at(doc, "t")).not.toContain("z-index");
+	});
+
+	it("两个块占同一片格子时各注各的 —— 这才是「谁压谁」说得出口", async () => {
+		const { doc } = await render(
+			liveCard([
+				builtin(
+					"a",
+					"title",
+					{ row: 1, column: 1, span: 12 },
+					{ grid: { row: 1, column: 1, span: 12, z: 1 } },
+				),
+				custom("b", "<div>角标</div>", { row: 1, column: 9, span: 4 }),
+			]),
+		);
+		expect(at(doc, "a")).toContain("z-index:1");
+		expect(at(doc, "b")).not.toContain("z-index");
+	});
+});

@@ -1,12 +1,12 @@
 import type { StatsRoastResponse, StatsRoastResult } from "@bilibili-notify/contract";
+import { Avatar, Icon } from "@bilibili-notify/ui";
 import { useMutation } from "@tanstack/react-query";
 import { useEffect } from "react";
-import { Avatar } from "../../components/atoms";
-import { Icon } from "../../components/icons";
+import { AI_PURPLE } from "../../config/colors";
 import { api } from "../../services/api";
 import { localTzOffset } from "../../services/stats";
 import { RoastPushBox } from "./RoastPushBox";
-import { ROAST_PURPLE, RoastShell, roastError } from "./RoastShell";
+import { RoastShell, roastError } from "./RoastShell";
 
 interface UpMeta {
 	name: string;
@@ -38,14 +38,14 @@ export function RoastCard({ days, meta }: { days: number; meta: Map<string, UpMe
 	const result: StatsRoastResult | undefined = roast.data?.ok ? roast.data.result : undefined;
 
 	const nameOf = (uid: string) => meta.get(uid)?.name ?? `UID ${uid}`;
-	const colorOf = (uid: string) => meta.get(uid)?.color ?? ROAST_PURPLE;
+	const colorOf = (uid: string) => meta.get(uid)?.color ?? AI_PURPLE;
 	const avatarOf = (uid: string) => meta.get(uid)?.avatar;
 
 	return (
 		<RoastShell
 			title="AI 锐评 · 鸽王 vs 勤奋 UP"
 			subtitle="把统计数据交给智能女仆,自动评榜并生成可推送的周报"
-			pendingText="女仆正在阅读数据并撰写锐评…"
+			pendingText="女仆正在阅读数据并撰写锐评"
 			isPending={roast.isPending}
 			err={roastError(roast)}
 			onRun={() => roast.mutate()}
@@ -74,7 +74,7 @@ export function RoastCard({ days, meta }: { days: number; meta: Map<string, UpMe
 									className="rounded-bn-card border border-bn-border-subtle bg-bn-surface-muted px-3 py-2.5"
 								>
 									<div
-										className="mb-1.5 flex items-center gap-1 text-[10.5px] font-bold"
+										className="mb-1.5 flex items-center gap-1 text-bn-2xs font-bold"
 										style={{ color }}
 									>
 										<Glyph size={12} />
@@ -87,11 +87,11 @@ export function RoastCard({ days, meta }: { days: number; meta: Map<string, UpMe
 											size={24}
 											url={avatarOf(who.uid)}
 										/>
-										<span className="truncate text-sm font-bold text-bn-text-primary">
+										<span className="truncate text-bn-base font-bold text-bn-text-primary">
 											{nameOf(who.uid)}
 										</span>
 									</div>
-									<div className="text-[11.5px] leading-relaxed text-bn-text-tertiary">
+									<div className="text-bn-xs leading-relaxed text-bn-text-tertiary">
 										{who.reason}
 									</div>
 								</div>
@@ -100,7 +100,10 @@ export function RoastCard({ days, meta }: { days: number; meta: Map<string, UpMe
 						{result.roast.length ? (
 							<div className="flex flex-col gap-1.5">
 								{result.roast.map((r) => (
-									<div key={`${r.uid}-${r.comment}`} className="flex gap-2 text-xs leading-relaxed">
+									<div
+										key={`${r.uid}-${r.comment}`}
+										className="flex gap-2 text-bn-sm leading-relaxed"
+									>
 										<span
 											className="mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full"
 											style={{ background: colorOf(r.uid) }}
@@ -124,15 +127,15 @@ export function RoastCard({ days, meta }: { days: number; meta: Map<string, UpMe
 					</div>
 
 					<div className="rounded-bn-card border border-bn-border-subtle p-3.5">
-						<div className="text-xs font-bold text-bn-text-primary">综合勤奋度评分</div>
-						<div className="mb-3 text-[10.5px] text-bn-text-secondary">
+						<div className="text-bn-sm font-bold text-bn-text-primary">综合勤奋度评分</div>
+						<div className="mb-3 text-bn-2xs text-bn-text-secondary">
 							由女仆依据本期数据评分 · 0–100
 						</div>
 						<div className="flex flex-col gap-2.5">
 							{[...result.scores]
 								.sort((a, b) => b.score - a.score)
 								.map((s) => (
-									<div key={s.uid} className="flex items-center gap-2 text-[11.5px]">
+									<div key={s.uid} className="flex items-center gap-2 text-bn-xs">
 										<span className="w-16 truncate font-semibold text-bn-text-primary">
 											{nameOf(s.uid)}
 										</span>
@@ -142,7 +145,7 @@ export function RoastCard({ days, meta }: { days: number; meta: Map<string, UpMe
 												style={{ width: `${s.score}%`, background: colorOf(s.uid) }}
 											/>
 										</div>
-										<span className="w-7 text-right font-mono font-bold text-bn-text-tertiary">
+										<span className="w-7 text-right tabular-nums font-bold text-bn-text-tertiary">
 											{s.score}
 										</span>
 									</div>

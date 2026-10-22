@@ -62,6 +62,17 @@ export const PROVIDER_BRANDS: Record<AIProviderId, ProviderBrand> = {
 			</>
 		),
 	},
+	// 云括号:阿里云标志性的一对方括弧,中间一道横线。
+	bailian: {
+		color: "#ff6a00",
+		glyph: (
+			<>
+				<path {...stroke} d="M9.2 4.5H7A3.5 3.5 0 0 0 3.5 8v8A3.5 3.5 0 0 0 7 19.5h2.2" />
+				<path {...stroke} d="M14.8 4.5H17A3.5 3.5 0 0 1 20.5 8v8a3.5 3.5 0 0 1-3.5 3.5h-2.2" />
+				<path {...stroke} d="M9.5 12h5" />
+			</>
+		),
+	},
 	// 鲸鱼:身子 + 尾鳍 + 一柱水花。
 	deepseek: {
 		color: "#4d6bfe",
@@ -79,7 +90,8 @@ export const PROVIDER_BRANDS: Record<AIProviderId, ProviderBrand> = {
 	},
 	// 兜底:一组可自由拨动的滑杆。
 	custom: {
-		color: "#94a3b8",
+		// 「没有厂商」不是一个品牌色 —— 同表里其余几格是各家的真 logo 色,这一格是兜底。
+		color: "var(--color-bn-inactive)",
 		glyph: (
 			<>
 				<path {...stroke} d="M5 7h14M5 12h14M5 17h14" />
@@ -92,7 +104,22 @@ export const PROVIDER_BRANDS: Record<AIProviderId, ProviderBrand> = {
 };
 
 /** 单个服务商的方形标识。`size` 是外框边长。 */
-export function ProviderLogo({ id, size = 26 }: { id: AIProviderId; size?: number }) {
+export function ProviderLogo({
+	id,
+	size = 26,
+	tone,
+}: {
+	id: AIProviderId;
+	size?: number;
+	/**
+	 * 盖掉品牌主色。留空走品牌色 —— 平常就该是品牌色。
+	 *
+	 * 同 `PlatformIcon` 的 `tone`:品牌色是中等亮度,摆在皮肤画的实心强调块上会撞,
+	 * 而这些标记是单色的(描边吃 `currentColor`),整枚一起糊掉。左栏选中项喂
+	 * `currentColor` 让它跟着文字色走。
+	 */
+	tone?: string;
+}) {
 	const brand = PROVIDER_BRANDS[id];
 	return (
 		<svg
@@ -101,7 +128,7 @@ export function ProviderLogo({ id, size = 26 }: { id: AIProviderId; size?: numbe
 			viewBox="0 0 24 24"
 			role="presentation"
 			aria-hidden="true"
-			style={{ color: brand.color }}
+			style={{ color: tone ?? brand.color }}
 		>
 			{brand.glyph}
 		</svg>

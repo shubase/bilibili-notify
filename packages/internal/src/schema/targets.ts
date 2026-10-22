@@ -1,33 +1,57 @@
 import { z } from "zod";
+import {
+	CONNECTION_PLATFORMS,
+	type ConnectionPlatform,
+	DIRECT_CONNECTORS,
+	ONEBOT_FORWARD_MIN_TIMEOUT_MS,
+	ONEBOT_IMAGE_MIN_TIMEOUT_MS,
+	PUSH_TARGET_KINDS,
+	PUSH_TARGET_SCOPES,
+	WEBHOOK_PLATFORMS,
+} from "../constants.js";
+import { ExtensionIdSchema } from "./extension-manifest.js";
+
+// 会话种类、目标形态、连接器这三个词表的本体都在零依赖的 constants —— 类型从那边导,
+// 别在这儿用 `z.infer` 再声明一份同义的联合(两份就会漂,而它们是同一件事)。
+export type { DirectConnector, PushTargetKind, PushTargetScope } from "../constants.js";
 
 /**
- * Push 目标平台。Adapter 矩阵按 platform 分发：
- * - `onebot`：独立端 OneBot v11 HTTP adapter
- * - `webhook`：任意 HTTP POST JSON
- * - `koishi-bot`：仅 koishi 薄壳侧实现，通过 `ctx.bots[botPlatform]` 调 koishi bot
- *   `sendMessage`；独立端不注册该 platform adapter
- * - `astrbot`：仅 AstrBot 插件侧实现，通过 Python 壳按 `unified_msg_origin` 投递
- * - `qq-official`：独立端 QQ 官方机器人(q.qq.com)WS 网关 adapter,频道/群/C2C
+ * **连接**能连的平台 —— 闭集。Adapter 矩阵按它分发(server 侧 `apps/server/src/platforms/`)。
+ * 加一档要配齐:constants 的 {@link CONNECTION_PLATFORMS} 加个名字 + 一份 config schema +
+ * 一个 server adapter + 一排面板控件。词表住零依赖的 constants 是为了前端也拿得到。
+ * - `onebot`:OneBot v11(HTTP / 正向 WS / 反向 WS)
+ * - `qq-official`:QQ 官方机器人(q.qq.com)WS 网关,频道/群/C2C
+ * - `feishu` / `dingtalk` / `wecom` / `generic`:走出站 webhook 那一族(见
+ *   {@link WEBHOOK_PLATFORMS})。它们**不是**四个 adapter,是同一个 adapter 的四种
+ *   报文方言 —— 「怎么连」由 `connector` 说了算,这里只说「连到哪」。
+ *
+ * **推送目标那一格不用这个**,见 {@link TargetPlatformSchema}。
  */
-export const PushTargetPlatformSchema = z.union([
-	z.literal("onebot"),
-	z.literal("webhook"),
-	z.literal("koishi-bot"),
-	z.literal("astrbot"),
-	z.literal("qq-official"),
-]);
-export type PushTargetPlatform = z.infer<typeof PushTargetPlatformSchema>;
+export const ConnectionPlatformSchema = z.enum(CONNECTION_PLATFORMS);
 
-export const PushTargetScopeSchema = z.enum(["group", "private", "channel"]);
-export type PushTargetScope = z.infer<typeof PushTargetScopeSchema>;
+/**
+ * **推送目标**的平台 —— 开放词表,只要求非空。
+ *
+ * 为什么这一侧是开的:桥(koishi / astrbot)把它自己接着的平台驮进来,那份清单是**运行时**
+ * 才知道的(桥上装了 telegram 插件就有 telegram)。写成闭集等于「必须先改一次词表、发一版,
+ * 主人才能收到 telegram 的推送」—— 而那条平台上一行我们自己的代码都不需要。
+ *
+ * 代价是拼错不再有人拦(`onebot` 写成 `oneboot` 照样存得下)。这个代价是认下的:目标本来就
+ * 只由面板与桥两条路创建,两条都不会手打平台名;而闭集换来的那点保护,在桥接上之后会变成
+ * 「合法的平台进不来」这种更贵的毛病。真要挡的是**能力**(能不能 @全体、收不收得到回复),
+ * 那由能力位承载,不是平台名。
+ */
+export const TargetPlatformSchema = z.string().min(1);
+
+export const PushTargetScopeSchema = z.enum(PUSH_TARGET_SCOPES);
 
 /* -------------------------------------------------------------------------- */
-/* Adapter (connection-level) configs                                         */
+/* Connection-level configs                                                   */
 /* -------------------------------------------------------------------------- */
 
 /**
- * OneBot 适配器三种连接方式(`transport`)共用的字段。
- * `transport` 是连接属性,只活在 adapter config 里 —— PushTarget / session 不受影响。
+ * OneBot 连接的三种连法(`transport`)共用的字段。
+ * `transport` 是连接属性,只活在连接的 config 里 —— PushTarget 不受影响。
  */
 const onebotCommonConfigShape = {
 	accessToken: z.string().optional(),
@@ -35,6 +59,14 @@ const onebotCommonConfigShape = {
 	protocolVersion: z.literal("v11").default("v11"),
 	/** 单次操作总超时（毫秒）。HTTP = 请求超时；WS = 等 echo 响应超时。 */
 	timeoutMs: z.number().int().positive().default(15_000),
+	/**
+	 * 带图普通消息的超时**下限**（毫秒）。协议端要先把图传到 QQ 图床才回响应，实测
+	 * 常超 15s，所以取 `max(timeoutMs, 此值)` 单独放宽。`0` = 关闭放宽，严格按
+	 * `timeoutMs` 走（想让挂掉的 bot 快速失败、别拖住串行发送的后续目标时用）。
+	 */
+	imageMinTimeoutMs: z.number().int().min(0).default(ONEBOT_IMAGE_MIN_TIMEOUT_MS),
+	/** 合并转发（`send_*_forward_msg`）的超时下限（毫秒）。语义同上，`0` = 关闭放宽。 */
+	forwardMinTimeoutMs: z.number().int().min(0).default(ONEBOT_FORWARD_MIN_TIMEOUT_MS),
 	/** 失败时的重试次数（不含首次）。 */
 	retryTimes: z.number().int().min(0).default(0),
 	/** 两次重试之间的等待（毫秒）。 */
@@ -71,52 +103,45 @@ export const OnebotWsConfigSchema = z
 export const OnebotWsReverseConfigSchema = z
 	.object({
 		transport: z.literal("ws-reverse"),
-		/** 独立端为该 adapter 开的 WS 监听端口；bot 连 `ws://<host>:<port>/`。 */
+		/** 独立端为该连接开的 WS 监听端口；bot 连 `ws://<host>:<port>/`。 */
 		port: z.number().int().min(1).max(65_535),
 		...onebotCommonConfigShape,
 	})
 	.strict();
 
 /**
- * OneBot 适配器连接配置 —— 按 `transport` 区分 HTTP / 正向 WS / 反向 WS。
+ * OneBot 连接配置 —— 按 `transport` 区分 HTTP / 正向 WS / 反向 WS。
  *
  * 用 `z.union`(而非 `discriminatedUnion`):http branch 的 `transport` 带
  * `.default("http")`,早期没有 `transport` 字段的旧 adapters.json 条目试到 http
  * branch 时 default 补上 → 旧数据无缝按 http 加载。三 branch 的 `transport` 是互斥
  * literal,新数据只会命中唯一一个 branch,无歧义。
  */
-export const OnebotAdapterConfigSchema = z.union([
+export const OnebotConnectionConfigSchema = z.union([
 	OnebotHttpConfigSchema,
 	OnebotWsConfigSchema,
 	OnebotWsReverseConfigSchema,
 ]);
-export type OnebotAdapterConfig = z.infer<typeof OnebotAdapterConfigSchema>;
-export type OnebotTransport = OnebotAdapterConfig["transport"];
+export type OnebotConnectionConfig = z.infer<typeof OnebotConnectionConfigSchema>;
+export type OnebotTransport = OnebotConnectionConfig["transport"];
 
-export const WebhookProviderSchema = z.enum(["generic", "dingtalk", "feishu", "wecom"]);
-export type WebhookProvider = z.infer<typeof WebhookProviderSchema>;
+/** 词表本体在零依赖的 constants,`WebhookPlatform` 这个类型也从那边导 —— 别在这儿再声明一份。 */
+export const WebhookPlatformSchema = z.enum(WEBHOOK_PLATFORMS);
 
-export const WebhookAdapterConfigSchema = z.object({
+/**
+ * 出站 webhook 的连接配置。
+ *
+ * **这里没有 `provider`** —— 它升格成了 `platform`(见 {@link WEBHOOK_PLATFORMS})。
+ * 老配置里那个字段由 `schema/migration.ts` 提上去并从 config 里摘掉;这一层是非 strict
+ * 的 z.object,所以万一漏了一条,strip 掉也不会让主人开不了机。
+ */
+export const WebhookConnectionConfigSchema = z.object({
 	url: z.url(),
-	/** 协议提供方;旧配置缺省为 generic,保持 bilibili-notify JSON envelope 兼容。 */
-	provider: WebhookProviderSchema.default("generic"),
 	secret: z.string().optional(),
 	/** 自定义 header 例如 Authorization */
 	headers: z.record(z.string(), z.string()).default({}),
 });
-export type WebhookAdapterConfig = z.infer<typeof WebhookAdapterConfigSchema>;
-
-export const KoishiBotAdapterConfigSchema = z.object({
-	/** koishi 内部 bot.platform，例如 'onebot' / 'discord' / 'telegram'。 */
-	botPlatform: z.string().min(1),
-	/** 同 platform 多 bot 时挑 bot。 */
-	selfId: z.string().optional(),
-});
-export type KoishiBotAdapterConfig = z.infer<typeof KoishiBotAdapterConfigSchema>;
-
-// AstrBot 由宿主 Python 壳完成实际投递；连接级配置固定为空对象。
-export const AstrBotAdapterConfigSchema = z.object({}).strict();
-export type AstrBotAdapterConfig = z.infer<typeof AstrBotAdapterConfigSchema>;
+export type WebhookConnectionConfig = z.infer<typeof WebhookConnectionConfigSchema>;
 
 /**
  * QQ 官方机器人公域/私域类型。私域可发原生 markdown,公域只能发模板 markdown ——
@@ -126,16 +151,16 @@ export const QQOfficialBotTypeSchema = z.enum(["public", "private"]);
 export type QQOfficialBotType = z.infer<typeof QQOfficialBotTypeSchema>;
 
 /**
- * QQ 官方机器人(q.qq.com,非 OneBot/NapCat)适配器连接配置。
+ * QQ 官方机器人(q.qq.com,非 OneBot/NapCat)连接配置。
  * 鉴权 appId+appSecret → getAppAccessToken;`sandbox` 切沙箱/正式环境的 wss+REST host。
  */
-export const QQOfficialAdapterConfigSchema = z
+export const QQOfficialConnectionConfigSchema = z
 	.object({
 		appId: z.string().min(1),
 		/**
 		 * 空串 = 尚未配置密钥,**合法可存**(与 onebot 的 `accessToken`、webhook 的
 		 * `secret` 建模一致)。这里曾经是 `.min(1)`,结果脱敏备份把 appSecret 抹成空串
-		 * 后就再也存不回去 —— 恢复直接 ConfigValidationError(scope=adapters)。
+		 * 后就再也存不回去 —— 恢复直接 ConfigValidationError(scope=connections)。
 		 *
 		 * 「要有真密钥才能连」是**连接期**的约束,不是**存储期**的:见
 		 * `platforms/qq-official.ts` 的 isAvailable / reconcile,两处都拒绝空密钥的
@@ -149,192 +174,297 @@ export const QQOfficialAdapterConfigSchema = z
 		logReconnects: z.boolean().default(false),
 	})
 	.strict();
-export type QQOfficialAdapterConfig = z.infer<typeof QQOfficialAdapterConfigSchema>;
+export type QQOfficialConnectionConfig = z.infer<typeof QQOfficialConnectionConfigSchema>;
 
-export const PushAdapterTestStatusSchema = z.object({
+export const ConnectionTestStatusSchema = z.object({
 	ok: z.boolean(),
 	lastCheckedAt: z.string(),
 	latencyMs: z.number().optional(),
 	err: z.string().optional(),
 });
-export type PushAdapterTestStatus = z.infer<typeof PushAdapterTestStatusSchema>;
+export type ConnectionTestStatus = z.infer<typeof ConnectionTestStatusSchema>;
+
+/** 直连连接器 —— 「怎么连」。词表与理由见 constants 的 {@link DIRECT_CONNECTORS}。 */
+export const DirectConnectorSchema = z.enum(DIRECT_CONNECTORS);
 
 /**
- * Push adapter — 平台级的"连接实例"。
+ * Connection — 一条"连接实例"。
  *
- * 类比 Koishi bot 实例：一份 baseUrl/accessToken 一次配置，被多个 PushTarget
+ * 类比一个 bot 实例:一份 baseUrl/accessToken 一次配置,被多个 PushTarget
  * (实际的群/私聊/dashboard 会话) 复用。
+ *
+ * 两根正交的轴:`platform`(连到哪)与 `connector`(怎么连)。`kind` 是**判别子**:
+ * - `direct` —— 我们自己说协议,连接就是一个平台,`platform` 必填;
+ * - `extension` —— 一个拓展提供的连接(对家主动连过来,把它那头的 bot 借给我们)。
+ *   **这一支没有 `platform`**:后面挂着哪些平台是运行时才知道的事,枚举不了。
+ *
+ * **老数据没有 `kind` / `connector`**,由 `schema/migration.ts` 的一次性迁移补上;
+ * 这里刻意不给 default,好让「没迁移过的数据」在 parse 阶段就响,而不是被默认值糊过去。
  */
-const PushAdapterCommonShape = {
+const ConnectionIdentityShape = {
 	id: z.uuid(),
 	name: z.string().min(1),
 	enabled: z.boolean(),
-	testStatus: PushAdapterTestStatusSchema.optional(),
+	testStatus: ConnectionTestStatusSchema.optional(),
 } as const;
 
-const OnebotAdapterSchema = z.object({
-	...PushAdapterCommonShape,
+const ConnectionCommonShape = {
+	...ConnectionIdentityShape,
+	kind: z.literal("direct"),
+	connector: DirectConnectorSchema,
+} as const;
+
+// 每一支把 `connector` 收窄到自己**真走得通**的那几档。收窄不只是为了拦住乱写的配置:
+// 收窄之后 `connection.connector === "webhook"` 才是个判别式,TS 能顺着它把 config
+// narrow 到对应形状 —— 否则每处都得改判 platform,「怎么连」这根轴白提了。
+const OnebotConnectionSchema = z.object({
+	...ConnectionCommonShape,
+	connector: z.enum(["http", "ws", "ws-reverse"]),
 	platform: z.literal("onebot"),
-	config: OnebotAdapterConfigSchema,
+	config: OnebotConnectionConfigSchema,
 });
 
-const WebhookAdapterSchema = z.object({
-	...PushAdapterCommonShape,
-	platform: z.literal("webhook"),
-	config: WebhookAdapterConfigSchema,
+const WebhookConnectionSchema = z.object({
+	...ConnectionCommonShape,
+	connector: z.literal("webhook"),
+	platform: WebhookPlatformSchema,
+	config: WebhookConnectionConfigSchema,
 });
 
-const KoishiBotAdapterSchema = z.object({
-	...PushAdapterCommonShape,
-	platform: z.literal("koishi-bot"),
-	config: KoishiBotAdapterConfigSchema,
-});
-
-export const AstrBotAdapterSchema = z.object({
-	...PushAdapterCommonShape,
-	platform: z.literal("astrbot"),
-	config: AstrBotAdapterConfigSchema,
-});
-export type AstrBotAdapter = z.infer<typeof AstrBotAdapterSchema>;
-
-const QQOfficialAdapterSchema = z.object({
-	...PushAdapterCommonShape,
+const QQOfficialConnectionSchema = z.object({
+	...ConnectionCommonShape,
+	// 官机只有 WS 网关一条路。
+	connector: z.literal("ws"),
 	platform: z.literal("qq-official"),
-	config: QQOfficialAdapterConfigSchema,
+	config: QQOfficialConnectionConfigSchema,
 });
-
-export const PushAdapterSchema = z.discriminatedUnion("platform", [
-	OnebotAdapterSchema,
-	WebhookAdapterSchema,
-	KoishiBotAdapterSchema,
-	AstrBotAdapterSchema,
-	QQOfficialAdapterSchema,
-]);
-export type PushAdapter = z.infer<typeof PushAdapterSchema>;
-
-/* -------------------------------------------------------------------------- */
-/* Target (session-level) — references an adapter                             */
-/* -------------------------------------------------------------------------- */
-
-// P2:.strict() —— 对齐已 strict 的 webhook session。此前
-// non-strict 放任 `gruopId` 之类拼写错被静默忽略,target 无可投递地址却校验
-// 通过、推送悄悄丢。多收一个未知键即报错,让配置拼写错在保存期就暴露。
-export const OnebotSessionSchema = z
-	.object({
-		groupId: z.string().optional(),
-		userId: z.string().optional(),
-		/** 群聊指令权限：普通群成员是否也可以管理本群 B 站订阅；缺省为关闭。 */
-		allowMemberManage: z.boolean().optional(),
-	})
-	.strict();
-export type OnebotSession = z.infer<typeof OnebotSessionSchema>;
-
-export const WebhookSessionSchema = z.object({}).strict();
-export type WebhookSession = z.infer<typeof WebhookSessionSchema>;
-
-export const KoishiBotSessionSchema = z
-	.object({
-		channelId: z.string().optional(),
-		guildId: z.string().optional(),
-		userId: z.string().optional(),
-	})
-	.strict();
-export type KoishiBotSession = z.infer<typeof KoishiBotSessionSchema>;
-
-export const AstrBotSessionSchema = z
-	.object({
-		/** AstrBot 会话稳定定位符，来自 `event.unified_msg_origin`。 */
-		unified_msg_origin: z.string().min(1),
-		/** 展示用宿主平台摘要，例如 aiocqhttp / telegram。 */
-		platform: z.string().optional(),
-		/** 展示用消息类型摘要，例如 group / private / channel。 */
-		messageType: z.string().optional(),
-		/** 展示用会话 ID 摘要；投递仍以 unified_msg_origin 为准。 */
-		sessionId: z.string().optional(),
-		/** 展示用会话名摘要。 */
-		sessionName: z.string().optional(),
-	})
-	.strict();
-export type AstrBotSession = z.infer<typeof AstrBotSessionSchema>;
 
 /**
- * QQ 官方机器人会话。按 target.scope 用不同字段(发送时运行期校验,缺失即拒)。
- * - channel(频道子频道):channelId 必填,guildId 仅面板分组/排错用。
- * - group(群):groupOpenid —— 不透明 id,只能从入站事件捞,用户不可手填群号。
- * - private(C2C 单聊):userOpenid —— 同样从入站事件捞。
+ * 拓展提供的连接(ADR-0012 决策 27 / 45)—— **一个借来的 bot**。
+ *
+ * 与直连同一套操作逻辑:一条连接就是一个 bot,底下的推送目标只填地址。桥那种「一条接入
+ * 驮 N 个 bot」的东西不是连接,是拓展自己的**设置**(`globals.extensions.<id>.settings`),
+ * 新建连接时从它驮着的 bot 里挑一个。
+ *
+ * - **有 `platform`**,开放词表 —— 一个 bot 就是一个平台,这一格从挑中的 bot 上来
+ *   (`ExtensionBotView.platform`)。它曾经刻意没有(决策 27:那时这一支是「一条桥接入」,
+ *   桥后面挂几个平台枚举不了);连接改成一个 bot 之后那个理由不再成立,而目标的
+ *   `platform` 正要从这里抄。
+ * - **没有 `connector`** —— 全仓读它的地方无一例外在问「是不是 webhook」(见
+ *   {@link isWebhookConnection})。给这一支塞一格,唯一作用是让那些读点编译得过。
+ * - **config 不由核心定形状** —— 归拓展自己那份 zod(决策 19)。它是拓展在 `listBots`
+ *   里交出来的那份,面板原样存回;核心的 schema 不该认识任何一个拓展 id。
+ *
+ * 判别子仍是 `kind`,不拿 `extensionId` 直接当 `kind` —— 那样判别键不可枚举,
+ * `discriminatedUnion` 第一次 parse 就抛。
  */
-export const QQOfficialSessionSchema = z
-	.object({
-		guildId: z.string().optional(),
-		channelId: z.string().optional(),
-		groupOpenid: z.string().optional(),
-		userOpenid: z.string().optional(),
-	})
-	.strict();
-export type QQOfficialSession = z.infer<typeof QQOfficialSessionSchema>;
+const ExtensionConnectionSchema = z.object({
+	...ConnectionIdentityShape,
+	kind: z.literal("extension"),
+	/** 哪个拓展负责它 —— **同时就是分发键**(由宿主填,拓展不自报,见决策 28)。 */
+	extensionId: ExtensionIdSchema,
+	/** 这个 bot 在哪个平台上 —— 开放词表,同 {@link TargetPlatformSchema}。 */
+	platform: TargetPlatformSchema,
+	config: z.unknown(),
+});
+
+const DirectConnectionSchema = z
+	.discriminatedUnion("platform", [
+		OnebotConnectionSchema,
+		WebhookConnectionSchema,
+		QQOfficialConnectionSchema,
+	])
+	.superRefine((connection, ctx) => {
+		// `connector` 与 OneBot 的 `config.transport` 在这一版是**同一件事的两份**
+		// (前者是新轴,后者是它今天的住处)。两份就会漂,所以这里把它钉死:漂了当场
+		// 报错,而不是让面板显示 ws、实际按 http 连。`config.transport` 那份会在
+		// 收口那步删掉,到时这条 refine 一并退休。
+		if (connection.platform === "onebot" && connection.connector !== connection.config.transport) {
+			ctx.addIssue({
+				code: "custom",
+				path: ["connector"],
+				message: `connector ${connection.connector} does not match config.transport ${connection.config.transport}`,
+			});
+		}
+	});
+
+/**
+ * 一条连接 —— 判别子是 `kind`。
+ *
+ * zod 4 认嵌套的判别联合,所以直连那侧仍按 `platform` 逐支收窄(config 跟着 narrow),
+ * 外面再按 `kind` 分岔;两层各自的错误消息都还是精确的那一条,不会退化成一大坨
+ * union 错误。
+ */
+export const ConnectionSchema = z.discriminatedUnion("kind", [
+	DirectConnectionSchema,
+	ExtensionConnectionSchema,
+]);
+export type Connection = z.infer<typeof ConnectionSchema>;
+
+/** 直连那一支 —— 有 `platform`、由我们自己说协议。 */
+export type DirectConnection = z.infer<typeof DirectConnectionSchema>;
+/** 拓展那一支 —— 没有 `platform`,config 归拓展自己校验。 */
+export type ExtensionConnection = z.infer<typeof ExtensionConnectionSchema>;
+
+/** webhook 那一档直连 —— 单向投递,没有会话。 */
+export type WebhookConnection = Extract<DirectConnection, { connector: "webhook" }>;
+
+/**
+ * 这条连接是不是**这个平台的直连**。
+ *
+ * 三个 adapter 开头那句「不是我的就退回去」都问这个。桥接入恒 false —— 它没有单一平台,
+ * 该由桥那套实现处理。narrow 之后 `connection.config` 也跟着收窄到那一档的形状。
+ */
+export function isConnectionOn<P extends ConnectionPlatform>(
+	connection: Connection,
+	platform: P,
+): connection is Extract<DirectConnection, { platform: P }> {
+	return connection.kind === "direct" && connection.platform === platform;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Target (session-level) — references a connection                           */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * 推送目标的两支形态。
+ *
+ * - `session` —— 一个**会话**:群、私聊、子频道。有地址,能收到入站消息,人手配。
+ * - `endpoint` —— 一个**单向出站终点**:地址烧在连接的 config 里,目标本身只是个壳。
+ *
+ * 它眼下与 `platform` 一一对应(webhook 那族 ⇔ endpoint),看着冗余 —— 但 `target.platform`
+ * 将来要开放(桥驮来的平台枚举不了),那之后按平台名比会全线恒假。判据先搬到这根轴上。
+ */
+export const PushTargetKindSchema = z.enum(PUSH_TARGET_KINDS);
 
 const PushTargetCommonShape = {
 	id: z.uuid(),
 	name: z.string().min(1),
-	adapterId: z.uuid(),
+	connectionId: z.uuid(),
 	scope: PushTargetScopeSchema,
 	enabled: z.boolean(),
-	/** 生命周期由 adapter 管理的系统目标；用户不直接编辑 / 删除。 */
-	managedBy: z.literal("adapter").optional(),
+	/** 生命周期由所属连接管理的系统目标；用户不直接编辑 / 删除。 */
+	managedBy: z.literal("connection").optional(),
 	/**
 	 * 最近一次显式 `/api/push/test` 或真实业务推送的结果。
-	 * 跟 PushAdapter.testStatus 互相独立 — 此处只反映会话级 (group/userId) 是否可达,
-	 * adapter 连接级状态在 PushAdapter.testStatus。
+	 * 跟 Connection.testStatus 互相独立 — 此处只反映会话级 (group/userId) 是否可达,
+	 * 连接级状态在 Connection.testStatus。
 	 */
-	testStatus: PushAdapterTestStatusSchema.optional(),
+	testStatus: ConnectionTestStatusSchema.optional(),
 } as const;
 
-const OnebotPushTargetSchema = z.object({
+/**
+ * 会话目标的**地址**。
+ *
+ * 这一格原先是每个平台一套 `session` 对象:OneBot 的 `{groupId?, userId?}`、官机的
+ * `{guildId?, channelId?, groupOpenid?, userOpenid?}`。四个可选字段配一个 `scope`,
+ * 于是「scope 说 group、填的却是 userId」这种状态在类型上完全合法,只能在发送时才发现。
+ *
+ * 收成一格之后那一整类状态不存在了:**scope 说是哪种会话,address 就是那个会话的地址**。
+ * OneBot 是群号 / QQ 号,官机是群 openid / 用户 openid / 子频道 id,将来接进来的平台
+ * 自然也只需要填这一格 —— 不用再为它抄一份 session schema。
+ *
+ * 它是**必填键**(可以是空串:目标先建后填是正常用法),空不空的检查留在发送那一刻 ——
+ * 那里本来就要检查,而在保存期拒绝会让「先建个壳、回头再填群号」这种用法做不到。
+ */
+const PushTargetSessionShape = {
+	kind: z.literal("session"),
+	address: z.string(),
+	/** Whether ordinary OneBot group members may manage this group's subscriptions. */
+	allowMemberManage: z.boolean().optional(),
+	/**
+	 * 上一级容器的地址。今天只有官机的频道用得上(`guildId`:子频道挂在频道服务器下)。
+	 *
+	 * 留着这一格不是为了官机 —— 是 Telegram 那种**论坛话题**:话题 id 是每个超级群自己
+	 * 一套的小整数,只存话题 id 的话,两个不同群里的同号话题会折成同一个地址。
+	 */
+	parentAddress: z.string().optional(),
+	// 这里**没有 `botId`**:一条连接就是一个 bot,连接 id 已经说全了 —— 对拓展连接也一样
+	// (ADR-0012 决策 45)。它曾经为「一条桥连接驮好几个 bot」留过一格,那件事现在住在
+	// 连接那一层。
+} as const;
+
+/**
+ * 两支目标 —— 判别子是 {@link PushTargetKindSchema} 的 `kind`,**不是 platform**。
+ *
+ * 曾经是按 platform 判别的:onebot / webhook / qq-official 三支,各带一份自己的 session
+ * schema。地址收成一格之后两支会话目标的形状**一模一样**,而 `target.platform` 又开放了
+ * —— zod 的 discriminatedUnion 要求判别键取值可枚举,继续按 platform 判别会在**第一次
+ * parse 时**抛 `Invalid discriminated union option`:门禁全绿,炸在开机读配置那一刻。
+ */
+const SessionPushTargetSchema = z.object({
 	...PushTargetCommonShape,
-	platform: z.literal("onebot"),
-	session: OnebotSessionSchema,
+	...PushTargetSessionShape,
+	platform: TargetPlatformSchema,
 });
 
-const WebhookPushTargetSchema = z.object({
+const EndpointPushTargetSchema = z.object({
 	...PushTargetCommonShape,
-	platform: z.literal("webhook"),
-	session: WebhookSessionSchema,
-});
-
-const KoishiBotPushTargetSchema = z.object({
-	...PushTargetCommonShape,
-	platform: z.literal("koishi-bot"),
-	session: KoishiBotSessionSchema,
-});
-
-export const AstrBotPushTargetSchema = z.object({
-	...PushTargetCommonShape,
-	platform: z.literal("astrbot"),
-	session: AstrBotSessionSchema,
-});
-export type AstrBotPushTarget = z.infer<typeof AstrBotPushTargetSchema>;
-
-const QQOfficialPushTargetSchema = z.object({
-	...PushTargetCommonShape,
-	platform: z.literal("qq-official"),
-	session: QQOfficialSessionSchema,
+	kind: z.literal("endpoint"),
+	platform: TargetPlatformSchema,
 });
 
 export const PushTargetSchema = z
-	.discriminatedUnion("platform", [
-		OnebotPushTargetSchema,
-		WebhookPushTargetSchema,
-		KoishiBotPushTargetSchema,
-		AstrBotPushTargetSchema,
-		QQOfficialPushTargetSchema,
-	])
+	.discriminatedUnion("kind", [SessionPushTargetSchema, EndpointPushTargetSchema])
 	.superRefine((target, ctx) => {
-		if (target.managedBy === "adapter" && target.platform !== "webhook") {
+		if (target.managedBy === "connection" && target.kind !== "endpoint") {
 			ctx.addIssue({
 				code: "custom",
 				path: ["managedBy"],
-				message: "managedBy is only supported for webhook targets",
+				message: "managedBy is only supported for endpoint targets",
 			});
 		}
 	});
 export type PushTarget = z.infer<typeof PushTargetSchema>;
+
+/**
+ * 群目标的「群地址」—— 与入站帧里的 `groupId` 是同一个值(OneBot 是群号,官机是群
+ * openid)。
+ *
+ * 它以前是一对反函数里的一头:另一头 `groupSessionFor` 按平台造 session。两头各写一个
+ * switch,新平台在一处落进 default、另一处被列出来,群配了却永远匹配不上还不报错 ——
+ * `group-address.test.ts` 就是为这件事写的。地址收成一格之后**那对函数塌成了取一个字段**,
+ * 反函数没有了,失配也就无从发生。
+ *
+ * 剩下的判断只有一句:`scope` 说它是群,`address` 才是群地址。私聊目标的 address 是
+ * 那个人的 id,不是群。
+ */
+export function groupAddressOf(target: PushTarget): string | undefined {
+	if (target.kind !== "session" || target.scope !== "group") return undefined;
+	return target.address || undefined;
+}
+
+/**
+ * 「谁」的两坐标 —— 平台 + 地址。
+ *
+ * 主人身份以前塌成一个裸字符串,比对就是字符串相等。`onebot` 的 QQ 号与官机的 C2C
+ * openid 是**两个命名空间**,撞上就等于认错人 —— 代码注释一直这么写着,却从来没有
+ * 东西校验过它。**没有 bot 那一格**:同一个平台上同一个地址就是同一个人,两个 bot 各看
+ * 见他一次也还是他(一条连接就是一个 bot,ADR-0012 决策 45)。
+ */
+export interface ChatIdentity {
+	platform: string;
+	/** 这个人在该平台上的地址:OneBot 是 QQ 号,官机是 C2C openid。 */
+	address: string;
+}
+
+/**
+ * 主人那个私聊目标的两坐标。不是私聊会话就没有 ——
+ * 群目标的 `address` 是群,拿它当主人身份等于把整个群当成主人。
+ */
+export function chatIdentityOf(target: PushTarget | undefined): ChatIdentity | undefined {
+	if (target?.kind !== "session" || target.scope !== "private" || !target.address) return undefined;
+	return { platform: target.platform, address: target.address };
+}
+
+/**
+ * 两个坐标是不是同一个人。平台与地址都必须给且相等 —— 少一格就不认,而不是当通配。
+ */
+export function sameChatIdentity(
+	a: ChatIdentity | undefined,
+	b: ChatIdentity | undefined,
+): boolean {
+	if (!a || !b) return false;
+	if (!a.platform || !a.address) return false;
+	return a.platform === b.platform && a.address === b.address;
+}

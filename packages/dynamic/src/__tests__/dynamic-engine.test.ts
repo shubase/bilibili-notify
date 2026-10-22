@@ -20,7 +20,11 @@
 import type { CommentaryGenerator } from "@bilibili-notify/ai";
 import type { BilibiliAPI } from "@bilibili-notify/api";
 import type { ImageRenderer } from "@bilibili-notify/image";
-import type { MessageBus, ServiceContext } from "@bilibili-notify/internal";
+import {
+	defaultMessageKindLayout,
+	type MessageBus,
+	type ServiceContext,
+} from "@bilibili-notify/internal";
 import { beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import { DynamicEngine, type DynamicEngine as DynamicEngineType } from "../dynamic-engine";
 import type { PushLike, SubItemView, SubscriptionsView } from "../push-like";
@@ -34,12 +38,12 @@ const cronMock = vi.hoisted(() => {
 	const instances: Array<{
 		cronTime: string;
 		onTick: () => void;
-		running: boolean;
+		isActive: boolean;
 		startCount: number;
 		stopCount: number;
 	}> = [];
 	class FakeCronJob {
-		running = false;
+		isActive = false;
 		startCount = 0;
 		stopCount = 0;
 		constructor(
@@ -54,11 +58,11 @@ const cronMock = vi.hoisted(() => {
 			instances.push(this);
 		}
 		start(): void {
-			this.running = true;
+			this.isActive = true;
 			this.startCount++;
 		}
 		stop(): void {
-			this.running = false;
+			this.isActive = false;
 			this.stopCount++;
 		}
 	}
@@ -146,7 +150,7 @@ function makeItem(opts: {
 	drawPicsWithDims?: Array<{ url: string; width: number; height: number }>;
 	/** 真 DYNAMIC_TYPE_DRAW 形态:图在 major.draw.items[].src(非 opus.pics)。 */
 	drawItems?: string[];
-	/** 视频动态(DYNAMIC_TYPE_AV)的 major.archive.jump_url;引擎按此算 {url}/BV。 */
+	/** 视频动态(DYNAMIC_TYPE_AV)的 major.archive.jump_url;引擎按此算链接部件 / BV。 */
 	videoJumpUrl?: string;
 }): Dynamic {
 	const text = opts.text ?? "";
@@ -199,6 +203,15 @@ function resp(items: Dynamic[], code = 0, message = "ok"): AllDynamicInfo {
 	};
 }
 
+/** 测试里写的订阅视图:除 uid / uname 外都可省,messageLayout 缺省为默认版式。 */
+type SeedView = Partial<SubItemView> & Pick<SubItemView, "uid" | "uname">;
+const viewOf = (v: SeedView): SubItemView => ({
+	messageLayout: defaultMessageKindLayout("dynamic"),
+	...v,
+});
+const viewsOf = (subs: Record<string, SeedView>): SubscriptionsView =>
+	Object.fromEntries(Object.entries(subs).map(([k, v]) => [k, viewOf(v)]));
+
 interface EngineBag {
 	engine: DynamicEngineType;
 	getAllDynamic: ReturnType<typeof vi.fn>;
@@ -221,8 +234,7 @@ function makeEngine(
 		config?: Partial<import("../dynamic-engine").DynamicEngineConfig>;
 		withImage?: boolean;
 		withAi?: boolean;
-		subs?: SubscriptionsView | null;
-		pickCardBackground?: import("../push-like").PickCardBackground;
+		subs?: Record<string, SeedView> | null;
 	} = {},
 ): EngineBag {
 	const { ctx, logs } = makeServiceCtx();
@@ -257,8 +269,7 @@ function makeEngine(
 			filter: { enable: false },
 			...over.config,
 		},
-		getSubs: () => over.subs ?? null,
-		pickCardBackground: over.pickCardBackground,
+		getSubs: () => (over.subs ? viewsOf(over.subs) : null),
 	});
 	return {
 		engine,
@@ -274,9 +285,10 @@ function makeEngine(
 }
 
 /** seed 一个已订阅 uid(timeline + subManager),供 detectDynamics 白盒直调。 */
-function seed(engine: DynamicEngineType, uid: string, timeline: number, sub?: SubItemView): void {
+/** 播种一个订阅视图;messageLayout 缺省为默认版式(宿主恒填,引擎不再有旧路径)。 */
+function seed(engine: DynamicEngineType, uid: string, timeline: number, sub?: SeedView): void {
 	priv(engine).dynamicTimelineManager.set(uid, timeline);
-	priv(engine).dynamicSubManager.set(uid, sub ?? { uid, uname: "UP" });
+	priv(engine).dynamicSubManager.set(uid, viewOf(sub ?? { uid, uname: "UP" }));
 }
 
 const detect = (engine: DynamicEngineType): Promise<void> => priv(engine).detectDynamics();
@@ -335,11 +347,15 @@ describe("DynamicEngine.detectDynamics — API 错误处理", () => {
 					e.event === "engine-error" &&
 					(e.args as unknown[]).some((a) => String(a).includes("账号被风控")),
 			).length;
+		// 数的是**风控告警**这一种私聊,不是私聊总数 —— 恢复时还会来一条「已恢复」
+		// (见「故障恢复通知」),拿总数计这条边沿会被那条报喜带偏。
+		const dmCount = () =>
+			b.push.sendPrivateMsg.mock.calls.filter((c) => String(c[0]).includes("账号被风控")).length;
 
 		b.getAllDynamic.mockResolvedValue(resp([], -352, "risk"));
 		await detect(b.engine); // 进入风控
 		await detect(b.engine); // 仍风控 → 抑制
-		expect(b.push.sendPrivateMsg).toHaveBeenCalledTimes(1);
+		expect(dmCount()).toBe(1);
 		expect(ecCount()).toBe(1);
 		expect(b.logs.filter((l) => l.level === "error" && l.msg.includes("账号被风控"))).toHaveLength(
 			1,
@@ -352,7 +368,7 @@ describe("DynamicEngine.detectDynamics — API 错误处理", () => {
 
 		b.getAllDynamic.mockResolvedValue(resp([], -352, "risk"));
 		await detect(b.engine); // 再次风控 → 边沿复位后重新告警
-		expect(b.push.sendPrivateMsg).toHaveBeenCalledTimes(2);
+		expect(dmCount()).toBe(2);
 		expect(ecCount()).toBe(2);
 	});
 
@@ -381,6 +397,166 @@ describe("DynamicEngine.detectDynamics — API 错误处理", () => {
 		expect(b.push.sendPrivateMsg).toHaveBeenCalledTimes(2);
 		expect(riskEc()).toBe(2);
 	});
+
+	/**
+	 * 告警私聊发不出去,不能把退避重启一起带走。
+	 *
+	 * `handleApiError` 开头就把 cron stop 了,重新起来全靠末尾那句
+	 * `scheduleDetectorRestart`。中间的私聊要是裸 `await` 并抛了出去,后面的
+	 * emit 和排程都不执行 —— 动态检测就此永久停摆,而日志上只有一条私聊失败。
+	 */
+	it("告警私聊抛错 → 退避重启照排(不因通知失败而永久停摆)", async () => {
+		const b = makeEngine();
+		seed(b.engine, "1", 0);
+		b.push.sendPrivateMsg.mockRejectedValue(new Error("master unreachable"));
+		b.getAllDynamic.mockResolvedValue(resp([], 4101132, "请求数据发生错误"));
+		await detect(b.engine);
+		expect(b.logs.some((l) => l.msg.includes("后自动重试动态检测"))).toBe(true);
+	});
+
+	it("风控告警私聊抛错 → 退避重启同样照排", async () => {
+		const b = makeEngine();
+		seed(b.engine, "1", 0);
+		b.push.sendPrivateMsg.mockRejectedValue(new Error("master unreachable"));
+		b.getAllDynamic.mockResolvedValue(resp([], -352, "risk"));
+		await detect(b.engine);
+		expect(b.logs.some((l) => l.msg.includes("后自动重试动态检测"))).toBe(true);
+	});
+});
+
+/**
+ * 「到底好没好」—— 故障恢复得跟报错走同一条通道说一声。
+ *
+ * 瞬时错误(4101132 这类未知码)会退避 300s 后自动重启检测,日志里三条
+ * 「将在 300s 后自动重试」「退避计时到,重启动态检测」「动态检测任务已启动」
+ * 一应俱全 —— 但全都只进日志。主人在 IM 里只收到一条报错,之后再无下文,分不清
+ * 是自己好了还是还坏着只是不再吭声。
+ *
+ * 报「恢复」的时机是**下一次真正拉取成功**,不是「重启了检测任务」:重启只是把
+ * cron 挂回去,故障还在的话下一轮照样失败,那时候说"好了"就是骗人。
+ *
+ * 恢复通知只走私聊,不发 `engine-error` —— 那个事件在独立端会点亮 AlertShell 的
+ * 红色告警面板,拿它报喜语义是反的。
+ */
+describe("DynamicEngine — 故障恢复通知", () => {
+	it("瞬时错误恢复后私聊说一声,并带上此前的错误码", async () => {
+		const b = makeEngine();
+		seed(b.engine, "1", 0);
+
+		b.getAllDynamic.mockResolvedValue(resp([], 4101132, "请求数据发生错误"));
+		await detect(b.engine);
+		expect(b.push.sendPrivateMsg).toHaveBeenCalledTimes(1);
+
+		b.getAllDynamic.mockResolvedValue(resp([]));
+		await detect(b.engine);
+		expect(b.push.sendPrivateMsg).toHaveBeenCalledTimes(2);
+		const msg = String(b.push.sendPrivateMsg.mock.calls[1][0]);
+		expect(msg).toContain("恢复");
+		expect(msg).toContain("4101132");
+	});
+
+	it("从没坏过的成功拉取不发恢复通知(否则每个 cron tick 刷一条)", async () => {
+		const b = makeEngine();
+		seed(b.engine, "1", 0);
+		b.getAllDynamic.mockResolvedValue(resp([]));
+		await detect(b.engine);
+		await detect(b.engine);
+		expect(b.push.sendPrivateMsg).not.toHaveBeenCalled();
+	});
+
+	it("恢复只报一次,后续成功拉取保持安静", async () => {
+		const b = makeEngine();
+		seed(b.engine, "1", 0);
+		b.getAllDynamic.mockResolvedValue(resp([], 4101132, "请求数据发生错误"));
+		await detect(b.engine);
+		b.getAllDynamic.mockResolvedValue(resp([]));
+		await detect(b.engine); // 恢复 → 报一次
+		await detect(b.engine); // 已经好了 → 不该再报
+		await detect(b.engine);
+		expect(b.push.sendPrivateMsg).toHaveBeenCalledTimes(2);
+	});
+
+	it("瞬时错误连续失败只告警一次(与风控边沿对称,不每 300s 打扰一次)", async () => {
+		const b = makeEngine();
+		seed(b.engine, "1", 0);
+		b.getAllDynamic.mockResolvedValue(resp([], 4101132, "请求数据发生错误"));
+		await detect(b.engine);
+		await detect(b.engine);
+		await detect(b.engine);
+		expect(b.push.sendPrivateMsg).toHaveBeenCalledTimes(1);
+		expect(
+			b.emits.filter(
+				(e) =>
+					e.event === "engine-error" &&
+					(e.args as unknown[]).some((a) => String(a).includes("4101132")),
+			),
+		).toHaveLength(1);
+	});
+
+	it("错误码变了 → 当作新故障重新告警", async () => {
+		const b = makeEngine();
+		seed(b.engine, "1", 0);
+		b.getAllDynamic.mockResolvedValue(resp([], 4101132, "请求数据发生错误"));
+		await detect(b.engine);
+		b.getAllDynamic.mockResolvedValue(resp([], -509, "限流"));
+		await detect(b.engine);
+		expect(b.push.sendPrivateMsg).toHaveBeenCalledTimes(2);
+	});
+
+	it("风控解除同样私聊说一声", async () => {
+		const b = makeEngine();
+		seed(b.engine, "1", 0);
+		b.getAllDynamic.mockResolvedValue(resp([], -352, "risk"));
+		await detect(b.engine);
+		expect(b.push.sendPrivateMsg).toHaveBeenCalledTimes(1);
+
+		b.getAllDynamic.mockResolvedValue(resp([]));
+		await detect(b.engine);
+		expect(b.push.sendPrivateMsg).toHaveBeenCalledTimes(2);
+		expect(String(b.push.sendPrivateMsg.mock.calls[1][0])).toContain("风控");
+	});
+
+	it("风控与瞬时错误同时挂着 → 恢复报一条,两样都说到", async () => {
+		const b = makeEngine();
+		seed(b.engine, "1", 0);
+		b.getAllDynamic.mockResolvedValue(resp([], -352, "risk"));
+		await detect(b.engine); // riskControlled 置位
+		b.getAllDynamic.mockResolvedValue(resp([], 4101132, "请求数据发生错误"));
+		await detect(b.engine); // transientErrorCode 也置位(风控边沿不清)
+
+		b.getAllDynamic.mockResolvedValue(resp([]));
+		await detect(b.engine);
+		const recovery = b.push.sendPrivateMsg.mock.calls.filter((c) => String(c[0]).includes("恢复"));
+		expect(recovery).toHaveLength(1);
+		expect(String(recovery[0][0])).toContain("风控");
+		expect(String(recovery[0][0])).toContain("4101132");
+	});
+
+	it("跨 -101 后恢复:不拿陈旧错误码报喜(登录恢复由上层 auth-restored 负责)", async () => {
+		const b = makeEngine();
+		seed(b.engine, "1", 0);
+		b.getAllDynamic.mockResolvedValue(resp([], 4101132, "请求数据发生错误"));
+		await detect(b.engine); // DM #1:报错
+		b.getAllDynamic.mockResolvedValue(resp([], -101, "not login"));
+		await detect(b.engine); // 独立 episode,-101 不发 DM
+		b.getAllDynamic.mockResolvedValue(resp([]));
+		await detect(b.engine); // 成功,但这是登录恢复,不该由这里报喜
+		expect(b.push.sendPrivateMsg).toHaveBeenCalledTimes(1);
+	});
+
+	it("恢复通知发不出去不能打断本轮动态推送", async () => {
+		const b = makeEngine();
+		seed(b.engine, "1", 0);
+		b.getAllDynamic.mockResolvedValue(resp([], 4101132, "请求数据发生错误"));
+		await detect(b.engine);
+
+		// 私聊通道自己坏了(master 不可达 / 适配器抛错)。恢复通知是锦上添花,
+		// 绝不能因为它发不出去就把这一轮真正要推的动态吞掉。
+		b.push.sendPrivateMsg.mockRejectedValue(new Error("master unreachable"));
+		b.getAllDynamic.mockResolvedValue(resp([makeItem({ uid: 1, pubTs: 1000 })]));
+		await detect(b.engine);
+		expect(b.push.broadcastDynamic).toHaveBeenCalled();
+	});
 });
 
 /**
@@ -406,10 +582,10 @@ describe("DynamicEngine — 登录失效时不再报第二遍", () => {
 	it("收到 auth-lost 立刻停 cron —— 别等下一轮再去白撞一次 -101", () => {
 		const b = makeEngine(oneSub);
 		b.engine.start();
-		expect(cronMock.instances[0]?.running).toBe(true);
+		expect(cronMock.instances[0]?.isActive).toBe(true);
 
 		b.trigger("auth-lost");
-		expect(cronMock.instances[0]?.running).toBe(false);
+		expect(cronMock.instances[0]?.isActive).toBe(false);
 	});
 
 	it("auth-lost 之后才落地的那一轮撞上 -101,不再报 engine-error", async () => {
@@ -476,7 +652,7 @@ describe("DynamicEngine — 登录失效时不再报第二遍", () => {
 
 		b.trigger("auth-restored");
 
-		expect(cronMock.instances.at(-1)?.running).toBe(true);
+		expect(cronMock.instances.at(-1)?.isActive).toBe(true);
 	});
 });
 
@@ -610,7 +786,12 @@ describe("DynamicEngine.detectDynamics — 时间线 / 订阅过滤", () => {
 		expect(priv(b.engine).dynamicTimelineManager.get("2")).toBe(300);
 		// uid1 失败 → 锚点停在 0,下轮重试,绝不静默越过(不丢动态)。
 		expect(priv(b.engine).dynamicTimelineManager.get("1")).toBe(0);
-		expect(b.push.broadcastDynamic).toHaveBeenCalledWith("2", expect.anything(), expect.anything());
+		expect(b.push.broadcastDynamic).toHaveBeenCalledWith(
+			"2",
+			expect.anything(),
+			expect.anything(),
+			expect.anything(),
+		);
 	});
 
 	it("DY1:锚点单调,绝不回退(已 push 过的更新 pub_ts 不倒退)", async () => {
@@ -642,6 +823,18 @@ describe("DynamicEngine.detectDynamics — 推送形态", () => {
 		expect(segments[0]?.type).toBe("image");
 	});
 
+	// per-UP 的皮肤 id 要一路走到 generateDynamicCard —— 断在哪一跳都是
+	// 「选得动、存得住、就是不生效」那一族,而且全绿。
+	it("per-UP 皮肤 id 进 colorOptions;样式没启用时也只多这一个键", async () => {
+		const b = makeEngine({ withImage: true });
+		b.generateDynamicCard.mockResolvedValue(Buffer.from("png"));
+		b.getAllDynamic.mockResolvedValue(resp([makeItem({ uid: 1, pubTs: 1000 })]));
+		seed(b.engine, "1", 0, { uid: "1", uname: "U1", cardSkin: "k5aaa-b0a710" });
+		await detect(b.engine);
+		// 验红:把 dynamic-engine.ts 里那句 `cardSkin: sub?.cardSkin` 删掉,这条红。
+		expect(b.generateDynamicCard.mock.calls[0]?.[1]).toEqual({ cardSkin: "k5aaa-b0a710" });
+	});
+
 	it("有 image + 有 AI → 段含 image + AI 点评文本", async () => {
 		const b = makeEngine({ withImage: true, withAi: true });
 		b.generateDynamicCard.mockResolvedValue(Buffer.from("png"));
@@ -654,7 +847,12 @@ describe("DynamicEngine.detectDynamics — 推送形态", () => {
 			text?: string;
 		}>;
 		expect(segments.some((s) => s.type === "image")).toBe(true);
-		expect(segments.some((s) => s.type === "text" && s.text === "这条很有意思")).toBe(true);
+		// 默认版式:AI 点评后跟链接部件,同条内以换行连接。
+		expect(
+			segments.some(
+				(s) => s.type === "text" && s.text === `这条很有意思\nhttps://t.bilibili.com/id-1`,
+			),
+		).toBe(true);
 	});
 
 	it("无 image 实例 → 纯文字段降级", async () => {
@@ -693,6 +891,42 @@ describe("DynamicEngine.detectDynamics — 推送形态", () => {
 		await detect(b.engine);
 		expect(b.push.broadcastDynamic).toHaveBeenCalledTimes(2);
 		expect(b.push.broadcastDynamic.mock.calls[1]?.[2]).toBe("dynamic-images");
+	});
+
+	it("主卡与图集是同一次推送:两次 broadcast 带同一个 pushId;下一条动态换新的", async () => {
+		const b = makeEngine({ config: { imageGroup: { enable: true, forward: false } } });
+		b.getAllDynamic.mockResolvedValue(
+			resp([
+				makeItem({
+					uid: 1,
+					pubTs: 1000,
+					type: "DYNAMIC_TYPE_DRAW",
+					drawPics: ["http://a/1.jpg", "http://a/2.jpg"],
+				}),
+				makeItem({
+					uid: 1,
+					pubTs: 2000,
+					type: "DYNAMIC_TYPE_DRAW",
+					drawPics: ["http://a/3.jpg", "http://a/4.jpg"],
+				}),
+			]),
+		);
+		seed(b.engine, "1", 0);
+		await detect(b.engine);
+		const calls = b.push.broadcastDynamic.mock.calls as Array<
+			[string, unknown, string, { pushId?: string } | undefined]
+		>;
+		expect(calls.map((c) => c[2])).toEqual([
+			"dynamic",
+			"dynamic-images",
+			"dynamic",
+			"dynamic-images",
+		]);
+		const ids = calls.map((c) => c[3]?.pushId);
+		expect(ids[0]).toMatch(/^[0-9a-f-]{36}$/);
+		expect(ids[1]).toBe(ids[0]);
+		expect(ids[3]).toBe(ids[2]);
+		expect(ids[2]).not.toBe(ids[0]);
 	});
 
 	it("图组发送失败 → 主卡已发出,锚点仍推进(不因附属图组失败而重发主卡 + 重复 @全体)", async () => {
@@ -759,7 +993,7 @@ describe("DynamicEngine.detectDynamics — 推送形态", () => {
 		seed(b.engine, "1", 0);
 		await detect(b.engine);
 		const call = b.push.broadcastDynamic.mock.calls[1];
-		expect((call?.[1]?.[0] as { images: unknown[] }).images).toEqual([
+		expect((call?.[1]?.[0] as { images: unknown[] } | undefined)?.images).toEqual([
 			{ url: "http://a/1.jpg", width: 800, height: 600 },
 		]);
 	});
@@ -780,7 +1014,7 @@ describe("DynamicEngine.detectDynamics — 推送形态", () => {
 		seed(b.engine, "1", 0);
 		await detect(b.engine);
 		const call = b.push.broadcastDynamic.mock.calls[1];
-		expect((call?.[1]?.[0] as { forward: boolean }).forward).toBe(false);
+		expect((call?.[1]?.[0] as { forward: boolean } | undefined)?.forward).toBe(false);
 	});
 
 	it("imageGroupForward=true + 多张图 → image-group segment 的 forward 为 true", async () => {
@@ -799,7 +1033,7 @@ describe("DynamicEngine.detectDynamics — 推送形态", () => {
 		seed(b.engine, "1", 0);
 		await detect(b.engine);
 		const call = b.push.broadcastDynamic.mock.calls[1];
-		expect((call?.[1]?.[0] as { forward: boolean }).forward).toBe(true);
+		expect((call?.[1]?.[0] as { forward: boolean } | undefined)?.forward).toBe(true);
 	});
 
 	it("imageGroupForward=true 但只有 1 张图 → forward 强制 false(单图合并转发无意义)", async () => {
@@ -818,7 +1052,7 @@ describe("DynamicEngine.detectDynamics — 推送形态", () => {
 		seed(b.engine, "1", 0);
 		await detect(b.engine);
 		const call = b.push.broadcastDynamic.mock.calls[1];
-		expect((call?.[1]?.[0] as { forward: boolean }).forward).toBe(false);
+		expect((call?.[1]?.[0] as { forward: boolean } | undefined)?.forward).toBe(false);
 	});
 
 	it("per-UP imageGroupEnable=false 覆盖全局 true → 不推图集", async () => {
@@ -896,7 +1130,7 @@ describe("DynamicEngine.detectDynamics — 推送形态", () => {
 		seed(b.engine, "1", 0, { uid: "1", uname: "UP", imageGroupForward: true });
 		await detect(b.engine);
 		const call = b.push.broadcastDynamic.mock.calls[1];
-		expect((call?.[1]?.[0] as { forward: boolean }).forward).toBe(true);
+		expect((call?.[1]?.[0] as { forward: boolean } | undefined)?.forward).toBe(true);
 	});
 });
 
@@ -906,25 +1140,27 @@ describe("DynamicEngine.detectDynamics — 动态文本模板 (Part A/B)", () =>
 		segments.find((s) => s.type === "text")?.text;
 	const segsOf = (b: EngineBag): Seg[] => b.push.broadcastDynamic.mock.calls[0]?.[1] as Seg[];
 
-	it("无图 + 无 AI → 默认模板纯文案(链接不再进模板;{url} 仍恒计算供旧模板/版式用)", async () => {
+	it("无图 + 无 AI → 默认模板文案 + 链接部件(默认版式同条换行连接)", async () => {
 		const b = makeEngine();
 		b.getAllDynamic.mockResolvedValue(resp([makeItem({ uid: 1, pubTs: 1000, name: "阿绫" })]));
 		seed(b.engine, "1", 0);
 		await detect(b.engine);
-		expect(textOf(segsOf(b))).toBe("阿绫发布了一条动态");
+		expect(textOf(segsOf(b))).toBe(`阿绫发布了一条动态\nhttps://t.bilibili.com/id-1`);
 	});
 
-	it("旧路径下模板不写 {url} → 无链接(旧存档语义保持)", async () => {
+	it("版式隐藏 link 部件 → 无链接", async () => {
 		const b = makeEngine({ config: { dynamicTemplate: "{name}发布了一条动态" } });
 		b.getAllDynamic.mockResolvedValue(resp([makeItem({ uid: 1, pubTs: 1000, name: "阿绫" })]));
-		seed(b.engine, "1", 0);
+		const noLink = defaultMessageKindLayout("dynamic");
+		for (const blk of noLink.blocks) if (blk.type === "link") blk.visible = false;
+		seed(b.engine, "1", 0, { uid: "1", uname: "UP", messageLayout: noLink });
 		await detect(b.engine);
 		expect(textOf(segsOf(b))).toBe("阿绫发布了一条动态");
 	});
 
-	it("视频转 BV 但 jump_url 无 BV → url 空,renderDynamicText 去掉尾随分隔符", async () => {
+	it("视频转 BV 但 jump_url 无 BV → url 空,link 部件缺席", async () => {
 		const b = makeEngine({
-			config: { dynamicVideoUrlToBV: true, videoTemplate: "{name}发布了新视频：{url}" },
+			config: { dynamicVideoUrlToBV: true, videoTemplate: "{name}发布了新视频" },
 		});
 		b.getAllDynamic.mockResolvedValue(
 			resp([
@@ -957,20 +1193,12 @@ describe("DynamicEngine.detectDynamics — 动态文本模板 (Part A/B)", () =>
 		noImg.getAllDynamic.mockResolvedValue(resp([makeItem({ uid: 1, pubTs: 1000, name: "阿绫" })]));
 		seed(noImg.engine, "1", 0);
 		await detect(noImg.engine);
-		expect(textOf(imgSegs)).toBe("阿绫发布了一条动态");
+		expect(textOf(imgSegs)).toBe(`阿绫发布了一条动态\nhttps://t.bilibili.com/id-1`);
 		expect(textOf(imgSegs)).toBe(textOf(segsOf(noImg)));
 	});
 
-	it("旧模板写 {url} → 单条链接(双前缀 bug 回归守护)", async () => {
-		const b = makeEngine({ config: { dynamicTemplate: "{name}发布了一条动态：{url}" } });
-		b.getAllDynamic.mockResolvedValue(resp([makeItem({ uid: 1, pubTs: 1000, name: "阿绫" })]));
-		seed(b.engine, "1", 0);
-		await detect(b.engine);
-		expect(textOf(segsOf(b))).toBe("阿绫发布了一条动态：https://t.bilibili.com/id-1");
-	});
-
-	it("视频动态(DYNAMIC_TYPE_AV)走 videoTemplate + jump_url 链接(旧模板写 {url})", async () => {
-		const b = makeEngine({ config: { videoTemplate: "{name}发布了新视频：{url}" } });
+	it("视频动态(DYNAMIC_TYPE_AV)走 videoTemplate + jump_url 链接", async () => {
+		const b = makeEngine({ config: { videoTemplate: "{name}发布了新视频" } });
 		b.getAllDynamic.mockResolvedValue(
 			resp([
 				makeItem({
@@ -984,7 +1212,7 @@ describe("DynamicEngine.detectDynamics — 动态文本模板 (Part A/B)", () =>
 		);
 		seed(b.engine, "1", 0);
 		await detect(b.engine);
-		expect(textOf(segsOf(b))).toBe("阿绫发布了新视频：https://www.bilibili.com/video/BV1demo");
+		expect(textOf(segsOf(b))).toBe("阿绫发布了新视频\nhttps://www.bilibili.com/video/BV1demo");
 	});
 
 	it("per-UP customDynamicTemplate 覆盖内建模板", async () => {
@@ -993,10 +1221,10 @@ describe("DynamicEngine.detectDynamics — 动态文本模板 (Part A/B)", () =>
 		seed(b.engine, "1", 0, {
 			uid: "1",
 			uname: "UP",
-			customDynamicTemplate: "🔔 {name} 有新动态 {url}",
+			customDynamicTemplate: "🔔 {name} 有新动态",
 		});
 		await detect(b.engine);
-		expect(textOf(segsOf(b))).toBe("🔔 阿绫 有新动态 https://t.bilibili.com/id-1");
+		expect(textOf(segsOf(b))).toBe(`🔔 阿绫 有新动态\nhttps://t.bilibili.com/id-1`);
 	});
 
 	it("全局 config.dynamicTemplate 覆盖内建兜底", async () => {
@@ -1004,7 +1232,7 @@ describe("DynamicEngine.detectDynamics — 动态文本模板 (Part A/B)", () =>
 		b.getAllDynamic.mockResolvedValue(resp([makeItem({ uid: 1, pubTs: 1000, name: "阿绫" })]));
 		seed(b.engine, "1", 0);
 		await detect(b.engine);
-		expect(textOf(segsOf(b))).toBe("【动态】阿绫");
+		expect(textOf(segsOf(b))).toBe(`【动态】阿绫\nhttps://t.bilibili.com/id-1`);
 	});
 
 	it("有 AI 点评时两分支都用点评,不走模板", async () => {
@@ -1015,7 +1243,7 @@ describe("DynamicEngine.detectDynamics — 动态文本模板 (Part A/B)", () =>
 		);
 		seed(b.engine, "1", 0);
 		await detect(b.engine);
-		expect(textOf(segsOf(b))).toBe("这条很有意思");
+		expect(textOf(segsOf(b))).toBe(`这条很有意思\nhttps://t.bilibili.com/id-1`);
 	});
 });
 
@@ -1187,7 +1415,7 @@ describe("DynamicEngine — reconcileJob 尊重风控退避", () => {
 		await detect(b.engine);
 
 		// 退避窗口内 adapter 收到订阅变更 → applyOps → reconcileJob。subManager 仍非空,
-		// dynamicJob 又是 undefined —— 若只看 dynamicJob?.running 会立即 startJob,提前去戳
+		// dynamicJob 又是 undefined —— 若只看 dynamicJob?.isActive 会立即 startJob,提前去戳
 		// 仍在风控的端点,击穿退避。修复后应识别 detectorRestartTimer 待执行而跳过。
 		b.engine.applyOps([
 			{ type: "add", sub: { uid: "2", uname: "UP2", dynamic: true } as SubItemView },
@@ -1199,15 +1427,15 @@ describe("DynamicEngine — reconcileJob 尊重风控退避", () => {
 
 describe("DynamicEngine — 生命周期 / cron 重启", () => {
 	it("start() 有订阅快照 → 建并启动 cron;stop() → 停止", () => {
-		const subs: SubscriptionsView = { "1": { uid: "1", uname: "UP", dynamic: true } };
+		const subs = { "1": { uid: "1", uname: "UP", dynamic: true } };
 		const b = makeEngine({ subs });
 		b.engine.start();
 		expect(cronMock.instances).toHaveLength(1);
-		expect(cronMock.instances[0]?.running).toBe(true);
+		expect(cronMock.instances[0]?.isActive).toBe(true);
 		expect(b.engine.isActive).toBe(true);
 
 		b.engine.stop();
-		expect(cronMock.instances[0]?.running).toBe(false);
+		expect(cronMock.instances[0]?.isActive).toBe(false);
 		expect(b.engine.isActive).toBe(false);
 	});
 
@@ -1237,14 +1465,14 @@ describe("DynamicEngine — 生命周期 / cron 重启", () => {
 		engine.start();
 		expect(cronMock.instances).toHaveLength(0);
 
-		snap = { "1": { uid: "1", uname: "UP", dynamic: true } };
+		snap = viewsOf({ "1": { uid: "1", uname: "UP", dynamic: true } });
 		trigger("auth-restored");
 		expect(cronMock.instances).toHaveLength(1);
-		expect(cronMock.instances[0]?.running).toBe(true);
+		expect(cronMock.instances[0]?.isActive).toBe(true);
 	});
 
 	it("updateConfig 改 dynamicCron(运行中)→ 旧 job 停,新 job 用新 cronTime", () => {
-		const subs: SubscriptionsView = { "1": { uid: "1", uname: "UP", dynamic: true } };
+		const subs = { "1": { uid: "1", uname: "UP", dynamic: true } };
 		const b = makeEngine({ subs });
 		b.engine.start();
 		expect(cronMock.instances).toHaveLength(1);
@@ -1258,11 +1486,11 @@ describe("DynamicEngine — 生命周期 / cron 重启", () => {
 		expect(cronMock.instances[0]?.stopCount).toBe(1);
 		expect(cronMock.instances).toHaveLength(2);
 		expect(cronMock.instances[1]?.cronTime).toBe("*/5 * * * *");
-		expect(cronMock.instances[1]?.running).toBe(true);
+		expect(cronMock.instances[1]?.isActive).toBe(true);
 	});
 
 	it("updateConfig 同 cron → 不重建 job", () => {
-		const subs: SubscriptionsView = { "1": { uid: "1", uname: "UP", dynamic: true } };
+		const subs = { "1": { uid: "1", uname: "UP", dynamic: true } };
 		const b = makeEngine({ subs });
 		b.engine.start();
 		b.engine.updateConfig({
@@ -1275,22 +1503,22 @@ describe("DynamicEngine — 生命周期 / cron 重启", () => {
 	});
 
 	it("applyOps:add dynamic 订阅 → 起 job;delete 最后一个 → 停 job", () => {
-		const sub: SubItemView = { uid: "1", uname: "UP", dynamic: true };
+		const sub = viewOf({ uid: "1", uname: "UP", dynamic: true });
 		const b = makeEngine({ subs: { "1": sub } });
 		b.engine.start(); // 快照里 sub.dynamic=true → 已有 running job
-		expect(cronMock.instances[0]?.running).toBe(true);
+		expect(cronMock.instances[0]?.isActive).toBe(true);
 
 		b.engine.applyOps([{ type: "delete", uid: "1" }]);
-		expect(cronMock.instances[0]?.running).toBe(false);
+		expect(cronMock.instances[0]?.isActive).toBe(false);
 
 		b.engine.applyOps([{ type: "add", sub }]);
 		// 重新有订阅 → reconcile 重启(可能复用或新建 instance,断言最终处于 running)
 		const last = cronMock.instances[cronMock.instances.length - 1];
-		expect(last?.running).toBe(true);
+		expect(last?.isActive).toBe(true);
 	});
 
 	it("回归:dynamicCron 无法解析(new CronJob 同步抛错)不炸穿 start(),记录 error 且不建 job(此前独立端会在启动期整进程崩溃,见 sidecar.stderr.log 的 CronError)", () => {
-		const subs: SubscriptionsView = { "1": { uid: "1", uname: "UP", dynamic: true } };
+		const subs = { "1": { uid: "1", uname: "UP", dynamic: true } };
 		const b = makeEngine({ subs, config: { dynamicCron: "BAD CRON" } });
 		expect(() => b.engine.start()).not.toThrow();
 		expect(cronMock.instances).toHaveLength(0);
@@ -1303,8 +1531,8 @@ describe("DynamicEngine — 生命周期 / cron 重启", () => {
 	});
 
 	it("applyOps:per-UID 走 debug,批次收口一条 info 汇总(Q1 不刷屏)", () => {
-		const s1: SubItemView = { uid: "1", uname: "U1", dynamic: true };
-		const s2: SubItemView = { uid: "2", uname: "U2", dynamic: true };
+		const s1 = viewOf({ uid: "1", uname: "U1", dynamic: true });
+		const s2 = viewOf({ uid: "2", uname: "U2", dynamic: true });
 		const b = makeEngine({ subs: { "1": s1, "2": s2 } });
 		b.logs.length = 0;
 		b.engine.applyOps([
@@ -1487,71 +1715,9 @@ describe("DynamicEngine — setAi / setImage 后置注入", () => {
 	});
 });
 
-// ---------------------------------------------------------------------------
-// 背景图轮换(每次推送轮换)
-// ---------------------------------------------------------------------------
-
-describe("DynamicEngine — 动态卡背景轮换", () => {
-	it("customCardStyle 多图 → pickDynamicColorOptions 经注入选择器逐张轮换", () => {
-		const cursors: Record<string, number> = {};
-		const b = makeEngine({
-			withImage: true,
-			pickCardBackground: (key, images) => {
-				const i = cursors[key] ?? 0;
-				cursors[key] = i + 1;
-				return images[i % images.length];
-			},
-		});
-		const style = { enable: true, backgroundImages: ["a", "b", "c"] };
-		const picks = [0, 1, 2, 3].map(
-			() => priv(b.engine).pickDynamicColorOptions("u1", style)?.backgroundImage,
-		);
-		expect(picks).toEqual(["a", "b", "c", "a"]);
-	});
-
-	it("单图 → 不轮换,原样沿用 backgroundImage", () => {
-		const b = makeEngine({ withImage: true, pickCardBackground: () => "ROTATED" });
-		const style = { enable: true, backgroundImage: "solo", backgroundImages: ["solo"] };
-		expect(priv(b.engine).pickDynamicColorOptions("u1", style)?.backgroundImage).toBe("solo");
-	});
-
-	it("enable=false / 缺省 → undefined(走渲染器全局兜底)", () => {
-		const b = makeEngine({ withImage: true, pickCardBackground: () => "X" });
-		expect(priv(b.engine).pickDynamicColorOptions("u1", { enable: false })).toBeUndefined();
-		expect(priv(b.engine).pickDynamicColorOptions("u1", undefined)).toBeUndefined();
-	});
-
-	it("未注入选择器(koishi)+ 多图 → 不轮换,沿用 backgroundImage", () => {
-		const b = makeEngine({ withImage: true });
-		const style = { enable: true, backgroundImage: "first", backgroundImages: ["first", "second"] };
-		expect(priv(b.engine).pickDynamicColorOptions("u1", style)?.backgroundImage).toBe("first");
-	});
-
-	it("回归:该 UP 无背景覆盖,但全局默认图廊配了多图 → 仍按 defaultBackgroundImages 轮换", () => {
-		const cursors: Record<string, number> = {};
-		const b = makeEngine({
-			withImage: true,
-			config: { defaultBackgroundImages: ["x", "y"] },
-			pickCardBackground: (key, images) => {
-				const i = cursors[key] ?? 0;
-				cursors[key] = i + 1;
-				return images[i % images.length];
-			},
-		});
-		const picks = [0, 1].map(
-			() => priv(b.engine).pickDynamicColorOptions("u1", { enable: false })?.backgroundImage,
-		);
-		expect(picks).toEqual(["x", "y"]);
-		// 该 UP 自带背景(哪怕只设了一张)优先于全局默认,不落到 defaultBackgroundImages。
-		expect(
-			priv(b.engine).pickDynamicColorOptions("u1", {
-				enable: true,
-				backgroundImage: "own",
-				backgroundImages: ["own"],
-			})?.backgroundImage,
-		).toBe("own");
-	});
-});
+// 从前这里有一整块「动态卡背景轮换」(`pickDynamicColorOptions` + 注入的选择器 + 全局
+// 默认图廊兜底)。整条 `cardStyle.backgroundImages` 链 2026-09-20 删掉(背景图归皮肤的
+// `image` 旋钮),剩下那道 enable 闸归 `card-style.test.ts`。
 
 // ---------------------------------------------------------------------------
 // H. 消息版式(messageLayout)— 发送侧结构自定义
@@ -1584,8 +1750,8 @@ describe("DynamicEngine.detectDynamics — 消息版式(messageLayout)", () => {
 		expect(b.push.broadcastDynamic).toHaveBeenCalledTimes(1);
 		const segments = b.push.broadcastDynamic.mock.calls[0]?.[1] as Seg[];
 		expect(segments.map((s) => s.type)).toEqual(["image", "text"]);
-		// 默认模板 "{name}发布了一条动态：{url}" 以 url='' 渲染 → "UP发布了一条动态",
-		// 链接作为独立部件在同条内以分隔符(\n)连接。
+		// 默认模板 "{name}发布了一条动态" → "UP发布了一条动态",链接作为独立部件在同条内以
+		// 分隔符(\n)连接。
 		expect(segments[1]?.text).toBe(`UP发布了一条动态\n${URL1}`);
 	});
 
@@ -1605,13 +1771,15 @@ describe("DynamicEngine.detectDynamics — 消息版式(messageLayout)", () => {
 		await detect(b.engine);
 		expect(b.push.broadcastDynamic).not.toHaveBeenCalled();
 		expect(b.push.broadcastDynamicSequence).toHaveBeenCalledTimes(1);
-		const [uid, messages, kind] = b.push.broadcastDynamicSequence.mock.calls[0] as [
+		const [uid, messages, kind, opts] = b.push.broadcastDynamicSequence.mock.calls[0] as [
 			string,
 			Seg[][],
 			string,
+			{ pushId?: string } | undefined,
 		];
 		expect(uid).toBe("1");
 		expect(kind).toBe("dynamic");
+		expect(opts?.pushId).toMatch(/^[0-9a-f-]{36}$/);
 		expect(messages).toHaveLength(2);
 		expect(messages[0]?.map((s) => s.type)).toEqual(["image"]);
 		expect(messages[1]?.map((s) => s.type)).toEqual(["text"]);
@@ -1642,18 +1810,6 @@ describe("DynamicEngine.detectDynamics — 消息版式(messageLayout)", () => {
 		expect(segments[1]?.text).toBe(URL1);
 	});
 
-	it("旧自定义模板仍写 {url} → 版式路径按 url='' 渲染,不出现双链接", async () => {
-		const b = makeEngine({ withImage: true });
-		b.generateDynamicCard.mockResolvedValue(Buffer.from("png"));
-		b.getAllDynamic.mockResolvedValue(resp([makeItem({ uid: 1, pubTs: 1000 })]));
-		seedLayout(b, layoutOf([{ type: "card" }, { type: "text" }, { type: "link" }]), {
-			customDynamicTemplate: "看看{name}：{url}",
-		});
-		await detect(b.engine);
-		const segments = b.push.broadcastDynamic.mock.calls[0]?.[1] as Seg[];
-		expect(segments[1]?.text).toBe(`看看UP\n${URL1}`);
-	});
-
 	it("全部块隐藏 → 本条不推送,但锚点照常推进(下轮不重推)", async () => {
 		const b = makeEngine({ withImage: true });
 		b.getAllDynamic.mockResolvedValue(resp([makeItem({ uid: 1, pubTs: 1000 })]));
@@ -1672,18 +1828,6 @@ describe("DynamicEngine.detectDynamics — 消息版式(messageLayout)", () => {
 		expect(b.generateDynamicCard).not.toHaveBeenCalled();
 	});
 
-	it("adapter 不支持 sequence(防御兜底)→ 合并回一条 broadcastDynamic", async () => {
-		const b = makeEngine({ withImage: true });
-		(b.push as { broadcastDynamicSequence?: unknown }).broadcastDynamicSequence = undefined;
-		b.generateDynamicCard.mockResolvedValue(Buffer.from("png"));
-		b.getAllDynamic.mockResolvedValue(resp([makeItem({ uid: 1, pubTs: 1000 })]));
-		seedLayout(b, layoutOf([{ type: "card" }, { type: "split", id: "split-1" }, { type: "text" }]));
-		await detect(b.engine);
-		expect(b.push.broadcastDynamic).toHaveBeenCalledTimes(1);
-		const segments = b.push.broadcastDynamic.mock.calls[0]?.[1] as Seg[];
-		expect(segments.map((s) => s.type)).toEqual(["image", "text"]);
-	});
-
 	it("渲染失败 → card 部件缺席,其余部件照发(软降级不变)", async () => {
 		const b = makeEngine({ withImage: true });
 		b.generateDynamicCard.mockRejectedValue(new Error("boom"));
@@ -1694,72 +1838,9 @@ describe("DynamicEngine.detectDynamics — 消息版式(messageLayout)", () => {
 		expect(segments.map((s) => s.type)).toEqual(["text"]);
 		expect(segments[0]?.text).toBe(`UP发布了一条动态\n${URL1}`);
 	});
-
-	it("两级都无 messageLayout(旧路径兜底)→ 模板 {url} 仍内嵌渲染(旧存档兼容)", async () => {
-		const b = makeEngine({ withImage: true });
-		b.generateDynamicCard.mockResolvedValue(Buffer.from("png"));
-		b.getAllDynamic.mockResolvedValue(resp([makeItem({ uid: 1, pubTs: 1000 })]));
-		// 旧存档自定义模板还写着 {url}:旧路径按真实 url 渲染,不剥离。
-		seed(b.engine, "1", 0, { uid: "1", uname: "UP", customDynamicTemplate: "看看{name}：{url}" });
-		await detect(b.engine);
-		const segments = b.push.broadcastDynamic.mock.calls[0]?.[1] as Seg[];
-		expect(segments.map((s) => s.type)).toEqual(["image", "text"]);
-		expect(segments[1]?.text).toBe(`看看UP：${URL1}`);
-	});
 });
 
-describe("DynamicEngine — config 级 messageLayout(koishi 端默认版式 + 链接开关)", () => {
-	type Seg = { type: string; text?: string };
-	const URL1 = "https://t.bilibili.com/id-1";
-	const configLayout = (linkVisible: boolean) => ({
-		blocks: [
-			{ id: "card", type: "card", visible: true },
-			{ id: "text", type: "text", visible: true },
-			{ id: "link", type: "link", visible: linkVisible },
-		],
-		separator: "\n",
-	});
-
-	it("sub 无版式但 config 有 → 走版式路径(链接独立部件)", async () => {
-		const b = makeEngine({ withImage: true, config: { messageLayout: configLayout(true) } });
-		b.generateDynamicCard.mockResolvedValue(Buffer.from("png"));
-		b.getAllDynamic.mockResolvedValue(resp([makeItem({ uid: 1, pubTs: 1000 })]));
-		seed(b.engine, "1", 0);
-		await detect(b.engine);
-		const segments = b.push.broadcastDynamic.mock.calls[0]?.[1] as Seg[];
-		expect(segments.map((s) => s.type)).toEqual(["image", "text"]);
-		expect(segments[1]?.text).toBe(`UP发布了一条动态\n${URL1}`);
-	});
-
-	it("config 版式 link 隐藏(koishi 开关关)→ 消息不含链接", async () => {
-		const b = makeEngine({ withImage: true, config: { messageLayout: configLayout(false) } });
-		b.generateDynamicCard.mockResolvedValue(Buffer.from("png"));
-		b.getAllDynamic.mockResolvedValue(resp([makeItem({ uid: 1, pubTs: 1000 })]));
-		seed(b.engine, "1", 0);
-		await detect(b.engine);
-		const segments = b.push.broadcastDynamic.mock.calls[0]?.[1] as Seg[];
-		expect(segments[1]?.text).toBe("UP发布了一条动态");
-	});
-
-	it("sub 版式优先于 config 版式", async () => {
-		const b = makeEngine({ withImage: true, config: { messageLayout: configLayout(true) } });
-		b.generateDynamicCard.mockResolvedValue(Buffer.from("png"));
-		b.getAllDynamic.mockResolvedValue(resp([makeItem({ uid: 1, pubTs: 1000 })]));
-		seed(b.engine, "1", 0, {
-			uid: "1",
-			uname: "UP",
-			messageLayout: {
-				blocks: [{ id: "text", type: "text", visible: true }],
-				separator: "\n",
-			},
-		});
-		await detect(b.engine);
-		const segments = b.push.broadcastDynamic.mock.calls[0]?.[1] as Seg[];
-		expect(segments.map((s) => s.type)).toEqual(["text"]);
-		expect(segments[0]?.text).toBe("UP发布了一条动态");
-	});
-});
-
+// ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
 // H. dynamic-detected —— 数据统计的动态/投稿数据源
 // ---------------------------------------------------------------------------
@@ -1856,5 +1937,170 @@ describe("DynamicEngine.detectDynamics — dynamic-detected 事件", () => {
 		await detect(b.engine);
 		expect(b.push.broadcastDynamic).not.toHaveBeenCalled();
 		expect(detected(b)).toHaveLength(1);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// F. 上次成功抓取的时刻
+//
+// 独立端的 `/status` 拿它回答「还在跑吗」。**只记成功、不记尝试**:连着失败三小时
+// 的系统若报「1 分钟前抓过」,这一项就从答案变成了骗局 —— 而那正是主人掏出手机
+// 敲 status 的场合。
+// ---------------------------------------------------------------------------
+
+describe("DynamicEngine.lastFetchAt", () => {
+	it("还没跑过 → undefined,而不是 0", () => {
+		const b = makeEngine();
+		expect(b.engine.lastFetchAt()).toBeUndefined();
+	});
+
+	it("成功拉到一轮 → 记下时刻", async () => {
+		const b = makeEngine();
+		b.getAllDynamic.mockResolvedValue(resp([]));
+		seed(b.engine, "1", 0);
+		const before = Date.now();
+		await detect(b.engine);
+		const at = b.engine.lastFetchAt();
+		expect(at).toBeDefined();
+		expect(at as number).toBeGreaterThanOrEqual(before);
+	});
+
+	it("拉取抛错 → 不刷新(否则「还在跑吗」永远答是)", async () => {
+		const b = makeEngine();
+		b.getAllDynamic.mockResolvedValue(resp([]));
+		seed(b.engine, "1", 0);
+		await detect(b.engine);
+		const first = b.engine.lastFetchAt();
+
+		b.getAllDynamic.mockRejectedValue(new Error("network down"));
+		await detect(b.engine);
+		expect(b.engine.lastFetchAt()).toBe(first);
+	});
+
+	it("接口返回错误码 → 同样不刷新", async () => {
+		const b = makeEngine();
+		b.getAllDynamic.mockResolvedValue(resp([]));
+		seed(b.engine, "1", 0);
+		await detect(b.engine);
+		const first = b.engine.lastFetchAt();
+
+		b.getAllDynamic.mockResolvedValue(resp([], -352, "risk"));
+		await detect(b.engine);
+		expect(b.engine.lastFetchAt()).toBe(first);
+	});
+});
+
+describe("联网搜索 override(aiWebSearch)", () => {
+	/**
+	 * 引擎自己不碰搜索 —— 它只负责把 per-engine 开关翻成这一次 comment() 的
+	 * override.webSearch。执行器在不在、要不要真挂工具,是生成器的事。
+	 */
+	const oneDyn = () => {
+		return resp([makeItem({ uid: 1, pubTs: 1000, text: "原始内容" })]);
+	};
+
+	it("aiWebSearch 开着 → comment 的 override 带 webSearch:true", async () => {
+		const b = makeEngine({ withAi: true, config: { aiEnabled: true, aiWebSearch: true } });
+		b.comment.mockResolvedValue("点评");
+		b.getAllDynamic.mockResolvedValue(oneDyn());
+		seed(b.engine, "1", 0);
+		await detect(b.engine);
+		expect(b.comment).toHaveBeenCalledWith(
+			expect.any(String),
+			"dynamic",
+			expect.anything(),
+			expect.objectContaining({ webSearch: true }),
+		);
+	});
+
+	it("没开 aiWebSearch → override 不带 webSearch(现状不变)", async () => {
+		const b = makeEngine({ withAi: true, config: { aiEnabled: true } });
+		b.comment.mockResolvedValue("点评");
+		b.getAllDynamic.mockResolvedValue(oneDyn());
+		seed(b.engine, "1", 0);
+		await detect(b.engine);
+		const override = b.comment.mock.calls[0]?.[3] as Record<string, unknown> | undefined;
+		expect(override?.webSearch).toBeUndefined();
+	});
+});
+
+// ---------------------------------------------------------------------------
+// K. detectNow —— devtools「现在就跑」
+// ---------------------------------------------------------------------------
+
+/**
+ * 与 cron 那一轮共用同一把锁:cron tick 撞上在跑的那轮就跳过(老规矩);`detectNow`
+ * 撞上则**等它跑完再跑一轮** —— 调用方是刚往 feed 里塞了东西才来的,那一轮的 feed 是
+ * 塞之前拉的,跳过等于白塞。
+ */
+describe("K. detectNow", () => {
+	function deferred() {
+		let resolve!: (v: ReturnType<typeof resp>) => void;
+		const promise = new Promise<ReturnType<typeof resp>>((r) => {
+			resolve = r;
+		});
+		return { promise, resolve };
+	}
+
+	it("跑一轮:拉 feed、处理,promise 在这一轮结束时落定", async () => {
+		const b = makeEngine();
+		b.getAllDynamic.mockResolvedValue(resp([makeItem({ uid: 1, pubTs: 1000, text: "x" })]));
+		seed(b.engine, "1", 0);
+		await b.engine.detectNow();
+		expect(b.getAllDynamic).toHaveBeenCalledTimes(1);
+		expect(b.push.broadcastDynamic).toHaveBeenCalledTimes(1);
+	});
+
+	it("cron tick 撞上在跑的一轮就跳过;detectNow 撞上则排在后面再跑一轮", async () => {
+		const b = makeEngine({ subs: { "1": { uid: "1", uname: "UP", dynamic: true } } });
+		const first = deferred();
+		b.getAllDynamic.mockReturnValueOnce(first.promise).mockResolvedValue(resp([]));
+		b.engine.start();
+		const tick = cronMock.instances[0];
+		if (!tick) throw new Error("cron 没建起来");
+
+		tick.onTick();
+		tick.onTick();
+		expect(b.getAllDynamic).toHaveBeenCalledTimes(1);
+
+		const second = b.engine.detectNow();
+		await Promise.resolve();
+		expect(b.getAllDynamic).toHaveBeenCalledTimes(1);
+
+		first.resolve(resp([]));
+		await second;
+		expect(b.getAllDynamic).toHaveBeenCalledTimes(2);
+	});
+
+	it("一轮卡住不落定:检测器重启之后新 job 的 tick 还得能跑,不能被旧锁永久堵死", async () => {
+		// 锁挂在实例上,活得比 cron job 长。一轮要是永远不落定(渲染闸堆住之类),
+		// 旧写法的 tick 会全部静默丢弃 —— 而且是**永久**:登录恢复 / 改 cron 重建 job
+		// 也救不回来。停掉检测器时锁得跟着松开,重启才算真的重新武装。
+		const b = makeEngine({ subs: { "1": { uid: "1", uname: "UP", dynamic: true } } });
+		const stuck = deferred();
+		b.getAllDynamic.mockReturnValueOnce(stuck.promise).mockResolvedValue(resp([]));
+		b.engine.start();
+		const first = cronMock.instances[0];
+		if (!first) throw new Error("cron 没建起来");
+		first.onTick();
+		expect(b.getAllDynamic).toHaveBeenCalledTimes(1);
+
+		b.engine.stop();
+		b.engine.start();
+		const second = cronMock.instances[1];
+		if (!second) throw new Error("重启后 cron 没重建");
+		second.onTick();
+		expect(b.getAllDynamic).toHaveBeenCalledTimes(2);
+
+		stuck.resolve(resp([]));
+	});
+
+	it("那一轮抛了:记日志、锁释放,下一次还能跑", async () => {
+		const b = makeEngine();
+		b.getAllDynamic.mockRejectedValueOnce(new TypeError("boom")).mockResolvedValue(resp([]));
+		seed(b.engine, "1", 0);
+		await b.engine.detectNow();
+		await b.engine.detectNow();
+		expect(b.getAllDynamic).toHaveBeenCalledTimes(2);
 	});
 });

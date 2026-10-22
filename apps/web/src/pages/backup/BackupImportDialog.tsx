@@ -1,7 +1,7 @@
-import { type ChangeEvent, useState } from "react";
-import { Btn } from "../../components/atoms";
-import { ModalShell } from "../../components/dialog";
+import { AddFileButton, Btn, ErrorNote, ModalShell } from "@bilibili-notify/ui";
+import { useState } from "react";
 import { type ClientBackup, isValidPin, looksLikeBackup, readFileAsText } from "./backup-file";
+import { ChoiceCard, PinField } from "./dialog-bits";
 
 type Mode = "overwrite" | "merge";
 
@@ -17,8 +17,7 @@ export function BackupImportDialog({ onCancel, onImport, busy }: BackupImportDia
 	const [mode, setMode] = useState<Mode>("overwrite");
 	const [pin, setPin] = useState("");
 
-	async function onFile(e: ChangeEvent<HTMLInputElement>): Promise<void> {
-		const file = e.target.files?.[0];
+	async function onFile(file: File | undefined): Promise<void> {
 		if (!file) return;
 		setError(null);
 		try {
@@ -48,42 +47,35 @@ export function BackupImportDialog({ onCancel, onImport, busy }: BackupImportDia
 	}
 
 	return (
-		<ModalShell onCancel={onCancel} width={400} bodyClassName="p-5">
-			<div className="mb-3 text-base font-bold text-bn-text-primary">导入 / 恢复备份</div>
+		<ModalShell onCancel={onCancel} width={400} bodyClassName="p-5" title="导入 / 恢复备份">
+			{/* 「这里还能塞一个文件」的虚线空位 —— 收编前是手写 label,说的还是家族统一
+			    前的老方言(bn-border 淡边 + 实底 + hover 不变粉)。 */}
+			<AddFileButton
+				accept=".json,.bnbackup,application/json"
+				onFile={onFile}
+				className="mb-3 flex items-center justify-center rounded-lg px-3 py-4 text-bn-base"
+			>
+				选择备份文件（.bnbackup / .json）…
+			</AddFileButton>
 
-			<label className="mb-3 flex cursor-pointer items-center justify-center rounded-lg border border-dashed border-bn-border bg-bn-surface px-3 py-4 text-[13px] text-bn-text-secondary transition hover:border-bn-pink/50 hover:text-bn-text-primary">
-				<span>选择备份文件（.bnbackup / .json）…</span>
-				<input
-					aria-label="选择备份文件"
-					type="file"
-					accept=".json,.bnbackup,application/json"
-					onChange={onFile}
-					className="sr-only"
-				/>
-			</label>
-
-			{error ? (
-				<div className="mb-3 rounded-lg border border-bn-danger-border bg-bn-danger-soft px-3 py-2 text-[12px] text-bn-danger-text">
-					{error}
-				</div>
-			) : null}
+			{error ? <ErrorNote className="mb-3">{error}</ErrorNote> : null}
 
 			{backup ? (
 				<>
-					<div className="mb-3 text-[12px] text-bn-text-secondary">
+					<div className="mb-3 text-bn-sm text-bn-text-secondary">
 						检测到：{isFull ? "完整备份（含机密）" : "脱敏导出（无机密）"}
 						{backup.createdAt ? ` · ${backup.createdAt.slice(0, 10)}` : ""}
 					</div>
 
-					<div className="mb-1 text-[12px] font-semibold text-bn-text-secondary">落地方式</div>
+					<div className="mb-1 text-bn-sm font-semibold text-bn-text-secondary">落地方式</div>
 					<div className="mb-3 grid grid-cols-2 gap-2">
-						<ModeCard
+						<ChoiceCard
 							active={mode === "overwrite"}
 							title="覆盖"
 							sub="回到快照 · 删多余"
 							onClick={() => setMode("overwrite")}
 						/>
-						<ModeCard
+						<ChoiceCard
 							active={mode === "merge"}
 							title="合并"
 							sub="并入现有 · 不删"
@@ -92,20 +84,12 @@ export function BackupImportDialog({ onCancel, onImport, busy }: BackupImportDia
 					</div>
 
 					{isFull ? (
-						<label className="mb-1 block">
-							<span className="mb-1 block text-[12px] font-semibold text-bn-text-secondary">
-								备份 PIN（6 位数字）
-							</span>
-							<input
-								type="password"
-								inputMode="numeric"
-								maxLength={6}
-								value={pin}
-								onChange={(e) => setPin(e.target.value.replace(/\D/g, "").slice(0, 6))}
-								placeholder="输入 6 位数字 PIN"
-								className="w-full rounded-md border border-bn-border bg-bn-surface px-3 py-2 text-[13px] tracking-[0.4em] text-bn-text-primary outline-none focus:border-bn-pink"
-							/>
-						</label>
+						<PinField
+							className="mb-1"
+							value={pin}
+							onChange={setPin}
+							placeholder="输入 6 位数字 PIN"
+						/>
 					) : null}
 				</>
 			) : null}
@@ -119,22 +103,5 @@ export function BackupImportDialog({ onCancel, onImport, busy }: BackupImportDia
 				</Btn>
 			</div>
 		</ModalShell>
-	);
-}
-
-function ModeCard(props: { active: boolean; title: string; sub: string; onClick: () => void }) {
-	return (
-		<button
-			type="button"
-			onClick={props.onClick}
-			className={`rounded-lg border px-3 py-2.5 text-left transition ${
-				props.active
-					? "border-bn-pink/60 bg-bn-pink/10"
-					: "border-bn-border bg-bn-surface hover:border-bn-pink/40"
-			}`}
-		>
-			<div className="text-[13px] font-bold text-bn-text-primary">{props.title}</div>
-			<div className="text-[11px] text-bn-text-tertiary">{props.sub}</div>
-		</button>
 	);
 }

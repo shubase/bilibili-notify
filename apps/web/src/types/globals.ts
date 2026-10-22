@@ -13,11 +13,13 @@ export type {
 	CardKind,
 	CardStyle,
 	CardStyleByKind,
-	CommandAliases,
 	CommandConfig,
 	ContentFilters,
 	GlobalConfig,
 	GlobalDefaults,
+	GroupCommandAliases,
+	GroupCommandConfig,
+	GroupVideoParseConfig,
 	GuardBundle,
 	GuardEntry,
 	ImageGroupSettings,
@@ -25,7 +27,6 @@ export type {
 	ModuleLogLevels,
 	ScheduleConfig,
 	TemplateBundle,
-	VideoParseConfig,
 } from "@bilibili-notify/internal";
 
 /**
