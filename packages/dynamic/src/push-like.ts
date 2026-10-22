@@ -9,7 +9,7 @@
  */
 
 import type { CommentaryCallOverride } from "@bilibili-notify/ai";
-import type { CardBlock, ForwardImage, MessageKindLayout } from "@bilibili-notify/internal";
+import type { ForwardImage, MessageKindLayout } from "@bilibili-notify/internal";
 import type { DynamicFilterConfig } from "./types";
 
 /** dynamic-engine 渲染好的图片缓冲（无 mime/扩展信息时默认 image/jpeg）。 */
@@ -114,19 +114,8 @@ export interface SubItemView {
 	dynamic?: boolean;
 	customCardStyle?: {
 		enable?: boolean;
-		cardColorStart?: string;
-		cardColorEnd?: string;
-		/** 玻璃片(内容层)透明度 0..1;透传给 generateDynamicCard 的 colorOptions。 */
-		glassOpacity?: number;
-		/** 完全透明:内容层透明 + 无模糊;透传给 generateDynamicCard 的 colorOptions。 */
-		glassClear?: boolean;
-		/** 背景图资产 id;透传给 generateDynamicCard 的 colorOptions。 */
-		backgroundImage?: string;
-		/**
-		 * 解析后的**完整**背景图列表(>1 张时「每次推送轮换」)。adapter 填入;engine 据它
-		 * 经注入的 pickCardBackground 选下一张覆盖 backgroundImage。缺省 / ≤1 张 = 不轮换。
-		 */
-		backgroundImages?: string[];
+		// 🪦 `backgroundImage` / `backgroundImages` 2026-09-20 随整条链删掉 —— 背景图归皮肤
+		// 自己的 `image` 旋钮(`--bn-knob-wallpaper`),不再从样式覆盖里透传。
 		/**
 		 * 字体家族名;透传给 generateDynamicCard 的 colorOptions(缺省回退全局)。
 		 * 此前整条链都漏着,per-UP 换字体选了等于没选。
@@ -160,10 +149,11 @@ export interface SubItemView {
 	 */
 	customVideoTemplate?: string;
 	/**
-	 * Per-UP 动态卡片版式(块顺序 / 显隐)。adapter 折叠 `cardLayout.dynamic` 后填入;
-	 * undefined = 走默认版式(复刻现状)。dynamic-engine 渲染时透传给 generateDynamicCard。
+	 * Per-UP 生效的**卡片皮肤 id**(ADR-0014)。宿主折叠 `eff.cardSkin` 后填入;
+	 * undefined = 内置默认皮肤。dynamic-engine 渲染时透传给 generateDynamicCard 的
+	 * colorOptions —— 版式住皮肤包里,不再逐块下发。
 	 */
-	dynamicLayout?: CardBlock[];
+	cardSkin?: string;
 	/**
 	 * Per-UP 解析后的**消息版式**动态切片(块顺序 / 显隐 / 分条符 + 分隔符)。宿主折叠
 	 * `eff.messageLayout.dynamic` 后填入。引擎按版式装配消息:文本模板以 url='' 渲染
@@ -174,12 +164,6 @@ export interface SubItemView {
 
 export type SubscriptionsView = Record<string, SubItemView>;
 export type SubManagerView = Map<string, SubItemView>;
-
-/**
- * 背景图轮换选择器:给定 scopeKey(`uid:dynamic`)与完整图列表,返回本次该用的背景(并在
- * 实现内推进游标)。宿主注入(独立端 fs 持久化游标);返回 undefined = 不轮换。
- */
-export type PickCardBackground = (scopeKey: string, images: string[]) => string | undefined;
 
 /**
  * 宿主提供给 engine 的增量操作描述:独立端在 SubscriptionStore 写入后转译为

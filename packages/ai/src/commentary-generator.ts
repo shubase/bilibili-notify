@@ -185,8 +185,10 @@ interface CallToolOptions {
 		args: Record<string, string>,
 		/** 慢工具报进度的口子 —— 转发者不必接,接了就会变成 progress 事件。 */
 		onProgress?: (chars: number) => void,
-	) => Promise<string>;
+	) => Promise<string | ToolCallOutput>;
 	onToolEvent?: (ev: ToolTraceEvent) => void;
+	/** 这次调用的工具轮数上限;不给 = {@link MAX_TOOL_ROUNDS}。 */
+	maxRounds?: number;
 	/**
 	 * 联网搜索执行器。给了它,循环里名为 `web_search` 的调用就由生成器
 	 * **亲自执行**而不走 `onToolCall` —— 字符串通道带不动结构化的来源列表,
@@ -194,6 +196,18 @@ interface CallToolOptions {
 	 */
 	webSearch?: WebSearchExecutor;
 }
+
+/**
+ * 一次工具调用的产出:回给模型的文字,外加要在这一轮之后**补给模型看**的图。
+ * 图走哪条路见 {@link ExtraToolResult.images}。
+ */
+interface ToolCallOutput {
+	text: string;
+	images?: readonly string[];
+}
+
+/** 工具结果之后补的那条带图消息的开头。说清图从哪来,模型才不会当成主人新贴的。 */
+const TOOL_IMAGE_NOTE = "(以下是上面工具调用交回的图,不是主人贴的。)";
 
 /** 平台中立的人格配置。 */
 export interface PersonaConfig {
@@ -328,6 +342,16 @@ export interface CommentaryCallOverride {
 	 * 那边一慢就该早点让主人知道。
 	 */
 	timeoutMs?: number;
+	/**
+	 * 调用方的取消信号。掐了就断开到模型的请求,并抛带 `cancelled` 记号的错 ——
+	 * 不回落、不降级、不按限流重来:用户点了「停」之后再发一个请求,烧的是他自己的 key。
+	 */
+	signal?: AbortSignal;
+}
+
+/** 被调用方取消时抛的错。带记号是为了让外圈的 catch 认得出它、别再换个姿势重来。 */
+function cancelledError(): Error {
+	return Object.assign(new Error("已取消"), { cancelled: true });
 }
 
 /**
@@ -448,6 +472,13 @@ export interface ChatStatelessOptions {
 	 * 「读取技能」是白烧一轮。
 	 */
 	restrictTools?: readonly string[];
+	/**
+	 * 这次的工具轮数上限;不给 = {@link MAX_TOOL_ROUNDS}。
+	 *
+	 * 卡片皮肤工坊从零做一整套至少要 8 把工具调用(元信息一把、七种卡各一把),
+	 * 默认的闸正好卡死它(ADR-0015 决策 23 的 🔗)。其余路照旧用默认值。
+	 */
+	maxToolRounds?: number;
 	/**
 	 * 挂不挂内置的 B 站只读工具。默认挂;专职模式关掉之后,工具表只剩
 	 * {@link ExtraTool} 注入的那些 —— 少一个口子,就少一条把它带跑的路。
@@ -1015,9 +1046,10 @@ export class CommentaryGenerator implements CommentaryProvider {
 					toolOptions.tools = narrowTools(toolOptions.tools, out.restrictTools);
 					this.logger.debug(`[tool] 工具面收窄至 ${toolOptions.tools.length} 把`);
 				}
-				return out.text;
+				return out.images?.length ? this.toolImagesFor(out.text, out.images) : out.text;
 			},
 			onToolEvent: opts?.onToolEvent,
+			...(opts?.maxToolRounds ? { maxRounds: opts.maxToolRounds } : {}),
 			...(searchExec ? { webSearch: searchExec } : {}),
 		};
 		const result = await this.callAPI(
@@ -1033,6 +1065,36 @@ export class CommentaryGenerator implements CommentaryProvider {
 
 		this.logger.debug(`[chat-stateless] 响应长度=${result.length}`);
 		return result;
+	}
+
+	/**
+	 * 注入工具交回的图 → 这一轮怎么让模型看见(ADR-0015 决策 19 的 🔗)。
+	 *
+	 * 三条路,顺序与聊天发图同一个口径:主模型自己看得见就把图原样交给工具环,由它补一条
+	 * 带图的消息;否则配了副模型就转成文字并进结果;两样都没有就说一句看不见。**看不见
+	 * 不是失败** —— 工具该做的事已经做完了,少的只是一张给模型自查的图。
+	 */
+	private async toolImagesFor(
+		text: string,
+		images: readonly string[],
+	): Promise<string | ToolCallOutput> {
+		if (this.mainModelCanSeeImages()) return { text, images };
+		const model = this.visionModel();
+		if (!model) {
+			return `${text}\n\n(这张图你看不见:当前模型不支持看图,也没配看图副模型。照实告诉主人,请主人自己看预览。)`;
+		}
+		const call = await this.makeVisionCaller();
+		const descriptions = await describeImages(images, {
+			call,
+			model,
+			contextText: text,
+			timeoutMs: VISION_TIMEOUT_MS,
+			onWarn: (msg, reason) => this.warnVisionOnce(msg, reason),
+		});
+		const block = renderImageDescriptions(descriptions);
+		return block
+			? `${text}\n\n${block}`
+			: `${text}\n\n(看图副模型这次没看成,图的样子不清楚。照实告诉主人,请主人自己看预览。)`;
 	}
 
 	/** 清除指定用户的对话历史 */
@@ -1091,6 +1153,12 @@ export class CommentaryGenerator implements CommentaryProvider {
 		 * 长得一模一样。
 		 */
 		onProgress?: (chars: number) => void,
+		stream?: {
+			/** 正文分片原样转出 —— 要把字流到界面上的调用方用。 */
+			onText?: (text: string) => void;
+			/** 见 {@link CommentaryCallOverride.signal}。 */
+			signal?: AbortSignal;
+		},
 	): Promise<string> {
 		let chars = 0;
 		let reported = 0;
@@ -1101,8 +1169,9 @@ export class CommentaryGenerator implements CommentaryProvider {
 			[{ role: "user", content: user }],
 			undefined,
 			undefined,
-			{ timeoutMs: STRUCTURED_TIMEOUT_MS },
+			{ timeoutMs: STRUCTURED_TIMEOUT_MS, signal: stream?.signal },
 			(text) => {
+				stream?.onText?.(text);
 				chars += text.length;
 				if (chars - reported < PROGRESS_STEP_CHARS) return;
 				reported = chars;
@@ -1231,7 +1300,16 @@ export class CommentaryGenerator implements CommentaryProvider {
 	 * 都归这儿:前者换参数照样被拒,后者换姿势照样慢。
 	 */
 	private static fatalOf(e: unknown): Error | null {
-		return CommentaryGenerator.rejectionOf(e) ?? CommentaryGenerator.timeoutOf(e);
+		return (
+			CommentaryGenerator.cancelledOf(e) ??
+			CommentaryGenerator.rejectionOf(e) ??
+			CommentaryGenerator.timeoutOf(e)
+		);
+	}
+
+	/** 调用方取消的 —— 认的是 {@link cancelledError} 打的记号,原样交回。 */
+	private static cancelledOf(e: unknown): Error | null {
+		return e instanceof Error && (e as { cancelled?: unknown }).cancelled === true ? e : null;
 	}
 
 	/**
@@ -1298,8 +1376,13 @@ export class CommentaryGenerator implements CommentaryProvider {
 	 */
 	private async withStreamWatchdog<T>(
 		run: (signal: AbortSignal, beat: () => void) => Promise<T>,
+		external?: AbortSignal,
 	): Promise<T> {
 		const controller = new AbortController();
+		// 调用方的取消与看门狗掐的是**同一根线**,但抛出去的是两种错:见 catch。
+		const onExternal = () => controller.abort();
+		external?.addEventListener("abort", onExternal, { once: true });
+		if (external?.aborted) controller.abort();
 		let timer: ReturnType<typeof setTimeout> | undefined;
 		let started = false;
 		// 每来一片就重新计时。**任何**一片都算数(空 delta、思考、工具分片)——
@@ -1314,6 +1397,7 @@ export class CommentaryGenerator implements CommentaryProvider {
 		try {
 			return await run(controller.signal, beat);
 		} catch (e) {
+			if (external?.aborted) throw cancelledError();
 			// 是我们掐的,就说是我们掐的:SDK 抛出来的是一句 "Request was aborted.",
 			// 照抄给主人等于什么都没说。打上记号是为了别再被当成「换个姿势重来」
 			// 的理由 —— 卡住和超时同类。
@@ -1326,6 +1410,7 @@ export class CommentaryGenerator implements CommentaryProvider {
 		} finally {
 			// 正常收尾也要撤 —— 否则一次聊天漏一个定时器在外面。
 			if (timer) clearTimeout(timer);
+			external?.removeEventListener("abort", onExternal);
 		}
 	}
 
@@ -1334,14 +1419,17 @@ export class CommentaryGenerator implements CommentaryProvider {
 		params: OpenAI.ChatCompletionCreateParamsStreaming,
 		onDelta: (text: string) => void,
 		onReasoning?: (text: string) => void,
+		external?: AbortSignal,
 	): Promise<OpenAI.ChatCompletionMessage> {
-		return this.withStreamWatchdog(async (signal, beat) =>
-			this.consumeChatStream(
-				await client.chat.completions.create(params, { signal }),
-				beat,
-				onDelta,
-				onReasoning,
-			),
+		return this.withStreamWatchdog(
+			async (signal, beat) =>
+				this.consumeChatStream(
+					await client.chat.completions.create(params, { signal }),
+					beat,
+					onDelta,
+					onReasoning,
+				),
+			external,
 		);
 	}
 
@@ -1417,6 +1505,17 @@ export class CommentaryGenerator implements CommentaryProvider {
 		const temperature = override?.temperature ?? this.config.temperature;
 		if (!apiKey) throw new Error("AI apiKey 未配置");
 		if (!baseURL) throw new Error("AI baseURL 未配置");
+		const signal = override?.signal;
+		if (signal?.aborted) throw cancelledError();
+		/**
+		 * 非流式请求也带着取消信号。SDK 被掐时抛的是一句 "Request was aborted.",
+		 * 换成带记号的取消错,外圈那几条回落 / 降级才认得出、不再重发。
+		 */
+		const cancellable = <T>(run: (opts: { signal?: AbortSignal }) => Promise<T>): Promise<T> =>
+			run({ signal }).catch((e: unknown) => {
+				if (signal?.aborted) throw cancelledError();
+				throw e;
+			});
 
 		// flavor 必须打出来:两种风味成功时的其余日志一字不差,主人切了 responses
 		// 只能靠这里确认真的换了协议,否则「到底走没走新路」查无实据。
@@ -1492,6 +1591,7 @@ export class CommentaryGenerator implements CommentaryProvider {
 				override,
 				onDelta,
 				onReasoning,
+				cancellable,
 			});
 		}
 
@@ -1541,8 +1641,11 @@ export class CommentaryGenerator implements CommentaryProvider {
 						{ ...base, stream: true } as OpenAI.ChatCompletionCreateParamsStreaming,
 						emit,
 						emitReasoning,
+						signal,
 					);
 				} catch (e) {
+					const cancelled = CommentaryGenerator.cancelledOf(e);
+					if (cancelled) throw cancelled;
 					if (acct.emitted > 0) throw new Error(this.sanitizeErr(e));
 					// 账单 / 鉴权那一层的拒绝跟 stream 无关,回落也是白撞一次。
 					const rejection = CommentaryGenerator.fatalOf(e);
@@ -1550,7 +1653,7 @@ export class CommentaryGenerator implements CommentaryProvider {
 					this.logger.warn(`[api] 流式不可用,回落非流式: ${this.sanitizeErr(e)}`);
 				}
 			}
-			const res = await client.chat.completions.create(base);
+			const res = await cancellable((opts) => client.chat.completions.create(base, opts));
 			// AI1:兼容网关命中内容审查 / 上游异常时会返回空 choices。直接
 			// res.choices[0].message 会抛不可读的 "Cannot read properties of
 			// undefined";给出明确可诊断的错误,让调用方 catch 后回退纯文字。
@@ -1593,7 +1696,8 @@ export class CommentaryGenerator implements CommentaryProvider {
 		// 本次 callAPI 已真正执行的搜索次数。计在调用局部而不是实例上 —— 并发的
 		// 两条生成各有各的预算,记在 this 上会互相吃额度。
 		const budget = { searchCalls: 0 };
-		for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
+		const maxRounds = toolOptions?.maxRounds ?? MAX_TOOL_ROUNDS;
+		for (let round = 0; round < maxRounds; round++) {
 			let message: OpenAI.ChatCompletionMessage;
 			try {
 				message = await fetchRoundRetrying();
@@ -1613,7 +1717,9 @@ export class CommentaryGenerator implements CommentaryProvider {
 						`[api] 服务商方言参数不受支持，摘掉后重试(主人手写的额外参数保留): ${this.sanitizeErr(e)}`,
 					);
 					try {
-						const res = await client.chat.completions.create(makeParams(false));
+						const res = await cancellable((opts) =>
+							client.chat.completions.create(makeParams(false), opts),
+						);
 						const choice = res.choices?.[0];
 						if (!choice) {
 							throw new Error("AI 网关返回空 choices(疑似命中内容审查或上游异常),无法生成");
@@ -1644,6 +1750,8 @@ export class CommentaryGenerator implements CommentaryProvider {
 			this.logger.debug(`[tool] 第 ${round + 1} 轮，调用 ${message.tool_calls.length} 个工具`);
 			if (!toolOptions) break;
 
+			/** 这一轮工具交回的图,等所有 tool 消息都回完再一次补上(每个 tool_call 得先有应答)。 */
+			const shown: string[] = [];
 			for (let i = 0; i < message.tool_calls.length; i++) {
 				const toolCall = message.tool_calls[i];
 				// SDK v5 起 `tool_calls` 是联合类型(function | custom)。我们从不声明
@@ -1673,7 +1781,17 @@ export class CommentaryGenerator implements CommentaryProvider {
 				apiMessages.push({
 					role: "tool",
 					tool_call_id: toolCall.id,
-					content: result,
+					content: result.content,
+				});
+				if (result.images) shown.push(...result.images);
+			}
+			if (shown.length > 0) {
+				apiMessages.push({
+					role: "user",
+					content: [
+						{ type: "text", text: TOOL_IMAGE_NOTE },
+						...shown.map((url) => ({ type: "image_url" as const, image_url: { url } })),
+					],
 				});
 			}
 		}
@@ -1697,6 +1815,8 @@ export class CommentaryGenerator implements CommentaryProvider {
 		override?: CommentaryCallOverride;
 		onDelta?: (text: string) => void;
 		onReasoning?: (text: string) => void;
+		/** 带取消信号发一次非流式请求,见 callAPI 里的同名闭包。 */
+		cancellable: <T>(run: (opts: { signal?: AbortSignal }) => Promise<T>) => Promise<T>;
 	}): Promise<string> {
 		const { client, model, temperature, toolOptions, override } = args;
 
@@ -1736,10 +1856,13 @@ export class CommentaryGenerator implements CommentaryProvider {
 
 		/** 非流式取一轮,思考与正文按「先想后说」补喂回调(与 chat 的回落路径同规矩)。 */
 		const createOnce = async (withReasoning: boolean): Promise<unknown[]> => {
-			const res = (await client.responses.create(
-				// SDK 的参数类型要求具名字段,而这里的请求体是动态拼的(方言 + 主人
-				// 的额外参数),经 unknown 过桥 —— 形状由 responses-api 的测试钉住。
-				makeParams(withReasoning) as unknown as Parameters<OpenAI["responses"]["create"]>[0],
+			const res = (await args.cancellable((opts) =>
+				client.responses.create(
+					// SDK 的参数类型要求具名字段,而这里的请求体是动态拼的(方言 + 主人
+					// 的额外参数),经 unknown 过桥 —— 形状由 responses-api 的测试钉住。
+					makeParams(withReasoning) as unknown as Parameters<OpenAI["responses"]["create"]>[0],
+					opts,
+				),
 			)) as { output?: unknown[] };
 			const items = res.output;
 			if (!Array.isArray(items)) {
@@ -1759,8 +1882,16 @@ export class CommentaryGenerator implements CommentaryProvider {
 		const fetchRound = async (): Promise<unknown[]> => {
 			if (emit) {
 				try {
-					return await this.streamResponsesOnce(client, makeParams(true), emit, emitReasoning);
+					return await this.streamResponsesOnce(
+						client,
+						makeParams(true),
+						emit,
+						emitReasoning,
+						override?.signal,
+					);
 				} catch (e) {
+					const cancelled = CommentaryGenerator.cancelledOf(e);
+					if (cancelled) throw cancelled;
 					if (acct.emitted > 0) throw new Error(this.sanitizeErr(e));
 					const rejection = CommentaryGenerator.fatalOf(e);
 					if (rejection) throw rejection;
@@ -1771,7 +1902,8 @@ export class CommentaryGenerator implements CommentaryProvider {
 		};
 
 		const budget = { searchCalls: 0 };
-		for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
+		const maxRounds = toolOptions?.maxRounds ?? MAX_TOOL_ROUNDS;
+		for (let round = 0; round < maxRounds; round++) {
 			let items: unknown[];
 			try {
 				items = await fetchRound();
@@ -1802,6 +1934,7 @@ export class CommentaryGenerator implements CommentaryProvider {
 			}
 			this.logger.debug(`[tool] 第 ${round + 1} 轮，调用 ${calls.length} 个工具`);
 			if (!toolOptions) break;
+			const shown: string[] = [];
 			for (let i = 0; i < calls.length; i++) {
 				const call = calls[i];
 				const result = await this.execToolCall(
@@ -1811,7 +1944,21 @@ export class CommentaryGenerator implements CommentaryProvider {
 					toolOptions,
 					budget,
 				);
-				input.push({ type: "function_call_output", call_id: call.callId, output: result });
+				input.push({
+					type: "function_call_output",
+					call_id: call.callId,
+					output: result.content,
+				});
+				if (result.images) shown.push(...result.images);
+			}
+			if (shown.length > 0) {
+				input.push({
+					role: "user",
+					content: [
+						{ type: "input_text", text: TOOL_IMAGE_NOTE },
+						...shown.map((url) => ({ type: "input_image", image_url: url, detail: "auto" })),
+					],
+				});
 			}
 		}
 
@@ -1831,6 +1978,7 @@ export class CommentaryGenerator implements CommentaryProvider {
 		params: Record<string, unknown>,
 		onDelta: (text: string) => void,
 		onReasoning?: (text: string) => void,
+		external?: AbortSignal,
 	): Promise<unknown[]> {
 		return this.withStreamWatchdog(async (signal, beat) => {
 			const stream = (await client.responses.create(
@@ -1841,7 +1989,7 @@ export class CommentaryGenerator implements CommentaryProvider {
 				{ signal },
 			)) as unknown as AsyncIterable<Record<string, unknown>>;
 			return this.consumeResponsesStream(stream, beat, onDelta, onReasoning);
-		});
+		}, external);
 	}
 
 	private async consumeResponsesStream(
@@ -1895,7 +2043,7 @@ export class CommentaryGenerator implements CommentaryProvider {
 		toolOptions: CallToolOptions,
 		/** 本次 callAPI 的搜索预算。对象引用共享 —— 多轮之间要接着数。 */
 		budget: { searchCalls: number },
-	): Promise<string> {
+	): Promise<{ content: string; images?: readonly string[] }> {
 		// 参数先解析出来给 start 用。解析失败不在这儿抛 —— 下面那段要靠
 		// `parseErr` 保持原有语义:参数坏了就**不执行**工具,只把错误当结果回去。
 		let args: Record<string, string> = {};
@@ -1904,9 +2052,18 @@ export class CommentaryGenerator implements CommentaryProvider {
 			// :461 LLM 常把 uid 输出成数字(`{"uid":12345}`)。裸 as
 			// Record<string,string> 是谎言 → 下游用 args.uid 当字符串与
 			// 订阅 key("12345")比对失配。逐值强制 String 归一。
+			// 对象 / 数组例外,原样回成 JSON:卡片工坊写一张卡的 `blocks` 是对象数组,
+			// `String(v)` 会把它压成一串 `[object Object]`,工具连原文都拿不回来。
 			const parsed = JSON.parse(rawArgs) as Record<string, unknown>;
 			args = Object.fromEntries(
-				Object.entries(parsed).map(([k, v]) => [k, typeof v === "string" ? v : String(v)]),
+				Object.entries(parsed).map(([k, v]) => [
+					k,
+					typeof v === "string"
+						? v
+						: typeof v === "object" && v !== null
+							? JSON.stringify(v)
+							: String(v),
+				]),
 			);
 		} catch (e) {
 			parseErr = e as Error;
@@ -1917,6 +2074,7 @@ export class CommentaryGenerator implements CommentaryProvider {
 		toolOptions.onToolEvent?.({ phase: "start", id: traceId, name, args });
 
 		let result: string;
+		let images: readonly string[] | undefined;
 		let ok: boolean;
 		/** `web_search` 专属:搜到的来源,end 事件带给界面画「来源列表」。 */
 		let sources: WebSearchSourceRef[] | undefined;
@@ -1949,9 +2107,14 @@ export class CommentaryGenerator implements CommentaryProvider {
 		} else if (toolOptions.onToolCall) {
 			try {
 				this.logger.debug(`[tool] 执行 ${name}(${JSON.stringify(args)})`);
-				result = await toolOptions.onToolCall(name, args, (chars) =>
+				const out = await toolOptions.onToolCall(name, args, (chars) =>
 					toolOptions.onToolEvent?.({ phase: "progress", id: traceId, chars }),
 				);
+				if (typeof out === "string") result = out;
+				else {
+					result = out.text;
+					images = out.images?.length ? out.images : undefined;
+				}
 				ok = true;
 			} catch (e) {
 				result = `工具执行失败: ${(e as Error).message}`;
@@ -1970,7 +2133,7 @@ export class CommentaryGenerator implements CommentaryProvider {
 			...(sources ? { sources } : {}),
 		});
 		this.logger.debug(`[tool] ${name} 结果长度=${result.length}`);
-		return result;
+		return images ? { content: result, images } : { content: result };
 	}
 }
 

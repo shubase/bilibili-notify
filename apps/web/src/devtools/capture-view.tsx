@@ -1,5 +1,5 @@
 /**
- * 截流组的那张列表:闸开着时拦下的每一条推送(目标 / 适配器 / 文本摘要 / 图数)。
+ * 截流组的那张列表:闸开着时拦下的每一条推送(目标 / 连接 / 文本摘要 / 图数)。
  *
  * 历史那边照记 delivered 不打标 —— 这里才是「其实没发出去」的对照;「清掉截流期间的历史行」
  * 按截流的时间段把那些行删掉,免得测完一轮历史页里全是假的「已送达」。
@@ -123,7 +123,7 @@ function CaptureRow({ entry }: { entry: DevCapturedDelivery }) {
 						</Pill>
 					) : null}
 				</span>
-				<span className="truncate text-bn-2xs text-bn-text-tertiary">{entry.adapterName}</span>
+				<span className="truncate text-bn-2xs text-bn-text-tertiary">{entry.connectionName}</span>
 			</span>
 			<span className="min-w-0 flex-1">
 				<span className="flex items-center gap-1.5">

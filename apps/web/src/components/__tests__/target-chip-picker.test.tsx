@@ -2,14 +2,14 @@
 /**
  * 「从推送目标里勾几个」的胶囊选择器 —— 今天周报的「发送到」用它。
  *
- * 缝在组件 props:目标列表、适配器表与已选 id 进,点击回调 id 出。停用的目标**照列照勾**
+ * 缝在组件 props:目标列表、连接表与已选 id 进,点击回调 id 出。停用的目标**照列照勾**
  * 并标「已停用」(主人定的:停用是暂停不是消失),而「停用」与服务端跳过它时同一条判定 ——
- * 适配器停用的目标也标。不测样式。
+ * 连接停用的目标也标。不测样式。
  */
 
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vite-plus/test";
-import type { PushAdapter, PushTarget } from "../../types/domain";
+import type { Connection, PushTarget } from "../../types/domain";
 import { TargetChipPicker } from "../target-chip-picker";
 
 const T_A = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
@@ -19,16 +19,17 @@ function target(id: string, name: string, enabled = true): PushTarget {
 	return {
 		id,
 		name,
-		adapterId: "11111111-1111-4111-8111-111111111111",
+		connectionId: "11111111-1111-4111-8111-111111111111",
 		scope: "group",
 		enabled,
+		kind: "session",
 		platform: "onebot",
-		session: { groupId: "123" },
+		address: "123",
 	} as PushTarget;
 }
 
 const ADAPTER = "11111111-1111-4111-8111-111111111111";
-const adapters = [{ id: ADAPTER, enabled: true }] as PushAdapter[];
+const connections = [{ id: ADAPTER, enabled: true }] as Connection[];
 
 afterEach(cleanup);
 
@@ -38,7 +39,7 @@ describe("TargetChipPicker", () => {
 		render(
 			<TargetChipPicker
 				targets={[target(T_A, "群 A"), target(T_B, "群 B")]}
-				adapters={adapters}
+				connections={connections}
 				selected={[T_A]}
 				onToggle={onToggle}
 				tone="#ff0000"
@@ -52,7 +53,7 @@ describe("TargetChipPicker", () => {
 		render(
 			<TargetChipPicker
 				targets={[target(T_A, "群 A"), target(T_B, "群 B")]}
-				adapters={adapters}
+				connections={connections}
 				selected={[T_A]}
 				onToggle={() => {}}
 				tone="#ff0000"
@@ -71,7 +72,7 @@ describe("TargetChipPicker", () => {
 		render(
 			<TargetChipPicker
 				targets={[target(T_A, "群 A"), target(T_B, "群 B", false)]}
-				adapters={adapters}
+				connections={connections}
 				selected={[]}
 				onToggle={onToggle}
 				tone="#ff0000"
@@ -84,11 +85,11 @@ describe("TargetChipPicker", () => {
 		expect(onToggle).toHaveBeenCalledWith(T_B);
 	});
 
-	it("目标自己开着、它挂的适配器停了 → 也标「已停用」(服务端一样不发)", () => {
+	it("目标自己开着、它挂的连接停了 → 也标「已停用」(服务端一样不发)", () => {
 		render(
 			<TargetChipPicker
 				targets={[target(T_A, "群 A")]}
-				adapters={[{ id: ADAPTER, enabled: false }] as PushAdapter[]}
+				connections={[{ id: ADAPTER, enabled: false }] as Connection[]}
 				selected={[]}
 				onToggle={() => {}}
 				tone="#ff0000"
@@ -101,7 +102,7 @@ describe("TargetChipPicker", () => {
 		render(
 			<TargetChipPicker
 				targets={[]}
-				adapters={adapters}
+				connections={connections}
 				selected={[]}
 				onToggle={() => {}}
 				tone="#ff0000"

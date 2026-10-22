@@ -21,20 +21,20 @@
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type {
+	Connection,
 	GlobalConfig,
-	PushAdapter,
+	PlatformAdapter,
 	PushTarget,
 	Subscription,
 } from "@bilibili-notify/internal";
 import {
-	DEFAULT_CARD_LAYOUT,
 	DEFAULT_MESSAGE_LAYOUT,
 	makeDefaultGlobalConfig,
 	makeEmptySubscription,
 } from "@bilibili-notify/internal";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import type { ConfigStore } from "../../config/store.js";
-import type { PlatformAdapter } from "../../platforms/types.js";
+import { createAdapterRegistry } from "../../platforms/registry.js";
 import { standaloneContentBuilder } from "../content-builder.js";
 import { createNodeMessageBus } from "../message-bus.js";
 import type { NodeServiceContext } from "../service-context.js";
@@ -208,7 +208,7 @@ function makeServiceCtx() {
 function makeConfigStore(initial: GlobalConfig) {
 	let g = initial;
 	let targets: PushTarget[] = [];
-	let adapters: PushAdapter[] = [];
+	let connections: Connection[] = [];
 	return {
 		// 背景轮换游标 fs 路径取自此。指向 OS 临时目录下一个**不存在**的子目录(跨平台:
 		// Windows/macOS/Linux 都解析为各自 tmp 根):load 读不到走 catch 返回 {};测试不触发
@@ -216,17 +216,17 @@ function makeConfigStore(initial: GlobalConfig) {
 		bootstrap: { dataDir: join(tmpdir(), "bn-engines-test-no-such-dir") },
 		getGlobals: () => g,
 		getTargets: () => targets,
-		getAdapters: () => adapters,
+		getConnections: () => connections,
 		patchTarget: vi.fn(async () => {}),
-		patchAdapter: vi.fn(async () => {}),
+		patchConnection: vi.fn(async () => {}),
 		_set: (next: GlobalConfig) => {
 			g = next;
 		},
 		_setTargets: (next: PushTarget[]) => {
 			targets = next;
 		},
-		_setAdapters: (next: PushAdapter[]) => {
-			adapters = next;
+		_setConnections: (next: Connection[]) => {
+			connections = next;
 		},
 	};
 }
@@ -244,14 +244,16 @@ function setup(opts?: {
 	globals?: GlobalConfig;
 	puppeteer?: boolean;
 	subs?: Subscription[];
-	/** 配置表里的适配器(开机健康探测会挨个探它们)。 */
-	adapters?: PushAdapter[];
+	/** 配置表里的连接(开机健康探测会挨个探它们)。 */
+	connections?: Connection[];
 	/** 平台实现(探测 / 能力都问它)。 */
 	platformAdapters?: PlatformAdapter[];
+	/** 卡片皮肤那三口(接线层给的);不给 = 这台机器只有内置默认皮肤。 */
+	cardSkins?: Parameters<typeof createEngines>[0]["cardSkins"];
 }): Ctx {
 	const serviceCtx = makeServiceCtx();
 	const configStore = makeConfigStore(opts?.globals ?? makeDefaultGlobalConfig());
-	if (opts?.adapters) configStore._setAdapters(opts.adapters);
+	if (opts?.connections) configStore._setConnections(opts.connections);
 	const api = { setUserAgent: vi.fn() };
 	const loginFlow = { setHealthCheckMs: vi.fn() };
 	const bus = createNodeMessageBus();
@@ -276,8 +278,9 @@ function setup(opts?: {
 			load: vi.fn(async () => {}),
 		} as any,
 		bus,
-		adapters: opts?.platformAdapters ?? [],
+		adapters: createAdapterRegistry(opts?.platformAdapters ?? []),
 		puppeteer: opts?.puppeteer ? ({} as any) : null,
+		...(opts?.cardSkins ? { cardSkins: opts.cardSkins } : {}),
 	});
 	return { runtime, bus, serviceCtx, configStore, api, loginFlow };
 }
@@ -415,6 +418,21 @@ describe("createEngines — boot wiring", () => {
 		expect(H.image[0].start).toHaveBeenCalledTimes(1);
 	});
 
+	// 「接线要有自己的守卫」:三口各自都有测试,证明不了 engines 真的把它们接上了 ——
+	// 漏接的症状是静默的(出图永远用内置默认皮肤,类型 / 测试 / 构建全绿)。
+	it("卡片皮肤那三口原样接到 ImageRenderer 上", () => {
+		const get = vi.fn(() => undefined);
+		const asset = vi.fn(async () => undefined);
+		const onFallback = vi.fn();
+		const c = setup({ puppeteer: true, cardSkins: { get, asset, onFallback } });
+		active = c;
+		const o = H.image[0].opts;
+		// 验红:把 engines.ts 里那三行 `resolveCardSkin: opts.cardSkins?.get` 删掉,这三条红。
+		expect(o.resolveCardSkin).toBe(get);
+		expect(o.resolveCardSkinAsset).toBe(asset);
+		expect(o.onCardSkinFallback).toBe(onFallback);
+	});
+
 	it("直播消息模板无开关:boot 时 live 引擎 config 始终带全局模板(回归 liveMsgEnabled 移除)", () => {
 		// 此前 liveMsgEnabled=false(默认)→ customLiveMsg 不带 customLiveStart,引擎走
 		// builtin。现无开关:全局模板始终下发,编辑即生效(默认值 == builtin,输出不变)。
@@ -476,6 +494,36 @@ describe("createEngines — enableImageRendering 运行时热启用", () => {
 });
 
 describe("createEngines — config-changed globals 热重载", () => {
+	it("group command changes refresh the dynamic hint without restarting", () => {
+		const c = setup();
+		active = c;
+		patchGlobals(c, (g) => {
+			g.groupCommands.prefix = "test";
+		});
+		c.bus.emit("config-changed", "globals");
+		expect(H.dynamic[0].updateConfig).toHaveBeenLastCalledWith(
+			expect.objectContaining({ helpHint: expect.stringContaining("test帮助") }),
+		);
+		patchGlobals(c, (g) => {
+			g.groupCommands.enabled = false;
+		});
+		c.bus.emit("config-changed", "globals");
+		expect(H.dynamic[0].updateConfig).toHaveBeenLastCalledWith(
+			expect.objectContaining({ helpHint: undefined }),
+		);
+		expect(H.live[0].updateConfig).not.toHaveBeenCalled();
+	});
+
+	it("private command changes do not refresh dynamic rendering", () => {
+		const c = setup();
+		active = c;
+		patchGlobals(c, (g) => {
+			g.commands.prefix = "private";
+		});
+		c.bus.emit("config-changed", "globals");
+		expect(H.dynamic[0].updateConfig).not.toHaveBeenCalled();
+	});
+
 	it("改 app 字段:热推 health + dynamic,不碰 live.updateConfig", () => {
 		const c = setup();
 		active = c;
@@ -635,20 +683,37 @@ describe("createEngines — config-changed globals 热重载", () => {
 		expect(cfg.videoTemplate).toBe("🎬 {name} {url}");
 	});
 
-	it("回归:改全局 cardStyle.backgroundImages → 两端 config 都带 defaultBackgroundImages(无覆盖的 UP 靠它轮换)", () => {
-		// 此前 dynamicConfig()/liveConfig() 都没有把全局默认图廊透传给引擎,
-		// 导致无 per-UP / per-kind 背景覆盖的 UP 永远只渲染渲染器内部缓存的
-		// 静态首图,图廊配再多张也不轮换。
+	it("回归:改全局 cardStyle.liveCoverImages → live config 带 defaultLiveCoverImages(无覆盖的 UP 靠它轮换)", () => {
+		// 此前 liveConfig() 没有把全局默认封面廊透传给引擎,导致无 per-UP / per-kind
+		// 覆盖的 UP 永远只渲染第一张,封面配再多张也不轮换。
+		// (背景图从前有一条同构的 `defaultBackgroundImages`;整条链 2026-09-20 删掉。)
 		const c = setup();
 		active = c;
 		patchGlobals(c, (g) => {
-			g.defaults.cardStyle.backgroundImages = ["a", "b"];
+			g.defaults.cardStyle.liveCoverImages = ["a", "b"];
 		});
 		c.bus.emit("config-changed", "globals");
-		const dynCfg = H.dynamic[0].updateConfig.mock.calls.at(-1)?.[0];
 		const liveCfg = H.live[0].updateConfig.mock.calls.at(-1)?.[0];
-		expect(dynCfg.defaultBackgroundImages).toEqual(["a", "b"]);
-		expect(liveCfg.defaultBackgroundImages).toEqual(["a", "b"]);
+		expect(liveCfg.defaultLiveCoverImages).toEqual(["a", "b"]);
+	});
+
+	it("回归:改全局上舰三档文案 → live config 的 customGuardBuy 三档各带各的文案与图片", () => {
+		// 此前 liveConfig() 只把 `captain.template` 当成所有档位的文案传给引擎,提督 /
+		// 总督的专属文案运行时从来不读(图片倒是三档各传各的)。
+		const guardBuy = {
+			enable: true,
+			captain: { template: "舰长那句", imageUrl: "cap.png" },
+			commander: { template: "提督那句", imageUrl: "com.png" },
+			governor: { template: "总督那句", imageUrl: "gov.png" },
+		};
+		const c = setup();
+		active = c;
+		patchGlobals(c, (g) => {
+			g.defaults.templates.guardBuy = guardBuy;
+		});
+		c.bus.emit("config-changed", "globals");
+		const liveCfg = H.live[0].updateConfig.mock.calls.at(-1)?.[0];
+		expect(liveCfg.customGuardBuy).toEqual(guardBuy);
 	});
 
 	it("item 4 — 改 defaults.ai 不扇出重设 UA / level / healthCheck", () => {
@@ -679,23 +744,21 @@ describe("createEngines — config-changed globals 热重载", () => {
 		expect(liveOps[0]).toMatchObject({ type: "update", uid: "1" });
 	});
 
-	it("回归:只改全局 cardLayout(不碰 cardStyle/ai/schedule 等)→ live.applyOps 与 dynamic.applyOps 都收到刷新(此前 layoutChanged 未接入热更 gate,保存版式后预览生效但实际推送仍用旧版式)", () => {
+	it("回归:只改全局 cardSkin(不碰 cardStyle/ai/schedule 等)→ live.applyOps 与 dynamic.applyOps 都收到刷新(热更 gate 漏掉它的话,换了皮肤要重启才生效)", () => {
 		const sub = makeEmptySubscription({ id: "sub-1", uid: "1" });
 		const c = setup({ subs: [sub] });
 		active = c;
 		H.dynamic[0].applyOps.mockClear();
 		H.live[0].applyOps.mockClear();
 		patchGlobals(c, (g) => {
-			const block = g.defaults.cardLayout.live[0];
-			expect(block).toBeDefined();
-			if (block) block.visible = false;
+			g.defaults.cardSkin = "skin-abc";
 		});
 		c.bus.emit("config-changed", "globals");
 
 		const liveOps = H.live[0].applyOps.mock.calls.at(-1)?.[0];
 		expect(liveOps).toHaveLength(1);
 		expect(liveOps[0]).toMatchObject({ type: "update", uid: "1" });
-		expect(liveOps[0].changes[0].cardLayout.live[0].visible).toBe(false);
+		expect(liveOps[0].changes[0].cardSkin).toBe("skin-abc");
 
 		expect(H.dynamic[0].applyOps).toHaveBeenCalledTimes(1);
 		const dynOps = H.dynamic[0].applyOps.mock.calls.at(-1)?.[0];
@@ -781,44 +844,40 @@ describe("createEngines — AI 热重载三态", () => {
 });
 
 describe("createEngines — image 配色热更", () => {
-	it("puppeteer 在位:globals 变更 → imageRenderer.updateConfig 带新配色", () => {
+	it("puppeteer 在位:globals 变更 → imageRenderer.updateConfig 带新样式", () => {
 		const c = setup({ puppeteer: true });
 		active = c;
 		patchGlobals(c, (g) => {
-			g.defaults.cardStyle.cardColorStart = "#123456";
+			g.defaults.cardStyle.liveCoverImages = ["cover-1"];
 		});
 		c.bus.emit("config-changed", "globals");
-		const last = H.image[0].updateConfig.mock.calls.at(-1)?.[0];
-		expect(last.cardColorStart).toBe("#123456");
+		expect(H.image[0].updateConfig).toHaveBeenCalled();
 		// cardStyle 变更不在 app section → 不扇出重设 UA(仅 boot 1 次)。
 		expect(c.api.setUserAgent).toHaveBeenCalledTimes(1);
 	});
 
-	it("font / 数据区 show 开关改完直透 ImageRenderer 同名字段(全链路不桥接)", () => {
+	/**
+	 * 字体那一项 2026-09-14 退役成皮肤旋钮,数据区那三个开关同日一起退役 —— 从 cardStyle
+	 * 透给渲染器的东西就此空了,所以这里钉的是**旋钮值**那条热更:拧一枚旋钮要当场生效,
+	 * 与从前改字体一样。
+	 */
+	it("旋钮值改完直透 ImageRenderer 同名字段(全链路不桥接)", () => {
 		const c = setup({ puppeteer: true });
 		active = c;
-		// boot 时构造的 ImageRenderer 已收到 default(PingFang / 数据区三项全开)。
+		// boot 时构造的 ImageRenderer 一个退役字段都不带:字体与数据区三开关都不在里面了。
 		const bootConfig = H.image[0].opts.config;
-		expect(bootConfig).toMatchObject({
-			font: "PingFang SC, sans-serif",
-			showPopularity: true,
-			showArea: true,
-			showFans: true,
-		});
+		expect(bootConfig.font).toBeUndefined();
+		expect(bootConfig.showPopularity).toBeUndefined();
+		expect(bootConfig.showArea).toBeUndefined();
+		expect(bootConfig.showFans).toBeUndefined();
 
 		patchGlobals(c, (g) => {
-			g.defaults.cardStyle.font = "Noto Sans CJK SC";
-			g.defaults.cardStyle.showPopularity = false;
-			g.defaults.cardStyle.showArea = false;
-			g.defaults.cardStyle.showFans = false;
+			g.defaults.cardSkinKnobs = { default: { font: "Noto Sans CJK SC" } };
 		});
 		c.bus.emit("config-changed", "globals");
 		const last = H.image[0].updateConfig.mock.calls.at(-1)?.[0];
 		expect(last).toMatchObject({
-			font: "Noto Sans CJK SC",
-			showPopularity: false,
-			showArea: false,
-			showFans: false,
+			cardSkinKnobs: { default: { font: "Noto Sans CJK SC" } },
 		});
 	});
 });
@@ -943,33 +1002,31 @@ describe("createEngines — 订阅禁用/启用转译", () => {
 		expect(view.customVideoTemplate).toBe("🎬 {name} {url}");
 	});
 
-	it("add op 携带 per-UP cardLayout(live 全量描述符 / dynamic 切片)", () => {
+	it("add op 携带 per-UP cardSkin(两个引擎各拿一份)", () => {
 		const sub = makeSub("800", true);
-		// per-UP 整份覆盖:把 live 的 cover 块关掉。
-		sub.overrides.cardLayout = {
-			...DEFAULT_CARD_LAYOUT,
-			live: DEFAULT_CARD_LAYOUT.live.map((b) => (b.id === "cover" ? { ...b, visible: false } : b)),
-		};
+		// per-UP 指了自己那套皮肤(ADR-0014 决策 17:per-UP = 选皮肤 + 变量覆盖)。
+		sub.overrides.cardSkin = "k9zzz-0badf00d";
 		const c = setup({ subs: [sub] });
 		active = c;
 		c.bus.emit("subscription-changed", [{ type: "add", sub }]);
 
-		// live add op 带整份 cardLayout,cover 关闭被透传。
 		const liveView = H.live[0].applyOps.mock.calls.at(-1)?.[0][0].sub;
-		expect(liveView.cardLayout.live.find((b: { id: string }) => b.id === "cover")?.visible).toBe(
-			false,
-		);
-
-		// dynamic add op 带 dynamic 切片(本例未改动,等于默认版式:含分割线与 additional 块)。
+		expect(liveView.cardSkin).toBe("k9zzz-0badf00d");
 		const dynView = H.dynamic[0].applyOps.mock.calls.at(-1)?.[0][0].sub;
-		expect(dynView.dynamicLayout?.map((b: { id: string }) => b.id)).toEqual([
-			"header",
-			"divider-1",
-			"content",
-			"additional",
-			"divider-2",
-			"stats",
-		]);
+		expect(dynView.cardSkin).toBe("k9zzz-0badf00d");
+	});
+
+	it("没有 per-UP 皮肤 → 两个引擎都拿全局那套", () => {
+		const sub = makeSub("801", true);
+		const c = setup({ subs: [sub] });
+		active = c;
+		patchGlobals(c, (g) => {
+			g.defaults.cardSkin = "k1aaa-11111111";
+		});
+		c.bus.emit("subscription-changed", [{ type: "add", sub }]);
+
+		expect(H.live[0].applyOps.mock.calls.at(-1)?.[0][0].sub.cardSkin).toBe("k1aaa-11111111");
+		expect(H.dynamic[0].applyOps.mock.calls.at(-1)?.[0][0].sub.cardSkin).toBe("k1aaa-11111111");
 	});
 
 	it("禁用订阅 add:dynamic add op 仍下发但 dynamic:false(engine applyOps 的 !op.sub.dynamic 拦截)", () => {
@@ -1153,11 +1210,13 @@ describe("resolveDynamicCardStyle — 推送卡与链接卡同一把尺", () => 
 		expect(resolveDynamicCardStyle(g.defaults, null)).toEqual({ enable: false });
 	});
 
-	it("全局给「动态」调了配色 → 全局作用域(null)也解析出完整样式", () => {
+	it("全局给「动态」调了样式 → 全局作用域(null)也解析出完整样式", () => {
 		const g = makeDefaultGlobalConfig();
-		g.defaults.cardStyleByKind = { dynamic: { cardColorStart: "#abcdef" } } as any;
+		// 载体 2026-09-20 从 `font` 换成 `liveCoverImages`:字体已不再往下喂(见
+		// `cardStyleToColorOptions`),拿它当「有内容的样式」会连着这条一起红。测的是解析,不是字体。
+		g.defaults.cardStyleByKind = { dynamic: { liveCoverImages: ["dyn.png"] } } as any;
 		const style = resolveDynamicCardStyle(g.defaults, null);
-		expect(style).toMatchObject({ enable: true, cardColorStart: "#abcdef" });
+		expect(style).toMatchObject({ enable: true, liveCoverImages: ["dyn.png"] });
 		// 与 per-UP 视图走的是同一个函数:没有 UP 覆盖的订阅算出来的必须一模一样。
 		const sub = makeEmptySubscription({ id: "s1", uid: "1" });
 		const subRt = { get: () => undefined } as any;
@@ -1167,10 +1226,10 @@ describe("resolveDynamicCardStyle — 推送卡与链接卡同一把尺", () => 
 	it("只有 UP 自己的基准覆盖、没有 per-kind → 折算那份基准", () => {
 		const g = makeDefaultGlobalConfig();
 		const sub = makeEmptySubscription({ id: "s1", uid: "1" });
-		sub.overrides.cardStyle = { cardColorEnd: "#000001" } as any;
+		sub.overrides.cardStyle = { liveCoverImages: ["up.png"] } as any;
 		expect(resolveDynamicCardStyle(g.defaults, sub.overrides)).toMatchObject({
 			enable: true,
-			cardColorEnd: "#000001",
+			liveCoverImages: ["up.png"],
 		});
 	});
 });
@@ -1185,11 +1244,10 @@ describe("createEngines — 链接卡的呈现与开关", () => {
 			defaults: { parse: true, form: "image" },
 			groups: {},
 		});
-		expect(c.runtime.linkCardPresentation().layout).toEqual(
-			c.configStore.getGlobals().defaults.cardLayout.dynamic,
+		expect(c.runtime.linkCardPresentation().cardSkin).toBe(
+			c.configStore.getGlobals().defaults.cardSkin,
 		);
 
-		const layout = [{ id: "content", type: "content", visible: true }];
 		patchGlobals(c, (g) => {
 			g.linkParsing = {
 				enabled: true,
@@ -1197,7 +1255,7 @@ describe("createEngines — 链接卡的呈现与开关", () => {
 				defaults: { parse: true, form: "image" },
 				groups: {},
 			};
-			g.defaults.cardLayout.dynamic = layout as any;
+			g.defaults.cardSkin = "skin-link";
 		});
 		c.bus.emit("config-changed", "globals");
 
@@ -1207,28 +1265,36 @@ describe("createEngines — 链接卡的呈现与开关", () => {
 			defaults: { parse: true, form: "image" },
 			groups: {},
 		});
-		expect(c.runtime.linkCardPresentation().layout).toEqual(layout);
+		expect(c.runtime.linkCardPresentation().cardSkin).toBe("skin-link");
 	});
 
-	// 例外引用的是目标:目标或适配器停用、删掉都会改变答案,所以逐群表要跟着
+	// 例外引用的是目标:目标或连接停用、删掉都会改变答案,所以逐群表要跟着
 	// globals / targets / adapters 三种变更重算,不能只盯 globals。
 	it("逐群答案随 globals、targets、adapters 三种 config-changed 重算", () => {
 		const ADAPTER = "11111111-1111-4111-8111-111111111111";
 		const TARGET = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 		const c = setup();
 		active = c;
-		c.configStore._setAdapters([
-			{ id: ADAPTER, name: "bot", enabled: true, platform: "onebot", config: {} } as any,
+		c.configStore._setConnections([
+			{
+				id: ADAPTER,
+				name: "bot",
+				enabled: true,
+				kind: "direct",
+				platform: "onebot",
+				config: {},
+			} as any,
 		]);
 		c.configStore._setTargets([
 			{
 				id: TARGET,
 				name: "群",
-				adapterId: ADAPTER,
+				connectionId: ADAPTER,
 				scope: "group",
 				enabled: true,
 				platform: "onebot",
-				session: { groupId: "123" },
+				kind: "session",
+				address: "123",
 			} as PushTarget,
 		]);
 		const KEY = `onebot:${ADAPTER}:123`;
@@ -1254,12 +1320,14 @@ describe("createEngines — 链接卡的呈现与开关", () => {
 		c.bus.emit("config-changed", "targets");
 		expect(c.runtime.linkPolicyFor(KEY).parse).toBe(false);
 
-		// 目标恢复、但适配器停用 → 同样不算;只发 adapters 的变更。
+		// 目标恢复、但连接停用 → 同样不算;只发 connections 的变更。
 		c.configStore._setTargets([{ ...c.configStore.getTargets()[0], enabled: true } as PushTarget]);
 		c.bus.emit("config-changed", "targets");
 		expect(c.runtime.linkPolicyFor(KEY).parse).toBe(true);
-		c.configStore._setAdapters([{ ...c.configStore.getAdapters()[0], enabled: false } as any]);
-		c.bus.emit("config-changed", "adapters");
+		c.configStore._setConnections([
+			{ ...c.configStore.getConnections()[0], enabled: false } as any,
+		]);
+		c.bus.emit("config-changed", "connections");
 		expect(c.runtime.linkPolicyFor(KEY).parse).toBe(false);
 	});
 
@@ -1269,16 +1337,25 @@ describe("createEngines — 链接卡的呈现与开关", () => {
 		expect(c.runtime.linkCardPresentation().colors).toBeUndefined();
 
 		patchGlobals(c, (g) => {
-			g.defaults.cardStyleByKind = { dynamic: { cardColorStart: "#abcdef" } } as any;
+			g.defaults.cardStyleByKind = { dynamic: { liveCoverImages: ["dyn.png"] } } as any;
 		});
 		c.bus.emit("config-changed", "globals");
-		expect(c.runtime.linkCardPresentation().colors).toMatchObject({ cardColorStart: "#abcdef" });
+		expect(c.runtime.linkCardPresentation().colors).toMatchObject({
+			liveCoverImages: ["dyn.png"],
+		});
 	});
 });
 
-describe("createEngines — 适配器的平台能力", () => {
+describe("createEngines — 连接所在平台的能力", () => {
 	const ADAPTER = "11111111-1111-4111-8111-111111111111";
-	const onebot = { id: ADAPTER, name: "bot", enabled: true, platform: "onebot", config: {} } as any;
+	const onebot = {
+		id: ADAPTER,
+		name: "bot",
+		enabled: true,
+		kind: "direct",
+		platform: "onebot",
+		config: {},
+	} as any;
 
 	/** 探一次就变「支持」的假平台实现;探之前是「未探测」。 */
 	function fakePlatform(answer: "supported" | "unknown" = "supported", probeOk = true) {
@@ -1302,43 +1379,45 @@ describe("createEngines — 适配器的平台能力", () => {
 	}
 	const tick = () => new Promise<void>((r) => setTimeout(r, 0));
 
-	it("开机健康探测顺路把「未探测」的能力探一次;之后从 adapterCapabilities 读得到", async () => {
+	it("开机健康探测顺路把「未探测」的能力探一次;之后从 connectionCapabilities 读得到", async () => {
 		const { pa, probeCapabilities } = fakePlatform();
-		const c = setup({ adapters: [onebot], platformAdapters: [pa] });
+		const c = setup({ connections: [onebot], platformAdapters: [pa] });
 		active = c;
 		await tick();
 		expect(probeCapabilities).toHaveBeenCalledTimes(1);
-		expect(c.runtime.adapterCapabilities(ADAPTER)).toEqual({
+		expect(c.runtime.connectionCapabilities(ADAPTER)).toEqual({
 			miniAppCard: { state: "supported", checkedAt: 1 },
 		});
 		// 已经有答案的不重探:主人点「测试」只做健康探测。
-		await c.runtime.probeAdapter(ADAPTER);
+		await c.runtime.probeConnection(ADAPTER);
 		expect(probeCapabilities).toHaveBeenCalledTimes(1);
 	});
 
 	it("探完仍「未探测」→ 主人点「测试」会再给一次机会", async () => {
 		const { pa, probeCapabilities } = fakePlatform("unknown");
-		const c = setup({ adapters: [onebot], platformAdapters: [pa] });
+		const c = setup({ connections: [onebot], platformAdapters: [pa] });
 		active = c;
 		await tick();
 		expect(probeCapabilities).toHaveBeenCalledTimes(1);
-		await c.runtime.probeAdapter(ADAPTER);
+		await c.runtime.probeConnection(ADAPTER);
 		expect(probeCapabilities).toHaveBeenCalledTimes(2);
-		expect(c.runtime.adapterCapabilities(ADAPTER)).toEqual({ miniAppCard: { state: "unknown" } });
+		expect(c.runtime.connectionCapabilities(ADAPTER)).toEqual({
+			miniAppCard: { state: "unknown" },
+		});
 	});
 
-	it("连都连不上的适配器不补探能力 —— 那一趟只会白等满一个超时", async () => {
+	it("连都连不上的连接不补探能力 —— 那一趟只会白等满一个超时", async () => {
 		const { pa, probeCapabilities } = fakePlatform("unknown", false);
-		const c = setup({ adapters: [onebot], platformAdapters: [pa] });
+		const c = setup({ connections: [onebot], platformAdapters: [pa] });
 		active = c;
 		await tick();
 		expect(pa.probe).toHaveBeenCalled();
 		expect(probeCapabilities).not.toHaveBeenCalled();
 	});
 
-	it("没有能力概念的平台(配置里没这条适配器也一样)→ undefined", () => {
+	it("没有能力概念的平台(配置里没这条连接也一样)→ undefined", () => {
 		const c = setup();
 		active = c;
-		expect(c.runtime.adapterCapabilities("nope")).toBeUndefined();
+		expect(c.runtime.connectionCapabilities("nope")).toBeUndefined();
 	});
 });

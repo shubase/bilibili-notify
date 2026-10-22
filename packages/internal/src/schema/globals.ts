@@ -1,12 +1,13 @@
 import { z } from "zod";
 import { BUILTIN_AI_PRESETS, DEFAULT_TEMPLATES, MIRROR_PREFIX_RE } from "../constants";
 import { allTemplateFingerprints } from "../template-defaults";
+import { isPlainObject } from "../util/plain-object";
 
 // 模板默认值住在零依赖的 `constants.ts` —— 前端要拿它跟盘上的值比对(「默认文案有
 // 更新」那套),从这里(带 zod)拿会把 zod 拽进浏览器 bundle。同 BUILTIN_AI_PRESETS。
 export { DEFAULT_TEMPLATES } from "../constants";
 
-import { CardLayoutSchema, DEFAULT_CARD_LAYOUT } from "./card-layout";
+import { CardSkinIdSchema, CardSkinKnobOverridesSchema, DEFAULT_CARD_SKIN_ID } from "./card-skin";
 import {
 	DEFAULT_COMMAND_CONFIG as DEFAULT_PRIVATE_COMMAND_CONFIG,
 	CommandConfigSchema as PrivateCommandConfigSchema,
@@ -102,6 +103,12 @@ export const AppConfigSchema = z.object({
 	 * 长期价值低)。
 	 */
 	logRetentionDays: z.number().int().min(1).max(365).default(7),
+	/**
+	 * 内存自检打印:开着就每 10 分钟往日志写一行 `[mem]`(堆用量 / 上限 / 占比 / RSS /
+	 * 弹幕收集器规模)。默认关 —— 概览页的「系统资源」卡已经实时在看,这行只给要留一条
+	 * 长曲线排泄漏的人。堆逼近上限的 warn 不归它管,始终在。
+	 */
+	memoryLog: z.boolean().default(false),
 });
 export type AppConfig = z.infer<typeof AppConfigSchema>;
 
@@ -197,9 +204,20 @@ export const GlobalDefaultsSchema = z.object({
 	// 按卡片类型的样式覆盖(渐变/字体/玻璃片/背景图);缺该字段的老 globals.json 自动补 {}
 	// (= 所有卡片跟随 cardStyle 基准,复刻现状)。生效解析见 resolveCardStyleForKind。
 	cardStyleByKind: CardStyleByKindSchema.default({}),
-	// `.default(DEFAULT_CARD_LAYOUT)` 让缺 cardLayout 字段的老 globals.json(在加该
-	// 字段前持久化的)load 时自动补全为默认版式,与 imageGroup 同源的迁移友好策略。
-	cardLayout: CardLayoutSchema.default(DEFAULT_CARD_LAYOUT),
+	// 全局用哪套卡片皮肤(ADR-0014)。缺字段的老 globals.json 补成内置默认皮肤;版式
+	// 本身住皮肤包里,不再住配置。存量的 `cardLayout` 键**直接丢**(决策 17 的
+	// 2026-09-18 🔗:迁移退役,升级上来的一律用出厂默认皮肤)—— 这几个配置 schema 都是
+	// 裸 `z.object`,zod 对未知键是 strip,老存档照样装得进来,那个键下次写盘时消失。
+	cardSkin: CardSkinIdSchema.default(DEFAULT_CARD_SKIN_ID),
+	/**
+	 * 用户拧过的**皮肤旋钮**,按皮肤 id 分开存(ADR-0014 决策 16 的 🔗,2026-09-14)。
+	 *
+	 * 按 id 存是为了「换回来还在」:一套皮肤调好的配色,换去别的皮肤再换回来不该清零。
+	 * **存覆盖不存值** —— 没拧过的键根本不在表里,渲染时让皮肤 CSS 自己的兜底生效
+	 * (默认皮肤的玻璃白纱三档基线就靠这个活着)。不分卡种:皮肤想让两种卡不同色,
+	 * 自己声明两枚旋钮。
+	 */
+	cardSkinKnobs: z.record(CardSkinIdSchema, CardSkinKnobOverridesSchema).default({}),
 	// 消息版式(发送侧结构):与 cardLayout 同款迁移友好策略,缺字段的老 globals.json
 	// load 时自动补默认(= 复刻现状:卡片+文本+链接合并一条)。
 	messageLayout: MessageLayoutSchema.default(DEFAULT_MESSAGE_LAYOUT),
@@ -281,7 +299,45 @@ export const DEFAULT_UPDATE_SETTINGS: UpdateSettings = {
 	mirrors: [],
 };
 
-export const GlobalConfigSchema = z.object({
+/**
+ * 拓展市场的源(ADR-0013)。官方源是内置的、不能删,**不在这里**;这里只有主人自己加的
+ * 第三方源 —— 一个 https 地址指向一份 `marketplace.json`。
+ */
+export const MarketplaceSourceSchema = z.object({
+	/** 本地身份(uuid);已装拓展记「从哪个源装的」靠它。 */
+	id: z.string().min(1).max(64),
+	/**
+	 * 可选:索引自己带 `name`,拿到之后以它为准;这里只在索引还没拿到 / 拿不到时顶一下。
+	 * 用户加源时**只填地址**,不用起名。
+	 */
+	name: z.string().min(1).max(40).optional(),
+	url: z.string().url().regex(MIRROR_PREFIX_RE, "源地址必须是 https:// 开头"),
+});
+export type MarketplaceSource = z.infer<typeof MarketplaceSourceSchema>;
+
+export const MarketplaceSettingsSchema = z.object({
+	/** 封顶 20 条 —— 打开市场那一页会去真连每一个。 */
+	sources: z.array(MarketplaceSourceSchema).max(20).default([]),
+});
+export type MarketplaceSettings = z.infer<typeof MarketplaceSettingsSchema>;
+
+export const DEFAULT_MARKETPLACE_SETTINGS: MarketplaceSettings = { sources: [] };
+
+/**
+ * 宿主记的一个拓展的持久状态:主人按的开关,加上拓展自己的那份设置。
+ */
+export const ExtensionStateSchema = z.object({
+	enabled: z.boolean().default(false),
+	/**
+	 * 这个拓展自己的持久设置(桥的接入名单住这儿)。**宿主不认识它的形状** —— 归拓展自己
+	 * 那份 zod(经 `ctx.settings(schema)` 现读),这里只保证原样存、原样取。写路径仍只有
+	 * 面板那一条(`PATCH /api/globals`)。
+	 */
+	settings: z.unknown().optional(),
+});
+export type ExtensionState = z.infer<typeof ExtensionStateSchema>;
+
+const GlobalConfigObjectSchema = z.object({
 	app: AppConfigSchema,
 	master: MasterConfigSchema,
 	defaults: GlobalDefaultsSchema,
@@ -340,9 +396,48 @@ export const GlobalConfigSchema = z.object({
 	 * 少了它,存量实例升上来第一件事就是开不了机。
 	 */
 	update: UpdateSettingsSchema.default(DEFAULT_UPDATE_SETTINGS),
+	/**
+	 * 拓展的开关,键是拓展 id(= 装载目录名 = 挂载点那一段)。
+	 *
+	 * **开放词表**,不是 `z.enum`:模块是编进产物的,而配置活得比某一版产物久 —— 一次
+	 * 回退、一次撤下,配置里就会多出一个当下没人认领的 id。闭集会把它判成非法(整份
+	 * globals 开不了机)或者被抹掉(用户再升回来时开关被人悄悄关了)。
+	 *
+	 * 读它用 {@link isExtensionEnabled} —— **缺失 = 关着**,别在读点各写各的 `?? false`。
+	 */
+	extensions: z.record(z.string(), ExtensionStateSchema).default({}),
+	/** 拓展市场的第三方源。老配置没有这一段 → 空表。 */
+	marketplace: MarketplaceSettingsSchema.default(DEFAULT_MARKETPLACE_SETTINGS),
 	bootstrap: BootstrapConfigSchema.optional(),
 });
+export const GlobalConfigSchema = z.preprocess((raw) => {
+	if (!isPlainObject(raw) || !isPlainObject(raw.commands)) return raw;
+	const commands = raw.commands;
+	const aliases = isPlainObject(commands.aliases) ? commands.aliases : {};
+	const isLegacyGroupConfig =
+		"ownerQq" in commands ||
+		"videoParse" in commands ||
+		(raw.groupCommands === undefined &&
+			Object.values(aliases).some((value) => typeof value === "string"));
+	if (!isLegacyGroupConfig) return raw;
+	return {
+		...raw,
+		groupCommands: raw.groupCommands ?? commands,
+		commands: {},
+	};
+}, GlobalConfigObjectSchema);
 export type GlobalConfig = z.infer<typeof GlobalConfigSchema>;
+
+/**
+ * 这个拓展模块开了没有。**缺失 = 关着**:开关是用户按的,桥接模块一开就是在对外收长
+ * 连接,不该因为升了一版就自己开起来。
+ */
+export function isExtensionEnabled(
+	config: { extensions?: Record<string, { enabled?: boolean } | undefined> },
+	id: string,
+): boolean {
+	return config.extensions?.[id]?.enabled === true;
+}
 
 export const DEFAULT_AI = {
 	enabled: false,
@@ -359,15 +454,14 @@ export const DEFAULT_AI = {
 
 export const DEFAULT_CARD_STYLE = {
 	enabled: true,
-	cardColorStart: "#e0c3fc",
-	cardColorEnd: "#8ec5fc",
-	font: "PingFang SC, sans-serif",
-	// 数据区三项默认全显示 = 复刻现状(简介显隐已交由版式 desc 块)。
-	showPopularity: true,
-	showArea: true,
-	showFans: true,
-	// 空列表 = 沿用渐变背景;glassOpacity 留空 = 各卡用内置基线(见 CardStyleSchema)。
-	backgroundImages: [] as string[],
+	// 渐变起 / 止色已退役(ADR-0014 决策 15 的 🔗)—— 出厂色住在
+	// `card-skin.ts` 的 `DEFAULT_CARD_GRADIENT`,由默认皮肤的外框 CSS 画出来。
+	// 字体与背景图已退役(2026-09-14,同玻璃那次):两项都归**皮肤自己的旋钮**,新装的机器
+	// 一个键都不写 —— 退役字段不该由出厂值写回去。
+	// 数据区那三件 2026-09-14 也退役了(同字体 / 背景图那次):人气 / 分区 / 粉丝拆成三个
+	// 原子块,schema 里连字段都不剩,这里自然也没有。
+	// (这几句从前的理由是「写了开机迁移就判不出搬过没有」——「旧版式 → 皮肤」那个迁移已于
+	// 2026-09-18 整个退役,见 ADR-0014 决策 17 的 🔗:升级上来的一律用出厂默认皮肤。)
 } as const;
 
 /** 工厂:创建一份完整的默认 GlobalConfig(不含 bootstrap)—— server 的出厂值与测试夹具共用。 */

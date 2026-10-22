@@ -15,10 +15,9 @@
 import { renderToString } from "@vue/server-renderer";
 import { describe, expect, it } from "vite-plus/test";
 import { createSSRApp, h } from "vue";
-import { renderCard } from "../render";
-import { DynamicCard } from "../templates/dynamic-card";
 import { buildDynamicNode } from "../templates/dynamic-content";
 import type { Dynamic } from "../types";
+import { renderViaDefaultSkin } from "./fixtures/skin-render";
 
 const fmt = { time: () => "刚刚", num: (n: number) => String(n) };
 
@@ -61,7 +60,7 @@ function drawDynamic(pics: Pic[]): Dynamic {
 
 async function picsHtml(pics: Pic[]): Promise<string> {
 	const node = await buildDynamicNode(drawDynamic(pics), false, fmt);
-	const app = createSSRApp({ render: () => h("div", [node.body]) });
+	const app = createSSRApp({ render: () => h("div", [node.text, node.pics]) });
 	return renderToString(app);
 }
 
@@ -182,11 +181,7 @@ describe("图廊 — 遮罩与角标的样式真的生成了", () => {
 			pic({ url: `https://i0.hdslb.com/bfs/new_dyn/p${i}.gif` }),
 		);
 		const node = await buildDynamicNode(drawDynamic(pics), false, fmt);
-		const html = await renderCard(
-			DynamicCard,
-			{ node, cardColorStart: "#A18CD1", cardColorEnd: "#FBC2EB" },
-			{ htmlWidth: 600 },
-		);
+		const html = await renderViaDefaultSkin("dynamic", { node }, { htmlWidth: 600 });
 		const css = html.slice(html.indexOf("<style>") + 7, html.indexOf("</style>"));
 		for (const cls of ["inset-0", "bg-black/40", "text-[28px]", "bg-black/50", "text-[10px]"]) {
 			expect(hasRule(css, cls), `${cls} 的规则没生成(多半被 Fragment 锚点吞了)`).toBe(true);

@@ -20,10 +20,13 @@ import { useUpdateCheckOnOpen } from "./hooks/useUpdateCheckOnOpen";
 import { useUpdateTransitionNotice } from "./hooks/useUpdateTransitionNotice";
 import About from "./pages/About";
 import Ai from "./pages/Ai";
+import CardSkinEditor from "./pages/CardSkinEditor";
 import Cards from "./pages/Cards";
 import Chat from "./pages/Chat";
 import Commands from "./pages/Commands";
 import Dashboard from "./pages/Dashboard";
+import ExtensionDetail from "./pages/ExtensionDetail";
+import Extensions from "./pages/Extensions";
 import History from "./pages/History";
 import Logs from "./pages/Logs";
 import Rules from "./pages/Rules";
@@ -112,10 +115,15 @@ function AuthedApp() {
 						<Route path="/" element={<Dashboard />} />
 						<Route path="/subs" element={<Subs />} />
 						<Route path="/targets" element={<Targets />} />
+						<Route path="/extensions" element={<Extensions />} />
+						<Route path="/extensions/:id" element={<ExtensionDetail />} />
 						<Route path="/history" element={<History />} />
 						<Route path="/stats" element={<Stats />} />
 						<Route path="/rules" element={<Rules />} />
 						<Route path="/cards" element={<Cards />} />
+						{/* 皮肤编辑器自铺 fixed inset-0(同聊天页):三栏并排要整个视口宽,
+						    挤在站内顶栏与两侧内边距里会两边都不够(ADR-0014 决策 20)。 */}
+						<Route path="/cards/skins/:id" element={<CardSkinEditor />} />
 						<Route path="/ai" element={<Ai />} />
 						{/* 聊天页自带 fixed inset-0 的整页底,视觉上盖过 header 与 main 的
 						    留白 —— 放在健康门里是刻意的:后端断了就该看到统一的错误壳,

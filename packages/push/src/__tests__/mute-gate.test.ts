@@ -23,7 +23,7 @@ import {
 import type { SubscriptionStore } from "@bilibili-notify/subscription";
 import { describe, expect, it } from "vite-plus/test";
 import { BilibiliPush } from "../bilibili-push";
-import { pushBase, silentLogger } from "./helpers";
+import { pushBase, setExtraDefault, silentLogger } from "./helpers";
 
 function makeSink(): { sink: NotificationSink; calls: string[] } {
 	const calls: string[] = [];
@@ -38,7 +38,7 @@ function makeSink(): { sink: NotificationSink; calls: string[] } {
 			calls.push(targetId);
 			return { ok: true, latencyMs: 1 } as DeliveryResult;
 		},
-		resolve: (id) => ({ id, name: id, adapterId: "a" }) as unknown as PushTarget,
+		resolve: (id) => ({ id, name: id, connectionId: "a" }) as unknown as PushTarget,
 	};
 	return { sink, calls };
 }
@@ -54,14 +54,14 @@ function makeStore(subs: Subscription[]): SubscriptionStore {
 	};
 }
 
-const MASTER = { id: "master", name: "master", adapterId: "a" } as unknown as PushTarget;
+const MASTER = { id: "master", name: "master", connectionId: "a" } as unknown as PushTarget;
 
 function setup(muted: () => boolean) {
 	const sub = makeEmptySubscription({ id: "s1", uid: "u1" });
 	sub.routing.live = ["t1"];
 	sub.routing.dynamic = ["t1"];
-	sub.atAllDefaults.live = false;
-	sub.atAllDefaults.dynamic = false;
+	setExtraDefault(sub, "atAllLive", false);
+	setExtraDefault(sub, "atAllDynamic", false);
 	const { sink, calls } = makeSink();
 	const push = new BilibiliPush({
 		...pushBase(),
@@ -125,7 +125,7 @@ describe("全局静音闸", () => {
 	it("不传 provider → 一切照旧(koishi 端没有静音这回事)", async () => {
 		const sub = makeEmptySubscription({ id: "s1", uid: "u1" });
 		sub.routing.live = ["t1"];
-		sub.atAllDefaults.live = false;
+		setExtraDefault(sub, "atAllLive", false);
 		const { sink, calls } = makeSink();
 		const push = new BilibiliPush({
 			...pushBase(),

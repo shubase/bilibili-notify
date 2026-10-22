@@ -2,14 +2,14 @@
  * 锐评投递 —— 多目标发送里「停用的目标」怎么处理。
  *
  * 缝在 `deliverRoast`:目标 id 列表进,发了谁 / 跳过谁 / 谁失败出。投递本体(渲染、
- * 降级)不在这儿测;这里只看它对目标表与适配器表的判断。
+ * 降级)不在这儿测;这里只看它对目标表与连接表的判断。
  *
- * 「停用」在链接解析与周报里是同一个意思(主人定的):目标或它的适配器停用 = 暂停,勾着
+ * 「停用」在链接解析与周报里是同一个意思(主人定的):目标或它的连接停用 = 暂停,勾着
  * 也不发。以前的做法是把停用目标扔给推送管线,管线判它不可达、退避重试到上限再报失败 ——
  * 一次停用换来一条失败通知,而且要等好几分钟。
  */
 
-import type { PushAdapter, PushTarget } from "@bilibili-notify/internal";
+import type { Connection, PushTarget } from "@bilibili-notify/internal";
 import { makeDefaultGlobalConfig } from "@bilibili-notify/internal";
 import { describe, expect, it, vi } from "vite-plus/test";
 import { type BoardLike, deliverRoast, type RoastDeliverDeps } from "../roast-deliver.js";
@@ -28,20 +28,21 @@ const BOARD: BoardLike = {
 	scores: [],
 };
 
-function target(id: string, adapterId: string, enabled: boolean): PushTarget {
+function target(id: string, connectionId: string, enabled: boolean): PushTarget {
 	return {
 		id,
 		name: id.slice(0, 4),
-		adapterId,
+		connectionId,
 		scope: "group",
 		enabled,
 		platform: "onebot",
-		session: { groupId: "123" },
+		kind: "session",
+		address: "123",
 	} as PushTarget;
 }
 
-function adapter(id: string, enabled: boolean): PushAdapter {
-	return { id, name: "bot", enabled, platform: "onebot", config: {} } as unknown as PushAdapter;
+function connection(id: string, enabled: boolean): Connection {
+	return { id, name: "bot", enabled, platform: "onebot", config: {} } as unknown as Connection;
 }
 
 function makeDeps() {
@@ -61,7 +62,7 @@ function makeDeps() {
 				target(T_OFF, ADAPTER, false),
 				target(T_ON_ADAPTER_OFF, ADAPTER_OFF, true),
 			],
-			getAdapters: () => [adapter(ADAPTER, true), adapter(ADAPTER_OFF, false)],
+			getConnections: () => [connection(ADAPTER, true), connection(ADAPTER_OFF, false)],
 		},
 	} as unknown as RoastDeliverDeps;
 	return { deps, sendToTarget };
@@ -96,7 +97,7 @@ describe("deliverRoast — 停用的目标", () => {
 		expect(out.failed).toEqual([]);
 	});
 
-	it("目标所属的适配器停用 → 同样跳过", async () => {
+	it("目标所属的连接停用 → 同样跳过", async () => {
 		const { deps, sendToTarget } = makeDeps();
 		const out = await deliverRoast(deps, {
 			kind: "board",

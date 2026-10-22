@@ -20,7 +20,7 @@ import type {
 	ToolTraceEvent,
 } from "../commentary-generator";
 import type { WebSearchResult } from "../web-search";
-import { makeGen as baseGen, streamOf } from "./harness";
+import { makeGen as baseGen, streamOf, untilAborted } from "./harness";
 
 // ---------------------------------------------------------------------------
 // mocks
@@ -192,6 +192,21 @@ describe("responses 风味:流式分流与思考参数", () => {
 		expect(params(1).stream).toBeUndefined();
 	});
 
+	it("还没吐字就被取消 → 两条回落(非流式、摘掉 reasoning)都不再发", async () => {
+		const ctl = new AbortController();
+		const hang = (_p: Record<string, unknown>, opts?: { signal?: AbortSignal }) => {
+			queueMicrotask(() => ctl.abort());
+			return untilAborted(opts?.signal);
+		};
+		(oai.responsesCreate as ReturnType<typeof vi.fn>).mockImplementationOnce(hang);
+		oai.responsesCreate.mockResolvedValue({ output: [msgItem("不该有这一次")] });
+		const gen = makeGen({ enableThinking: true });
+		await expect(
+			gen.generateRaw("S", "U", undefined, { onText: () => {}, signal: ctl.signal }),
+		).rejects.toMatchObject({ cancelled: true });
+		expect(oai.responsesCreate).toHaveBeenCalledTimes(1);
+	});
+
 	it("reasoning 参数被拒且没吐过字 → 摘掉 reasoning 重试(额外参数保留)", async () => {
 		// chatStateless 没有 onDelta → 不会先试流式,第一发即非流式:一共两发。
 		oai.responsesCreate
@@ -277,5 +292,57 @@ describe("responses 风味:失败语义", () => {
 		const gen = makeGen();
 		await expect(gen.chatStateless([{ role: "user", content: "hi" }])).rejects.toThrow();
 		expect(oai.chatCreate).not.toHaveBeenCalled();
+	});
+});
+
+describe("responses 风味:卡片工坊的管道", () => {
+	const SHOT = "data:image/jpeg;base64,U0hPVA==";
+	const look = {
+		definition: {
+			type: "function" as const,
+			function: { name: "look_card", description: "看一眼", parameters: { type: "object" } },
+		},
+		execute: async () => ({ text: "直播卡的截图", images: [SHOT] }),
+	};
+
+	it("工具交回图 + 主模型看得见 → function_call_output 之后补一条带 input_image 的 user 项", async () => {
+		oai.responsesCreate
+			.mockResolvedValueOnce(streamOf([completed([fnCallItem("look_card", {}, "fc_1")])]))
+			.mockResolvedValueOnce(streamOf([textDelta("看过了"), completed([msgItem("看过了")])]));
+		// custom 兜底档当作看得见图。
+		await makeGen({ provider: "custom", enableVision: true }).chatStatelessStream(
+			[{ role: "user", content: "看看" }],
+			{ onDelta: () => {}, extraTools: [look] },
+		);
+
+		const input = params(1).input as Array<Record<string, unknown>>;
+		const outAt = input.findIndex((it) => it.type === "function_call_output");
+		const imageAt = input.findIndex(
+			(it) =>
+				it.role === "user" &&
+				Array.isArray(it.content) &&
+				(it.content as Array<Record<string, unknown>>).some(
+					(p) => p.type === "input_image" && p.image_url === SHOT,
+				),
+		);
+		expect(input[outAt]?.output).toBe("直播卡的截图");
+		expect(imageAt).toBeGreaterThan(outAt);
+	});
+
+	it("maxToolRounds 在这条路上同样生效", async () => {
+		for (let i = 0; i < 9; i++) {
+			oai.responsesCreate.mockResolvedValueOnce(
+				streamOf([completed([fnCallItem("look_card", {}, `fc_${i}`)])]),
+			);
+		}
+		oai.responsesCreate.mockResolvedValueOnce(
+			streamOf([textDelta("做完了"), completed([msgItem("做完了")])]),
+		);
+		const out = await makeGen().chatStatelessStream([{ role: "user", content: "做一整套" }], {
+			onDelta: () => {},
+			extraTools: [look],
+			maxToolRounds: 24,
+		});
+		expect(out).toBe("做完了");
 	});
 });

@@ -40,12 +40,7 @@ function makeRenderer(
 		serviceCtx: ctx,
 		puppeteer: { page: async () => ({}) as never } as unknown as PuppeteerLike,
 		config: {
-			cardColorStart: "#000000",
-			cardColorEnd: "#ffffff",
 			font: "全局那款",
-			showPopularity: true,
-			showArea: true,
-			showFans: true,
 			...config,
 		},
 		resolveAsset: async () => "",

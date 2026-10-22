@@ -145,24 +145,6 @@ export interface VideoInfoPage {
 	duration: number;
 }
 
-export interface VideoInfo {
-	bvid: string;
-	aid: number;
-	videos: number;
-	tid: number;
-	tname: string;
-	copyright: number;
-	pic: string;
-	title: string;
-	pubdate: number;
-	ctime: number;
-	desc: string;
-	duration: number;
-	owner: VideoInfoOwner;
-	stat: VideoInfoStat;
-	pages?: VideoInfoPage[];
-}
-
 export interface VideoInfoData {
 	code: number;
 	message?: string;

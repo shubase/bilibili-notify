@@ -1,10 +1,15 @@
 import { once } from "node:events";
 import type { AddressInfo } from "node:net";
-import type { Disposable, Logger, ServiceContext } from "@bilibili-notify/internal";
+import type {
+	Disposable,
+	InboundGroupMessage,
+	InboundPrivateMessage,
+	Logger,
+	ServiceContext,
+} from "@bilibili-notify/internal";
 import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 import { type WebSocket, WebSocketServer } from "ws";
 import { createQQGatewayConn, QQ_OPCODE, type QQDiscoveredSession } from "../qq-official";
-import type { InboundGroupMessage, InboundPrivateMessage } from "../types.js";
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 async function waitFor(cond: () => boolean, timeoutMs = 3000): Promise<void> {
@@ -98,7 +103,7 @@ async function startFakeGateway(opts?: { heartbeatInterval?: number }): Promise<
 
 function connOpts(gw: FakeGateway, over: Partial<Parameters<typeof createQQGatewayConn>[0]> = {}) {
 	return {
-		adapterId: "a1",
+		connectionId: "a1",
 		resolveGatewayUrl: async () => gw.url,
 		getToken: async () => "ACCESS",
 		onDiscovered: vi.fn(),
@@ -235,6 +240,7 @@ describe("createQQGatewayConn — 群消息正文(链接解析的入口)", () =>
 			userId: "M1",
 			text: "看这个 https://www.bilibili.com/video/BV1zMtU6uEEb/",
 			cardLinks: [],
+			miniAppCardLinks: [],
 		} satisfies InboundGroupMessage);
 	});
 
@@ -256,6 +262,7 @@ describe("createQQGatewayConn — 群消息正文(链接解析的入口)", () =>
 			userId: "M1",
 			text: " https://b23.tv/abc",
 			cardLinks: [],
+			miniAppCardLinks: [],
 		});
 		gw.dispatch("C2C_MESSAGE_CREATE", {
 			author: { user_openid: "U1" },
@@ -313,6 +320,7 @@ describe("createQQGatewayConn — 群消息正文(链接解析的入口)", () =>
 			userId: "M",
 			text: "b",
 			cardLinks: [],
+			miniAppCardLinks: [],
 		});
 	});
 });

@@ -1,22 +1,24 @@
 import { randomBytes, randomUUID } from "node:crypto";
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import {
+	CONFIG_SCHEMA_VERSION,
 	type ConfigScope,
-	DEFAULT_CARD_LAYOUT,
+	type Connection,
+	ConnectionPlatformSchema,
+	ConnectionSchema,
 	DEFAULT_MESSAGE_LAYOUT,
 	type Disposable,
 	deterministicUuid,
+	EXTRA_KEYS,
 	type GlobalConfig,
 	GlobalConfigSchema,
+	isWebhookConnection,
 	type MessageBus,
 	makeDefaultGlobalConfig,
-	normalizeCardLayout,
+	migrateConfigSections,
 	normalizeMessageLayout,
-	type PushAdapter,
-	PushAdapterSchema,
 	type PushTarget,
-	PushTargetPlatformSchema,
 	PushTargetSchema,
 	type ServiceContext,
 	type Subscription,
@@ -65,6 +67,17 @@ export interface ConfigScopeMeta {
 	lastUpdatedAt: string | null;
 }
 
+/**
+ * 一次整体替换要写进去的分区。缺席的分区保持不动 —— 「不给」和「给一个空数组」
+ * 是两回事:后者是真的清空。
+ */
+export interface ConfigSections {
+	globals?: GlobalConfig;
+	subscriptions?: Subscription[];
+	connections?: Connection[];
+	targets?: PushTarget[];
+}
+
 export interface ConfigStore {
 	readonly bootstrap: BootstrapConfig;
 
@@ -77,12 +90,13 @@ export interface ConfigStore {
 	// --- reads ------------------------------------------------------------
 	getGlobals(): GlobalConfig;
 	getSubscriptions(): Subscription[];
-	getAdapters(): PushAdapter[];
+	getConnections(): Connection[];
+	/** 只拷命中的那一条 —— 入站热路径按 id 校验归属用,别拿 getConnections() 再 find。 */
+	getConnection(id: string): Connection | undefined;
 	getTargets(): PushTarget[];
 
 	getGlobalsMeta(): ConfigScopeMeta;
 	getSubscriptionsMeta(): ConfigScopeMeta;
-	getAdaptersMeta(): ConfigScopeMeta;
 	getTargetsMeta(): ConfigScopeMeta;
 
 	// --- writes -----------------------------------------------------------
@@ -91,13 +105,19 @@ export interface ConfigStore {
 	upsertSubscription(sub: Subscription): Promise<void>;
 	patchSubscription(id: string, patch: DeepPartial<Subscription>): Promise<Subscription>;
 	deleteSubscription(id: string): Promise<boolean>;
-	upsertAdapter(adapter: PushAdapter): Promise<void>;
-	patchAdapter(id: string, patch: DeepPartial<PushAdapter>): Promise<PushAdapter>;
-	deleteAdapter(id: string): Promise<boolean>;
+	upsertConnection(connection: Connection): Promise<void>;
+	patchConnection(id: string, patch: DeepPartial<Connection>): Promise<Connection>;
+	deleteConnection(id: string): Promise<boolean>;
 	upsertTarget(target: PushTarget): Promise<void>;
 	patchTarget(id: string, patch: DeepPartial<PushTarget>): Promise<PushTarget>;
 	recordTargetTestStatus(id: string, status: PushTarget["testStatus"]): Promise<PushTarget>;
 	deleteTarget(id: string): Promise<boolean>;
+
+	/**
+	 * 整体替换若干分区(恢复备份 / 一次性迁移)。先全量校验再落盘,失败不留半新半旧。
+	 * 详见实现处的注释。
+	 */
+	replaceSections(next: ConfigSections): Promise<ConfigScope[]>;
 }
 
 export interface CreateConfigStoreOptions {
@@ -221,7 +241,7 @@ async function readJsonOrInit<T>(
 
 async function fileExists(absPath: string): Promise<boolean> {
 	try {
-		await readFile(absPath, "utf8");
+		await stat(absPath);
 		return true;
 	} catch (err) {
 		if ((err as NodeJS.ErrnoException).code === "ENOENT") return false;
@@ -231,8 +251,8 @@ async function fileExists(absPath: string): Promise<boolean> {
 
 /**
  * Splits the legacy `PushTarget` shape (config bundled connection + session)
- * into the new (PushAdapter, PushTarget) pair. Targets with the same platform
- * and connection params share an adapter so the user doesn't end up with N
+ * into the new (Connection, PushTarget) pair. Targets with the same platform
+ * and connection params share a connection so the user doesn't end up with N
  * identical NapCat connection entries after migrating N groups.
  */
 interface LegacyPushTarget {
@@ -245,13 +265,13 @@ interface LegacyPushTarget {
 }
 
 function migrateLegacyTargets(raw: unknown[]): {
-	adapters: PushAdapter[];
+	connections: Connection[];
 	targets: PushTarget[];
 } {
-	const adapters: PushAdapter[] = [];
+	const connections: Connection[] = [];
 	const targets: PushTarget[] = [];
-	// connection-key → adapterId, so duplicate connections collapse.
-	const adapterIdByKey = new Map<string, string>();
+	// connection-key → connectionId, so duplicate connections collapse.
+	const connectionIdByKey = new Map<string, string>();
 
 	for (const item of raw) {
 		const legacy = item as LegacyPushTarget;
@@ -266,14 +286,16 @@ function migrateLegacyTargets(raw: unknown[]): {
 			const baseUrl = cfg.baseUrl ?? "";
 			const accessToken = cfg.accessToken ?? "";
 			const key = `onebot|${baseUrl}|${accessToken}`;
-			let adapterId = adapterIdByKey.get(key);
-			if (!adapterId) {
-				adapterId = randomUUID();
-				adapterIdByKey.set(key, adapterId);
-				adapters.push({
-					id: adapterId,
-					name: deriveAdapterName(legacy.name, baseUrl),
+			let connectionId = connectionIdByKey.get(key);
+			if (!connectionId) {
+				connectionId = randomUUID();
+				connectionIdByKey.set(key, connectionId);
+				connections.push({
+					id: connectionId,
+					name: deriveConnectionName(legacy.name, baseUrl),
 					enabled: true,
+					kind: "direct",
+					connector: "http",
 					platform: "onebot",
 					config: {
 						transport: "http",
@@ -292,11 +314,12 @@ function migrateLegacyTargets(raw: unknown[]): {
 			targets.push({
 				id: legacy.id,
 				name: legacy.name,
-				adapterId,
+				connectionId,
+				kind: "session",
 				platform: "onebot",
 				scope: legacy.scope,
 				enabled: legacy.enabled,
-				session: { groupId: cfg.groupId, userId: cfg.userId },
+				address: (legacy.scope === "private" ? cfg.userId : cfg.groupId) ?? "",
 			});
 		} else if (legacy.platform === "webhook") {
 			const cfg = legacy.config as {
@@ -306,18 +329,21 @@ function migrateLegacyTargets(raw: unknown[]): {
 			};
 			const url = cfg.url ?? "";
 			const key = `webhook|${url}|${cfg.secret ?? ""}`;
-			let adapterId = adapterIdByKey.get(key);
-			if (!adapterId) {
-				adapterId = randomUUID();
-				adapterIdByKey.set(key, adapterId);
-				adapters.push({
-					id: adapterId,
-					name: deriveAdapterName(legacy.name, url),
+			let connectionId = connectionIdByKey.get(key);
+			if (!connectionId) {
+				connectionId = randomUUID();
+				connectionIdByKey.set(key, connectionId);
+				connections.push({
+					id: connectionId,
+					name: deriveConnectionName(legacy.name, url),
 					enabled: true,
-					platform: "webhook",
+					kind: "direct",
+					connector: "webhook",
+					// 这条遗留路径来自「webhook 是一个平台」那一代,当时连 provider 都还没有
+					// (它是后来才加进 config 的)—— 所以一律落 generic。
+					platform: "generic",
 					config: {
 						url,
-						provider: "generic",
 						secret: cfg.secret || undefined,
 						headers: cfg.headers ?? {},
 					},
@@ -326,26 +352,162 @@ function migrateLegacyTargets(raw: unknown[]): {
 			targets.push({
 				id: legacy.id,
 				name: legacy.name,
-				adapterId,
-				platform: "webhook",
+				connectionId,
+				kind: "endpoint",
+				platform: "generic",
 				scope: legacy.scope,
 				enabled: legacy.enabled,
-				session: {},
 			});
 		}
 		// Unknown legacy platform (incl. the removed web-dashboard) — drop silently;
 		// the user sees the target disappear and can re-create it under a supported platform.
 	}
 
-	return { adapters, targets };
+	return { connections, targets };
 }
 
-/** 平台字面量还在 union 里才算认识;不认识的就是被撤下的平台留下的存量,丢弃比启动期 throw 强。 */
-function isKnownPlatform(raw: unknown): boolean {
-	return PushTargetPlatformSchema.safeParse((raw as { platform?: unknown })?.platform).success;
+/**
+ * 随宿主一起撤下的那些平台 —— 盘上还留着它们的存量条目。
+ *
+ * 当年的 schema 是收它们的(面板不给建,但直调 API / 旧备份都能留下),今天没有任何
+ * adapter 认领,加载时一律静默丢掉:safeParse 一失败就是启动期 throw,而那时没有面板
+ * 可以进去改,boot 三振回落也救不回来。
+ *
+ * **写成显式名单,不用「词表里没有」反推** —— 目标的平台是开放词表(桥驮来什么算什么),
+ * 反推在那一侧等于「认不得的平台上的损坏一律吃掉」。
+ */
+const RETIRED_PLATFORMS: ReadonlySet<string> = new Set(["web-dashboard", "koishi-bot", "astrbot"]);
+
+/**
+ * 盘上这条**连接**是不是「已撤下平台留下的存量」—— 该静默丢掉的那种。
+ *
+ * 判据是:**我们认得的平台必须能 parse;认不得的平台又 parse 不过,才是存量。**
+ * 所以它**只在 parse 失败之后**才问,永远不跑在 parse 之前。
+ *
+ * ⚠️ **别再把它挪回 parse 之前。** 拿原始 JSON 用闭集问「这个平台认得吗」,等于
+ * 「词表里没有 = 不存在」:桥接入根本没有 `platform` 那一格,拓展带来的连接平台也不在
+ * 闭集里 —— 两者都会在**开机时被静默丢光**,而且下一次任何写入都会把这个丢弃**写实到
+ * 盘上**。主人看到的是配置自己消失,没有一行报错。换成「parse 得过就留下」之后,以后
+ * 新增哪一支都不必回来改这里。
+ *
+ * ⚠️ **目标那一侧不用这条**(见 {@link isRetiredTargetRecord}):连接的平台是闭集、目标的
+ * 是开放词表,同一条判据套过去就变成「桥驮来的平台上的真损坏一律静默吃掉」。
+ *
+ * - `koishi-bot` 的老条目:词表外 + 老形状 parse 不过 → 丢弃(与从前同样的行为)
+ * - 没有 `platform` 的拓展连接(桥接入还是连接那一版的形状,未发版):丢弃
+ * - 桥借来的 telegram bot 那条连接:parse 得过 → 走不到这里
+ * - onebot 的坏条目:词表内 → 照旧 throw,不许静默吃掉真正的损坏
+ */
+function isRetiredConnectionRecord(raw: unknown): boolean {
+	const record = raw as { kind?: unknown; platform?: unknown } | undefined;
+	// 拓展连接曾经**没有** `platform`(那时它是「一条桥接入」,ADR-0012 决策 27);连接改成
+	// 「一个 bot」之后这一格必填(决策 45)。老形状没发过版,不写迁移 —— 当作已撤下的形状
+	// 丢掉,主人在拓展页重建一条接入即可。带 platform 的拓展连接 parse 得过,走不到这里。
+	if (record?.kind === "extension") return record.platform === undefined;
+	return !ConnectionPlatformSchema.safeParse(record?.platform).success;
 }
 
-function deriveAdapterName(targetName: string, addr: string): string {
+/**
+ * 盘上这条**目标**是不是已撤下平台留下的存量。
+ *
+ * 🔴 判据只有一条:**平台名在那份显式的撤下名单里**。目标的平台是开放词表
+ * (`TargetPlatformSchema`),所以「认不认得」根本不能靠词表答 —— 拿连接那份闭集去反推
+ * 的话,一条桥借来的 telegram bot 底下的目标只要有任何真实损坏(地址没了、scope 打错)
+ * 就会被当成「老形状」静默丢掉,下一次写盘再把这个丢弃变成永久的;而同样的损坏落在
+ * onebot 目标上却是照旧 throw。同一种坏数据两种下场,且丢掉那一侧没有任何一行报错。
+ */
+function isRetiredTargetRecord(raw: unknown): boolean {
+	const record = raw as { platform?: unknown } | undefined;
+	return typeof record?.platform === "string" && RETIRED_PLATFORMS.has(record.platform);
+}
+
+/**
+ * 连接的**身份轴**不许改 —— 换 `kind` 或换 `platform` 都等于换了另一条连接,而目标还
+ * 挂在原来那个 id 上。允许改的话,「onebot 群目标」会一夜之间挂在一条飞书连接下面。
+ *
+ * 🔴 **两支都比 platform。** 拓展那一支曾经没有这一格(那时它是「一条桥接入」,驮着 N 个
+ * 平台的 bot,ADR-0012 决策 27),于是这里对它整个早退;改成「一条连接 = 一个借来的 bot」
+ * (决策 45)之后它有了,而早退没跟着改 —— 症状是把一条桥连接从 QQ bot 换成 telegram bot
+ * 能存下去,底下的 QQ 群目标平台原地不动,投递却跑去了 telegram。
+ */
+function assertConnectionIdentityStable(current: Connection, next: Connection): void {
+	if (current.kind !== next.kind) {
+		throw new ConfigValidationError(
+			"connections",
+			{
+				id: next.id,
+				from: current.kind,
+				to: next.kind,
+				message: "connection kind cannot be changed",
+			},
+			`connection ${next.id} kind cannot be changed`,
+		);
+	}
+	if (current.platform !== next.platform) {
+		throw new ConfigValidationError(
+			"connections",
+			{
+				id: next.id,
+				from: current.platform,
+				to: next.platform,
+				message: "connection platform cannot be changed",
+			},
+			`connection ${next.id} platform cannot be changed`,
+		);
+	}
+}
+
+/**
+ * 「这条连接不存在」那一句。
+ *
+ * 🔴 **它是被别的模块读的**(路由拿它把错分成 404 还是 400),所以不能只是一句文案:
+ * 两处各写一遍字符串,改一个字就静默变成 500 —— 类型、测试、门禁全绿。要判「是不是
+ * 没找到」走 {@link isConnectionNotFound},别再拿 message 做相等比较。
+ */
+export const CONNECTION_NOT_FOUND = "connection not found";
+
+/** 这个错是不是「没有这条连接」。跨模块的判据只此一处。 */
+export function isConnectionNotFound(err: unknown): boolean {
+	if (!(err instanceof ConfigValidationError)) return false;
+	const issues = err.issues as { message?: string } | undefined;
+	return issues?.message === CONNECTION_NOT_FOUND;
+}
+
+/**
+ * 目标与它挂着的那条连接对不对得上 —— 连接存在,且平台是同一个。
+ *
+ * 逐条 upsert 与整体 replaceSections 都走这一份:同一条不变式抄两遍,总有一天只改了
+ * 一边(而那两条路上「半新半旧的配置」代价完全一样)。
+ *
+ * 🔴 **拓展那一支同样比平台。** 它曾经没有 `platform`(那时一条连接是「一条驮着 N 个
+ * 平台的桥接入」,ADR-0012 决策 27),于是这里对它整个早退;改成「一条连接 = 一个借来的
+ * bot」(决策 45)之后它有了,面板建目标时也正是从连接上抄的这一格 —— 早退留着,就等于
+ * 「目标写着 onebot、连接却是 telegram」能存下去,而错要到发第一条推送时才现形。
+ */
+function assertTargetOwner(target: PushTarget, connections: readonly Connection[]): void {
+	const owner = connections.find((a) => a.id === target.connectionId);
+	if (!owner) {
+		throw new ConfigValidationError(
+			"targets",
+			{ id: target.id, connectionId: target.connectionId, message: CONNECTION_NOT_FOUND },
+			`target ${target.id} references unknown connection ${target.connectionId}`,
+		);
+	}
+	if (owner.platform !== target.platform) {
+		throw new ConfigValidationError(
+			"targets",
+			{
+				id: target.id,
+				connectionPlatform: owner.platform,
+				targetPlatform: target.platform,
+				message: "platform mismatch",
+			},
+			`target ${target.id} platform ${target.platform} does not match connection ${owner.platform}`,
+		);
+	}
+}
+
+function deriveConnectionName(targetName: string, addr: string): string {
 	if (addr) {
 		try {
 			const u = new URL(addr);
@@ -357,33 +519,43 @@ function deriveAdapterName(targetName: string, addr: string): string {
 	return targetName || "默认连接";
 }
 
-type WebhookAdapter = Extract<PushAdapter, { platform: "webhook" }>;
+/** 靠 webhook 连的那族连接 —— 判据是**连接器**,平台是飞书 / 钉钉 / 企微 / 未指明中的一个。 */
+type WebhookConnection = Extract<Connection, { connector: "webhook" }>;
 
-function managedWebhookTargetId(adapterId: string): string {
-	return deterministicUuid(`push-target:webhook-adapter:${adapterId}`);
+/**
+ * 托管目标的 id。**种子里那个 `adapter` 是冻住的**,别顺着改名一起改:它算出来的 uuid
+ * 已经落在主人盘上,订阅的路由表按 id 引用着它 —— 换种子等于给每条 webhook 连接凭空
+ * 换一张目标,主人配好的路由指向一个不存在的 id,而且不报错。
+ */
+function managedWebhookTargetId(connectionId: string): string {
+	return deterministicUuid(`push-target:webhook-adapter:${connectionId}`);
 }
 
-function makeManagedWebhookTarget(adapter: WebhookAdapter, existing?: PushTarget): PushTarget {
+function makeManagedWebhookTarget(
+	connection: WebhookConnection,
+	existing?: PushTarget,
+): PushTarget {
 	return {
-		id: existing?.id ?? managedWebhookTargetId(adapter.id),
-		name: adapter.name || "Webhook",
-		adapterId: adapter.id,
-		platform: "webhook",
+		id: existing?.id ?? managedWebhookTargetId(connection.id),
+		name: connection.name || "Webhook",
+		connectionId: connection.id,
+		kind: "endpoint",
+		// 托管目标的平台跟着连接走 —— 连接改成钉钉,这里下一次同步就跟着改。
+		platform: connection.platform,
 		scope: "channel",
-		enabled: adapter.enabled,
-		managedBy: "adapter",
+		enabled: connection.enabled,
+		managedBy: "connection",
 		testStatus: existing?.testStatus,
-		session: {},
 	};
 }
 
 function syncManagedWebhookTarget(
-	adapter: WebhookAdapter,
+	connection: WebhookConnection,
 	targets: readonly PushTarget[],
 ): { next: PushTarget[]; changed: boolean; aliases: Map<string, string> } {
-	const owned = targets.filter((t) => t.platform === "webhook" && t.adapterId === adapter.id);
-	const existing = owned.find((t) => t.managedBy === "adapter") ?? owned[0];
-	const desired = makeManagedWebhookTarget(adapter, existing);
+	const owned = targets.filter((t) => t.kind === "endpoint" && t.connectionId === connection.id);
+	const existing = owned.find((t) => t.managedBy === "connection") ?? owned[0];
+	const desired = makeManagedWebhookTarget(connection, existing);
 	if (!existing) return { next: [...targets, desired], changed: true, aliases: new Map() };
 
 	const aliases = new Map<string, string>();
@@ -391,30 +563,32 @@ function syncManagedWebhookTarget(
 		if (target.id !== desired.id) aliases.set(target.id, desired.id);
 	}
 	const next = targets
-		.filter((t) => !(t.platform === "webhook" && t.adapterId === adapter.id && t.id !== desired.id))
+		.filter(
+			(t) => !(t.kind === "endpoint" && t.connectionId === connection.id && t.id !== desired.id),
+		)
 		.map((t) => (t.id === desired.id ? desired : t));
 	const changed =
 		aliases.size > 0 ||
 		existing.name !== desired.name ||
-		existing.adapterId !== desired.adapterId ||
+		existing.connectionId !== desired.connectionId ||
+		existing.kind !== desired.kind ||
 		existing.platform !== desired.platform ||
 		existing.scope !== desired.scope ||
 		existing.enabled !== desired.enabled ||
-		existing.managedBy !== desired.managedBy ||
-		Object.keys(existing.session).length !== 0;
+		existing.managedBy !== desired.managedBy;
 	return { next, changed, aliases };
 }
 
 function syncManagedWebhookTargets(
-	adapters: readonly PushAdapter[],
+	connections: readonly Connection[],
 	targets: readonly PushTarget[],
 ): { next: PushTarget[]; changed: boolean; aliases: Map<string, string> } {
 	let next = [...targets];
 	let changed = false;
 	const aliases = new Map<string, string>();
-	for (const adapter of adapters) {
-		if (adapter.platform !== "webhook") continue;
-		const r = syncManagedWebhookTarget(adapter, next);
+	for (const connection of connections) {
+		if (!isWebhookConnection(connection)) continue;
+		const r = syncManagedWebhookTarget(connection, next);
 		next = r.next;
 		changed ||= r.changed;
 		for (const [from, to] of r.aliases) aliases.set(from, to);
@@ -441,25 +615,17 @@ function removeTargetIdsFromSubscriptions(
 			}
 		}
 
-		const atAll = {
-			dynamic: { ...sub.atAll.dynamic },
-			live: { ...sub.atAll.live },
-		};
-		for (const key of Object.keys(atAll.dynamic)) {
-			if (ids.has(key)) {
-				delete atAll.dynamic[key];
-				subChanged = true;
-			}
-		}
-		for (const key of Object.keys(atAll.live)) {
-			if (ids.has(key)) {
-				delete atAll.live[key];
-				subChanged = true;
-			}
+		// 附加项的 per-目标 三态表跟着 routing 一起清 —— schema 强制它的 key ⊆ 主特性目标。
+		const extras = { ...sub.extras };
+		for (const key of EXTRA_KEYS) {
+			const kept = Object.entries(extras[key]).filter(([id]) => !ids.has(id));
+			if (kept.length === Object.keys(extras[key]).length) continue;
+			extras[key] = Object.fromEntries(kept);
+			subChanged = true;
 		}
 		if (!subChanged) return sub;
 		changed = true;
-		return { ...sub, routing, atAll };
+		return { ...sub, routing, extras };
 	});
 	return { next, changed };
 }
@@ -488,22 +654,23 @@ function replaceTargetIdsInSubscriptions(
 			if (after.length !== before.length || subChanged) routing[key] = after;
 		}
 
-		const atAll = {
-			dynamic: { ...sub.atAll.dynamic },
-			live: { ...sub.atAll.live },
-		};
-		for (const group of [atAll.dynamic, atAll.live]) {
+		const extras = { ...sub.extras };
+		for (const key of EXTRA_KEYS) {
+			const group = { ...extras[key] };
+			let groupChanged = false;
 			for (const [from, to] of aliases) {
 				if (!(from in group)) continue;
 				const value = group[from];
 				if (!(to in group) && value !== undefined) group[to] = value;
 				delete group[from];
+				groupChanged = true;
 				subChanged = true;
 			}
+			if (groupChanged) extras[key] = group;
 		}
 		if (!subChanged) return sub;
 		changed = true;
-		return { ...sub, routing, atAll };
+		return { ...sub, routing, extras };
 	});
 	return { next, changed };
 }
@@ -524,13 +691,13 @@ class NodeConfigStore implements ConfigStore {
 
 	private globals: GlobalConfig;
 	private subscriptions: Subscription[];
-	private adapters: PushAdapter[];
+	private connections: Connection[];
 	private targets: PushTarget[];
 
 	private readonly meta: Record<ConfigScope, ScopeMetaInternal> = {
 		globals: { exists: false, lastUpdatedAt: null },
 		subscriptions: { exists: false, lastUpdatedAt: null },
-		adapters: { exists: false, lastUpdatedAt: null },
+		connections: { exists: false, lastUpdatedAt: null },
 		targets: { exists: false, lastUpdatedAt: null },
 		secrets: { exists: false, lastUpdatedAt: null },
 	};
@@ -538,7 +705,7 @@ class NodeConfigStore implements ConfigStore {
 	private readonly queues: Record<ConfigScope, Queue> = {
 		globals: Promise.resolve(),
 		subscriptions: Promise.resolve(),
-		adapters: Promise.resolve(),
+		connections: Promise.resolve(),
 		targets: Promise.resolve(),
 		secrets: Promise.resolve(),
 	};
@@ -554,7 +721,7 @@ class NodeConfigStore implements ConfigStore {
 		// Initialize with safe defaults; `load()` overwrites.
 		this.globals = makeDefaultGlobalConfig();
 		this.subscriptions = [];
-		this.adapters = [];
+		this.connections = [];
 		this.targets = [];
 	}
 
@@ -564,8 +731,8 @@ class NodeConfigStore implements ConfigStore {
 				return join(this.stateDir, "globals.json");
 			case "subscriptions":
 				return join(this.stateDir, "subscriptions.json");
-			case "adapters":
-				return join(this.stateDir, "adapters.json");
+			case "connections":
+				return join(this.stateDir, "connections.json");
 			case "targets":
 				return join(this.stateDir, "targets.json");
 			case "secrets":
@@ -675,12 +842,14 @@ class NodeConfigStore implements ConfigStore {
 
 			// 迁移此前保存的卡片版式到当前块模型(例如把各块上下间距从模版回填进
 			// layout)。normalizeCardLayout 按版本门控,已是最新的版式原样通过。
-			// 消息版式同款对齐:未知块丢弃、缺失的内置块追加,老存档前向兼容。
+			// ⚠️ 旧版式已是可选键(ADR-0014 决策 15,迁移跑完就删掉):**键不在就别补回来**,
+			// 补一份等于把「已经迁过了」的记号抹掉,下次开机会再折一套派生皮肤。
+			// 消息版式:未知块丢弃、缺失的内置块追加,老存档前向兼容。(卡片版式那一份已随
+			// 旧版式整个退役 —— 见 ADR-0014 决策 17 的 2026-09-18 🔗。)
 			this.globals = {
 				...this.globals,
 				defaults: {
 					...this.globals.defaults,
-					cardLayout: normalizeCardLayout(this.globals.defaults.cardLayout, DEFAULT_CARD_LAYOUT),
 					messageLayout: normalizeMessageLayout(
 						this.globals.defaults.messageLayout,
 						DEFAULT_MESSAGE_LAYOUT,
@@ -793,53 +962,41 @@ class NodeConfigStore implements ConfigStore {
 			this.meta.subscriptions.lastUpdatedAt = existed ? null : new Date().toISOString();
 		}
 
-		// adapters + targets (with one-time migration from the legacy single-file
+		// connections + targets (with one-time migration from the legacy single-file
 		// targets.json that bundled connection+session into `config`)
-		await this.loadAdaptersAndTargets();
+		await this.loadConnectionsAndTargets();
 
 		this.loaded = true;
 		this.serviceCtx.logger.info(
-			`config-store loaded (stateDir=${this.stateDir} subs=${this.subscriptions.length} adapters=${this.adapters.length} targets=${this.targets.length})`,
+			`config-store loaded (stateDir=${this.stateDir} subs=${this.subscriptions.length} connections=${this.connections.length} targets=${this.targets.length})`,
 		);
 	}
 
 	/**
-	 * Loads adapters.json + targets.json. If adapters.json is missing AND the
-	 * existing targets.json is in the legacy single-blob format (config field
-	 * holding both connection and session params), runs a one-shot migration
-	 * that extracts adapters and rewrites targets to reference them.
+	 * Loads connections.json + targets.json. If neither connections.json nor the
+	 * file it replaced (adapters.json) is present AND the existing targets.json is
+	 * in the legacy single-blob format (config field holding both connection and
+	 * session params), runs a one-shot migration that extracts connections and
+	 * rewrites targets to reference them.
 	 */
-	private async loadAdaptersAndTargets(): Promise<void> {
-		const adaptersExist = await fileExists(this.path("adapters"));
+	private async loadConnectionsAndTargets(): Promise<void> {
+		const connectionsExist = await fileExists(this.path("connections"));
+		// 这个文件从前叫 adapters.json。搬名字的方式是**读老的、写新的、老的一动不动** ——
+		// 老那份于是既是原件备份,又让回退到旧载荷这条路仍然能开机:旧构建找的正是它,
+		// 而它还是迁移前的形状。代价是升级后的编辑不会回流过去,回退等于退回升级那一刻。
+		const legacyPath = join(this.stateDir, "adapters.json");
+		const legacyOnly = !connectionsExist && (await fileExists(legacyPath));
+		const sourcePath = connectionsExist ? this.path("connections") : legacyPath;
 
-		// New-format path: adapters.json is already present.
-		if (adaptersExist) {
-			const adaptersRaw = JSON.parse(await readFile(this.path("adapters"), "utf8"));
-			if (!Array.isArray(adaptersRaw)) {
+		if (connectionsExist || legacyOnly) {
+			const connectionsRaw = JSON.parse(await readFile(sourcePath, "utf8"));
+			if (!Array.isArray(connectionsRaw)) {
 				throw new ConfigValidationError(
-					"adapters",
-					{ message: "adapters.json must be an array" },
-					"adapters.json on disk is not an array",
+					"connections",
+					{ message: "connections.json must be an array" },
+					"connections.json on disk is not an array",
 				);
 			}
-			const adapters: PushAdapter[] = [];
-			for (const [idx, raw] of adaptersRaw.entries()) {
-				// 已撤下的平台(web-dashboard、koishi-bot、astrbot,或将来的某个)留下的存量条目:
-				// 静默丢弃,不进严格校验 —— safeParse 失败会 throw,而这里是启动路径,没有面板能进去改。
-				if (!isKnownPlatform(raw)) continue;
-				const r = PushAdapterSchema.safeParse(raw);
-				if (!r.success) {
-					throw new ConfigValidationError(
-						"adapters",
-						{ index: idx, issues: r.error.issues },
-						`adapters.json[${idx}] failed schema validation`,
-					);
-				}
-				adapters.push(r.data);
-			}
-			this.adapters = adapters;
-			this.meta.adapters.exists = true;
-
 			const { value, existed } = await readJsonOrInit<unknown[]>(
 				this.path("targets"),
 				() => [] as PushTarget[],
@@ -851,12 +1008,61 @@ class NodeConfigStore implements ConfigStore {
 					"targets.json on disk is not an array",
 				);
 			}
+
+			// 形状迁移 —— 老盘上的连接没有 `kind` / `connector`、目标没有 `kind`,schema 会当场
+			// 拒,开机就起不来。判据是数据形状不是版本号,且迁移幂等,所以「上次写到一半掉电」
+			// 重来一遍无害;两个分区一起判,只有都迁完才算新形状。
+			// 🔴 **回退到旧载荷不安全** —— strip 掉不认识的键并不会把**缺失的必填键**变出来。
+			// 迁移后的 targets 没有 v1 必需的 `adapterId` / `session`,0.10.x 读到直接抛
+			// `targets.json[N] failed schema validation`、起不来;而 webhook 目标的平台已经是
+			// feishu / dingtalk / wecom / generic,旧版词表里没有,会先被 `isKnownPlatform`
+			// **静默丢弃**。要回退得先把 `targets.json.bak` 覆盖回去(所以那份 .bak 不能省)。
+			// connections 那一侧确实安全:adapters.json 原地留着,旧版读的正是它。
+			const migrated = migrateConfigSections({ connections: connectionsRaw, targets: value });
+			if (legacyOnly || migrated.changed.connections || migrated.changed.targets) {
+				this.serviceCtx.logger.info(
+					`config-store migrating config v${migrated.from} → v${CONFIG_SCHEMA_VERSION}` +
+						" (原件留在同名 .bak;adapters.json 原地不动)",
+				);
+			}
+			// 从老文件名读来的那趟一定要写:connections.json 还不存在。它自己的原件就是没被
+			// 动过的 adapters.json,所以这条路不留 .bak。
+			if (legacyOnly) {
+				await atomicWriteJson(this.path("connections"), migrated.connections);
+			} else if (migrated.changed.connections) {
+				// 原件留一份 —— 迁移错了主人还能自己捞回去。
+				await copyFile(this.path("connections"), `${this.path("connections")}.bak`);
+				await atomicWriteJson(this.path("connections"), migrated.connections);
+			}
+			if (migrated.changed.targets) {
+				await copyFile(this.path("targets"), `${this.path("targets")}.bak`);
+				await atomicWriteJson(this.path("targets"), migrated.targets);
+			}
+
+			const connections: Connection[] = [];
+			for (const [idx, raw] of migrated.connections.entries()) {
+				const r = ConnectionSchema.safeParse(raw);
+				if (!r.success) {
+					// 已撤下平台的存量连接静默丢弃 —— 判据见 isRetiredConnectionRecord。
+					if (isRetiredConnectionRecord(raw)) continue;
+					throw new ConfigValidationError(
+						"connections",
+						{ index: idx, issues: r.error.issues },
+						`connections.json[] failed schema validation`,
+					);
+				}
+				connections.push(r.data);
+			}
+			this.connections = connections;
+			this.meta.connections.exists = true;
+
 			const targets: PushTarget[] = [];
-			for (const [idx, raw] of value.entries()) {
-				// 已撤下平台的存量目标同理丢弃。
-				if (!isKnownPlatform(raw)) continue;
+			for (const [idx, raw] of migrated.targets.entries()) {
 				const r = PushTargetSchema.safeParse(raw);
 				if (!r.success) {
+					// 已撤下平台的存量目标同理丢弃 —— 但判据是**另一条**(目标的平台是开放词表),
+					// 见 isRetiredTargetRecord。
+					if (isRetiredTargetRecord(raw)) continue;
 					throw new ConfigValidationError(
 						"targets",
 						{ index: idx, issues: r.error.issues },
@@ -865,7 +1071,7 @@ class NodeConfigStore implements ConfigStore {
 				}
 				targets.push(r.data);
 			}
-			const synced = syncManagedWebhookTargets(this.adapters, targets);
+			const synced = syncManagedWebhookTargets(this.connections, targets);
 			this.targets = synced.next;
 			this.meta.targets.exists = true;
 			this.meta.targets.lastUpdatedAt = existed ? null : new Date().toISOString();
@@ -882,16 +1088,16 @@ class NodeConfigStore implements ConfigStore {
 			return;
 		}
 
-		// Legacy migration path: adapters.json missing. Inspect targets.json.
+		// Legacy migration path: neither connections.json nor adapters.json is there. Inspect targets.json.
 		const targetsExist = await fileExists(this.path("targets"));
 		if (!targetsExist) {
 			// Brand-new install: write empty files and continue.
-			await atomicWriteJson(this.path("adapters"), []);
+			await atomicWriteJson(this.path("connections"), []);
 			await atomicWriteJson(this.path("targets"), []);
-			this.adapters = [];
+			this.connections = [];
 			this.targets = [];
-			this.meta.adapters.exists = true;
-			this.meta.adapters.lastUpdatedAt = new Date().toISOString();
+			this.meta.connections.exists = true;
+			this.meta.connections.lastUpdatedAt = new Date().toISOString();
 			this.meta.targets.exists = true;
 			this.meta.targets.lastUpdatedAt = new Date().toISOString();
 			return;
@@ -907,36 +1113,36 @@ class NodeConfigStore implements ConfigStore {
 		}
 
 		// Two possibilities: (a) already-new shape but the user manually deleted
-		// adapters.json — try parsing each entry against the new schema first.
+		// connections.json — try parsing each entry against the new schema first.
 		const tryNew = targetsRaw.every((t) => PushTargetSchema.safeParse(t).success);
 		if (tryNew && targetsRaw.length > 0) {
-			// New shape but no adapters file → bail with an explicit error so the
+			// New shape but no connections file → bail with an explicit error so the
 			// user notices something is off rather than us silently inventing data.
 			throw new ConfigValidationError(
-				"adapters",
-				{ message: "adapters.json missing but targets.json is in new format" },
-				"adapters.json missing but targets.json already in new format; cannot rebuild adapters automatically",
+				"connections",
+				{ message: "connections.json missing but targets.json is in new format" },
+				"connections.json missing but targets.json already in new format; cannot rebuild connections automatically",
 			);
 		}
 
 		// Run migration: targetsRaw is the legacy shape.
 		this.serviceCtx.logger.info(
-			`config-store migrating ${targetsRaw.length} legacy push target(s) → adapter + target split`,
+			`config-store migrating ${targetsRaw.length} legacy push target(s) → connection + target split`,
 		);
-		const { adapters, targets } = migrateLegacyTargets(targetsRaw);
-		const synced = syncManagedWebhookTargets(adapters, targets);
+		const { connections, targets } = migrateLegacyTargets(targetsRaw);
+		const synced = syncManagedWebhookTargets(connections, targets);
 		const replaced = replaceTargetIdsInSubscriptions(this.subscriptions, synced.aliases);
-		this.adapters = adapters;
+		this.connections = connections;
 		this.targets = synced.next;
 		if (replaced.changed) this.subscriptions = replaced.next;
-		await atomicWriteJson(this.path("adapters"), adapters);
+		await atomicWriteJson(this.path("connections"), connections);
 		await atomicWriteJson(this.path("targets"), this.targets);
 		if (replaced.changed) {
 			await atomicWriteJson(this.path("subscriptions"), this.subscriptions);
 			this.touch("subscriptions");
 		}
-		this.meta.adapters.exists = true;
-		this.meta.adapters.lastUpdatedAt = new Date().toISOString();
+		this.meta.connections.exists = true;
+		this.meta.connections.lastUpdatedAt = new Date().toISOString();
 		this.meta.targets.exists = true;
 		this.meta.targets.lastUpdatedAt = new Date().toISOString();
 	}
@@ -955,8 +1161,13 @@ class NodeConfigStore implements ConfigStore {
 		return deepClone(this.subscriptions);
 	}
 
-	getAdapters(): PushAdapter[] {
-		return deepClone(this.adapters);
+	getConnections(): Connection[] {
+		return deepClone(this.connections);
+	}
+
+	getConnection(id: string): Connection | undefined {
+		const hit = this.connections.find((connection) => connection.id === id);
+		return hit ? deepClone(hit) : undefined;
 	}
 
 	getTargets(): PushTarget[] {
@@ -969,10 +1180,6 @@ class NodeConfigStore implements ConfigStore {
 
 	getSubscriptionsMeta(): ConfigScopeMeta {
 		return { ...this.meta.subscriptions };
-	}
-
-	getAdaptersMeta(): ConfigScopeMeta {
-		return { ...this.meta.adapters };
 	}
 
 	getTargetsMeta(): ConfigScopeMeta {
@@ -1092,137 +1299,109 @@ class NodeConfigStore implements ConfigStore {
 		return removed;
 	}
 
-	async upsertAdapter(adapter: PushAdapter): Promise<void> {
-		const saved = await this.runScoped("adapters", async () => {
-			const parsed = PushAdapterSchema.safeParse(adapter);
-			if (!parsed.success) {
-				throw new ConfigValidationError("adapters", parsed.error.issues);
-			}
-			const existing = this.adapters.find((a) => a.id === parsed.data.id);
-			if (existing && existing.platform !== parsed.data.platform) {
-				throw new ConfigValidationError(
-					"adapters",
-					{
-						id: parsed.data.id,
-						from: existing.platform,
-						to: parsed.data.platform,
-						message: "adapter platform cannot be changed",
-					},
-					`adapter ${parsed.data.id} platform cannot be changed`,
-				);
-			}
-			const next = upsertById(this.adapters, parsed.data);
-			await atomicWriteJson(this.path("adapters"), next);
-			this.adapters = next;
-			this.touch("adapters");
-			return parsed.data;
-		});
+	/**
+	 * 一条连接落盘之后的**连带账**:托管的 webhook 目标跟着同步、目标换 id 时订阅里的
+	 * 引用跟着改写,最后按「这一轮到底动了哪几个分区」发事件。
+	 *
+	 * upsert 与 patch 共用这一份 —— 两处各抄一遍的话,加一个连带分区时总会漏掉一边,
+	 * 而症状是「改连接时同步了、打补丁时没同步」这种只有真机才露馅的分叉。
+	 */
+	private async syncWebhookSideEffects(connection: Connection): Promise<void> {
 		let targetAliases = new Map<string, string>();
-		const targetsChanged =
-			saved.platform === "webhook"
-				? await this.runScoped("targets", async () => {
-						const synced = syncManagedWebhookTarget(saved, this.targets);
-						targetAliases = synced.aliases;
-						if (!synced.changed) return false;
-						await atomicWriteJson(this.path("targets"), synced.next);
-						this.targets = synced.next;
-						this.touch("targets");
-						return true;
-					})
-				: false;
+		const targetsChanged = isWebhookConnection(connection)
+			? await this.runScoped("targets", async () => {
+					const synced = syncManagedWebhookTarget(connection, this.targets);
+					targetAliases = synced.aliases;
+					if (!synced.changed) return false;
+					await atomicWriteJson(this.path("targets"), synced.next);
+					this.targets = synced.next;
+					this.touch("targets");
+					return true;
+				})
+			: false;
 		const subscriptionsChanged = await this.replaceSubscriptionTargetAliases(targetAliases);
-		this.bus.emit("config-changed", "adapters");
+		this.bus.emit("config-changed", "connections");
 		if (targetsChanged) this.bus.emit("config-changed", "targets");
 		if (subscriptionsChanged) this.bus.emit("config-changed", "subscriptions");
 	}
 
-	async patchAdapter(id: string, patch: DeepPartial<PushAdapter>): Promise<PushAdapter> {
-		const result = await this.runScoped("adapters", async () => {
-			const idx = this.adapters.findIndex((a) => a.id === id);
-			if (idx < 0) {
-				throw new ConfigValidationError(
-					"adapters",
-					{ id, message: "adapter not found" },
-					`adapter ${id} not found`,
-				);
-			}
-			const current = this.adapters[idx] as PushAdapter;
-			const merged = deepMerge(current, { ...patch, id });
-			const parsed = PushAdapterSchema.safeParse(merged);
+	async upsertConnection(connection: Connection): Promise<void> {
+		const saved = await this.runScoped("connections", async () => {
+			const parsed = ConnectionSchema.safeParse(connection);
 			if (!parsed.success) {
-				throw new ConfigValidationError("adapters", parsed.error.issues);
+				throw new ConfigValidationError("connections", parsed.error.issues);
 			}
-			if (current.platform !== parsed.data.platform) {
-				throw new ConfigValidationError(
-					"adapters",
-					{
-						id,
-						from: current.platform,
-						to: parsed.data.platform,
-						message: "adapter platform cannot be changed",
-					},
-					`adapter ${id} platform cannot be changed`,
-				);
-			}
-			const next = [...this.adapters];
-			next[idx] = parsed.data;
-			await atomicWriteJson(this.path("adapters"), next);
-			this.adapters = next;
-			this.touch("adapters");
+			const existing = this.connections.find((a) => a.id === parsed.data.id);
+			if (existing) assertConnectionIdentityStable(existing, parsed.data);
+			const next = upsertById(this.connections, parsed.data);
+			await atomicWriteJson(this.path("connections"), next);
+			this.connections = next;
+			this.touch("connections");
 			return parsed.data;
 		});
-		let targetAliases = new Map<string, string>();
-		const targetsChanged =
-			result.platform === "webhook"
-				? await this.runScoped("targets", async () => {
-						const synced = syncManagedWebhookTarget(result, this.targets);
-						targetAliases = synced.aliases;
-						if (!synced.changed) return false;
-						await atomicWriteJson(this.path("targets"), synced.next);
-						this.targets = synced.next;
-						this.touch("targets");
-						return true;
-					})
-				: false;
-		const subscriptionsChanged = await this.replaceSubscriptionTargetAliases(targetAliases);
-		this.bus.emit("config-changed", "adapters");
-		if (targetsChanged) this.bus.emit("config-changed", "targets");
-		if (subscriptionsChanged) this.bus.emit("config-changed", "subscriptions");
+		await this.syncWebhookSideEffects(saved);
+	}
+
+	async patchConnection(id: string, patch: DeepPartial<Connection>): Promise<Connection> {
+		const result = await this.runScoped("connections", async () => {
+			const idx = this.connections.findIndex((a) => a.id === id);
+			if (idx < 0) {
+				throw new ConfigValidationError(
+					"connections",
+					{ id, message: CONNECTION_NOT_FOUND },
+					`connection ${id} not found`,
+				);
+			}
+			const current = this.connections[idx] as Connection;
+			const merged = deepMerge(current, { ...patch, id });
+			const parsed = ConnectionSchema.safeParse(merged);
+			if (!parsed.success) {
+				throw new ConfigValidationError("connections", parsed.error.issues);
+			}
+			assertConnectionIdentityStable(current, parsed.data);
+			const next = [...this.connections];
+			next[idx] = parsed.data;
+			await atomicWriteJson(this.path("connections"), next);
+			this.connections = next;
+			this.touch("connections");
+			return parsed.data;
+		});
+		await this.syncWebhookSideEffects(result);
 		return deepClone(result);
 	}
 
-	async deleteAdapter(id: string): Promise<boolean> {
-		const removedAdapter = await this.runScoped("adapters", async () => {
-			const idx = this.adapters.findIndex((a) => a.id === id);
+	async deleteConnection(id: string): Promise<boolean> {
+		const removedConnection = await this.runScoped("connections", async () => {
+			const idx = this.connections.findIndex((a) => a.id === id);
 			if (idx < 0) return undefined;
-			const adapter = this.adapters[idx] as PushAdapter;
+			const connection = this.connections[idx] as Connection;
 			// 引用检查必须在任务体内(执行期)对 this.targets 求值,而非 enqueue
 			// 时 —— 在 scope 外同步检查会与并行 targets 队列竞态:check 通过后、
-			// 删除执行前一个 upsertTarget 引用该 adapter 即产生孤儿 target。
-			// (互补:upsertTarget 侧 assertAdapterMatches 也校验 adapter 存在。)
-			const referencing = this.targets.filter((t) => t.adapterId === id).map((t) => t.id);
-			if (adapter.platform !== "webhook" && referencing.length > 0) {
+			// 删除执行前一个 upsertTarget 引用该连接即产生孤儿 target。
+			// (互补:upsertTarget 侧 assertTargetOwner 也校验连接存在。)
+			const referencing = this.targets.filter((t) => t.connectionId === id).map((t) => t.id);
+			if (!isWebhookConnection(connection) && referencing.length > 0) {
 				throw new ConfigValidationError(
-					"adapters",
-					{ id, targetIds: referencing, message: "adapter still in use" },
-					`adapter ${id} is still referenced by ${referencing.length} target(s)`,
+					"connections",
+					{ id, targetIds: referencing, message: "connection still in use" },
+					`connection ${id} is still referenced by ${referencing.length} target(s)`,
 				);
 			}
-			const next = this.adapters.filter((_, i) => i !== idx);
-			await atomicWriteJson(this.path("adapters"), next);
-			this.adapters = next;
-			this.touch("adapters");
-			return adapter;
+			const next = this.connections.filter((_, i) => i !== idx);
+			await atomicWriteJson(this.path("connections"), next);
+			this.connections = next;
+			this.touch("connections");
+			return connection;
 		});
-		if (!removedAdapter) return false;
+		if (!removedConnection) return false;
 
 		let targetsChanged = false;
 		let subscriptionsChanged = false;
-		if (removedAdapter.platform === "webhook") {
+		if (isWebhookConnection(removedConnection)) {
 			let removedTargetIds: string[] = [];
 			targetsChanged = await this.runScoped("targets", async () => {
-				removedTargetIds = this.targets.filter((t) => t.adapterId === id).map((t) => t.id);
-				const next = this.targets.filter((t) => t.adapterId !== id);
+				removedTargetIds = this.targets.filter((t) => t.connectionId === id).map((t) => t.id);
+				const next = this.targets.filter((t) => t.connectionId !== id);
 				if (next.length === this.targets.length) return false;
 				await atomicWriteJson(this.path("targets"), next);
 				this.targets = next;
@@ -1239,32 +1418,49 @@ class NodeConfigStore implements ConfigStore {
 			});
 		}
 
-		this.bus.emit("config-changed", "adapters");
+		this.bus.emit("config-changed", "connections");
 		if (targetsChanged) this.bus.emit("config-changed", "targets");
 		if (subscriptionsChanged) this.bus.emit("config-changed", "subscriptions");
 		return true;
 	}
 
 	async upsertTarget(target: PushTarget): Promise<void> {
+		let targetAliases: ReadonlyMap<string, string> = new Map();
 		await this.runScoped("targets", async () => {
 			const parsed = PushTargetSchema.safeParse(target);
 			if (!parsed.success) {
 				throw new ConfigValidationError("targets", parsed.error.issues);
 			}
-			this.assertAdapterMatches(parsed.data);
-			if (parsed.data.platform === "webhook") {
+			assertTargetOwner(parsed.data, this.connections);
+			// endpoint 目标是连接的派生物,不接受外部凭空创建 —— 但**备份恢复送回来的那条
+			// 是它自己**:导出走 getTargets(),必然带上托管 target。所以放行的判据是 managedBy,
+			// 光看形态会把它一起挡掉,任何含 webhook 连接的备份都恢复不了(而恢复是逐条 await
+			// 的,炸在这一步时 globals / 订阅 / 连接已经落盘,配置只剩半新半旧)。
+			if (parsed.data.kind === "endpoint" && parsed.data.managedBy !== "connection") {
 				throw new ConfigValidationError(
 					"targets",
-					{ message: "webhook target is managed by adapter" },
-					"webhook targets are created from webhook adapters automatically",
+					{ message: "webhook target is managed by its connection" },
+					"webhook targets are created from webhook connections automatically",
 				);
 			}
-			const next = upsertById(this.targets, parsed.data);
+			let next = upsertById(this.targets, parsed.data);
+			// 交回托管同步:恢复回来的那条可能带着**老 id**(makeManagedWebhookTarget 取的是
+			// `existing?.id ?? 确定性id`,老记录会一直保留自己的 id),与该连接名下当前那条
+			// 并存。由它决定谁留下、把另一个记进 aliases,订阅引用随后跟着改写 —— 与
+			// upsertConnection 完全同一条路径,别在这儿另写一套。
+			const owner = this.connections.find((a) => a.id === parsed.data.connectionId);
+			if (owner && isWebhookConnection(owner)) {
+				const synced = syncManagedWebhookTarget(owner, next);
+				next = synced.next;
+				targetAliases = synced.aliases;
+			}
 			await atomicWriteJson(this.path("targets"), next);
 			this.targets = next;
 			this.touch("targets");
 		});
+		const subscriptionsChanged = await this.replaceSubscriptionTargetAliases(targetAliases);
 		this.bus.emit("config-changed", "targets");
+		if (subscriptionsChanged) this.bus.emit("config-changed", "subscriptions");
 	}
 
 	async patchTarget(id: string, patch: DeepPartial<PushTarget>): Promise<PushTarget> {
@@ -1278,7 +1474,7 @@ class NodeConfigStore implements ConfigStore {
 				);
 			}
 			const current = this.targets[idx] as PushTarget;
-			if (current.platform === "webhook" && current.managedBy === "adapter") {
+			if (current.kind === "endpoint" && current.managedBy === "connection") {
 				throw new ConfigValidationError(
 					"targets",
 					{
@@ -1286,7 +1482,7 @@ class NodeConfigStore implements ConfigStore {
 						keys: Object.keys(patch as Record<string, unknown>),
 						message: "managed target cannot be edited directly",
 					},
-					`target ${id} is managed by adapter and cannot be edited directly`,
+					`target ${id} is managed by its connection and cannot be edited directly`,
 				);
 			}
 			const merged = deepMerge(current, { ...patch, id });
@@ -1294,7 +1490,7 @@ class NodeConfigStore implements ConfigStore {
 			if (!parsed.success) {
 				throw new ConfigValidationError("targets", parsed.error.issues);
 			}
-			this.assertAdapterMatches(parsed.data);
+			assertTargetOwner(parsed.data, this.connections);
 			const next = [...this.targets];
 			next[idx] = parsed.data;
 			await atomicWriteJson(this.path("targets"), next);
@@ -1327,38 +1523,16 @@ class NodeConfigStore implements ConfigStore {
 		return deepClone(result);
 	}
 
-	private assertAdapterMatches(target: PushTarget): void {
-		const adapter = this.adapters.find((a) => a.id === target.adapterId);
-		if (!adapter) {
-			throw new ConfigValidationError(
-				"targets",
-				{ adapterId: target.adapterId, message: "adapter not found" },
-				`target.adapterId ${target.adapterId} does not match any adapter`,
-			);
-		}
-		if (adapter.platform !== target.platform) {
-			throw new ConfigValidationError(
-				"targets",
-				{
-					adapterPlatform: adapter.platform,
-					targetPlatform: target.platform,
-					message: "platform mismatch",
-				},
-				`target.platform (${target.platform}) ≠ adapter.platform (${adapter.platform})`,
-			);
-		}
-	}
-
 	async deleteTarget(id: string): Promise<boolean> {
 		const removed = await this.runScoped("targets", async () => {
 			const idx = this.targets.findIndex((t) => t.id === id);
 			if (idx < 0) return false;
 			const target = this.targets[idx] as PushTarget;
-			if (target.managedBy === "adapter") {
+			if (target.managedBy === "connection") {
 				throw new ConfigValidationError(
 					"targets",
 					{ id, message: "managed target cannot be deleted directly" },
-					`target ${id} is managed by adapter and cannot be deleted directly`,
+					`target ${id} is managed by its connection and cannot be deleted directly`,
 				);
 			}
 			const next = this.targets.filter((_, i) => i !== idx);
@@ -1381,7 +1555,109 @@ class NodeConfigStore implements ConfigStore {
 		return removed;
 	}
 
+	/**
+	 * 整体替换若干配置分区 —— **恢复备份与一次性迁移走这条路**,别再伪装成一串用户编辑。
+	 *
+	 * 逐条 upsert/delete 的老写法有两处治不好的病:
+	 * ① 它会撞上专为用户设的守卫(webhook 目标不许手工创建),而恢复送回来的恰恰是系统
+	 *    自己生成的那条;
+	 * ② 中途失败时前面的分区**已经落盘**,配置只剩半新半旧 —— 订阅引用着从未创建的
+	 *    target id,而原状态已被覆盖,用户连退回去都做不到。
+	 *
+	 * 这里分两步:**先把所有分区校验完(一个字节都不写)**,再落盘。落盘顺序是三个数组
+	 * 先写(可回滚)、globals 最后写(`writeGlobals` 自带密钥袋回滚);数组写之前各留一份
+	 * `.bak`,任何一步炸了就拿它们推回去。
+	 *
+	 * 缺席的分区保持不动。返回真正改过的 scope。
+	 */
+	async replaceSections(next: ConfigSections): Promise<ConfigScope[]> {
+		const changed = await this.runAllScopes(async () => {
+			// ---- 1) 校验:任一分区不过就整个中止,不写任何东西 ----------------
+			let globals: GlobalConfig | undefined;
+			if (next.globals !== undefined) {
+				const r = GlobalConfigSchema.safeParse(next.globals);
+				if (!r.success) throw new ConfigValidationError("globals", r.error.issues);
+				globals = r.data;
+			}
+			const subscriptions = next.subscriptions && parseAll("subscriptions", next.subscriptions);
+			const connections = next.connections && parseAll("connections", next.connections);
+			const targets = next.targets && parseAll("targets", next.targets);
+
+			// ---- 2) 跨分区不变式 + 托管目标归一化(与 load() 同一套) ----------
+			const effConnections = connections ?? this.connections;
+			const effTargets = targets ?? this.targets;
+			const effSubs = subscriptions ?? this.subscriptions;
+			for (const t of effTargets) assertTargetOwner(t, effConnections);
+			const synced = syncManagedWebhookTargets(effConnections, effTargets);
+			const replaced = replaceTargetIdsInSubscriptions(effSubs, synced.aliases);
+
+			// ---- 3) 落盘:数组先写(留 .bak),globals 最后写 -------------------
+			const writes: Array<[ConfigScope, unknown]> = [];
+			if (subscriptions || replaced.changed) writes.push(["subscriptions", replaced.next]);
+			if (connections) writes.push(["connections", effConnections]);
+			if (targets || synced.changed) writes.push(["targets", synced.next]);
+
+			const backups: Array<[string, string]> = [];
+			for (const [scope] of writes) {
+				const path = this.path(scope);
+				if (!(await fileExists(path))) continue;
+				// 🔴 **不能叫 `.bak`**:那个名字是 v1→v2 迁移留给主人的**救命原件**(「迁移错了
+				// 还能自己捞回去」),而这里这份是写一半用来推回去的临时件、`finally` 里无条件
+				// 删掉 —— 同名的话,恢复一次备份就把那份原件顺手抹了,没有一行日志。
+				const bak = `${path}.restore.bak`;
+				await copyFile(path, bak);
+				backups.push([path, bak]);
+			}
+			try {
+				for (const [scope, value] of writes) await atomicWriteJson(this.path(scope), value);
+				if (globals) await this.writeGlobals(globals);
+			} catch (e) {
+				for (const [path, bak] of backups) await copyFile(bak, path).catch(() => {});
+				throw e;
+			} finally {
+				for (const [, bak] of backups) await rm(bak, { force: true }).catch(() => {});
+			}
+
+			// ---- 4) 双写都成了才更新内存 -----------------------------------
+			const touched: ConfigScope[] = [];
+			if (subscriptions || replaced.changed) {
+				this.subscriptions = replaced.next;
+				this.touch("subscriptions");
+				touched.push("subscriptions");
+			}
+			if (connections) {
+				this.connections = effConnections;
+				this.touch("connections");
+				touched.push("connections");
+			}
+			if (targets || synced.changed) {
+				this.targets = synced.next;
+				this.touch("targets");
+				touched.push("targets");
+			}
+			if (globals) {
+				this.touch("globals");
+				touched.push("globals");
+			}
+			return touched;
+		});
+		for (const scope of changed) this.bus.emit("config-changed", scope);
+		return changed;
+	}
+
 	// ---- internals ------------------------------------------------------
+
+	/**
+	 * 一次拿住全部四把 scope 锁。顺序固定(globals → subscriptions → connections →
+	 * targets),别的调用方一次只拿一把,所以不会死锁。
+	 */
+	private runAllScopes<T>(task: () => Promise<T>): Promise<T> {
+		return this.runScoped("globals", () =>
+			this.runScoped("subscriptions", () =>
+				this.runScoped("connections", () => this.runScoped("targets", task)),
+			),
+		);
+	}
 
 	private async replaceSubscriptionTargetAliases(
 		aliases: ReadonlyMap<string, string>,
@@ -1413,6 +1689,33 @@ class NodeConfigStore implements ConfigStore {
 		this.queues[scope] = next.catch(() => undefined);
 		return next;
 	}
+}
+
+function parseAll(scope: "subscriptions", items: readonly Subscription[]): Subscription[];
+function parseAll(scope: "connections", items: readonly Connection[]): Connection[];
+function parseAll(scope: "targets", items: readonly PushTarget[]): PushTarget[];
+/**
+ * 逐条重新校验一个分区。入参虽然带着类型,但它来自备份文件 / 磁盘 JSON —— 那个类型
+ * 是句谎话,运行期必须自己验一遍。报错带下标,跟 load() 的口径一致。
+ */
+function parseAll(scope: ConfigScope, items: readonly unknown[]): unknown[] {
+	const schema =
+		scope === "subscriptions"
+			? SubscriptionSchema
+			: scope === "connections"
+				? ConnectionSchema
+				: PushTargetSchema;
+	return items.map((item, idx) => {
+		const r = schema.safeParse(item);
+		if (!r.success) {
+			throw new ConfigValidationError(
+				scope,
+				{ index: idx, issues: r.error.issues },
+				`${scope}[${idx}] failed schema validation`,
+			);
+		}
+		return r.data;
+	});
 }
 
 function upsertById<T extends { id: string }>(arr: readonly T[], item: T): T[] {

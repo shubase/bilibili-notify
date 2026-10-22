@@ -41,6 +41,35 @@ export function featureToPushKind(feature: FeatureKey): PushKind {
 }
 
 /**
+ * 推送类型 → 它归哪把特性键管 —— {@link featureToPushKind} 的反向。
+ *
+ * 一条历史行记的是 `PushKind`,而路由、闸、订阅里的开关认的是 `FeatureKey`;人工重推
+ * 要复检「这个目标还在不在这条路由里」,就得从行上那个 kind 翻回那把键。
+ *
+ * `live` 与 `live-ongoing` 并回同一把:开播与周期「正在直播」在历史上是两件事,在配置上
+ * 共用一把键和同一份目标(所以这个方向**不是**单射,翻不回「是开播还是复推」)。
+ */
+export function pushKindToFeature(kind: PushKind): FeatureKey {
+	switch (kind) {
+		case "dynamic":
+			return "dynamic";
+		case "live":
+		case "live-ongoing":
+			return "live";
+		case "live-end":
+			return "liveEnd";
+		case "guard":
+			return "liveGuardBuy";
+		case "sc":
+			return "superchat";
+		case "special-danmaku":
+			return "specialDanmaku";
+		case "special-enter":
+			return "specialUserEnter";
+	}
+}
+
+/**
  * 一行历史的四态:
  * - delivered:全部消息都到了
  * - partial:本体到了,附加项(@全体 / 图集 / 词云 / 总结)或本体的后续分条没到
@@ -83,6 +112,17 @@ export const HistoryMessageSchema = z.object({
 	payload: HistoryPayloadSchema,
 	role: HistoryMessageRoleSchema,
 	result: HistoryMessageResultSchema.optional(),
+	/**
+	 * 这条是**哪一条的重投**(ADR-0017 决策 15):值是被补的那条消息在本行 `messages`
+	 * 里的下标。人工重推追加进原行而不新开行,所以一行里会有同一条消息的好几次尝试;
+	 * 序号就是稳定身份 —— 消息只按序追加,从不重排、从不删除。
+	 *
+	 * 缺省 = 这条不是重投,它自己就是一号。**不给默认值 0**:0 是本体那一号的合法身份,
+	 * 填上去会让每条老消息都自称「我是第 0 条的重投」,整行的身份全塌成一个。
+	 *
+	 * 它同时是展开逐条时那个「第 N 次尝试」标记的来源,不用再开第二个字段。
+	 */
+	retryOf: z.number().int().nonnegative().optional(),
 });
 export type HistoryMessage = z.infer<typeof HistoryMessageSchema>;
 

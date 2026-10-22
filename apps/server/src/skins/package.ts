@@ -1,15 +1,16 @@
 /**
  * zip 皮肤包解析:不可信字节流 → { manifest, assets } 或拒绝。
  *
- * 两道闸防 zip bomb:filter 阶段按 zip 头声称的大小/数量预筛(骗过它的畸形头),
+ * 两道闸防 zip bomb:解压前按 zip 头声称的大小/数量预筛(共用的 `openZipEntries`),
  * 解压后再按真实 byteLength 复核。包内文件走白名单(skin.json + assets/ 图片),
  * macOS 打包垃圾(__MACOSX/、.DS_Store)静默忽略 —— 用户自己压的包十有八九带。
  */
 
 import type { SkinManifest } from "@bilibili-notify/contract";
 import { MAX_FONT_ASSET_BYTES } from "@bilibili-notify/internal/constants";
-import { strFromU8, unzipSync } from "fflate";
+import { strFromU8 } from "fflate";
 import { parseAssetNames } from "../runtime/asset-labels.js";
+import { openZipEntries } from "../zip-junk.js";
 import { ASSET_NAMES_FILE } from "./asset-names.js";
 import { stripDecorationResidue } from "./css-sanitizer.js";
 import {
@@ -60,12 +61,6 @@ export type OpenSkinPackageResult =
 	  }
 	| { ok: false; errors: string[] };
 
-function isJunk(name: string): boolean {
-	return (
-		name.endsWith("/") || name.startsWith("__MACOSX/") || name.split("/").pop() === ".DS_Store"
-	);
-}
-
 /** manifest 各处引用的图片集合(整页壁纸 + chat 壁纸)。zip 校验与编辑保存共用一把尺。 */
 export function referencedImages(manifest: SkinManifest): Set<string> {
 	const referenced = new Set<string>();
@@ -98,31 +93,12 @@ export function referencedAssets(manifest: SkinManifest): Set<string> {
 }
 
 export function openSkinPackage(buf: Uint8Array): OpenSkinPackageResult {
-	let entries: Record<string, Uint8Array>;
-	let precheckError: string | null = null;
-	let count = 0;
-	let claimedTotal = 0;
-	try {
-		entries = unzipSync(buf, {
-			filter: (f) => {
-				if (isJunk(f.name)) return false;
-				count += 1;
-				claimedTotal += f.originalSize;
-				if (count > MAX_PACKAGE_FILES) {
-					precheckError = `包内文件太多(上限 ${MAX_PACKAGE_FILES} 个)`;
-					return false;
-				}
-				if (claimedTotal > MAX_TOTAL_BYTES) {
-					precheckError = "包解压后总大小超限";
-					return false;
-				}
-				return true;
-			},
-		});
-	} catch {
-		return { ok: false, errors: ["不是合法的 zip 文件"] };
-	}
-	if (precheckError) return { ok: false, errors: [precheckError] };
+	const opened = openZipEntries(buf, {
+		maxFiles: MAX_PACKAGE_FILES,
+		maxTotalBytes: MAX_TOTAL_BYTES,
+	});
+	if (!opened.ok) return { ok: false, errors: [opened.error] };
+	const entries = opened.entries;
 
 	const errors: string[] = [];
 	let manifestBytes: Uint8Array | null = null;

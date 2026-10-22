@@ -1,6 +1,6 @@
 import type { DevCapturedDelivery } from "@bilibili-notify/contract";
-import type { NotificationPayload } from "@bilibili-notify/internal";
-import type { PlatformAdapter } from "../platforms/types.js";
+import type { NotificationPayload, PlatformAdapter } from "@bilibili-notify/internal";
+import { connectionDispatchKey } from "@bilibili-notify/internal";
 
 /**
  * D1 截流:推送出口(`PlatformAdapter.send`)外面套一层闸。
@@ -103,15 +103,15 @@ export function createCaptureGate(): CaptureGate {
 			// `this`,那条写在 PlatformAdapter 的文档上。
 			return {
 				...inner,
-				async send(adapter, target, payload, opts) {
-					if (!on) return inner.send(adapter, target, payload, opts);
+				async send(connection, target, payload, opts) {
+					if (!on) return inner.send(connection, target, payload, opts);
 					seq += 1;
 					list.push({
 						id: String(seq),
 						at: Date.now(),
-						adapterId: adapter.id,
-						adapterName: adapter.name,
-						platform: adapter.platform,
+						connectionId: connection.id,
+						connectionName: connection.name,
+						platform: connectionDispatchKey(connection),
 						targetId: target.id,
 						targetName: target.name,
 						private: opts?.private === true,

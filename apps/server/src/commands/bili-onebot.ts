@@ -5,6 +5,7 @@ import {
 	DEFAULT_GROUP_COMMAND_ALIASES,
 	DEFAULT_GROUP_COMMAND_OWNER_QQ,
 	DEFAULT_GROUP_COMMAND_PREFIX,
+	EXTRA_KEYS,
 	FEATURE_KEYS,
 	type GlobalConfig,
 	type GroupCommandAliases,
@@ -103,7 +104,10 @@ interface UpSearchCandidate {
 	fans?: number;
 }
 
-type OnebotGroupTarget = Extract<PushTarget, { platform: "onebot" }> & { scope: "group" };
+type OnebotGroupTarget = Extract<PushTarget, { kind: "session" }> & {
+	platform: "onebot";
+	scope: "group";
+};
 
 interface GroupSubscriptionListResult {
 	text: string;
@@ -258,7 +262,7 @@ export function createBiliOnebotCommandHandler(runtime: AppRuntime): OnebotInbou
 		const groupTarget = findGroupTarget(runtime, adapterId, event.groupId);
 		const isOwner = event.userId === commandConfig.ownerQq;
 		const isGroupAdminOrAbove = isOwner || event.role === "owner" || event.role === "admin";
-		const allowMemberManage = groupTarget?.session.allowMemberManage === true;
+		const allowMemberManage = groupTarget?.allowMemberManage === true;
 		const canManageGroup = isGroupAdminOrAbove || allowMemberManage;
 
 		if (requiresOwner(command) && !isOwner) {
@@ -493,17 +497,14 @@ async function setMemberManagePermission(
 ): Promise<string> {
 	if (action === "status") {
 		const target = findGroupTarget(runtime, adapterId, groupId);
-		return formatMemberManageStatus(target?.session.allowMemberManage === true, config);
+		return formatMemberManageStatus(target?.allowMemberManage === true, config);
 	}
 
 	const enabled = action === "on";
 	const target = await ensureGroupTarget(runtime, adapterId, groupId);
-	const session = { ...target.session };
-	if (enabled) session.allowMemberManage = true;
-	else delete session.allowMemberManage;
 	const next: OnebotGroupTarget = {
 		...target,
-		session,
+		allowMemberManage: enabled || undefined,
 	};
 	await runtime.configStore.upsertTarget(next);
 	return formatMemberManageUpdate(enabled, config);
@@ -849,18 +850,19 @@ async function ensureGroupTarget(
 	if (existing) return existing;
 
 	const adapter = runtime.configStore
-		.getAdapters()
-		.find((a) => a.platform === "onebot" && a.id === adapterId);
+		.getConnections()
+		.find((a) => a.kind === "direct" && a.platform === "onebot" && a.id === adapterId);
 	if (!adapter) throw new Error("当前 OneBot 连接没有对应的推送适配器配置");
 
 	const target: OnebotGroupTarget = {
 		id: randomUUID(),
 		name: groupTargetNameForCreate(groupId, groupName),
-		adapterId: adapter.id,
+		connectionId: adapter.id,
+		kind: "session",
 		platform: "onebot",
 		scope: "group",
 		enabled: true,
-		session: { groupId },
+		address: groupId,
 	};
 	await runtime.configStore.upsertTarget(target);
 	return target;
@@ -874,12 +876,12 @@ function findGroupTarget(
 	const targets = runtime.configStore
 		.getTargets()
 		.filter(isOnebotGroupTarget)
-		.filter((t) => t.session.groupId === groupId);
-	return targets.find((t) => t.adapterId === adapterId) ?? targets[0] ?? null;
+		.filter((t) => t.address === groupId);
+	return targets.find((t) => t.connectionId === adapterId) ?? null;
 }
 
 function isOnebotGroupTarget(target: PushTarget): target is OnebotGroupTarget {
-	return target.platform === "onebot" && target.scope === "group";
+	return target.kind === "session" && target.platform === "onebot" && target.scope === "group";
 }
 
 function attachTargetToSubscription(sub: Subscription, targetId: string): Subscription {
@@ -896,26 +898,30 @@ function applyCommandSubscriptionDefaults(
 	opts: { targetId: string; isNewSubscription: boolean; isNewGroupRoute: boolean },
 ): Subscription {
 	const current = sub.overrides.features ?? {};
-	const atAll = {
-		dynamic: { ...sub.atAll.dynamic },
-		live: { ...sub.atAll.live },
+	const extras = {
+		...sub.extras,
+		atAllLive: { ...sub.extras.atAllLive },
 	};
-	if (!opts.isNewSubscription && opts.isNewGroupRoute && atAll.live[opts.targetId] === undefined) {
-		atAll.live[opts.targetId] = false;
+	if (
+		!opts.isNewSubscription &&
+		opts.isNewGroupRoute &&
+		extras.atAllLive[opts.targetId] === undefined
+	) {
+		extras.atAllLive[opts.targetId] = false;
 	}
 	return {
 		...sub,
-		atAllDefaults: {
-			...sub.atAllDefaults,
-			live: opts.isNewSubscription ? false : sub.atAllDefaults.live,
-		},
-		atAll,
+		extras,
 		overrides: {
 			...sub.overrides,
 			features: {
 				...current,
 				liveGuardBuy: current.liveGuardBuy ?? COMMAND_SUBSCRIPTION_DEFAULT_FEATURES.liveGuardBuy,
 				superchat: current.superchat ?? COMMAND_SUBSCRIPTION_DEFAULT_FEATURES.superchat,
+				extras: {
+					...current.extras,
+					...(opts.isNewSubscription ? { atAllLive: false } : {}),
+				},
 			},
 		},
 	};
@@ -924,13 +930,12 @@ function applyCommandSubscriptionDefaults(
 function detachTargetFromSubscription(sub: Subscription, targetId: string): Subscription {
 	const routing = { ...sub.routing };
 	for (const key of FEATURE_KEYS) routing[key] = routing[key].filter((id) => id !== targetId);
-	const atAll = {
-		dynamic: { ...sub.atAll.dynamic },
-		live: { ...sub.atAll.live },
-	};
-	delete atAll.dynamic[targetId];
-	delete atAll.live[targetId];
-	return { ...sub, routing, atAll };
+	const extras = { ...sub.extras };
+	for (const key of EXTRA_KEYS) {
+		extras[key] = { ...extras[key] };
+		delete extras[key][targetId];
+	}
+	return { ...sub, routing, extras };
 }
 
 function hasAnyRouting(sub: Subscription): boolean {

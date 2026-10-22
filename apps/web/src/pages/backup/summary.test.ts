@@ -3,7 +3,7 @@ import type { ImportResult } from "./summary";
 import { summarizeImport } from "./summary";
 
 /**
- * 脱敏备份**不含任何凭据** —— 恢复回来的适配器密钥是空的、AI API Key 是空的。
+ * 脱敏备份**不含任何凭据** —— 恢复回来的连接密钥是空的、AI API Key 是空的。
  * 配置都在、开关也开着,但推不出去。用户不会想到是这个原因,除非导入回执直接讲明。
  *
  * (schema 层的坑同时也修了:appSecret 曾经 `.min(1)`,脱敏档根本存不回去,直接
@@ -12,7 +12,7 @@ import { summarizeImport } from "./summary";
 
 const empty: ImportResult = {
 	subscriptions: { upserted: 0, deleted: 0 },
-	adapters: { upserted: 0, deleted: 0 },
+	connections: { upserted: 0, deleted: 0 },
 	targets: { upserted: 0, deleted: 0 },
 	globalsApplied: false,
 	cookiesRestored: false,
@@ -40,11 +40,14 @@ describe("summarizeImport", () => {
 	});
 
 	describe("脱敏档:凭据是空的,必须讲出来", () => {
-		it("导入了适配器 → 提示重填适配器密钥", () => {
-			const s = summarizeImport({ ...empty, adapters: { upserted: 1, deleted: 0 } }, "sanitized");
+		it("导入了连接 → 提示重填连接密钥", () => {
+			const s = summarizeImport(
+				{ ...empty, connections: { upserted: 1, deleted: 0 } },
+				"sanitized",
+			);
 
 			expect(s).toContain("不含凭据");
-			expect(s).toContain("适配器密钥");
+			expect(s).toContain("连接密钥");
 		});
 
 		it("应用了全局设置 → 提示重填 AI API Key", () => {
@@ -56,7 +59,7 @@ describe("summarizeImport", () => {
 		// 完整备份带着密钥一起回来,提示只会添乱。
 		it("完整备份不提示", () => {
 			const s = summarizeImport(
-				{ ...empty, adapters: { upserted: 1, deleted: 0 }, globalsApplied: true },
+				{ ...empty, connections: { upserted: 1, deleted: 0 }, globalsApplied: true },
 				"full",
 			);
 

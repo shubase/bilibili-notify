@@ -12,11 +12,11 @@
  * 规矩:停用是暂停不是消失),运行时不解析。
  */
 
-import type { AdapterCapabilitiesMap, MiniAppCardSupport } from "@bilibili-notify/contract";
+import type { ConnectionCapabilitiesMap, MiniAppCardSupport } from "@bilibili-notify/contract";
 import {
-	INBOUND_CAPABLE_PLATFORMS,
 	LINK_REPLY_FORMS,
 	type LinkReplyForm,
+	platformCanReceiveReply,
 } from "@bilibili-notify/internal/constants";
 import {
 	DisclosurePill,
@@ -36,7 +36,12 @@ import {
 import { useState } from "react";
 import { Link } from "react-router-dom";
 import { SECTION_ACCENT } from "../config/section-accents";
-import { isTargetPaused, type PushAdapter, type PushTarget } from "../types/domain";
+import {
+	type Connection,
+	type DirectConnection,
+	isTargetPaused,
+	type PushTarget,
+} from "../types/domain";
 import type { GlobalConfig, GlobalConfigPatch } from "../types/globals";
 import { Field } from "./forms";
 
@@ -50,34 +55,57 @@ export const LINK_REPLY_FORM_LABELS: Record<LinkReplyForm, string> = {
 /** 三态格的取值:跟默认,或一个显式值。 */
 const INHERIT = "inherit" as const;
 
-/** 能列进例外表的目标:群类,且平台收得到入站消息(webhook 只出不进,配了也没用)。 */
-function isGroupCandidate(t: PushTarget): boolean {
-	return (
-		t.scope === "group" && (INBOUND_CAPABLE_PLATFORMS as readonly string[]).includes(t.platform)
-	);
+/**
+ * 能列进例外表的目标:群类,且这条路上收得到入站消息(webhook 只出不进,配了也没用)。
+ *
+ * **直连问的是 `platformCanReceiveReply`,不是自己拿词表 `includes` 一遍** —— 这里原先是
+ * 那份词表的第三个消费方,而另外两个走的是这个谓词。
+ *
+ * 🔴 **拓展借来的连接不走那个谓词**:一条拓展连接就是一个借来的 bot(ADR-0012 决策 45),
+ * 它的 `platform` 是从 bot 身上抄来的**开放字符串**(telegram / discord / 自定义…),
+ * `PLATFORM_REGISTRY` 里根本没有它,于是 `inbound` 恒为 undefined、整批群被这张表漏掉 ——
+ * 而运行时照样解析它们发的链接,配不上的那几群就永远调不了。判据只能是「这条连接是拓展
+ * 借来的」。
+ */
+function isGroupCandidate(t: PushTarget, connections: readonly Connection[]): boolean {
+	if (t.scope !== "group") return false;
+	if (connections.find((c) => c.id === t.connectionId)?.kind === "extension") return true;
+	return platformCanReceiveReply(t.platform);
 }
 
 /** 面板上「未探测」那一档;引擎还没起来、或表里根本没这条时都是它。 */
 const NOT_PROBED: MiniAppCardSupport = { state: "unknown" };
 
+/**
+ * 能力表两级索引都要给全:能力是**平台**的属性,只按连接查在一条连接驮多个平台的时候
+ * 会把别的平台的答案读过来。两个读它的地方(一行群目标 / 一条连接)各自带着平台名。
+ */
+function miniAppSupport(
+	capabilities: ConnectionCapabilitiesMap,
+	connectionId: string,
+	platform: string,
+): MiniAppCardSupport | undefined {
+	return capabilities[connectionId]?.[platform]?.miniAppCard;
+}
+
 export function LinkParsingSettings({
 	draft,
 	onPatch,
 	targets,
-	adapters,
+	connections,
 	capabilities,
 }: {
 	draft: GlobalConfig;
 	onPatch: (delta: GlobalConfigPatch) => void;
 	/** 推送目标表(由页面取数),这里只挑群类的列出来。 */
 	targets: readonly PushTarget[];
-	/** 适配器表(由页面取数),面板只列 OneBot 的。 */
-	adapters: readonly PushAdapter[];
-	/** `GET /api/adapters/capabilities`:各适配器能不能签小程序卡。 */
-	capabilities: AdapterCapabilitiesMap;
+	/** 连接表(由页面取数),面板只列 OneBot 的。 */
+	connections: readonly Connection[];
+	/** `GET /api/connections/capabilities`:各连接能不能签小程序卡。 */
+	capabilities: ConnectionCapabilitiesMap;
 }) {
 	const cfg = draft.linkParsing;
-	const candidates = targets.filter(isGroupCandidate);
+	const candidates = targets.filter((t) => isGroupCandidate(t, connections));
 	// 两格都调回「跟默认」时草稿里留下的是个空对象(删除哨兵把字段删掉,不删这一格),
 	// 它已经不是例外了 —— 数键会让卡上多出一条根本不存在的例外,直到存盘重拉才消失。
 	const overrides = Object.values(cfg.groups).filter(
@@ -181,8 +209,8 @@ export function LinkParsingSettings({
 										target={t}
 										cfg={cfg}
 										onPatch={onPatch}
-										support={capabilities[t.adapterId]?.miniAppCard}
-										paused={isTargetPaused(t, adapters)}
+										support={miniAppSupport(capabilities, t.connectionId, t.platform)}
+										paused={isTargetPaused(t, connections)}
 									/>
 								))
 							: null}
@@ -190,7 +218,7 @@ export function LinkParsingSettings({
 				)}
 			</Field>
 
-			<CapabilityPanel adapters={adapters} capabilities={capabilities} />
+			<CapabilityPanel connections={connections} capabilities={capabilities} />
 		</GlassBox>
 	);
 }
@@ -208,28 +236,32 @@ function supportText(s: MiniAppCardSupport): { dot: "ok" | "off" | "pending"; te
 }
 
 /**
- * 「适配器支持情况」:每个 OneBot 适配器一行,三态 支持 / 不支持(带原因)/ 未探测。只列
+ * 「连接支持情况」:每条 OneBot 连接一行,三态 支持 / 不支持(带原因)/ 未探测。只列
  * OneBot —— 官机与 webhook 没有能力概念,一句话说清。探测是连上时自动做的,主人在推送
  * 目标页点「测试」也会补探「未探测」的。
  */
 function CapabilityPanel({
-	adapters,
+	connections,
 	capabilities,
 }: {
-	adapters: readonly PushAdapter[];
-	capabilities: AdapterCapabilitiesMap;
+	connections: readonly Connection[];
+	capabilities: ConnectionCapabilitiesMap;
 }) {
-	const onebots = adapters.filter((a) => a.platform === "onebot");
+	// 只有直连认得出自己是不是 OneBot;桥接入的平台是它握手时报的,那一栏等接桥再说。
+	const onebots = connections.filter(
+		(a): a is Extract<DirectConnection, { platform: "onebot" }> =>
+			a.kind === "direct" && a.platform === "onebot",
+	);
 	return (
-		<section aria-label="适配器支持情况" className="mt-4">
-			<Section label="适配器支持情况">
+		<section aria-label="连接支持情况" className="mt-4">
+			<Section label="连接支持情况">
 				{onebots.length === 0 ? (
 					<EmptyNote size="sm" className="m-2">
-						还没有 OneBot 适配器;小程序卡只有 OneBot 实现能签
+						还没有 OneBot 连接;小程序卡只有 OneBot 实现能签
 					</EmptyNote>
 				) : (
 					onebots.map((a) => {
-						const support = capabilities[a.id]?.miniAppCard ?? NOT_PROBED;
+						const support = miniAppSupport(capabilities, a.id, a.platform) ?? NOT_PROBED;
 						const { dot, text } = supportText(support);
 						return (
 							<Row
@@ -278,9 +310,9 @@ function GroupRow({
 	target: PushTarget;
 	cfg: LinkParsing;
 	onPatch: (delta: GlobalConfigPatch) => void;
-	/** 这群所在适配器能不能签小程序卡;没有能力概念的平台(官机)是 undefined。 */
+	/** 这群所在连接能不能签小程序卡;没有能力概念的平台(官机)是 undefined。 */
 	support: MiniAppCardSupport | undefined;
-	/** 目标自己停用、或它挂的适配器停用 —— 运行时都不解析,面板得说同一句话。 */
+	/** 目标自己停用、或它挂的连接停用 —— 运行时都不解析,面板得说同一句话。 */
 	paused: boolean;
 }) {
 	const o = cfg.groups[target.id];
@@ -333,7 +365,7 @@ function GroupRow({
 			{target.platform === "qq-official" ? (
 				<HintNote className="basis-full">QQ 官方机器人不支持小程序卡,选了也会回落图片卡</HintNote>
 			) : support?.state === "unsupported" ? (
-				<HintNote className="basis-full">该适配器不支持小程序卡,选了也会回落图片卡</HintNote>
+				<HintNote className="basis-full">该连接不支持小程序卡,选了也会回落图片卡</HintNote>
 			) : null}
 		</fieldset>
 	);

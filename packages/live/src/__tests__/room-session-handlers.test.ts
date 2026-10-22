@@ -19,10 +19,11 @@ import { GuardLevel } from "@bilibili-notify/blive";
 import type { ServiceContext } from "@bilibili-notify/internal";
 import { defaultMessageKindLayout } from "@bilibili-notify/internal";
 import { beforeEach, describe, expect, it, vi } from "vite-plus/test";
-import type { SubItemView } from "../push-like";
+import type { CustomGuardBuyLike, SubItemView } from "../push-like";
 import { LivePushType, wantsLiveEndExtras } from "../push-like";
 import { RoomContext } from "../room-helpers";
 import { RoomSession } from "../room-session";
+import { LiveTemplateRenderer } from "../template-renderer";
 import { LiveType } from "../types";
 
 // biome-ignore lint/suspicious/noExplicitAny: 测试需访问 private/protected
@@ -38,7 +39,7 @@ function makeSub(over: Partial<SubItemView> = {}): SubItemView {
 		liveEnd: true,
 		liveGuardBuy: false,
 		superchat: false,
-		liveEndExtras: { wordcloud: false, liveSummary: false },
+		extras: { atAllDynamic: false, atAllLive: true, wordcloud: false, liveSummary: false },
 		target: {},
 		customCardStyle: { enable: false },
 		customLiveMsg: { enable: false },
@@ -76,7 +77,10 @@ interface CtxMocks {
 	safeBroadcast: ReturnType<typeof vi.fn>;
 }
 
-function makeCtx(opts?: { customGuardBuyEnabled?: boolean }): { ctx: RoomContext; m: CtxMocks } {
+function makeCtx(opts?: { customGuardBuy?: CustomGuardBuyLike }): {
+	ctx: RoomContext;
+	m: CtxMocks;
+} {
 	const fakeServiceCtx: ServiceContext = {
 		logger: { debug() {}, info() {}, warn() {}, error() {} },
 		setInterval: () => ({ dispose() {} }),
@@ -107,7 +111,7 @@ function makeCtx(opts?: { customGuardBuyEnabled?: boolean }): { ctx: RoomContext
 		logger: fakeServiceCtx.logger,
 		isDisposed: () => false,
 		config: {
-			customGuardBuy: { enable: opts?.customGuardBuyEnabled ?? false },
+			customGuardBuy: opts?.customGuardBuy ?? { enable: false },
 			customLiveMsg: { enable: false },
 		},
 		api: { getUserInfoInLive: m.getUserInfoInLive },
@@ -169,7 +173,10 @@ describe("RoomSession.onIncomeSuperChat", () => {
 		const { ctx, m } = makeCtx();
 		const s = new RoomSession(
 			ctx,
-			makeSub({ liveEnd: true, liveEndExtras: { wordcloud: true, liveSummary: false } }),
+			makeSub({
+				liveEnd: true,
+				extras: { atAllDynamic: false, atAllLive: true, wordcloud: true, liveSummary: false },
+			}),
 		) as AnySession;
 		await s.onIncomeSuperChat(scBody);
 		expect(m.recordDanmaku).toHaveBeenCalledTimes(1);
@@ -205,6 +212,19 @@ describe("RoomSession.onIncomeSuperChat", () => {
 		expect(m.broadcastToTargets.mock.calls[0]?.[2]).toBe(LivePushType.Superchat);
 	});
 
+	// per-UP 的皮肤 id 要一路走到 generate* —— 断在哪一跳都是「选得动、存得住、就是不生效」。
+	it("per-UP 皮肤 id 透传给 generateSCCard(样式没启用也照带)", async () => {
+		const { ctx, m } = makeCtx();
+		m.isSubscribed.mockImplementation((_s: unknown, feat: string) => feat === "superchat");
+		const s = new RoomSession(
+			ctx,
+			makeSub({ superchat: true, minScPrice: 30, cardSkin: "k7xxx-c0ffee" }),
+		) as AnySession;
+		await s.onIncomeSuperChat(scBody);
+		// 验红:把 room-session.ts 里那句 `cardSkin: this.sub.cardSkin` 删掉,这条红。
+		expect(m.generateSCCard.mock.calls[0]?.[1]).toMatchObject({ cardSkin: "k7xxx-c0ffee" });
+	});
+
 	it("有 per-kind sc 样式 → generateSCCard 收到 sc 专属 colorOptions(而非基准)", async () => {
 		const { ctx, m } = makeCtx();
 		m.isSubscribed.mockImplementation((_s: unknown, feat: string) => feat === "superchat");
@@ -213,19 +233,16 @@ describe("RoomSession.onIncomeSuperChat", () => {
 			makeSub({
 				superchat: true,
 				minScPrice: 30,
-				customCardStyle: { enable: true, backgroundImage: "base-bg" },
+				customCardStyle: { enable: true, font: "Base Sans" },
 				customCardStyleByKind: {
-					sc: { enable: true, backgroundImage: "sc-bg", glassOpacity: 0.5 },
+					sc: { enable: true, font: "SC Sans" },
 				},
 			}),
 		) as AnySession;
 		await s.onIncomeSuperChat(scBody);
 		expect(m.generateSCCard).toHaveBeenCalledTimes(1);
 		// 第二参 = colorOptions(sc 专属覆盖基准)。
-		expect(m.generateSCCard.mock.calls[0]?.[1]).toMatchObject({
-			backgroundImage: "sc-bg",
-			glassOpacity: 0.5,
-		});
+		expect(m.generateSCCard.mock.calls[0]?.[1]).toMatchObject({ font: "SC Sans" });
 	});
 
 	it("无 per-kind sc 覆盖 → generateSCCard 回退到基准 customCardStyle", async () => {
@@ -236,89 +253,26 @@ describe("RoomSession.onIncomeSuperChat", () => {
 			makeSub({
 				superchat: true,
 				minScPrice: 30,
-				customCardStyle: { enable: true, backgroundImage: "base-bg" },
+				customCardStyle: { enable: true, font: "Base Sans" },
 			}),
 		) as AnySession;
 		await s.onIncomeSuperChat(scBody);
-		expect(m.generateSCCard.mock.calls[0]?.[1]).toMatchObject({ backgroundImage: "base-bg" });
+		expect(m.generateSCCard.mock.calls[0]?.[1]).toMatchObject({ font: "Base Sans" });
 	});
 
-	it("基准与 per-kind 都未启用 → generateSCCard 第二参为 undefined(走渲染器全局兜底)", async () => {
+	// 样式没启用 = 一个样式字段都不许递出去(渲染器按「缺省 → 吃全局 config」判,递一份
+	// 禁用的样式过去就等于把它启用了)。皮肤 id 不是样式,它恒在 —— 出图总得知道画哪一套。
+	it("基准与 per-kind 都未启用 → generateSCCard 只收到皮肤 id,一个样式字段都没有", async () => {
 		const { ctx, m } = makeCtx();
 		m.isSubscribed.mockImplementation((_s: unknown, feat: string) => feat === "superchat");
 		const s = new RoomSession(ctx, makeSub({ superchat: true, minScPrice: 30 })) as AnySession;
 		await s.onIncomeSuperChat(scBody);
-		expect(m.generateSCCard.mock.calls[0]?.[1]).toBeUndefined();
+		expect(m.generateSCCard.mock.calls[0]?.[1]).toEqual({ cardSkin: undefined });
 	});
 
-	it("per-kind sc 配多图 → 连续 SC 推送经 pickBackground 逐张轮换背景", async () => {
-		const { ctx, m } = makeCtx();
-		m.isSubscribed.mockImplementation((_s: unknown, feat: string) => feat === "superchat");
-		// 注入按 scopeKey 计数的选择器,模拟「每次推送轮换」。
-		const cursors: Record<string, number> = {};
-		// biome-ignore lint/suspicious/noExplicitAny: 覆写 mock ctx 的可选回调
-		(ctx as any).pickBackground = (key: string, images: string[]): string => {
-			const i = cursors[key] ?? 0;
-			cursors[key] = i + 1;
-			return images[i % images.length] as string;
-		};
-		const s = new RoomSession(
-			ctx,
-			makeSub({
-				superchat: true,
-				minScPrice: 30,
-				customCardStyleByKind: { sc: { enable: true, backgroundImages: ["a", "b", "c"] } },
-			}),
-		) as AnySession;
-		await s.onIncomeSuperChat(scBody);
-		await s.onIncomeSuperChat(scBody);
-		await s.onIncomeSuperChat(scBody);
-		await s.onIncomeSuperChat(scBody);
-		const bgs = m.generateSCCard.mock.calls.map(
-			(c) => (c[1] as { backgroundImage?: string } | undefined)?.backgroundImage,
-		);
-		expect(bgs).toEqual(["a", "b", "c", "a"]);
-	});
-
-	it("per-kind sc 单图 → 不调 pickBackground,沿用该单图(engines 已填 backgroundImage)", async () => {
-		const { ctx, m } = makeCtx();
-		m.isSubscribed.mockImplementation((_s: unknown, feat: string) => feat === "superchat");
-		const s = new RoomSession(
-			ctx,
-			makeSub({
-				superchat: true,
-				minScPrice: 30,
-				// engines 的 cardStyleToColorOptions 同时填单 backgroundImage 与列表。
-				customCardStyleByKind: {
-					sc: { enable: true, backgroundImage: "solo", backgroundImages: ["solo"] },
-				},
-			}),
-		) as AnySession;
-		await s.onIncomeSuperChat(scBody);
-		expect(ctx.pickBackground).not.toHaveBeenCalled();
-		expect(m.generateSCCard.mock.calls[0]?.[1]).toMatchObject({ backgroundImage: "solo" });
-	});
-
-	it("回归:基准与 per-kind 都无覆盖,但全局默认配了多图 → 仍按 defaultBackgroundImages 轮换(而非静默回退单图)", async () => {
-		const { ctx, m } = makeCtx();
-		m.isSubscribed.mockImplementation((_s: unknown, feat: string) => feat === "superchat");
-		const cursors: Record<string, number> = {};
-		// biome-ignore lint/suspicious/noExplicitAny: 覆写 mock ctx 的可选回调
-		(ctx as any).pickBackground = (key: string, images: string[]): string => {
-			const i = cursors[key] ?? 0;
-			cursors[key] = i + 1;
-			return images[i % images.length] as string;
-		};
-		// biome-ignore lint/suspicious/noExplicitAny: 测试注入引擎级全局默认多图
-		(ctx as any).config.defaultBackgroundImages = ["x", "y"];
-		const s = new RoomSession(ctx, makeSub({ superchat: true, minScPrice: 30 })) as AnySession;
-		await s.onIncomeSuperChat(scBody);
-		await s.onIncomeSuperChat(scBody);
-		const bgs = m.generateSCCard.mock.calls.map(
-			(c) => (c[1] as { backgroundImage?: string } | undefined)?.backgroundImage,
-		);
-		expect(bgs).toEqual(["x", "y"]);
-	});
+	// 从前这里有三条「SC 卡背景图每次推送轮换」(per-kind 多图 / 单图不轮 / 落回全局默认
+	// 图廊)。整条 `cardStyle.backgroundImages` 链 2026-09-20 删掉(背景图归皮肤的 `image`
+	// 旋钮),同构的**直播封面**轮换仍由下面的「resolvedCardStyle live 封面轮换」钉着。
 });
 
 // ---------------------------------------------------------------------------
@@ -358,16 +312,82 @@ describe("RoomSession.onGuardBuy", () => {
 				liveGuardBuy: true,
 				customGuardBuy: {
 					enable: true,
-					captainImgUrl: "cap",
-					supervisorImgUrl: "sup",
-					governorImgUrl: "gov",
-				} as SubItemView["customGuardBuy"],
+					captain: { template: "", imageUrl: "cap" },
+					commander: { template: "", imageUrl: "sup" },
+					governor: { template: "", imageUrl: "gov" },
+				},
 			}),
 		) as AnySession;
 		await s.onGuardBuy(guardBody);
 		expect(m.renderGuardBuy).toHaveBeenCalledTimes(1);
 		expect(m.broadcastToTargets).toHaveBeenCalledTimes(1);
 		expect(m.broadcastToTargets.mock.calls[0]?.[2]).toBe(LivePushType.LiveGuardBuy);
+	});
+
+	/**
+	 * 回归守卫 —— 自定义上舰的**文案**和图片一样按档位取。
+	 *
+	 * 此前宿主只把 `captain.template` 当成唯一一条文案往下传,图片却是按 guard_level
+	 * 分三档取的:面板上给提督 / 总督写的专属文案运行时从来不读,有人上总督,推出去
+	 * 的是舰长那句。这里用真的模板渲染器,钉「哪一档来,就用哪一档的文案和图」。
+	 */
+	describe("自定义开启 → 文案与图片按事件的档位取", () => {
+		const tiers: CustomGuardBuyLike = {
+			enable: true,
+			governor: { template: "{uname} 成了 {mname} 的总督", imageUrl: "gov.png" },
+			commander: { template: "{uname} 成了 {mname} 的提督", imageUrl: "com.png" },
+			captain: { template: "{uname} 成了 {mname} 的舰长", imageUrl: "cap.png" },
+		};
+		const cases = [
+			["总督", GuardLevel.Governor, "船员 成了 主播 的总督", "gov.png"],
+			["提督", GuardLevel.Admiral, "船员 成了 主播 的提督", "com.png"],
+			["舰长", GuardLevel.Captain, "船员 成了 主播 的舰长", "cap.png"],
+		] as const;
+
+		/** 用真渲染器 + 能看见图片地址的 contentBuilder 跑一次上舰,返回推出去的那条消息。 */
+		async function pushOf(
+			level: GuardLevel,
+			where: { sub?: CustomGuardBuyLike; global?: CustomGuardBuyLike },
+		): Promise<unknown> {
+			const { ctx, m } = makeCtx(where.global ? { customGuardBuy: where.global } : undefined);
+			const real = new LiveTemplateRenderer();
+			m.renderGuardBuy.mockImplementation((p) => real.renderGuardBuy(p));
+			(ctx as AnySession).contentBuilder.image = (src: string) => ({ kind: "image", src });
+			m.isSubscribed.mockImplementation((_s: unknown, feat: string) => feat === "liveGuardBuy");
+			const s = new RoomSession(
+				ctx,
+				makeSub({
+					liveGuardBuy: true,
+					minGuardLevel: 3,
+					customGuardBuy: where.sub ?? { enable: false },
+				}),
+			) as AnySession;
+			s.masterInfo = { username: "主播", userface: "", roomId: "r1", liveOpenFollowerNum: 0 };
+			await s.onGuardBuy({
+				guard_level: level,
+				gift_name: "礼物",
+				user: { uname: "船员", uid: 7 },
+			});
+			expect(m.broadcastToTargets).toHaveBeenCalledTimes(1);
+			return m.broadcastToTargets.mock.calls[0]?.[1];
+		}
+
+		it.each(cases)("per-UP 开启:上%s → 推该档的文案与图片", async (_label, level, text, img) => {
+			expect(await pushOf(level, { sub: tiers })).toEqual([
+				{ kind: "image", src: img },
+				{ kind: "text", text },
+			]);
+		});
+
+		it.each(cases)(
+			"per-UP 未开、全局开启:上%s → 推该档的文案与图片",
+			async (_label, level, text, img) => {
+				expect(await pushOf(level, { global: tiers })).toEqual([
+					{ kind: "image", src: img },
+					{ kind: "text", text },
+				]);
+			},
+		);
 	});
 
 	it("默认(custom 关)+ generateGuardCard + api code0 → 图片卡片(LiveGuardBuy)", async () => {
@@ -384,6 +404,17 @@ describe("RoomSession.onGuardBuy", () => {
 		expect(m.broadcastToTargets.mock.calls[0]?.[2]).toBe(LivePushType.LiveGuardBuy);
 	});
 
+	it("per-UP 皮肤 id 透传给 generateGuardCard", async () => {
+		const { ctx, m } = makeCtx();
+		m.isSubscribed.mockImplementation((_s: unknown, feat: string) => feat === "liveGuardBuy");
+		const s = new RoomSession(
+			ctx,
+			makeSub({ liveGuardBuy: true, minGuardLevel: 3, cardSkin: "k8yyy-facade" }),
+		) as AnySession;
+		await s.onGuardBuy(guardBody);
+		expect(m.generateGuardCard.mock.calls[0]?.[2]).toMatchObject({ cardSkin: "k8yyy-facade" });
+	});
+
 	it("有 per-kind guard 样式 → generateGuardCard 收到 guard 专属 colorOptions", async () => {
 		const { ctx, m } = makeCtx();
 		m.isSubscribed.mockImplementation((_s: unknown, feat: string) => feat === "liveGuardBuy");
@@ -395,18 +426,15 @@ describe("RoomSession.onGuardBuy", () => {
 			ctx,
 			makeSub({
 				liveGuardBuy: true,
-				customCardStyle: { enable: true, backgroundImage: "base-bg" },
+				customCardStyle: { enable: true, font: "Base Sans" },
 				customCardStyleByKind: {
-					guard: { enable: true, backgroundImage: "guard-bg", glassClear: true },
+					guard: { enable: true, font: "Guard Sans" },
 				},
 			}),
 		) as AnySession;
 		await s.onGuardBuy(guardBody);
 		// 第三参 = colorOptions(guard 专属);第四参为版式。
-		expect(m.generateGuardCard.mock.calls[0]?.[2]).toMatchObject({
-			backgroundImage: "guard-bg",
-			glassClear: true,
-		});
+		expect(m.generateGuardCard.mock.calls[0]?.[2]).toMatchObject({ font: "Guard Sans" });
 	});
 });
 
@@ -466,8 +494,8 @@ describe("RoomSession.onLiveStart", () => {
 		const s = new RoomSession(
 			ctx,
 			makeSub({
-				customCardStyle: { enable: true, backgroundImage: "base-bg" },
-				customCardStyleByKind: { live: { enable: true, backgroundImage: "live-bg" } },
+				customCardStyle: { enable: true, font: "Base Sans" },
+				customCardStyleByKind: { live: { enable: true, font: "Live Sans" } },
 			}),
 		) as AnySession;
 		s.useLiveRoomInfo = vi.fn(async () => {
@@ -487,7 +515,7 @@ describe("RoomSession.onLiveStart", () => {
 		s.armPeriodicTimer = vi.fn();
 		await s.onLiveStart();
 		expect(m.sendLiveNotifyCard.mock.calls[0]?.[0]?.cardStyle).toMatchObject({
-			backgroundImage: "live-bg",
+			font: "Live Sans",
 		});
 	});
 

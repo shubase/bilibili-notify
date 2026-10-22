@@ -1,43 +1,46 @@
 import type {
-	AdapterCapabilities,
+	Connection,
+	ConnectionCapabilities,
 	DeliveryResult,
 	Logger,
 	NotificationPayload,
 	NotificationSink,
-	PushAdapter,
+	PlatformAdapter,
+	ProbeResult,
 	PushTarget,
 } from "@bilibili-notify/internal";
-import { isTargetPaused } from "@bilibili-notify/internal";
-import type { ConfigStore } from "../config/store.js";
-import type { PlatformAdapter, ProbeResult } from "../platforms/types.js";
+import { connectionDispatchKey, isTargetPaused } from "@bilibili-notify/internal";
+import { CONNECTION_NOT_FOUND, type ConfigStore } from "../config/store.js";
+import { adapterForConnection } from "../platforms/dispatch.js";
+import type { AdapterRegistry } from "../platforms/registry.js";
 
 /**
  * Extended sink — keeps the canonical NotificationSink surface but adds an
- * `out-of-band` adapter probe entry point used by `/api/adapters/:id/test` and
- * the {@link AdapterProbeScheduler}.
+ * `out-of-band` connection probe entry point, used by
+ * `/api/connections/:id/test` and by the engines' periodic health probe.
  */
 export interface MultiplexSink extends NotificationSink {
-	probeAdapter(adapterId: string): Promise<ProbeResult>;
+	probeConnection(connectionId: string): Promise<ProbeResult>;
 	/**
-	 * 适配器的平台能力快照(能不能签小程序卡);适配器缺、平台实现缺、平台没有能力概念都是
-	 * undefined —— 调用方按「什么都不支持」处理。
+	 * 这条连接所在平台的能力快照(能不能签小程序卡);连接缺、平台实现缺、平台没有能力
+	 * 概念都是 undefined —— 调用方按「什么都不支持」处理。
 	 */
-	adapterCapabilities(adapterId: string): AdapterCapabilities | undefined;
+	connectionCapabilities(connectionId: string): ConnectionCapabilities | undefined;
 	/** 主动探一次能力;同上的三种缺失回 undefined。 */
-	probeAdapterCapabilities(adapterId: string): Promise<AdapterCapabilities | undefined>;
+	probeConnectionCapabilities(connectionId: string): Promise<ConnectionCapabilities | undefined>;
 }
 
 /**
  * Standalone {@link NotificationSink} implementation.
  *
- * Resolves `targetId → PushTarget → PushAdapter` against the live ConfigStore,
- * looks up the matching {@link PlatformAdapter} by `adapter.platform`, and
+ * Resolves `targetId → PushTarget → Connection` against the live ConfigStore,
+ * looks up the matching {@link PlatformAdapter} by `connection.platform`, and
  * delegates the delivery. The sink itself stays generic — adding a new platform
  * just means registering another platform adapter.
  */
 export interface MultiplexSinkOptions {
 	store: ConfigStore;
-	adapters: PlatformAdapter[];
+	adapters: AdapterRegistry;
 	logger: Logger;
 	/** Optional hook fired after every send (success or failure). Used by the history store. */
 	onDelivery?: (
@@ -50,30 +53,26 @@ export interface MultiplexSinkOptions {
 
 export function createMultiplexSink(opts: MultiplexSinkOptions): MultiplexSink {
 	const log = opts.logger;
-	const adapterByPlatform = new Map<string, PlatformAdapter>();
-	for (const ad of opts.adapters) {
-		for (const p of ad.platforms) {
-			if (adapterByPlatform.has(p)) {
-				log.warn(`[sink] platform=${p} adapter override; previous registration replaced`);
-			}
-			adapterByPlatform.set(p, ad);
-		}
-	}
+	// 出口**每次现问注册表** —— 拓展是后加载的,而且拨一下开关就会来去(ADR-0012 决策 29)。
+	// 从前这里自己建了一张键 → adapter 的 Map,那是「哪个 adapter 管这条连接」的第二份
+	// 实现;现在与别处共用 `adapterForConnection` 那一份。
+	const adapterFor = (connection: Connection): PlatformAdapter | undefined =>
+		adapterForConnection(opts.adapters.list(), connection);
 
 	function findTarget(targetId: string): PushTarget | undefined {
 		return opts.store.getTargets().find((t) => t.id === targetId);
 	}
 
-	function findAdapterFor(target: PushTarget): PushAdapter | undefined {
-		return opts.store.getAdapters().find((a) => a.id === target.adapterId);
+	function findConnection(connectionId: string): Connection | undefined {
+		return opts.store.getConnections().find((a) => a.id === connectionId);
 	}
 
-	/** 配置里的那条适配器 + 它所属平台的实现;缺一个就没法问它任何事。 */
-	function routeOf(adapterId: string) {
-		const adapter = opts.store.getAdapters().find((a) => a.id === adapterId);
-		if (!adapter) return undefined;
-		const platformAdapter = adapterByPlatform.get(adapter.platform);
-		return platformAdapter ? { adapter, platformAdapter } : undefined;
+	/** 配置里的那条连接 + 它所属平台的实现;缺一个就没法问它任何事。 */
+	function routeOf(connectionId: string) {
+		const connection = findConnection(connectionId);
+		if (!connection) return undefined;
+		const platformAdapter = adapterFor(connection);
+		return platformAdapter ? { connection, platformAdapter } : undefined;
 	}
 
 	return {
@@ -84,17 +83,17 @@ export function createMultiplexSink(opts: MultiplexSinkOptions): MultiplexSink {
 		isEnabled(targetId: string): boolean {
 			const target = findTarget(targetId);
 			if (!target) return false;
-			return !isTargetPaused(target, opts.store.getAdapters());
+			return !isTargetPaused(target, opts.store.getConnections());
 		},
 
 		isAvailable(targetId: string): boolean {
 			const target = findTarget(targetId);
 			if (!target) return false;
-			const adapter = findAdapterFor(target);
-			if (!adapter) return false;
-			const platformAdapter = adapterByPlatform.get(adapter.platform);
+			const connection = findConnection(target.connectionId);
+			if (!connection) return false;
+			const platformAdapter = adapterFor(connection);
 			if (!platformAdapter) return false;
-			return platformAdapter.isAvailable(adapter, target);
+			return platformAdapter.isAvailable(connection, target);
 		},
 
 		send(targetId: string, payload: NotificationPayload): Promise<DeliveryResult> {
@@ -105,26 +104,32 @@ export function createMultiplexSink(opts: MultiplexSinkOptions): MultiplexSink {
 			return dispatch(targetId, payload, { private: true });
 		},
 
-		adapterCapabilities(adapterId: string): AdapterCapabilities | undefined {
-			const route = routeOf(adapterId);
-			return route?.platformAdapter.capabilities?.(route.adapter);
+		connectionCapabilities(connectionId: string): ConnectionCapabilities | undefined {
+			const route = routeOf(connectionId);
+			return route?.platformAdapter.capabilities?.(route.connection);
 		},
 
-		async probeAdapterCapabilities(adapterId: string): Promise<AdapterCapabilities | undefined> {
-			const route = routeOf(adapterId);
-			return route?.platformAdapter.probeCapabilities?.(route.adapter);
+		async probeConnectionCapabilities(
+			connectionId: string,
+		): Promise<ConnectionCapabilities | undefined> {
+			const route = routeOf(connectionId);
+			return route?.platformAdapter.probeCapabilities?.(route.connection);
 		},
 
-		async probeAdapter(adapterId: string): Promise<ProbeResult> {
-			const adapter = opts.store.getAdapters().find((a) => a.id === adapterId);
-			if (!adapter) {
-				return { ok: false, latencyMs: 0, err: "adapter not found" };
+		async probeConnection(connectionId: string): Promise<ProbeResult> {
+			const connection = findConnection(connectionId);
+			if (!connection) {
+				return { ok: false, latencyMs: 0, err: CONNECTION_NOT_FOUND };
 			}
-			const platformAdapter = adapterByPlatform.get(adapter.platform);
+			const platformAdapter = adapterFor(connection);
 			if (!platformAdapter) {
-				return { ok: false, latencyMs: 0, err: `no platform adapter for ${adapter.platform}` };
+				return {
+					ok: false,
+					latencyMs: 0,
+					err: `no platform adapter for ${connectionDispatchKey(connection)}`,
+				};
 			}
-			return platformAdapter.probe(adapter);
+			return platformAdapter.probe(connection);
 		},
 	};
 
@@ -137,23 +142,23 @@ export function createMultiplexSink(opts: MultiplexSinkOptions): MultiplexSink {
 		if (!target) {
 			return { ok: false, latencyMs: 0, err: "target not found" };
 		}
-		const adapter = findAdapterFor(target);
-		if (!adapter) {
+		const connection = findConnection(target.connectionId);
+		if (!connection) {
 			const result: DeliveryResult = {
 				ok: false,
 				latencyMs: 0,
-				err: `adapter not found: adapterId=${target.adapterId}`,
+				err: `connection not found: connectionId=${target.connectionId}`,
 			};
 			log.warn(`[sink] ${result.err} (target=${target.id})`);
 			opts.onDelivery?.(target, payload, result, options);
 			return result;
 		}
-		const platformAdapter = adapterByPlatform.get(adapter.platform);
+		const platformAdapter = adapterFor(connection);
 		if (!platformAdapter) {
 			const result: DeliveryResult = {
 				ok: false,
 				latencyMs: 0,
-				err: `no platform adapter for ${adapter.platform}`,
+				err: `no platform adapter for ${connectionDispatchKey(connection)}`,
 			};
 			log.warn(`[sink] ${result.err} (target=${target.id})`);
 			opts.onDelivery?.(target, payload, result, options);
@@ -164,7 +169,7 @@ export function createMultiplexSink(opts: MultiplexSinkOptions): MultiplexSink {
 		// 与 OneBot adapter 内 `opts.private ?? scope` 的 ?? 配合就会让 scope==="private"
 		// 的 target 走错分支(已同步修 onebot.ts,这里双层防御)。
 		const sendOpts = options.private ? { private: true } : {};
-		const result = await platformAdapter.send(adapter, target, payload, sendOpts);
+		const result = await platformAdapter.send(connection, target, payload, sendOpts);
 		opts.onDelivery?.(target, payload, result, options);
 		return result;
 	}

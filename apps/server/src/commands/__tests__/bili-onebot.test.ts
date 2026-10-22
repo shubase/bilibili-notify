@@ -23,9 +23,14 @@ import {
 	parseBiliCommand,
 	parseOnebotGroupMessage,
 } from "../bili-onebot.js";
-import { clearBiliVideoParseCacheForTest, parseBiliVideoTarget } from "../bili-video-parser.js";
+import {
+	clearBiliVideoParseCacheForTest,
+	findBiliVideoTargetFromMessage,
+	parseBiliVideoTarget,
+} from "../bili-video-parser.js";
 
 beforeEach(() => {
+	vi.unstubAllGlobals();
 	H.ensureFollowed.mockReset();
 	clearBiliVideoParseCacheForTest();
 });
@@ -72,6 +77,81 @@ describe("bili OneBot group command parser", () => {
 			aid: 170001,
 			cacheKey: "av170001",
 		});
+	});
+
+	it("从嵌套 QQ 小程序卡片字段中解析 Bilibili 视频", async () => {
+		await expect(
+			findBiliVideoTargetFromMessage(
+				[
+					{
+						type: "json",
+						data: {
+							content: {
+								app: "com.tencent.miniapp_01",
+								meta: {
+									detail_1: {
+										qqdocurl: "https://www.bilibili.com/video/BV1QY4y1p7Jd?share_source=qq",
+									},
+								},
+							},
+						},
+					},
+				],
+				"",
+			),
+		).resolves.toEqual({ bvid: "BV1QY4y1p7Jd", cacheKey: "BV1QY4y1p7Jd" });
+	});
+
+	it("从 NapCat QQ 小程序卡片 qqdocurl 的 b23 短链解析 Bilibili 视频", async () => {
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async () => {
+				return new Response(null, {
+					status: 302,
+					headers: { location: "https://www.bilibili.com/video/BV1QY4y1p7Jd" },
+				});
+			}),
+		);
+
+		await expect(
+			findBiliVideoTargetFromMessage(
+				[
+					{
+						type: "json",
+						data: {
+							data: JSON.stringify({
+								app: "com.tencent.miniapp_01",
+								meta: {
+									detail_1: {
+										title: "哔哩哔哩",
+										qqdocurl: "https://b23.tv/QLujKj9?share_medium=android&share_source=qq",
+									},
+								},
+							}),
+						},
+					},
+				],
+				"",
+			),
+		).resolves.toEqual({ bvid: "BV1QY4y1p7Jd", cacheKey: "BV1QY4y1p7Jd" });
+	});
+
+	it("b23 短链返回中间页时，从 HTML 内容里继续提取视频链接", async () => {
+		const fetchMock = vi
+			.fn()
+			.mockResolvedValueOnce(new Response("", { status: 200 }))
+			.mockResolvedValueOnce(
+				new Response(
+					'<script>location.href="https://www.bilibili.com/video/BV1QY4y1p7Jd"</script>',
+				),
+			);
+		vi.stubGlobal("fetch", fetchMock);
+
+		await expect(parseBiliVideoTarget("https://b23.tv/QLujKj9")).resolves.toEqual({
+			bvid: "BV1QY4y1p7Jd",
+			cacheKey: "BV1QY4y1p7Jd",
+		});
+		expect(fetchMock).toHaveBeenCalledTimes(2);
 	});
 
 	it("支持配置命令前缀和关键字", () => {
@@ -217,10 +297,11 @@ describe("bili OneBot group command handler", () => {
 		expect(h.targets).toHaveLength(1);
 		expect(h.targets[0]).toMatchObject({
 			name: "女仆值班室",
-			adapterId: "onebot-main",
+			connectionId: "onebot-main",
 			platform: "onebot",
 			scope: "group",
-			session: { groupId: "987" },
+			kind: "session",
+			address: "987",
 		});
 		expect(h.subscriptions).toHaveLength(1);
 		const targetId = h.targets[0]?.id;
@@ -229,7 +310,7 @@ describe("bili OneBot group command handler", () => {
 			expect.arrayContaining([expect.arrayContaining([targetId])]),
 		);
 		expect(h.subscriptions[0]?.routing.live).toContain(targetId);
-		expect(h.subscriptions[0]?.atAllDefaults.live).toBe(false);
+		expect(h.subscriptions[0]?.overrides.features?.extras?.atAllLive).toBe(false);
 		expect(h.subscriptions[0]?.overrides.features).toMatchObject({
 			liveGuardBuy: true,
 			superchat: true,
@@ -326,11 +407,12 @@ describe("bili OneBot group command handler", () => {
 		h.targets.push({
 			id: "target-987",
 			name: "QQ群 987",
-			adapterId: "onebot-main",
+			connectionId: "onebot-main",
 			platform: "onebot",
 			scope: "group",
 			enabled: true,
-			session: { groupId: "987" },
+			kind: "session",
+			address: "987",
 		});
 		h.subscriptions.push(makeRoutedSubscription("123456", "测试UP", "target-987"));
 
@@ -345,21 +427,22 @@ describe("bili OneBot group command handler", () => {
 		h.targets.push({
 			id: "target-987",
 			name: "测试群",
-			adapterId: "onebot-main",
+			connectionId: "onebot-main",
 			platform: "onebot",
 			scope: "group",
 			enabled: true,
-			session: { groupId: "987" },
+			kind: "session",
+			address: "987",
 		});
 		const sub = makeRoutedSubscription("123456", "测试UP", "other-target");
-		sub.atAllDefaults.live = true;
+		sub.overrides.features = { extras: { atAllLive: true } };
 		h.subscriptions.push(sub);
 
 		await sendCommand(h.runtime, "bili订阅123456");
 
 		expect(h.subscriptions[0]?.routing.live).toContain("target-987");
-		expect(h.subscriptions[0]?.atAllDefaults.live).toBe(true);
-		expect(h.subscriptions[0]?.atAll.live).toMatchObject({ "target-987": false });
+		expect(h.subscriptions[0]?.overrides.features?.extras?.atAllLive).toBe(true);
+		expect(h.subscriptions[0]?.extras.atAllLive).toMatchObject({ "target-987": false });
 	});
 
 	it("普通成员未开启管理权限时，使用管理员命令会回复权限状态", async () => {
@@ -378,11 +461,13 @@ describe("bili OneBot group command handler", () => {
 		h.targets.push({
 			id: "target-987",
 			name: "测试群",
-			adapterId: "onebot-main",
+			connectionId: "onebot-main",
 			platform: "onebot",
 			scope: "group",
 			enabled: true,
-			session: { groupId: "987", allowMemberManage: true },
+			kind: "session",
+			address: "987",
+			allowMemberManage: true,
 		});
 
 		await sendCommand(h.runtime, "bili取消123456", { userId: "20000", role: "member" });
@@ -410,7 +495,7 @@ describe("bili OneBot group command handler", () => {
 
 	it("旧英文默认 aliases 会自动迁移为中文展示", async () => {
 		const h = makeRuntime();
-		h.globals.commands.aliases = {
+		h.globals.groupCommands.aliases = {
 			help: "help",
 			add: "add",
 			del: "del",
@@ -451,11 +536,12 @@ describe("bili OneBot group command handler", () => {
 		h.targets.push({
 			id: "target-987",
 			name: "测试群",
-			adapterId: "onebot-main",
+			connectionId: "onebot-main",
 			platform: "onebot",
 			scope: "group",
 			enabled: true,
-			session: { groupId: "987" },
+			kind: "session",
+			address: "987",
 		});
 		h.subscriptions.push(makeRoutedSubscription("123456", "测试UP", "target-987"));
 
@@ -475,11 +561,12 @@ describe("bili OneBot group command handler", () => {
 		h.targets.push({
 			id: "target-987",
 			name: "测试群",
-			adapterId: "onebot-main",
+			connectionId: "onebot-main",
 			platform: "onebot",
 			scope: "group",
 			enabled: true,
-			session: { groupId: "987" },
+			kind: "session",
+			address: "987",
 		});
 		for (let i = 1; i <= 11; i += 1) {
 			h.subscriptions.push(makeRoutedSubscription(String(100000 + i), `测试UP${i}`, "target-987"));
@@ -520,11 +607,12 @@ describe("bili OneBot group command handler", () => {
 		h.targets.push({
 			id: "target-987",
 			name: "测试群",
-			adapterId: "onebot-main",
+			connectionId: "onebot-main",
 			platform: "onebot",
 			scope: "group",
 			enabled: true,
-			session: { groupId: "987" },
+			kind: "session",
+			address: "987",
 		});
 		h.subscriptions.push(makeRoutedSubscription("123456", "测试UP", "target-987"));
 
@@ -600,21 +688,24 @@ describe("bili OneBot group command handler", () => {
 		expect(h.replies[0]).toContain("普通成员管理权限已开启");
 		expect(h.targets).toHaveLength(1);
 		expect(h.targets[0]).toMatchObject({
-			adapterId: "onebot-main",
+			connectionId: "onebot-main",
 			platform: "onebot",
 			scope: "group",
-			session: { groupId: "987", allowMemberManage: true },
+			kind: "session",
+			address: "987",
+			allowMemberManage: true,
 		});
 
 		await sendCommand(h.runtime, "bili权限关闭", { userId: "20000", role: "admin" });
 
 		expect(h.replies[1]).toContain("普通成员管理权限已关闭");
 		expect(h.targets[0]).toMatchObject({
-			session: { groupId: "987" },
+			kind: "session",
+			address: "987",
 		});
 		expect(
-			(h.targets[0] as Extract<PushTarget, { platform: "onebot" }>).session,
-		).not.toHaveProperty("allowMemberManage");
+			(h.targets[0] as Extract<PushTarget, { kind: "session" }>).allowMemberManage,
+		).toBeUndefined();
 	});
 
 	it("普通成员即使已被授权，也不能修改普通成员管理权限", async () => {
@@ -622,17 +713,19 @@ describe("bili OneBot group command handler", () => {
 		h.targets.push({
 			id: "target-987",
 			name: "测试群",
-			adapterId: "onebot-main",
+			connectionId: "onebot-main",
 			platform: "onebot",
 			scope: "group",
 			enabled: true,
-			session: { groupId: "987", allowMemberManage: true },
+			kind: "session",
+			address: "987",
+			allowMemberManage: true,
 		});
 
 		await sendCommand(h.runtime, "bili权限关闭", { userId: "20000", role: "member" });
 
 		expect(h.replies[0]).toBe("只有群主、管理员或主人可以修改普通成员管理权限。");
-		expect((h.targets[0] as Extract<PushTarget, { platform: "onebot" }>).session).toMatchObject({
+		expect(h.targets[0]).toMatchObject({
 			allowMemberManage: true,
 		});
 	});
@@ -659,6 +752,43 @@ describe("bili OneBot group command handler", () => {
 		expect(text).toContain("📝 简介：测试简介");
 		expect(text).toContain("🔗 https://www.bilibili.com/video/BV1QY4y1p7Jd");
 		expect(text).not.toContain("🎬 Bilibili 视频解析");
+	});
+
+	it("自动解析 QQ 小程序卡片二次转发里的 Bilibili 视频链接", async () => {
+		const h = makeRuntime();
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async () => {
+				return new Response(null, {
+					status: 302,
+					headers: { location: "https://www.bilibili.com/video/BV1QY4y1p7Jd" },
+				});
+			}),
+		);
+
+		await sendCommand(h.runtime, "", {
+			message: [
+				{
+					type: "json",
+					data: {
+						data: JSON.stringify({
+							app: "com.tencent.miniapp_01",
+							meta: {
+								detail_1: {
+									qqdocurl: "https://b23.tv/QLujKj9?share_medium=android&share_source=qq",
+								},
+							},
+						}),
+					},
+				},
+			],
+		});
+
+		expect(h.replies).toHaveLength(0);
+		expect(h.segmentReplies).toHaveLength(1);
+		expect(h.runtime.engines.api.getVideoInfo).toHaveBeenCalledWith({
+			bvid: "BV1QY4y1p7Jd",
+		});
 	});
 
 	it("视频解析全局关闭后不处理群聊视频链接", async () => {
@@ -717,7 +847,7 @@ function makeRuntime() {
 		},
 		configStore: {
 			getGlobals: () => globals,
-			getAdapters: () => [{ id: "onebot-main", platform: "onebot" }],
+			getConnections: () => [{ id: "onebot-main", kind: "direct", platform: "onebot" }],
 			getTargets: () => targets,
 			upsertTarget: vi.fn(async (target: PushTarget) => {
 				const index = targets.findIndex((t) => t.id === target.id);

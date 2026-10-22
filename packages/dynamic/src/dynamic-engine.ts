@@ -15,7 +15,6 @@ import { DateTime } from "luxon";
 import { resolveDynamicColorOptions } from "./card-style";
 import { DynamicFilterReason, filterDynamic } from "./dynamic-filter";
 import type {
-	PickCardBackground,
 	PushLike,
 	PushSegment,
 	SubItemView,
@@ -177,13 +176,7 @@ export interface DynamicEngineConfig {
 	 * 它翻成 override.webSearch,执行器在不在是生成器的事。
 	 */
 	aiWebSearch?: boolean;
-	/**
-	 * 全局默认卡片背景图廊(`defaults.cardStyle.backgroundImages`)。该 UP 无 per-UP
-	 * 背景覆盖时,`pickDynamicColorOptions` 拿它做「每次推送轮换」的兜底列表 ——
-	 * 否则这些 UP 会一直渲染渲染器内部缓存的静态首图,图廊配再多张也不轮换。
-	 */
-	defaultBackgroundImages?: string[];
-	/** 动态卡片 header 右侧提示语，例如“发送 bili帮助 获取菜单”。 */
+	/** Optional hint for discovering the standalone group commands. */
 	helpHint?: string;
 }
 
@@ -202,11 +195,6 @@ export interface DynamicEngineOptions {
 	 * （engine 会在收到 `subscription-changed` / `auth-restored` 后再次拉取）。
 	 */
 	getSubs: () => SubscriptionsView | null;
-	/**
-	 * 背景图轮换选择器。某 UP 的动态卡配 >1 张背景图时「每次推送轮换」;宿主注入
-	 * (独立端 fs 持久化游标)。返回 undefined = 本次不换,沿用首图。
-	 */
-	pickCardBackground: PickCardBackground;
 }
 
 /** 从动态数据中提取图片 URL，用于多模态 AI 点评（最多 4 张） */
@@ -283,7 +271,6 @@ export class DynamicEngine {
 	private ai?: CommentaryClient;
 	private readonly logger: Logger;
 	private readonly getSubs: () => SubscriptionsView | null;
-	private readonly pickCardBackground: PickCardBackground;
 
 	private config: DynamicEngineConfig;
 	private dynamicJob?: CronJob;
@@ -345,7 +332,6 @@ export class DynamicEngine {
 		this.ai = opts.ai;
 		this.config = opts.config;
 		this.getSubs = opts.getSubs;
-		this.pickCardBackground = opts.pickCardBackground;
 		this.logger = opts.serviceCtx.logger;
 	}
 
@@ -506,22 +492,6 @@ export class DynamicEngine {
 
 		this.dynamicSubManager = dynamicSubManager;
 		this.startJob();
-	}
-
-	/**
-	 * 解析动态卡 colorOptions(规则见 {@link resolveDynamicColorOptions}):该 UP 自带
-	 * 图廊 ?? 引擎级默认图廊,游标键 `uid:dynamic`。每次渲染调一次 = 每推送轮换一张。
-	 */
-	private pickDynamicColorOptions(
-		uid: string,
-		style: SubItemView["customCardStyle"],
-	): SubItemView["customCardStyle"] | undefined {
-		return resolveDynamicColorOptions({
-			style,
-			defaultBackgroundImages: this.config.defaultBackgroundImages,
-			pick: this.pickCardBackground,
-			scopeKey: `${uid}:dynamic`,
-		});
 	}
 
 	/** 建「已观测」锚点(缺则以此刻为起点)。每一个订阅都要有,与推送开关无关。 */
@@ -880,16 +850,15 @@ export class DynamicEngine {
 						// dynamic-engine 与 image-engine 的 Dynamic 类型同源同构（皆为 Bilibili
 						// 动态接口的子集，仅声明字段不同），运行时是同一对象。这里用 unknown
 						// 中转的类型断言避开两份独立 .d.ts 的结构性差异。
-						const generateDynamicCard = this.image.generateDynamicCard.bind(this.image) as (
-							data: Parameters<ImageRenderer["generateDynamicCard"]>[0],
-							colorOptions?: Parameters<ImageRenderer["generateDynamicCard"]>[1],
-							layout?: Parameters<ImageRenderer["generateDynamicCard"]>[2],
-							options?: { helpHint?: string },
-						) => Promise<Buffer>;
-						buffer = await generateDynamicCard(
+						buffer = await this.image.generateDynamicCard(
 							item as unknown as Parameters<ImageRenderer["generateDynamicCard"]>[0],
-							this.pickDynamicColorOptions(uid, sub?.customCardStyle),
-							sub?.dynamicLayout,
+							// 样式覆盖没启用时 resolveDynamicColorOptions 回 undefined(= 吃渲染器的
+							// 全局配置);皮肤 id 与它无关,恒要带上 —— 两件事混在一个对象里传,
+							// 展开的顺序决定了「没启用」不会把一份禁用的样式漏出去。
+							{
+								...resolveDynamicColorOptions(sub?.customCardStyle),
+								cardSkin: sub?.cardSkin,
+							},
 							{ helpHint: this.config.helpHint },
 						);
 					}

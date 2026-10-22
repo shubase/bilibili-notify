@@ -16,6 +16,7 @@ import { useQuery } from "@tanstack/react-query";
 import { type ReactNode, useMemo } from "react";
 import { Link } from "react-router-dom";
 import { HeroStrip } from "../components/hero-strip";
+import { SystemResourceCard } from "../components/system-resource-card";
 import {
 	newerVersionOf,
 	phaseLabel,
@@ -29,6 +30,7 @@ import {
 	HEALTH_QUERY_OPTIONS,
 	useBackendReachable,
 } from "../hooks/useBackendReachable";
+import { useResourcesChannel } from "../hooks/useResourcesChannel";
 import { api } from "../services/api";
 import {
 	type DailyHistoryCountView,
@@ -110,6 +112,7 @@ function LiveNowPanel({ live, subs }: { live: LiveListenerSnapshot[]; subs: Subs
 	return (
 		<GlassPanel
 			accent="var(--color-bn-pink)"
+			icon={<Icon.live width={15} height={15} />}
 			title="正在直播"
 			subtitle="实时刷新"
 			right={
@@ -207,7 +210,12 @@ function TrendPanel({ daily }: { daily: DailyHistoryCountView[] }) {
 	}, [daily]);
 	const total = daily.reduce((sum, day) => sum + day.total, 0);
 	return (
-		<GlassPanel title="本周推送趋势" subtitle="按推送类型分布" accent="var(--color-bn-blue)">
+		<GlassPanel
+			title="本周推送趋势"
+			subtitle="按推送类型分布"
+			accent="var(--color-bn-blue)"
+			icon={<Icon.chart width={15} height={15} />}
+		>
 			{/* TimelinePanel 6 条 history × 单行 ~50px + padding ≈ 320px;StatsBar 抬高
 			    到 280 让同行 TrendPanel 视觉对齐,不至于半空。 */}
 			{/* 柱子与下面的图例走同一份家族色 —— 此前柱子在库里写死,和图例只是碰巧同色。 */}
@@ -284,6 +292,9 @@ function TimelinePanel({
 		<GlassPanel
 			title="最近推送活动"
 			subtitle="时间轴视图"
+			// 与 KPI 行的「今日推送」同一抹紫 —— 讲的是同一件事(发出去的推送)。
+			accent="var(--color-bn-purple)"
+			icon={<Icon.bell width={15} height={15} />}
 			right={
 				<Link to="/history">
 					<Btn size="sm" variant="ghost">
@@ -430,6 +441,7 @@ function FansPanel({ subs }: { subs: Subscription[] }) {
 			title="粉丝数变化"
 			subtitle="自订阅起点 / 近 24h / 近 7d"
 			accent="var(--color-bn-pink)"
+			icon={<Icon.heart width={15} height={15} />}
 			right={
 				<Pill color="var(--color-bn-pink)" size="sm">
 					● {entries.length} 位订阅
@@ -498,6 +510,29 @@ interface PluginCell {
 	logLevelSource: "global" | "module";
 }
 
+/**
+ * 每格读哪个覆盖键。
+ *
+ * 四个基础设施件共用 **`core`** —— 服务端的基础 logger 跟着 `logLevels.core` 走
+ * (`runtime/engines.ts`),而引擎之外的每一条日志(push / sink / master 私聊 /
+ * 粉丝轮询 / 路由 / 配置 / 历史 / ws)都从它出,那正好就是这四格。
+ *
+ * 此前这里是一份只认四个引擎键的写死名单,注释还断言「infra 四件没有槽位」。
+ * 那句话在写下的当天(2026-05-13,概览页把占位的 core 格拆成 8 个真包)成立,
+ * 六天后服务端把基础 logger 接到 `logLevels.core` 上就不成立了,而没有任何东西
+ * 拦下这次分歧:把 core 调成 info,服务端真按 info 打日志,卡上一点变化都没有。
+ */
+const OVERRIDE_KEY: Record<ModuleCellId, "core" | "dynamic" | "live" | "image" | "ai"> = {
+	api: "core",
+	storage: "core",
+	subscription: "core",
+	push: "core",
+	dynamic: "dynamic",
+	live: "live",
+	image: "image",
+	ai: "ai",
+};
+
 function pickLogTone(level: string | undefined): { fg: string; bg: string } {
 	const key: LogLevel = level === "error" || level === "debug" || level === "warn" ? level : "info";
 	return { fg: LOG_LEVEL_TONE[key], bg: logLevelTint(key) };
@@ -512,39 +547,58 @@ function VersionBadge({ children }: { children: ReactNode }) {
 	);
 }
 
-function PluginMatrix({ cells }: { cells: PluginCell[] }) {
+/** 一组四个模块:小标题 + 四条单行(状态点 · 名字 …… 覆盖徽章 · 状态)。 */
+function ModuleGroup({ caption, cells }: { caption: string; cells: PluginCell[] }) {
 	return (
-		<div
-			className="grid gap-2"
-			// minmax(220, 1fr) 保证最窄的列也容得下 "日志 INFO* puppeteer 就绪"
-			// 这一行不折行;auto-fill + 1fr 让有空间时各列等宽撑满。
-			style={{ gridTemplateColumns: "repeat(auto-fill, minmax(220px, 1fr))" }}
-		>
-			{cells.map((c) => {
+		// 小标题定高 18px,四条平摊剩下的高度;与右边那组同在一个等高的 grid 里,行线才对得齐。
+		<div className="grid grid-rows-[18px_repeat(4,minmax(0,1fr))]">
+			<div className="flex items-end pb-0.5 text-bn-2xs font-semibold tracking-[0.08em] text-bn-text-tertiary">
+				{caption}
+			</div>
+			{cells.map((c, i) => {
 				const tone = pickLogTone(c.logLevel);
 				const levelLabel = c.logLevel ? c.logLevel.toUpperCase() : "—";
+				// 只有**被单独调过**的模块才挂徽章。八个模块各挂一个一模一样的 DEBUG 时,
+				// 重复度高到会被当成背景纹理,真正要紧的「哪个被单独设过」反而淹在里面;
+				// 全局那一档搬去了左边的事实列,一处说一遍。
 				const isOverride = c.logLevelSource === "module";
+				// 行改成单行、状态右对齐之后,行间那道细线才立得住:它分开的是两条对齐的
+				// 「名字 …… 值」,不再是两块各自居中的双行文字。最后一条不画,别贴着卡底。
+				const divider = i < cells.length - 1 ? "border-b border-bn-border-subtle" : "";
 				return (
-					<div key={c.id} className="rounded-lg px-3 py-2.5">
-						<div className="mb-1.5 flex items-center justify-between">
-							<span className="text-bn-sm font-bold text-bn-text-primary">{c.label}</span>
-							<StatusDot size="sm" kind={c.enabled ? "ok" : "off"} />
-						</div>
-						<div className="flex items-center gap-1.5 whitespace-nowrap text-bn-xs text-bn-text-secondary">
-							日志{" "}
+					<div
+						key={c.id}
+						data-module={c.id}
+						className={`flex min-h-0 items-center gap-2 py-1.5 ${divider}`}
+					>
+						<StatusDot size="sm" kind={c.enabled ? "ok" : "off"} />
+						<span className="truncate text-bn-sm font-bold text-bn-text-primary">{c.label}</span>
+						<span className="flex-1" />
+						{isOverride ? (
 							<span
-								className="rounded-sm px-1.5 text-bn-2xs font-bold"
+								className="shrink-0 rounded-sm px-1.5 text-bn-2xs font-bold leading-4"
 								style={{ background: tone.bg, color: tone.fg }}
-								title={isOverride ? "按模块覆盖" : "继承全局"}
+								title="按模块覆盖"
 							>
 								{levelLabel}
-								{isOverride ? "*" : ""}
 							</span>
-							{c.sub ? <span className="ml-auto text-bn-2xs">{c.sub}</span> : null}
-						</div>
+						) : null}
+						<span className="shrink-0 text-bn-sm font-medium tabular-nums text-bn-text-secondary">
+							{c.sub}
+						</span>
 					</div>
 				);
 			})}
+		</div>
+	);
+}
+
+/** 事实列里的一行:左边标签、右边值。 */
+function Fact({ label, children }: { label: string; children: ReactNode }) {
+	return (
+		<div className="flex items-center justify-between gap-2 text-bn-xs text-bn-text-secondary">
+			<span>{label}</span>
+			<span className="inline-flex items-center gap-1.5">{children}</span>
 		</div>
 	);
 }
@@ -577,16 +631,11 @@ export function SystemHealthCard({
 	imageEnabled: boolean;
 	aiEnabled: boolean;
 }) {
-	// ModuleLogLevels 当前只覆盖 core/dynamic/live/image/ai;infra 四件(api/storage/
-	// subscription/push)没有 per-package override 槽位,这里直接回退到全局等级。
-	const HAS_OVERRIDE_SLOT = new Set<ModuleCellId>(["dynamic", "live", "image", "ai"]);
 	const effectiveLevel = (
 		id: ModuleCellId,
 	): { level: string | undefined; source: "global" | "module" } => {
-		if (HAS_OVERRIDE_SLOT.has(id)) {
-			const override = logLevels?.[id as "dynamic" | "live" | "image" | "ai"];
-			if (override) return { level: override, source: "module" };
-		}
+		const override = logLevels?.[OVERRIDE_KEY[id]];
+		if (override) return { level: override, source: "module" };
 		return { level: logLevel, source: "global" };
 	};
 
@@ -613,40 +662,37 @@ export function SystemHealthCard({
 	// Infra → Engine. 这 4 个 infra 包 boot 成功后 100% constructed,所以状态点跟
 	// reachable 同步;子文案改填业务计数(api 显示登录态,storage 已加载,subscription
 	// / push 分别显示订阅 / 目标数)以增加信息量。
-	const cells: PluginCell[] = [
+	const infra: PluginCell[] = [
 		buildCell("api", "接口 · api", true, loggedIn ? "已登录" : "未登录"),
 		buildCell("storage", "持久化 · storage", true, "已加载"),
 		buildCell("subscription", "订阅 · subscription", true, `${subCount} 个订阅`),
 		buildCell("push", "推送 · push", true, `${targetCount} 个目标`),
+	];
+	const engines: PluginCell[] = [
 		buildCell("dynamic", "动态 · dynamic", dynamicEnabled, dynamicEnabled ? "运行中" : "未启用"),
 		buildCell("live", "直播 · live", liveEnabled, liveEnabled ? "运行中" : "无监听"),
 		buildCell("image", "卡片 · image", imageEnabled, imageEnabled ? "puppeteer 就绪" : "未接入"),
 		buildCell("ai", "AI · ai", aiEnabled, aiEnabled ? "运行中" : "未启用"),
 	];
+	const total = infra.length + engines.length;
+	// 就绪数就是亮着的状态点的个数 —— 它不是第二个真相源,只是把八颗点数成一个数。
+	const ready = [...infra, ...engines].filter((c) => c.enabled).length;
+	const summary = !reachable
+		? "后端失联,状态未知"
+		: ready === total
+			? "模块全部就绪"
+			: `${total - ready} 个模块未启用`;
 
 	// 失联时那份更新状态只是快照,按了「去更新」也去不了哪 —— 不催。
 	// 直接算成要显示的那句话:`newer` 非 null 蕴含 `update` 在,但 TS narrow 不出来,
 	// 留着中间量就得在每个用处再守一次 `update`。
 	const updateLabel = reachable && update && newerVersionOf(update) ? phaseLabel(update) : null;
+	// 事实列里那枚全局等级徽章的两个色 —— 同一帧算一次就够。
+	const globalTone = pickLogTone(logLevel);
 
 	return (
 		<GlassBox
 			title="系统状态 · 各模块"
-			subtitle={
-				<span className="inline-flex flex-wrap items-center gap-1.5">
-					<span>核心</span>
-					<VersionBadge>{health?.version ?? "—"}</VersionBadge>
-					<span className="opacity-40">·</span>
-					<span>面板</span>
-					<VersionBadge>{__WEB_VERSION__}</VersionBadge>
-					{updateLabel ? (
-						<>
-							<span className="opacity-40">·</span>
-							<span className="font-semibold text-bn-pink">{updateLabel}</span>
-						</>
-					) : null}
-				</span>
-			}
 			accent={reachable ? "var(--color-bn-success)" : "var(--color-bn-danger)"}
 			icon={<Icon.check size={14} />}
 			badge={!reachable ? "失联" : health?.status === "ok" ? "健康" : "—"}
@@ -660,14 +706,61 @@ export function SystemHealthCard({
 				) : undefined
 			}
 			dense
+			// 与「系统资源」并排时跟着行高长满,正文里的事实列与模块格子再把这份高度分掉。
+			className="h-full"
 		>
-			{!reachable ? (
-				<ErrorNote className="mb-2.5">
-					后端 API 当前不可达 (apps/server 未运行 或
-					网络中断),以下数据可能为最后一次成功拉取的快照。
-				</ErrorNote>
-			) : null}
-			<PluginMatrix cells={cells} />
+			<div className="flex h-full flex-col">
+				{!reachable ? (
+					<ErrorNote className="mb-2.5">
+						后端 API 当前不可达 (apps/server 未运行 或
+						网络中断),以下数据可能为最后一次成功拉取的快照。
+					</ErrorNote>
+				) : null}
+				{/* 左:事实列(就绪数 + 核心 / 面板 / 全局日志);右:两组四行。
+				    flex-1 + min-h-0:失联横幅在时把剩下的高度让给正文,而不是让正文按 h-full
+				    去顶满父高、把横幅挤出去。窄屏上下叠,事实列的竖线换成横线。 */}
+				<div className="grid min-h-0 flex-1 grid-cols-1 gap-x-[22px] gap-y-3 sm:grid-cols-[196px_minmax(0,1fr)]">
+					<div className="flex flex-col justify-center gap-4.5 border-b border-bn-border-subtle pb-3 sm:border-b-0 sm:border-r sm:pb-0 sm:pr-[22px]">
+						<div>
+							<div
+								className="flex items-baseline gap-1 leading-none tabular-nums"
+								title="就绪的模块数"
+							>
+								<span className="text-bn-hero font-bold tracking-tight text-bn-text-primary">
+									{reachable ? ready : "—"}
+								</span>
+								<span className="text-bn-md font-semibold text-bn-text-tertiary">{` / ${total}`}</span>
+							</div>
+							<div className="mt-1.5 text-bn-xs text-bn-text-secondary">{summary}</div>
+						</div>
+						<div className="flex flex-col gap-2">
+							<Fact label="核心">
+								<VersionBadge>{health?.version ?? "—"}</VersionBadge>
+								{updateLabel ? (
+									<span className="font-semibold text-bn-pink">{updateLabel}</span>
+								) : null}
+							</Fact>
+							<Fact label="面板">
+								<VersionBadge>{__WEB_VERSION__}</VersionBadge>
+							</Fact>
+							<Fact label="全局日志">
+								<span
+									className="inline-block rounded-md px-1.5 py-px text-bn-2xs font-bold"
+									style={{ background: globalTone.bg, color: globalTone.fg }}
+									// 光一个「WARN」没有上下文,读屏器与鼠标悬停都得知道它说的是哪一档。
+									title="全局日志等级"
+								>
+									{logLevel ? logLevel.toUpperCase() : "—"}
+								</span>
+							</Fact>
+						</div>
+					</div>
+					<div className="grid grid-cols-1 gap-y-3 sm:grid-cols-2 sm:gap-x-7">
+						<ModuleGroup caption="基础设施" cells={infra} />
+						<ModuleGroup caption="引擎" cells={engines} />
+					</div>
+				</div>
+			</div>
 		</GlassBox>
 	);
 }
@@ -716,6 +809,8 @@ export default function Dashboard() {
 		queryKey: ["globals"],
 		queryFn: () => api.get<GlobalConfig>("/api/globals"),
 	});
+	// 只在这一页订 `resources`:服务端据此决定还量不量浏览器子树(那一步要起子进程)。
+	const resources = useResourcesChannel();
 
 	const subs = subsQuery.data ?? [];
 	const targets = targetsQuery.data ?? [];
@@ -818,21 +913,26 @@ export default function Dashboard() {
 				<TimelinePanel entries={history} subs={subs} targets={targets} />
 			</div>
 
-			{/* system health (full width) */}
-			<SystemHealthCard
-				health={health.data}
-				reachable={reachable}
-				logLevel={globalsQuery.data?.app.logLevel}
-				logLevels={globalsQuery.data?.app.logLevels}
-				loggedIn={loggedIn}
-				subCount={subs.length}
-				targetCount={targets.length}
-				dynamicEnabled={health.data?.modules?.dynamic ?? loggedIn}
-				liveEnabled={health.data?.modules?.live ?? false}
-				imageEnabled={health.data?.modules?.image ?? false}
-				aiEnabled={health.data?.modules?.ai ?? false}
-				update={updateQuery.data}
-			/>
+			{/* row 5: 各模块状态(窄) + 系统资源(宽) —— 同属「系统」这一组,并排不多占一行。
+			    列比刻意不与 row 4 相同:两行都是 1fr_1.3fr 的话竖缝落在同一条线上,整页
+			    被切成两半。1fr_1.6fr 把缝挪出去,顺带让资源卡吃掉模块卡的一部分宽度。 */}
+			<div className="grid grid-cols-1 gap-3.5 xl:grid-cols-[1fr_1.6fr]">
+				<SystemHealthCard
+					health={health.data}
+					reachable={reachable}
+					logLevel={globalsQuery.data?.app.logLevel}
+					logLevels={globalsQuery.data?.app.logLevels}
+					loggedIn={loggedIn}
+					subCount={subs.length}
+					targetCount={targets.length}
+					dynamicEnabled={health.data?.modules?.dynamic ?? loggedIn}
+					liveEnabled={health.data?.modules?.live ?? false}
+					imageEnabled={health.data?.modules?.image ?? false}
+					aiEnabled={health.data?.modules?.ai ?? false}
+					update={updateQuery.data}
+				/>
+				<SystemResourceCard state={resources} reachable={reachable} />
+			</div>
 		</div>
 	);
 }

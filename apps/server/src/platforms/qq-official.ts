@@ -1,24 +1,23 @@
 import type { QQDiscoveredEntry } from "@bilibili-notify/contract";
 import type {
+	Connection,
 	DeliveryResult,
+	DirectConnection,
 	Disposable,
-	Logger,
-	NotificationPayload,
-	PushAdapter,
-	PushTarget,
-	PushTargetScope,
-	QQOfficialAdapterConfig,
-	QQOfficialSession,
-	ServiceContext,
-} from "@bilibili-notify/internal";
-import { type RawData, WebSocket } from "ws";
-import type {
 	InboundGroupMessage,
 	InboundMeta,
 	InboundPrivateMessage,
+	Logger,
+	NotificationPayload,
 	PlatformAdapter,
 	ProbeResult,
-} from "./types.js";
+	PushTarget,
+	PushTargetScope,
+	QQOfficialConnectionConfig,
+	ServiceContext,
+} from "@bilibili-notify/internal";
+import { connectionDispatchKey, isConnectionOn } from "@bilibili-notify/internal";
+import { type RawData, WebSocket } from "ws";
 
 /** QQ 开放平台换取 App Access Token 的端点(与沙箱/正式无关,固定走 bots.qq.com)。 */
 const QQ_TOKEN_ENDPOINT = "https://bots.qq.com/app/getAppAccessToken";
@@ -316,11 +315,12 @@ export function extractQQGroupMessage(
 		userId: typeof memberOpenid === "string" ? memberOpenid : "",
 		text: content,
 		cardLinks: [],
+		miniAppCardLinks: [],
 	};
 }
 
 /** 单 adapter 发现列表上限 —— 内存 ring buffer,超出丢最旧(纯便利选择器,不持久化)。 */
-const QQ_DISCOVERY_MAX_PER_ADAPTER = 50;
+const QQ_DISCOVERY_MAX_PER_CONNECTION = 50;
 
 // QQDiscoveredEntry(= QQDiscoveredSession + lastSeenMs)在 @bilibili-notify/contract(web 同源消费)。
 
@@ -331,34 +331,34 @@ const QQ_DISCOVERY_MAX_PER_ADAPTER = 50;
  */
 export interface QQSessionRegistry {
 	/** 记一次发现:同 scope+openid 去重(更新 lastSeen/hint 并移到最前),超容丢最旧。 */
-	record(adapterId: string, session: QQDiscoveredSession, atMs: number): void;
+	record(connectionId: string, session: QQDiscoveredSession, atMs: number): void;
 	/** 列出某 adapter 最近发现的会话(最近优先)。 */
-	list(adapterId: string): QQDiscoveredEntry[];
+	list(connectionId: string): QQDiscoveredEntry[];
 	/** 删除某 adapter 的全部发现(reconcile 删该 adapter 时)。 */
-	clear(adapterId: string): void;
+	clear(connectionId: string): void;
 }
 
-export function createQQSessionRegistry(opts?: { maxPerAdapter?: number }): QQSessionRegistry {
-	const max = opts?.maxPerAdapter ?? QQ_DISCOVERY_MAX_PER_ADAPTER;
-	const byAdapter = new Map<string, QQDiscoveredEntry[]>();
+export function createQQSessionRegistry(opts?: { maxPerConnection?: number }): QQSessionRegistry {
+	const max = opts?.maxPerConnection ?? QQ_DISCOVERY_MAX_PER_CONNECTION;
+	const byConnection = new Map<string, QQDiscoveredEntry[]>();
 	const keyOf = (s: { scope: string; openid: string }) => `${s.scope}:${s.openid}`;
 
 	return {
-		record(adapterId, session, atMs) {
-			const prev = byAdapter.get(adapterId) ?? [];
+		record(connectionId, session, atMs) {
+			const prev = byConnection.get(connectionId) ?? [];
 			// 后到的事件没带 displayHint(GROUP_ADD_ROBOT 不带用户名)时留着先前记住的那个:
 			// 群事件本来就不带群名,那个 hint 是面板上唯一能认的东西。带了就以新的为准。
 			const known = prev.find((e) => keyOf(e) === keyOf(session));
 			const next = prev.filter((e) => keyOf(e) !== keyOf(session));
 			next.unshift({ ...known, ...session, lastSeenMs: atMs });
 			if (next.length > max) next.length = max;
-			byAdapter.set(adapterId, next);
+			byConnection.set(connectionId, next);
 		},
-		list(adapterId) {
-			return [...(byAdapter.get(adapterId) ?? [])];
+		list(connectionId) {
+			return [...(byConnection.get(connectionId) ?? [])];
 		},
-		clear(adapterId) {
-			byAdapter.delete(adapterId);
+		clear(connectionId) {
+			byConnection.delete(connectionId);
 		},
 	};
 }
@@ -380,7 +380,7 @@ function qqRawToString(raw: RawData): string {
 }
 
 export interface QQGatewayConnOptions {
-	adapterId: string;
+	connectionId: string;
 	/** 解析 wss 网关地址(REST GET /gateway → url,沙箱改写)。每次连接前调,便于换 host。 */
 	resolveGatewayUrl(): Promise<string>;
 	/** 取当前 App Access Token(token manager 已缓存/刷新),用于 IDENTIFY/RESUME。 */
@@ -424,7 +424,7 @@ export interface QQGatewayConn {
  * openid 与监听审核,不回消息。
  */
 export function createQQGatewayConn(opts: QQGatewayConnOptions): QQGatewayConn {
-	const { adapterId, serviceCtx, logger } = opts;
+	const { connectionId, serviceCtx, logger } = opts;
 	const intents = opts.intents ?? QQ_PUSH_INTENTS;
 	const reconnectBase = opts.reconnectBaseMs ?? QQ_RECONNECT_BASE_MS;
 
@@ -449,7 +449,7 @@ export function createQQGatewayConn(opts: QQGatewayConnOptions): QQGatewayConn {
 		if (!ws || ws.readyState !== WebSocket.OPEN) return;
 		if (!acked) {
 			// 上一拍心跳没收到 ACK = 僵尸连接,关掉触发重连(对齐 @satorijs)。
-			logger.warn(`[qq] adapter=${adapterId} 心跳无 ACK,判定僵尸连接,关闭重连`);
+			logger.warn(`[qq] adapter=${connectionId} 心跳无 ACK,判定僵尸连接,关闭重连`);
 			try {
 				ws.close();
 			} catch {
@@ -471,7 +471,7 @@ export function createQQGatewayConn(opts: QQGatewayConnOptions): QQGatewayConn {
 			token = await opts.getToken();
 		} catch (e) {
 			state.lastError = `getToken 失败: ${String(e)}`;
-			logger.warn(`[qq] adapter=${adapterId} ${state.lastError}`);
+			logger.warn(`[qq] adapter=${connectionId} ${state.lastError}`);
 			try {
 				ws?.close();
 			} catch {
@@ -506,7 +506,7 @@ export function createQQGatewayConn(opts: QQGatewayConnOptions): QQGatewayConn {
 			sink(msg);
 		} catch (err) {
 			logger.warn(
-				`[qq] adapter=${adapterId} 处理入站${what}失败: ${err instanceof Error ? err.message : String(err)}`,
+				`[qq] adapter=${connectionId} 处理入站${what}失败: ${err instanceof Error ? err.message : String(err)}`,
 			);
 		}
 	}
@@ -518,17 +518,17 @@ export function createQQGatewayConn(opts: QQGatewayConnOptions): QQGatewayConn {
 		if (t === "READY") {
 			if (typeof d.session_id === "string") sessionId = d.session_id;
 			online = true;
-			logger.info(`[qq] adapter=${adapterId} 网关已就绪(READY)`);
+			logger.info(`[qq] adapter=${connectionId} 网关已就绪(READY)`);
 			return;
 		}
 		if (t === "RESUMED") {
 			online = true;
 			if (opts.shouldLogReconnects?.())
-				logger.info(`[qq] adapter=${adapterId} 网关已续连(RESUMED)`);
+				logger.info(`[qq] adapter=${connectionId} 网关已续连(RESUMED)`);
 			return;
 		}
 		if (t === "MESSAGE_AUDIT_REJECT") {
-			logger.warn(`[qq] adapter=${adapterId} 消息审核未通过(MESSAGE_AUDIT_REJECT)`);
+			logger.warn(`[qq] adapter=${connectionId} 消息审核未通过(MESSAGE_AUDIT_REJECT)`);
 			return;
 		}
 		if (typeof t === "string") {
@@ -555,11 +555,11 @@ export function createQQGatewayConn(opts: QQGatewayConnOptions): QQGatewayConn {
 			case QQ_OPCODE.INVALID_SESSION:
 				sessionId = "";
 				lastSeq = null;
-				logger.warn(`[qq] adapter=${adapterId} 会话失效(INVALID_SESSION),将重新鉴权`);
+				logger.warn(`[qq] adapter=${connectionId} 会话失效(INVALID_SESSION),将重新鉴权`);
 				break;
 			case QQ_OPCODE.RECONNECT:
 				if (opts.shouldLogReconnects?.())
-					logger.warn(`[qq] adapter=${adapterId} 服务端要求重连(RECONNECT)`);
+					logger.warn(`[qq] adapter=${connectionId} 服务端要求重连(RECONNECT)`);
 				try {
 					ws?.close();
 				} catch {
@@ -660,18 +660,16 @@ export function createQQGatewayConn(opts: QQGatewayConnOptions): QQGatewayConn {
  */
 export function qqMessageEndpoint(
 	scope: PushTargetScope,
-	session: QQOfficialSession,
+	address: string,
 ): { path: string } | { err: string } {
-	if (scope === "channel") {
-		if (!session.channelId) return { err: "channel: channelId missing" };
-		return { path: `/channels/${session.channelId}/messages` };
+	if (!address) {
+		const what =
+			scope === "channel" ? "channelId" : scope === "group" ? "groupOpenid" : "userOpenid";
+		return { err: `${scope}: ${what} missing` };
 	}
-	if (scope === "group") {
-		if (!session.groupOpenid) return { err: "group: groupOpenid missing" };
-		return { path: `/v2/groups/${session.groupOpenid}/messages` };
-	}
-	if (!session.userOpenid) return { err: "private: userOpenid missing" };
-	return { path: `/v2/users/${session.userOpenid}/messages` };
+	if (scope === "channel") return { path: `/channels/${address}/messages` };
+	if (scope === "group") return { path: `/v2/groups/${address}/messages` };
+	return { path: `/v2/users/${address}/messages` };
 }
 
 // ---------------------------------------------------------------------------
@@ -962,7 +960,7 @@ export interface QQGuild {
  * `GET /guilds/{id}/channels`,只保留文字子频道(type 0)。某 guild 子频道列失败则跳过
  * 不整体崩。on-demand 一次性 token(不复用网关 manager,UI 偶发调用可接受)。
  */
-export async function fetchQQGuildChannels(cfg: QQOfficialAdapterConfig): Promise<QQGuild[]> {
+export async function fetchQQGuildChannels(cfg: QQOfficialConnectionConfig): Promise<QQGuild[]> {
 	const { token } = await fetchAppAccessToken(cfg.appId, cfg.appSecret);
 	const base = qqApiBase(cfg.sandbox);
 	const headers = qqRestHeaders(token, cfg.appId);
@@ -1009,23 +1007,29 @@ interface QQLive {
 	conn: QQGatewayConn;
 	fingerprint: string;
 	/** `logReconnects` 的活值容器 —— 这个开关不影响连接本身,不该被塞进
-	 * {@link qqAdapterFingerprint}(会导致纯改日志偏好也触发断连重建)。reconcile
+	 * {@link qqConnectionFingerprint}(会导致纯改日志偏好也触发断连重建)。reconcile
 	 * 每轮同步这个容器,conn 通过 `shouldLogReconnects` 读它,做到不重建连接也能热更。 */
 	logReconnectsBox: { value: boolean };
 }
 
-function qqAdapterFingerprint(cfg: QQOfficialAdapterConfig): string {
+function qqConnectionFingerprint(cfg: QQOfficialConnectionConfig): string {
 	return JSON.stringify({ appId: cfg.appId, appSecret: cfg.appSecret, sandbox: cfg.sandbox });
 }
 
 /**
- * 凭据齐不齐 —— 存储期允许空 appSecret(见 `QQOfficialAdapterConfigSchema`:脱敏备份
+ * 凭据齐不齐 —— 存储期允许空 appSecret(见 `QQOfficialConnectionConfigSchema`:脱敏备份
  * 恢复回来就是空的),所以「能不能真的连上去」得由运行期自己判断。建连(reconcile)
  * 与投递(isAvailable)两条路都走这一个谓词,不会一边挡一边放。
  */
-function isConnectable(cfg: QQOfficialAdapterConfig): boolean {
+function isConnectable(cfg: QQOfficialConnectionConfig): boolean {
 	return cfg.appId.length > 0 && cfg.appSecret.length > 0;
 }
+
+/**
+ * 这个 adapter 认的那一档连接 —— `isConnectionOn(c, "qq-official")` 收窄之后的形状,
+ * `config` 跟着窄。内部那些 helper 一律收它:「这是条官机连接」只在几个入口各判一次。
+ */
+type QQOfficialConnection = Extract<DirectConnection, { platform: "qq-official" }>;
 
 /**
  * QQ 官方机器人(q.qq.com)平台 adapter。有状态:每 adapter 一条 WS 网关长连(捞 openid
@@ -1040,7 +1044,7 @@ export function createQQOfficialAdapter(opts: QQOfficialAdapterOptions): Platfor
 	const tokenOnly = new Map<string, QQTokenManager>();
 	let disposed = false;
 
-	function makeTokenManager(cfg: QQOfficialAdapterConfig): QQTokenManager {
+	function makeTokenManager(cfg: QQOfficialConnectionConfig): QQTokenManager {
 		return createQQTokenManager({
 			appId: cfg.appId,
 			clientSecret: cfg.appSecret,
@@ -1049,13 +1053,13 @@ export function createQQOfficialAdapter(opts: QQOfficialAdapterOptions): Platfor
 		});
 	}
 
-	function makeLive(adapter: PushAdapter): QQLive {
-		const cfg = adapter.config as QQOfficialAdapterConfig;
+	function makeLive(connection: QQOfficialConnection): QQLive {
+		const cfg = connection.config;
 		const tm = makeTokenManager(cfg);
 		const base = qqApiBase(cfg.sandbox);
 		const logReconnectsBox = { value: cfg.logReconnects };
 		const conn = createQQGatewayConn({
-			adapterId: adapter.id,
+			connectionId: connection.id,
 			resolveGatewayUrl: async () => {
 				const token = await tm.getToken();
 				const res = await fetch(`${base}/gateway`, { headers: qqRestHeaders(token, cfg.appId) });
@@ -1064,34 +1068,34 @@ export function createQQOfficialAdapter(opts: QQOfficialAdapterOptions): Platfor
 				return qqGatewayUrlForHost(body.url, cfg.sandbox);
 			},
 			getToken: () => tm.getToken(),
-			onDiscovered: (s) => registry.record(adapter.id, s, Date.now()),
+			onDiscovered: (s) => registry.record(connection.id, s, Date.now()),
 			...(opts.onInboundPrivate
 				? {
 						onInboundPrivate: (m: InboundPrivateMessage) =>
-							opts.onInboundPrivate?.(m, { adapterId: adapter.id }),
+							opts.onInboundPrivate?.(m, { connectionId: connection.id, platform: "qq-official" }),
 					}
 				: {}),
 			...(opts.onInboundGroup
 				? {
 						onInboundGroup: (m: InboundGroupMessage) =>
-							opts.onInboundGroup?.(m, { adapterId: adapter.id }),
+							opts.onInboundGroup?.(m, { connectionId: connection.id, platform: "qq-official" }),
 					}
 				: {}),
 			serviceCtx,
 			logger,
 			shouldLogReconnects: () => logReconnectsBox.value,
 		});
-		return { tm, conn, fingerprint: qqAdapterFingerprint(cfg), logReconnectsBox };
+		return { tm, conn, fingerprint: qqConnectionFingerprint(cfg), logReconnectsBox };
 	}
 
 	/** send 取 token:优先复用网关连接的 manager,否则起一个仅 token 的兜底。 */
-	function tokenManagerFor(adapter: PushAdapter): QQTokenManager {
-		const l = live.get(adapter.id);
+	function tokenManagerFor(connection: QQOfficialConnection): QQTokenManager {
+		const l = live.get(connection.id);
 		if (l) return l.tm;
-		let tm = tokenOnly.get(adapter.id);
+		let tm = tokenOnly.get(connection.id);
 		if (!tm) {
-			tm = makeTokenManager(adapter.config as QQOfficialAdapterConfig);
-			tokenOnly.set(adapter.id, tm);
+			tm = makeTokenManager(connection.config);
+			tokenOnly.set(connection.id, tm);
 		}
 		return tm;
 	}
@@ -1114,12 +1118,11 @@ export function createQQOfficialAdapter(opts: QQOfficialAdapterOptions): Platfor
 		base: string,
 		headers: Record<string, string>,
 		scope: PushTargetScope,
-		session: QQOfficialSession,
+		address: string,
 		messagesPath: string,
 		part: QQSendPart,
 	): Promise<{ status: number; body: unknown } | { err: string }> {
 		if (scope === "channel") {
-			const channelId = session.channelId ?? "";
 			if (part.kind === "text") {
 				return qqPostJson(base, headers, messagesPath, { content: part.text });
 			}
@@ -1129,11 +1132,10 @@ export function createQQOfficialAdapter(opts: QQOfficialAdapterOptions): Platfor
 					image: part.url,
 				});
 			}
-			return qqPostChannelForm(base, headers, channelId, part.caption ?? " ", part.buffer);
+			return qqPostChannelForm(base, headers, address, part.caption ?? " ", part.buffer);
 		}
 		// group / private:文本直发;图片两步上传→media。
 		const gScope = scope === "group" ? "group" : "private";
-		const openid = scope === "group" ? (session.groupOpenid ?? "") : (session.userOpenid ?? "");
 		if (part.kind === "text") {
 			return qqPostJson(base, headers, messagesPath, buildQQV2Message({ content: part.text }));
 		}
@@ -1141,7 +1143,7 @@ export function createQQOfficialAdapter(opts: QQOfficialAdapterOptions): Platfor
 			part.kind === "image-buffer"
 				? buildQQFileUpload(part.buffer)
 				: { file_type: QQ_FILE_TYPE_IMAGE, srv_send_msg: false, url: part.url };
-		const up = await qqUploadMedia(base, headers, gScope, openid, upload);
+		const up = await qqUploadMedia(base, headers, gScope, address, upload);
 		if (!up.ok) return { err: up.err };
 		const content =
 			part.kind === "image-buffer" || part.kind === "image-url" ? part.caption : undefined;
@@ -1151,30 +1153,29 @@ export function createQQOfficialAdapter(opts: QQOfficialAdapterOptions): Platfor
 	return {
 		platforms: ["qq-official"],
 
-		isAvailable(adapter: PushAdapter, target: PushTarget): boolean {
-			if (adapter.platform !== "qq-official" || target.platform !== "qq-official") return false;
-			if (!adapter.enabled || !target.enabled) return false;
-			return isConnectable(adapter.config as QQOfficialAdapterConfig);
+		isAvailable(connection: Connection, target: PushTarget): boolean {
+			if (!isConnectionOn(connection, "qq-official") || target.platform !== "qq-official") {
+				return false;
+			}
+			if (!connection.enabled || !target.enabled) return false;
+			return isConnectable(connection.config);
 		},
 
-		reconcile(adapters: readonly PushAdapter[]): void {
+		reconcile(connections: readonly Connection[]): void {
 			if (disposed) return;
-			const desired = new Map<string, PushAdapter>();
-			for (const a of adapters) {
-				if (a.platform !== "qq-official" || !a.enabled) continue;
+			const desired = new Map<string, QQOfficialConnection>();
+			for (const a of connections) {
+				if (!isConnectionOn(a, "qq-official") || !a.enabled) continue;
 				// 空密钥不建连。脱敏备份恢复回来的 adapter 就是这样(appSecret 被抹成空串),
 				// 它仍然 enabled —— 拉起来只会拿空密钥反复撞网关。等用户把密钥填回来,
 				// config 一变 reconcile 自然会把它接上。
-				if (!isConnectable(a.config as QQOfficialAdapterConfig)) continue;
+				if (!isConnectable(a.config)) continue;
 				desired.set(a.id, a);
 			}
 			// 删除/失效:不再期望或配置指纹变了 → 关连接、清发现表。
 			for (const [id, l] of live) {
 				const want = desired.get(id);
-				if (
-					!want ||
-					qqAdapterFingerprint(want.config as QQOfficialAdapterConfig) !== l.fingerprint
-				) {
+				if (!want || qqConnectionFingerprint(want.config) !== l.fingerprint) {
 					l.conn.close();
 					l.tm.dispose();
 					live.delete(id);
@@ -1190,12 +1191,12 @@ export function createQQOfficialAdapter(opts: QQOfficialAdapterOptions): Platfor
 			// 期望配置的当前值同步进已存活连接的 box,做到不重连也能热更开关。
 			for (const [id, l] of live) {
 				const want = desired.get(id);
-				if (want) l.logReconnectsBox.value = (want.config as QQOfficialAdapterConfig).logReconnects;
+				if (want) l.logReconnectsBox.value = want.config.logReconnects;
 			}
 			// 全清兜底 token-only:它仅在 reconcile 跑之前给 send 取 token 用。reconcile 后,
-			// desired 适配器都有 live(自带 tm),非 desired 的会被 isAvailable 挡掉不再 send ——
+			// desired 的连接都有 live(自带 tm),非 desired 的会被 isAvailable 挡掉不再 send ——
 			// 故此刻所有 tokenOnly 都是 stale。逐 id 只清 desired 会漏掉「曾被 send、后被删除/
-			// 禁用」的适配器,泄漏其刷新定时器,这里整张清掉根治。
+			// 禁用」的连接,泄漏其刷新定时器,这里整张清掉根治。
 			for (const tm of tokenOnly.values()) tm.dispose();
 			tokenOnly.clear();
 		},
@@ -1204,10 +1205,14 @@ export function createQQOfficialAdapter(opts: QQOfficialAdapterOptions): Platfor
 			disposeAll();
 		},
 
-		async probe(adapter: PushAdapter): Promise<ProbeResult> {
+		async probe(connection: Connection): Promise<ProbeResult> {
 			const t0 = Date.now();
-			if (adapter.platform !== "qq-official") {
-				return { ok: false, latencyMs: 0, err: `wrong platform: ${adapter.platform}` };
+			if (!isConnectionOn(connection, "qq-official")) {
+				return {
+					ok: false,
+					latencyMs: 0,
+					err: `wrong platform: ${connectionDispatchKey(connection)}`,
+				};
 			}
 			// 实际推送走 REST(token + /v2/.../messages),与 WS 网关(仅用于捞 openid)彼此独立
 			// —— 探连通性应该测「REST 能不能通」,不是「WS 握手有没有跑完」。此前用
@@ -1215,11 +1220,11 @@ export function createQQOfficialAdapter(opts: QQOfficialAdapterOptions): Platfor
 			// 造成"报错但其实能通"的假阴性;②读缓存布尔值不含任何网络往返,延迟恒为 0ms。
 			// 命中只读的 /gateway 端点(不发消息,符合"系统不要主动测试"发消息的既有约束),
 			// 换真实的可达性 + 延迟。
-			const cfg = adapter.config as QQOfficialAdapterConfig;
+			const cfg = connection.config;
 			const base = qqApiBase(cfg.sandbox);
 			let token: string;
 			try {
-				token = await tokenManagerFor(adapter).getToken();
+				token = await tokenManagerFor(connection).getToken();
 			} catch (e) {
 				return {
 					ok: false,
@@ -1242,30 +1247,30 @@ export function createQQOfficialAdapter(opts: QQOfficialAdapterOptions): Platfor
 		},
 
 		async send(
-			adapter: PushAdapter,
+			connection: Connection,
 			target: PushTarget,
 			payload: NotificationPayload,
 			_opts: { private?: boolean } = {},
 		): Promise<DeliveryResult> {
-			if (adapter.platform !== "qq-official" || target.platform !== "qq-official") {
+			if (!isConnectionOn(connection, "qq-official") || target.platform !== "qq-official") {
 				return {
 					ok: false,
 					latencyMs: 0,
-					err: `wrong platform: adapter=${adapter.platform} target=${target.platform}`,
+					err: `wrong platform: adapter=${connectionDispatchKey(connection)} target=${target.platform}`,
 				};
 			}
 			const scope = target.scope;
-			const session = target.session as QQOfficialSession;
-			// 先按 scope 校验会话字段:缺 openid/channelId 立即失败,不取 token、不发注定失败的 REST。
-			const endpoint = qqMessageEndpoint(scope, session);
+			const address = target.kind === "session" ? target.address : "";
+			// 先校验地址:缺 openid/channelId 立即失败,不取 token、不发注定失败的 REST。
+			const endpoint = qqMessageEndpoint(scope, address);
 			if ("err" in endpoint) return { ok: false, latencyMs: 0, err: endpoint.err };
 
 			const t0 = Date.now();
-			const cfg = adapter.config as QQOfficialAdapterConfig;
+			const cfg = connection.config;
 			const base = qqApiBase(cfg.sandbox);
 			let token: string;
 			try {
-				token = await tokenManagerFor(adapter).getToken();
+				token = await tokenManagerFor(connection).getToken();
 			} catch (e) {
 				return {
 					ok: false,
@@ -1312,7 +1317,7 @@ export function createQQOfficialAdapter(opts: QQOfficialAdapterOptions): Platfor
 			let lastErr = "";
 			for (const part of parts) {
 				try {
-					const r = await sendPart(base, headers, scope, session, endpoint.path, part);
+					const r = await sendPart(base, headers, scope, address, endpoint.path, part);
 					if ("err" in r) {
 						lastErr = r.err;
 						break;

@@ -95,14 +95,8 @@ export type LiveData = {
 };
 
 export type CardColorOptions = {
-	cardColorStart?: string;
-	cardColorEnd?: string;
-	/** 玻璃片(内容层)透明度 0..1;缺省时各卡走自身基线。 */
-	glassOpacity?: number;
-	/** 完全透明:内容层透明 + 无模糊(优先于 glassOpacity)。 */
-	glassClear?: boolean;
-	/** 自定义背景图资产 id(或已解析 URL);缺省时走渐变。 */
-	backgroundImage?: string;
+	// 🪦 `backgroundImage` 2026-09-20 删掉:背景图 2026-09-14 退役成皮肤自己的 `image`
+	// 旋钮(`--bn-knob-wallpaper`),这一项从 2026-09-19 起已经喂不到任何 CSS。
 	/**
 	 * 字体家族名;缺省时回退渲染器全局 config。
 	 *
@@ -114,10 +108,11 @@ export type CardColorOptions = {
 	fontAsset?: string;
 	/** 直播卡自定义封面资产 id(或已解析 URL);缺省时用 B 站房间封面/关键帧。仅 live 卡消费。 */
 	liveCoverImage?: string;
-	/** 直播卡数据区:显示人气 / 点赞;缺省时回退渲染器全局 config。 */
-	showPopularity?: boolean;
-	/** 直播卡数据区:显示分区;缺省时回退渲染器全局 config。 */
-	showArea?: boolean;
-	/** 直播卡数据区:显示粉丝数据;缺省时回退渲染器全局 config。 */
-	showFans?: boolean;
+	/**
+	 * 用哪套**卡片皮肤**(ADR-0014):皮肤 id,缺省 / 空串 = 内置默认皮肤。
+	 *
+	 * 取代了从前逐张卡传进来的 `layout` 切片 —— 版式现在住在皮肤包里,调用方只报一个
+	 * 引用。宿主解析不出这个 id(皮肤被删了)时渲染器回落默认皮肤并报告警,不拒发。
+	 */
+	cardSkin?: string;
 };

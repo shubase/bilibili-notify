@@ -27,7 +27,7 @@
 | `Btn` | 按钮,7 变体(`primary` 粉实底 / `blue` 蓝实底 / `ghost` / `outline` 中性描边 / `danger` 纯红字 / `danger-outline` 红描边 / `danger-solid` 红实底)× 3 尺寸。**`danger` 与 `danger-outline` 的区别只在那圈边**(纯红字钮夹在说明文字里认不出可点),行内小钮的底保持透明;`danger-solid` 是确认弹窗「确认销毁」那一档,分量与 `primary` 对等。**实心底档(primary/blue/danger-solid)一律挂 `btn btn-primary` 双挂点、前景走 `on-solid` token** —— 单挂 `btn` 会被皮肤刷成中性底,实底前景浮上去就隐形(爱发电按钮的车;守卫在 web 的 skin-hook-coverage 测试) |
 | `Pill` | 圆角小徽章(**不可点**的 `<span>`);`subtle` = 12% 底色染色字,否则实底白字 |
 | `IconButton` | 只装一枚图标的方钮/圆钮(关闭 / 移除 / 箭头)。五档 `size`(xs 16 → xl 36)、三档 `tone`(**只管 hover 语义**,静态字色一律 tertiary)、`shape=pill`、`surface` 两档:`filled` 描边面底(要从背景里浮出来),`scrim` 遮罩 + 磨砂 + on-solid 字色(**压在图片 / 渐变上**的那种,底下是任意内容,tertiary 灰不可读 —— 这一档连静态字色一起换,不能只叠一层)。`label` 必填(图标没文字),tooltip 要另写才给 `title`。`className` **只收定位这类不冲突的**工具类(`absolute`/`opacity-0 group-hover:*`),覆盖本体是覆盖不住的 —— 要改本体就加档 |
-| `AddButton` / `AddCard` / `AddFileButton` | 「这里还能再加一个」的虚线语汇(虚线=空位;hover 三件套=粉描边+粉字+粉纱底,整族统一)。`AddButton` 行内走药丸、`block` 占整行走卡片圆角;`AddCard` 是网格里的一格,＋/标题/副标题**由组件出**,调用方只给文字;`AddFileButton` 是 file-input 变体(`<label>` 裹隐藏 input,上传中换句提示并禁用),形状/字号走 `className`。三者共用一份 `ADD_LANGUAGE`(**已导出**,库外家族成员如 scope-tabs「添加 UP」chip 也说这句话,别手抄),边色与空态框同档 `bn-inactive/50`(通用 `bn-border` 在默认亮色下几乎隐形)。自带 `data-bn="add-slot"`(专词,**btn 仍禁挂** —— 皮肤按钮实底会把空位画成真按钮;表单里的「+ 添加一行」与 Rules 的「添加 UP」chip 也挂它) |
+| `AddButton` / `AddCard` / `AddFileButton` | 「这里还能再加一个」的虚线语汇(虚线=空位;hover 三件套=粉描边+粉字+粉纱底,整族统一)。`AddButton` 行内走药丸、`block` 占整行走卡片圆角;`AddCard` 是网格里的一格,＋/标题/副标题**由组件出**,调用方只给文字;`AddFileButton` 是 file-input 变体(`<label>` 裹隐藏 input,上传中换句提示并禁用),形状/字号走 `className`;**`onFile` 交出去之后它自己把 `value` 清空** —— 浏览器只在「挑的文件变了」时才发 change,不清的话同一份文件挑第二次点了没反应(传上去被拒、删了再传回来都是真实路径),所以别再为这条手搭一个。三者共用一份 `ADD_LANGUAGE`(**已导出**,库外家族成员如 scope-tabs「添加 UP」chip 也说这句话,别手抄),边色与空态框同档 `bn-inactive/50`(通用 `bn-border` 在默认亮色下几乎隐形)。自带 `data-bn="add-slot"`(专词,**btn 仍禁挂** —— 皮肤按钮实底会把空位画成真按钮;表单里的「+ 添加一行」与 Rules 的「添加 UP」chip 也挂它) |
 | `SELECTED_LANGUAGE` / `SELECTED_TINT_BG` | (导出的**语汇常量**,不是组件)「这一项当前被选中 / 激活」的全站统一说法:全浓粉描边 + 粉字 + **不透明**粉调底(`color-mix` 落在 surface 上出,混 transparent 的纱在壁纸皮肤下隐形 —— Subs 分组胶囊踩过的雷)。真·选中态(Subs 分组胶囊、FontPicker 候选行、备份 ChoiceCard、scope-tabs「添加 UP」展开态)整句吃 `SELECTED_LANGUAGE`,别手抄;只要那块粉底、不是选中语义的(状态条 / 装饰徽章 / 粉药丸钮)单独吃 `SELECTED_TINT_BG`。圆角 / padding / 字号由摆放处给,不算漂移 |
 | `MenuItem` | 弹层(下拉 / 右键菜单 / 附件菜单)里的一整行:图标槽 + 内容,`active` 染粉加粗、`danger` 整行连图标转红。行内有副标题时**必须给 `ariaLabel`**,否则读屏器把标题和小字连起来念。**刻意不挂 `data-bn`** —— 皮肤给按钮写的实底落到每行菜单上很难看,而词表里没有 `menu-item` 这一档;浮层本体自己挂了 `glass-strong` |
 | `DisclosurePill` | 「点它展开 / 收起下面那块」的胶囊钮(历史行的「N 条 ▾」、逐群例外表的「展开」)。借 `Pill` 的形制,但它是**开合**不是选项 —— 有 `aria-expanded`,别拿 `ToneChip` 顶替。挂点沿用 `chip` / `chip-active`(展开时按选中那档画),`color` 同 `Pill`;`className` 只收定位类 |
@@ -42,7 +42,8 @@
 | `EmptyNote` | 「这里还什么都没有」中性虚线框的唯一写法;`md`(默认)给整块面板的空态、`sm` 给表单小节里内嵌的一行。**只此两档** —— 收编前站内九份手写在四种圆角三种字号之间漂。自带 `data-bn="note note-empty"`(**虚线是它的语义**,皮肤那头的 NOTES 也这么嘱咐) |
 | `HintNote` | 「顺带说一句」低调旁注盒:虚线 + 软底 + 小字,不打断主流程(实线红盒是「出事了」,虚线是「旁白 / 引用落了空」)。三档 `tone`:`neutral` 中性说明 / `success` 报喜旁注(预览用的是真实数据)/ `danger` 警示旁注(引用的字体 / 推送目标已失效)。形状钉死家族 `sm` 档不设尺寸;底走**实色** soft token(`/60` 纱在壁纸皮肤下隐形);布局(flex 行)与外边距走 `className`。danger 档自带 `data-bn="note note-danger"`(对皮肤与红盒同档),其余只挂 `note` |
 | `Spinner` | 品牌色圆环加载指示(淡粉底环 + 粉顶弧) |
-| `PlatformIcon` / `platformLabel` / `platformTint` | 推送平台图标、显示名与**标识色**(onebot / qq-official / webhook)。三者同一张表 —— 色也导出,是因为不导出就只能在页面里照抄一份(Targets 就抄过,连兜底的灰都一字不差);认不出的平台退 `--color-bn-inactive` |
+| `PlatformIcon` / `usePlatformLabel` / `usePlatformTint` / `PlatformMetaProvider` | 推送平台的图标、短名与**标识色**。**表由消费方注入**(`PlatformMetaProvider`,web 那份接的是 internal 的 `PLATFORM_REGISTRY`)—— 库只管怎么画:有图标名画图标表里那枚、有整段 `svg`(拓展随清单交上来、**消费方保证过过白名单**)就画那一段、都没有画首字方章、`tone` 盖得掉色。品牌图形的来源见 `THIRD_PARTY_ICONS.md`。没 Provider 或表里没有的平台一律退「认不出」:色 `--color-bn-inactive`、短名就是平台名本身。色也导出(hook 形式)是因为不导出就只能在页面里照抄一份(Targets 就抄过,连兜底的灰都一字不差) |
+| `Donut` | 环形占比图:灰轨道 + 按比例排布的彩弧,`label` 摆环心。单段给 `value`+`color`;**多段给 `segments`** —— 各段顺时针首尾相接,用来说「这部分 + 那部分 = 总占用」(概览页资源卡的 CPU / 内存两个环就是「本体 + 其他」)。负值当 0、0 长的段不画(圆头线帽会把它画成一个点)、各段之和越过一圈时整体按比例压回一圈;多段自动换平头线帽,圆头会让相邻两段互相盖住、读出来的比例不对。`title` 是念给读屏器的那句话 —— 同页两个环讲的不是同一件事,都念「占比」听不出区别,所以它有默认值但该逐个给 |
 | `StatsBar` | 迷你堆叠柱状图(live/dyn/sc/guard 四段,由高到低堆)。**`colors` 必填,库里不留默认值** —— 那四段是推送家族色,唯一出处 `push-kinds.ts` 在业务侧,平台中立的库取不到;给默认值等于把此前那份写死的副本原样留下 |
 | `Section` / `Row` | 抽屉与面板里的「小节标题 + 行列表」骨架 |
 | `NoticeStack` / `NoticeCard` | 角落通知栈(portal + fixed 角落 + aria-live)与富通知卡(图标片 + 标题/时间行 + 正文 + 关闭钮,挂 `glass-strong`)。推送 toast(右下 polite)与组件告警(右上 assertive)共用;**颜色语义全留调用方** —— 逐 kind 染色走 `tileStyle`、静态语义配色走 `tileClassName`/`titleClassName`/`style`。`time` 收**预格式化**字符串(toast 到分、告警到秒,精度是语义)。一句话瞬时提示别用它,那是 `Toast` 的活 |
@@ -53,7 +54,7 @@
 
 | 组件 | 干什么 / 长什么样 |
 | --- | --- |
-| `TInput` / `TArea` / `TNum` / `TSelect` / `TColor` | 设置表单的 T 系列受控件:全部自带 `data-bn="input"` 挂点与 `bg-bn-field` 底;`secret` 走 password 型防明文;`ariaLabel` **不是装饰**(label 包裹场景读屏器会念整段提示);定宽走 `width` 数字(没装 tailwind-merge,`w-*` 类压不掉基线)。与 `Input` 的分工:`Input` 是带图标槽的搜索框原语,T 系列是设置表单家族 |
+| `TInput` / `TArea` / `TNum` / `TSelect` / `TColor` | 设置表单的 T 系列受控件:全部自带 `data-bn="input"` 挂点与 `bg-bn-field` 底;`secret` 走 password 型防明文;`ariaLabel` **不是装饰**(label 包裹场景读屏器会念整段提示);定宽走 `width` 数字(没装 tailwind-merge,`w-*` 类压不掉基线;`TSelect` 给了 `width` 就不再垫 160px 的最小宽,单位选择器那种窄的用它)。与 `Input` 的分工:`Input` 是带图标槽的搜索框原语,T 系列是设置表单家族 |
 | `Picker` | 通用段选钮组(选项 ≤ ~5 用它别用 TSelect):挂 chip/chip-active、带 `aria-pressed`;`color` 是逐项语义色 |
 | `ArrayEditor` / `QuietHoursEditor` | 「一列可增删的行」的两个特化:字符串行 / 免扰时段(0-23 整点对,跨午夜 start>end)。行号徽标 / 移除钮 / 虚线添加钮是**不导出**的实现细节 |
 
@@ -65,7 +66,7 @@
 | --- | --- |
 | `GlassPanel` | 轻玻璃面板:标题/副标题/右槽/accent 渐变角光 + icon 方块。`accent` 收十六进制**或** `var(--color-bn-*)`(内部用 `color-mix()` 造透明度);缺省 = `var(--color-bn-pink)`,跟皮肤换装 |
 | `GlassStatCard` | 数字大卡:label + 等宽大数字 + 可选呼吸点/footer;`color` 同 `GlassPanel.accent`,hex 与 `var()` 都收 |
-| `GlassBox` | 重玻璃分区卡(Rules/Cards/AI 页那种):icon 芯片 + badge + 右侧动作槽 + 分隔线 |
+| `GlassBox` | 重玻璃分区卡(Rules/Cards/AI 页那种):icon 芯片 + badge + 右侧动作槽 + 分隔线。`mark` 是**自绘**的图标位(不套 accent 芯片 —— 桥接入卡的角光跟连接状态走、方块却印「哪一种桥」,两者不该同色);`aside` 摆在 badge 之后同一行,给不是 accent 色的东西(状态点 + 「已连接」) |
 | `CollapseBlock` | GlassBox 内的「开关折叠块」:关=灰、开=accent 染色并展开 children |
 | `LoadingBlock` | 等待占位:Spinner + 提示语(可选第二行小字),`role=status`。`variant="card"`(默认)自带玻璃底,给直接坐在页面背景上的等待态;`variant="inset"` 去掉玻璃底,给**已经在别人卡里**的位置(否则玻璃叠玻璃)。「正在读取…」一律用它,别再裸写一行字 |
 

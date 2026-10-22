@@ -19,7 +19,7 @@ const HEALTHY: StatusReport = {
 	login: "已登录",
 	lastFetchAt: NOW - 2 * MIN,
 	renderQueue: 0,
-	adapters: [{ name: "NapCat", ok: true }],
+	connections: [{ name: "NapCat", ok: true }],
 	mutedUntil: 0,
 };
 
@@ -47,7 +47,7 @@ describe("status 指令", () => {
 		expect(spec.signature).toBeUndefined();
 	});
 
-	// 四项各占一行。适配器全连着时**不点名** —— 名字只在断了的时候有用,
+	// 四项各占一行。连接全连着时**不点名** —— 名字只在断了的时候有用,
 	// 平时列一串只是噪音(下面单独有一条验断掉时会点名)。
 	it("四项都在", async () => {
 		const { replies, run } = setup();
@@ -102,9 +102,9 @@ describe("status 指令", () => {
 		expect(replies[0]).not.toContain("静音");
 	});
 
-	it("适配器断了 → 标出来是哪个", async () => {
+	it("连接断了 → 标出来是哪个", async () => {
 		const { replies, run } = setup({
-			adapters: [
+			connections: [
 				{ name: "NapCat", ok: true },
 				{ name: "Lagrange", ok: false },
 			],
@@ -114,8 +114,8 @@ describe("status 指令", () => {
 	});
 
 	// 一个都没配的时候别显示一行空白,那看起来像功能坏了。
-	it("一个适配器都没配 → 说清楚", async () => {
-		const { replies, run } = setup({ adapters: [] });
+	it("一条连接都没配 → 说清楚", async () => {
+		const { replies, run } = setup({ connections: [] });
 		await run();
 		expect(replies[0]).toContain("还没配");
 	});

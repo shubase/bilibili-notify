@@ -2,7 +2,7 @@
  * 新手导览的判据核心(2026-08-29 grilling 定案:5 步全机器判据、按结果态建模)。
  *
  * 步骤链(五轮定稿顺序:先打通推送通道,订阅放最后 —— 订阅表单要勾推送目标,
- * 先订阅的话通道没就绪还得回头重编辑):①B站登录 ②适配器存在且 test 通过
+ * 先订阅的话通道没就绪还得回头重编辑):①B站登录 ②连接存在且 test 通过
  * ③启用的推送目标存在 ④target 测试推送成功 ⑤订阅数>0。可选尾巴(image/ai)
  * 不计毕业。
  *
@@ -22,7 +22,7 @@ function inputs(partial: Partial<OnboardingInputs>): OnboardingInputs {
 	return {
 		biliLoggedIn: false,
 		subsCount: 0,
-		adapters: [],
+		connections: [],
 		targets: [],
 		modules: undefined,
 		...partial,
@@ -45,38 +45,38 @@ describe("deriveOnboarding 步骤判据", () => {
 
 	it("登录后 active 直接推进到 adapter —— 订阅在最后,不挡通道配置", () => {
 		const v = deriveOnboarding(inputs({ biliLoggedIn: true }));
-		expect(stepMap(v)).toMatchObject({ login: true, adapter: false, subs: false });
-		expect(v.activeKey).toBe("adapter");
+		expect(stepMap(v)).toMatchObject({ login: true, connection: false, subs: false });
+		expect(v.activeKey).toBe("connection");
 	});
 
 	it("adapter 只建不测 → adapter 步未完成(定案:存在且 test 通过)", () => {
 		const v = deriveOnboarding(
 			inputs({
 				biliLoggedIn: true,
-				adapters: [{ enabled: true, testStatus: undefined }],
+				connections: [{ enabled: true, testStatus: undefined }],
 			}),
 		);
-		expect(stepMap(v).adapter).toBe(false);
-		// 但 hasAdapter 已亮 —— 导览靠它把子步从「新建」翻到「测试连通」,灯不断档
-		expect(v.hasAdapter).toBe(true);
+		expect(stepMap(v).connection).toBe(false);
+		// 但 hasConnection 已亮 —— 导览靠它把子步从「新建」翻到「测试连通」,灯不断档
+		expect(v.hasConnection).toBe(true);
 	});
 
-	it("hasAdapter:没建过任何适配器时为 false", () => {
-		expect(deriveOnboarding(inputs({})).hasAdapter).toBe(false);
+	it("hasConnection:没建过任何连接时为 false", () => {
+		expect(deriveOnboarding(inputs({})).hasConnection).toBe(false);
 	});
 
 	it("disabled 的 adapter 测过也不算 —— 它不参与推送", () => {
 		const v = deriveOnboarding(
-			inputs({ adapters: [{ enabled: false, testStatus: { ok: true } }] }),
+			inputs({ connections: [{ enabled: false, testStatus: { ok: true } }] }),
 		);
-		expect(stepMap(v).adapter).toBe(false);
+		expect(stepMap(v).connection).toBe(false);
 	});
 
 	it("adapter 测过 + 启用目标存在 → active=test", () => {
 		const v = deriveOnboarding(
 			inputs({
 				biliLoggedIn: true,
-				adapters: [{ enabled: true, testStatus: { ok: true } }],
+				connections: [{ enabled: true, testStatus: { ok: true } }],
 				targets: [{ enabled: true, testStatus: undefined }],
 			}),
 		);
@@ -88,7 +88,7 @@ describe("deriveOnboarding 步骤判据", () => {
 		const v = deriveOnboarding(
 			inputs({
 				biliLoggedIn: true,
-				adapters: [{ enabled: true, testStatus: { ok: true } }],
+				connections: [{ enabled: true, testStatus: { ok: true } }],
 				targets: [{ enabled: true, testStatus: { ok: true } }],
 			}),
 		);
@@ -102,7 +102,7 @@ describe("deriveOnboarding 步骤判据", () => {
 			inputs({
 				biliLoggedIn: true,
 				subsCount: 1,
-				adapters: [{ enabled: true, testStatus: { ok: true } }],
+				connections: [{ enabled: true, testStatus: { ok: true } }],
 				targets: [{ enabled: true, testStatus: { ok: true } }],
 			}),
 		);
@@ -115,7 +115,7 @@ describe("deriveOnboarding 步骤判据", () => {
 			inputs({
 				biliLoggedIn: true,
 				subsCount: 1,
-				adapters: [{ enabled: true, testStatus: { ok: true } }],
+				connections: [{ enabled: true, testStatus: { ok: true } }],
 				targets: [{ enabled: false, testStatus: { ok: true } }],
 			}),
 		);
@@ -146,7 +146,7 @@ describe("deriveOnboarding 可选尾巴", () => {
 			inputs({
 				biliLoggedIn: true,
 				subsCount: 1,
-				adapters: [{ enabled: true, testStatus: { ok: true } }],
+				connections: [{ enabled: true, testStatus: { ok: true } }],
 				targets: [{ enabled: true, testStatus: { ok: true } }],
 				modules: { image: true, ai: false },
 			}),
@@ -167,24 +167,24 @@ describe("deriveOnboarding 可选尾巴", () => {
  * 供每次尝试都触发灯重亮(同一原因连败两次,err 文本不变,at 一定变)。
  */
 describe("deriveOnboarding failNote", () => {
-	it("adapter 步失败 → 带出启用适配器的 err 与 lastCheckedAt", () => {
+	it("adapter 步失败 → 带出启用连接的 err 与 lastCheckedAt", () => {
 		const v = deriveOnboarding(
 			inputs({
 				biliLoggedIn: true,
-				adapters: [
+				connections: [
 					{ enabled: true, testStatus: { ok: false, err: "连接被拒绝", lastCheckedAt: "t1" } },
 				],
 			}),
 		);
-		expect(v.activeKey).toBe("adapter");
+		expect(v.activeKey).toBe("connection");
 		expect(v.failNote).toEqual({ text: "连接被拒绝", at: "t1" });
 	});
 
-	it("err 缺失回落「测试未通过」;disabled 适配器的失败不算", () => {
+	it("err 缺失回落「测试未通过」;disabled 连接的失败不算", () => {
 		const v = deriveOnboarding(
 			inputs({
 				biliLoggedIn: true,
-				adapters: [
+				connections: [
 					{ enabled: false, testStatus: { ok: false, err: "旧账", lastCheckedAt: "t0" } },
 					{ enabled: true, testStatus: { ok: false, lastCheckedAt: "t1" } },
 				],
@@ -197,7 +197,7 @@ describe("deriveOnboarding failNote", () => {
 		const v = deriveOnboarding(
 			inputs({
 				biliLoggedIn: true,
-				adapters: [{ enabled: true, testStatus: { ok: true } }],
+				connections: [{ enabled: true, testStatus: { ok: true } }],
 				targets: [
 					{ enabled: true, testStatus: { ok: false, err: "发送超时", lastCheckedAt: "t2" } },
 				],
@@ -217,7 +217,7 @@ describe("deriveOnboarding failNote", () => {
 		const v = deriveOnboarding(
 			inputs({
 				biliLoggedIn: true,
-				adapters: [{ enabled: true, testStatus: { ok: true } }],
+				connections: [{ enabled: true, testStatus: { ok: true } }],
 				targets: [
 					{ enabled: false, testStatus: { ok: false, err: "上周的旧账", lastCheckedAt: "t0" } },
 					{ enabled: true },
@@ -228,10 +228,10 @@ describe("deriveOnboarding failNote", () => {
 		expect(v.failNote).toBeNull();
 	});
 
-	it("失败不属于当前步就沉默 —— login 未完成时不翻适配器的旧账", () => {
+	it("失败不属于当前步就沉默 —— login 未完成时不翻连接的旧账", () => {
 		const v = deriveOnboarding(
 			inputs({
-				adapters: [{ enabled: true, testStatus: { ok: false, err: "x", lastCheckedAt: "t" } }],
+				connections: [{ enabled: true, testStatus: { ok: false, err: "x", lastCheckedAt: "t" } }],
 			}),
 		);
 		expect(v.activeKey).toBe("login");

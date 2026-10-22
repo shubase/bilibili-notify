@@ -1,28 +1,49 @@
 import { constants } from "node:fs";
 import { access } from "node:fs/promises";
 import type { Server as HttpServer } from "node:http";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import type { StatsOverviewResponse } from "@bilibili-notify/contract";
-import { groupSessionFor, type NotificationPayload } from "@bilibili-notify/internal";
+import {
+	chatIdentityOf,
+	type InboundGroupMessage,
+	type InboundMeta,
+	type InboundPrivateMessage,
+	isExtensionEnabled,
+	type NotificationPayload,
+} from "@bilibili-notify/internal";
 import { type ServerType, serve } from "@hono/node-server";
 import type { Hono } from "hono";
-import { createApp } from "./app.js";
+import { createApp, createCardSkinStore } from "./app.js";
 import { shouldRefuseBareAuth } from "./auth/bare-auth-policy.js";
 import { type AuthSystem, createAuthSystem } from "./auth/index.js";
 import { createSessionCodec } from "./auth/session.js";
 import { createWsTicketStore } from "./auth/ws-ticket.js";
 import { createBackupService } from "./backup/service.js";
+import { readCardSkinAssetDataUrl } from "./card-skins/asset-url.js";
+import { createCardSkinFallbackLog } from "./card-skins/fallbacks.js";
+import type { CardSkinStore } from "./card-skins/store.js";
 import { createBiliOnebotCommandHandler } from "./commands/bili-onebot.js";
 import { loadBootstrapConfig, resolveConfigPath } from "./config/loader.js";
 import { type ChromeSource, persistChromeSource } from "./config/persist.js";
 import { type ResolveWebDistDirInput, resolveWebDistDir } from "./config/web-dist.js";
 import { createDevtools } from "./devtools/index.js";
+import { extensionsRootIn } from "./extensions/discover.js";
+import {
+	EXTENSION_MAX_LOAD_FAILURES,
+	type LoadedExtensions,
+	loadExtensions,
+} from "./extensions/loader.js";
+import { createMarketplace } from "./extensions/marketplace.js";
+import { createExtensionMounts } from "./extensions/mount.js";
+import { createExtensionUpgrades } from "./extensions/upgrade.js";
 import { startHistoryRetention } from "./history/retention.js";
 import { startLogRetention } from "./logs/retention.js";
 import { createLogSink } from "./logs/sink.js";
+import { adapterForConnection } from "./platforms/dispatch.js";
 import { createOnebotAdapter } from "./platforms/onebot.js";
 import { createQQOfficialAdapter, createQQSessionRegistry } from "./platforms/qq-official.js";
-import type { InboundGroupMessage, InboundMeta, InboundPrivateMessage } from "./platforms/types.js";
+import { createAdapterRegistry } from "./platforms/registry.js";
 import { createWebhookAdapter } from "./platforms/webhook.js";
 import { APP_VERSION, STARTED_AT } from "./routes/health.js";
 import { type AppRuntime, createAppRuntime } from "./runtime/bootstrap.js";
@@ -36,13 +57,15 @@ import { renderHelp } from "./runtime/command-help.js";
 import { createEngines } from "./runtime/engines.js";
 import { isEntrypoint } from "./runtime/entrypoint.js";
 import { startFansPoller } from "./runtime/fans-poller.js";
-import { createLinkParser, type LinkSourcePlatform } from "./runtime/link-parser.js";
+import { createLinkParser } from "./runtime/link-parser.js";
 import { createLoginCommand } from "./runtime/login-command.js";
-import { resolveProbeInterval, startMemoryProbe } from "./runtime/memory-probe.js";
 import { createMuteCommand } from "./runtime/mute-command.js";
 import { resolveExpectedParent, startParentWatch } from "./runtime/parent-watch.js";
+import { browserSubtreeRss } from "./runtime/process-tree.js";
 import { createPuppeteerAdapter, type StandalonePuppeteer } from "./runtime/puppeteer.js";
 import { createReportCommand } from "./runtime/report-command.js";
+import { type ResourceMonitor, startResourceMonitor } from "./runtime/resource-monitor.js";
+import { resolveRestartAbility, runningInContainer } from "./runtime/restart-ability.js";
 import { createRoastCommandHandler } from "./runtime/roast-command.js";
 import { createRoastDraftStore } from "./runtime/roast-draft-store.js";
 import { createRoastScheduler } from "./runtime/roast-scheduler.js";
@@ -50,6 +73,7 @@ import { createStatusCommand } from "./runtime/status-command.js";
 import { bindSubscriptionStore } from "./runtime/subscription-store.js";
 import { createUpdateService } from "./update/service.js";
 import {
+	EXTENSION_MARKETPLACE_URL,
 	RELEASES_PAGE_URL,
 	TRUSTED_UPDATE_KEYS,
 	UPDATE_MANIFEST_URLS,
@@ -90,9 +114,12 @@ export async function startStandaloneServer(
 	let puppeteer: StandalonePuppeteer | null = null;
 	let subBinding: ReturnType<typeof bindSubscriptionStore> | undefined;
 	let engines: ReturnType<typeof createEngines> | undefined;
+	let cardSkinStore: CardSkinStore | undefined;
 	let wsTicketStore: ReturnType<typeof createWsTicketStore> | null | undefined;
 	let server: ServerType | undefined;
 	let wsServer: ReturnType<typeof createWsServer> | undefined;
+	let resourceMonitor: ResourceMonitor | undefined;
+	let loadedExtensions: LoadedExtensions | undefined;
 	let previousLogHook: ((entry: LogEntry) => void) | undefined;
 	// QQ 官方机器人网关捞到的群/C2C openid 落进这张共享发现表(不落盘),既喂 adapter
 	// 也喂 /api/qq/sessions 路由的面板选择器。一个进程一份。
@@ -113,6 +140,9 @@ export async function startStandaloneServer(
 				processHandlerCleanup = undefined;
 				runtime?.serviceCtx.setLogHook(previousLogHook);
 				wsServer?.dispose();
+				// 拓展先收:它注册的定时器 / 端点都挂在自己那面 ctx 上,收在核心之前
+				// 才不会在核心已经拆了之后还被回调进去。
+				await loadedExtensions?.dispose();
 				wsTicketStore?.dispose();
 				subBinding?.dispose();
 				engines?.dispose();
@@ -234,11 +264,61 @@ export async function startStandaloneServer(
 		//
 		// 两个 adapter 都在自己那层把帧归一化成平台中立的形状,汇合点是同一个。
 		let onInboundPrivate: ((msg: InboundPrivateMessage, meta: InboundMeta) => void) | undefined;
-		let onInboundGroup:
-			| ((platform: LinkSourcePlatform, msg: InboundGroupMessage, meta: InboundMeta) => void)
-			| undefined;
+		let onInboundGroup: ((msg: InboundGroupMessage, meta: InboundMeta) => void) | undefined;
 		// 当前跑的这份载荷的版本 —— 启动时算过一次的那个常量,别再向上找一遍 package.json。
 		const payloadVersion = APP_VERSION;
+		// 构建产物的入口恒为 `.mjs`;只有 tsx 直跑源码时才是 `.ts`。devtools 那道门与
+		// 「能不能重启」是同一个事实,算一次两处用。
+		const sourceRun = import.meta.url.endsWith(".ts");
+		// 按下重启还回不回得来 —— 判的是外面有没有人拉,与「是不是开发版」不是一回事。
+		const restartAbility = resolveRestartAbility({
+			parentPid: process.env.BN_PARENT_PID,
+			sourceRun,
+			inContainer: runningInContainer(),
+		});
+
+		/**
+		 * 优雅停机 + 退 0,等外面那位把它拉起来 —— 应用更新与「重启一下」共用这一段。
+		 *
+		 * **退出码必须是 0**:非 0 会被编排系统当成崩溃,退避重启甚至进 CrashLoopBackOff;
+		 * 桌面外壳那边同样只认 0(见 sidecar_exit_disposition),非 0 会摊出一张崩溃页。
+		 */
+		const stopAndExit = async (reason: string): Promise<void> => {
+			try {
+				await close(reason);
+			} catch (err) {
+				// close() 是 rethrow 的。停机里某一处 dispose 抛了也得退 0:这时进程反正
+				// 要没了,非 0 只会让编排系统当成崩溃去退避重启。
+				log.error(
+					`${reason}: graceful close failed, exiting anyway: ${err instanceof Error ? err.message : String(err)}`,
+				);
+			} finally {
+				process.exit(0);
+			}
+		};
+		// **唯一那个装载根**(`<dataDir>/extensions/`)。市场、装载器、面板上传装包、开发版
+		// devtools 认的是同一个目录 —— 算四遍等于给「拓展装在哪」留了四个改错的机会。
+		const extensionsRoot = extensionsRootIn(bootstrap.dataDir);
+		// 拓展市场(ADR-0013):官方源与自主升级共用同一对信任公钥与同一份加速前缀;没有公钥的
+		// 构建(fork 出去自己构建的)就没有官方源,第三方源照用。
+		const marketplace = createMarketplace({
+			root: extensionsRoot,
+			official:
+				TRUSTED_UPDATE_KEYS.length > 0
+					? { url: EXTENSION_MARKETPLACE_URL, trustedKeys: TRUSTED_UPDATE_KEYS }
+					: undefined,
+			sources: () => runtime.configStore.getGlobals().marketplace.sources,
+			mirrors: () => runtime.configStore.getGlobals().update.mirrors,
+			prerelease: () => runtime.configStore.getGlobals().update.channel === "prerelease",
+			installed: () =>
+				loadedExtensions
+					?.list()
+					.map((entry) => ({ id: entry.id, version: entry.manifest?.version })) ?? [],
+			rescan: async () => {
+				await loadedExtensions?.rescan();
+			},
+			logger: log,
+		});
 		const updateService = createUpdateService({
 			currentVersion: payloadVersion,
 			// boot.mjs 在加载这份载荷之前摆进来的(见 src/boot.ts)。直接跑
@@ -261,30 +341,32 @@ export async function startStandaloneServer(
 				serviceCtx: runtime.serviceCtx,
 				onInboundEvent: createBiliOnebotCommandHandler(runtime),
 				onInboundPrivate: (msg, meta) => onInboundPrivate?.(msg, meta),
-				onInboundGroup: (msg, meta) => onInboundGroup?.("onebot", msg, meta),
+				onInboundGroup: (msg, meta) => onInboundGroup?.(msg, meta),
 			}),
 			createQQOfficialAdapter({
 				logger: log,
 				serviceCtx: runtime.serviceCtx,
 				registry: qqSessionRegistry,
 				onInboundPrivate: (msg, meta) => onInboundPrivate?.(msg, meta),
-				onInboundGroup: (msg, meta) => onInboundGroup?.("qq-official", msg, meta),
+				onInboundGroup: (msg, meta) => onInboundGroup?.(msg, meta),
 			}),
 			createWebhookAdapter({ logger: log }),
 		];
-		// 每个平台的「谁」长得不一样:onebot 是 user_id,qq-official 是 C2C 的
-		// userOpenid。**绝不能跨平台比对** —— 两个命名空间里的字符串撞上就等于
-		// 认错人。取不到(没配 / 群目标没有 userOpenid / 平台还没接入站)就返回
-		// undefined,于是谁都不认。
+		// 出口从此住在一张**活的注册表**里:内置这几个开机就在,拓展注册进来的后到、
+		// 拨开关还会走(ADR-0012 决策 29)。消费方在分发那一刻问它要,不存快照。
+		const adapterRegistry = createAdapterRegistry(rawAdapters);
+
+		// 主人是「谁」—— 平台 + 地址(+ 是哪个 bot 看到的)三坐标,不是一个裸字符串。
+		// onebot 的 user_id 与官机的 C2C openid 是两个命名空间,撞上就等于认错人;
+		// 从前那句「绝不能跨平台比对」只写在注释里,真正兜着它的是「一条连接只驮一个
+		// 平台」这个前提。取不到(没配 / 配的是群目标 / 地址还没填)就返回 undefined,
+		// 于是谁都不认。
 		//
 		// 审批与指令分发共用同一个来源:各写一份迟早有一边判得不一样。
-		const masterUserId = () => {
+		const masterIdentity = () => {
 			const id = runtime.configStore.getGlobals().master.targetId;
 			if (!id) return undefined;
-			const t = runtime.configStore.getTargets().find((x) => x.id === id);
-			if (t?.platform === "onebot") return t.session.userId;
-			if (t?.platform === "qq-official") return t.session.userOpenid;
-			return undefined;
+			return chatIdentityOf(runtime.configStore.getTargets().find((x) => x.id === id));
 		};
 
 		// devtools:门是载荷版本号(开发版才给,alpha 也不给)。给的话往下传的都是装饰过的:
@@ -294,10 +376,19 @@ export async function startStandaloneServer(
 		const subStore = subBinding.store;
 		const devtools = createDevtools({
 			payloadVersion,
-			// 构建产物的入口恒为 `.mjs`;只有 tsx 直跑源码时才是 `.ts`。见 createDevtools 那道门。
-			sourceRun: import.meta.url.endsWith(".ts"),
+			sourceRun,
 			updateService,
-			adapters: rawAdapters,
+			adapters: adapterRegistry,
+			// 开发版装拓展那条路(见 devtools/scenarios/extensions.ts)。仓里那个目录只在
+			// 源码运行时够得着,而 devtools 本来就只在那种构建里存在 —— 两道门是同一道。
+			extensions: {
+				repoDir: resolve(dirname(fileURLToPath(import.meta.url)), "..", "..", "..", "extensions"),
+				installRoot: extensionsRoot,
+				loaded: () => loadedExtensions,
+			},
+			// 「假装一条桥连上来」要连回自己身上。走 127.0.0.1 而不是 bootstrap 里那个 host:
+			// 那格常是 `0.0.0.0`(监听通配),拿它当目的地连不上。
+			address: () => (listeningPort ? `127.0.0.1:${listeningPort}` : undefined),
 			historyStore: runtime.historyStore,
 			api: authSystem.api,
 			// 场景挑订阅:配置里的订阅 + 运行时解析出的房号(与 room-session 拿的是同一份)。
@@ -316,9 +407,10 @@ export async function startStandaloneServer(
 			inbound: () => ({ private: onInboundPrivate, group: onInboundGroup }),
 			commands: () => ({
 				prefix: runtime.configStore.getGlobals().commands.prefix,
-				masterUserId: masterUserId(),
+				master: masterIdentity(),
 			}),
-			adapterConfigs: () => runtime.configStore.getAdapters(),
+			connectionConfigs: () => runtime.configStore.getConnections(),
+			globals: () => runtime.configStore.getGlobals(),
 			targets: () => runtime.configStore.getTargets(),
 			bus: runtime.bus,
 			authSystem,
@@ -330,7 +422,29 @@ export async function startStandaloneServer(
 			loginFlow: () => authSystem?.flow,
 		});
 		if (devtools) log.info("devtools enabled (dev build): /api/dev is mounted");
-		const adapters = devtools?.adapters ?? rawAdapters;
+		const adapters = devtools?.adapters ?? adapterRegistry;
+
+		// ---------- 卡片皮肤库(ADR-0014)----------
+		// **全进程唯一一家店**:出图(engines 的 ImageRenderer)、面板的皮肤库路由、卡片
+		// 预览三处问的都是它。各建一家的话,面板装了新皮肤而推送还在用开机那一刻的索引,
+		// 症状还是静默的(装包成功、出图不变)。
+		//
+		// 顺序是:`configStore.load()`(上面早就跑过)→ 建店 + `init()` 读盘 → 才把 `get`
+		// 交给引擎。(开机一次性的「旧版式 → 皮肤」迁移已整个退役,见 ADR-0014 决策 17
+		// 的 2026-09-18 🔗:没选过皮肤的一律用出厂默认。)
+		//
+		// ⚠️ 走 `ensureReady()` 而不是裸 `init()`:`ensureReady` 是 `this.ready ??= this.init()`,
+		// 而 `init()` 自己**不设** `this.ready` —— 裸调它开机是读了盘,但那把锁还空着,于是
+		// 首个 `/api/card-skins*` / 预览 / 工坊请求会在**请求路径上**把整个皮肤目录再读一遍。
+		// 真正的代价不是那点 I/O:`init()` 开头一句 `index.clear()`,之后一串 await 才填满,
+		// 而出图那头 `get(id)` 是**同步**读同一个实例的索引 —— 这个窗口里撞上一次推送就回落
+		// 默认皮肤并记一笔 fallback(2026-09-19 审查)。
+		cardSkinStore = createCardSkinStore(bootstrap.dataDir);
+		await cardSkinStore.ensureReady();
+		for (const w of cardSkinStore.warnings()) log.warn(`[card-skin] ${w}`);
+		const cardSkinFallbacks = createCardSkinFallbackLog({ logger: { warn: (m) => log.warn(m) } });
+		const skins = cardSkinStore;
+
 		engines = createEngines({
 			serviceCtx: runtime.serviceCtx,
 			// 全进程唯一那个字体读取口 —— 预览路由经 RouteDeps.runtime 取的是同一个。
@@ -345,15 +459,29 @@ export async function startStandaloneServer(
 			bus: runtime.bus,
 			adapters,
 			puppeteer,
+			cardSkins: {
+				get: (id) => skins.get(id) ?? undefined,
+				asset: (skinId, name) => readCardSkinAssetDataUrl(skins, skinId, name),
+				onFallback: (info) => cardSkinFallbacks.record(info),
+			},
 		});
 		runtime.attachEngines(engines);
 
-		// 内存自检:默认 10 分钟一条,`BN_MEMORY_PROBE_SECONDS=0` 关掉。
+		// 资源采样:概览页「系统资源」卡的数据源,也是内存自检那行日志的出处。
 		// 挂在 engines 之后,好把弹幕收集器的规模一起报出来 —— 那是引擎里唯一
 		// 一处随「弹幕量 × 在播时长」无界增长的结构,堆涨时第一个该看它。
-		startMemoryProbe({
+		resourceMonitor = startResourceMonitor({
 			serviceCtx: runtime.serviceCtx,
-			intervalSeconds: resolveProbeInterval(process.env.BN_MEMORY_PROBE_SECONDS),
+			// 开发版才有:堆读数可被 devtools 换掉,占比 / warn / 曲线全照真的算一遍。
+			readers: devtools ? { memoryUsage: devtools.memoryUsage } : undefined,
+			// 浏览器那一行:`puppeteer` 是可换的(系统页改 chrome 来源会热换一个新适配器),
+			// 所以每次现问那个变量,别把当下这一个捕进闭包。
+			browser: {
+				info: () => puppeteer?.browserProcess() ?? { state: "none", pid: null },
+				subtreeRss: (pid) => browserSubtreeRss(pid),
+			},
+			// 每 tick 现问,系统页拨一下开关立刻生效,不用重启也不用另接 config-changed。
+			memoryLogEnabled: () => runtime.configStore.getGlobals().app.memoryLog,
 			probes: [
 				() => {
 					const s = engines?.live.danmakuStats();
@@ -452,7 +580,7 @@ export async function startStandaloneServer(
 		const roastCommands = createRoastCommandHandler({
 			drafts: roastDrafts,
 			logger: log,
-			masterUserId,
+			masterIdentity,
 			deliver: (draft) => roastScheduler.deliverApproved(draft),
 			reply: tellMaster,
 		});
@@ -496,8 +624,8 @@ export async function startStandaloneServer(
 					lastFetchAt: engines?.dynamic.lastFetchAt(),
 					// 没装 Chrome 就没有渲染队列。
 					renderQueue: puppeteer?.renderQueueDepth() ?? 0,
-					adapters: runtime.configStore
-						.getAdapters()
+					connections: runtime.configStore
+						.getConnections()
 						.filter((a) => a.enabled)
 						// **没探测过 ≠ 断了**。webhook 这类平台压根不支持探测,testStatus
 						// 永远是 undefined;当成断线的话主人会永远看见一条假报警。
@@ -536,7 +664,7 @@ export async function startStandaloneServer(
 
 		const commandDispatcher = createCommandDispatcher({
 			logger: log,
-			masterUserId,
+			masterIdentity,
 			reply: tellMaster,
 			config: () => runtime.configStore.getGlobals().commands,
 			commands,
@@ -545,15 +673,18 @@ export async function startStandaloneServer(
 		});
 
 		// 群里贴视频链接 → 回一张卡。回到来源群不走推送目标表:用收到这条消息的那个
-		// adapter 直接发,群不必配成推送目标(主人定的:机器人在的所有群都算)。
+		// 那条连接直接发,群不必配成推送目标(主人定的:机器人在的所有群都算)。
 		// OneBot 的 groupId 是群号,官机的是群 openid —— 临时目标按平台各造各的。
 		// `engines` 是个会被热重载赋值的 let,闭包里 TS 收不窄;这一刻它一定在(上面刚建的)。
 		const runtimeEngines = engines;
-		// 回到来源群用的是收到那一帧的适配器:配置里那条 + 它所属平台的实现,两者都在才发得出。
-		const replyRoute = (platform: LinkSourcePlatform, adapterId: string) => {
-			const adapter = runtime.configStore.getAdapters().find((a) => a.id === adapterId);
-			const platformAdapter = adapters.find((a) => a.platforms.includes(platform));
-			return adapter && platformAdapter ? { adapter, platformAdapter } : null;
+		// 回到来源群用的是收到那一帧的那条连接:配置里那条 + 认领它的那个 adapter,两者都在
+		// 才发得出。**按连接找 adapter,不按消息里报的平台名找** —— 拓展驮进来的连接后面
+		// 挂着 telegram 时平台报的是 telegram,而认领它的 adapter 按的是拓展 id。
+		const replyRoute = (connectionId: string) => {
+			const connection = runtime.configStore.getConnections().find((a) => a.id === connectionId);
+			if (!connection) return null;
+			const platformAdapter = adapterForConnection(adapters.list(), connection);
+			return platformAdapter ? { connection, platformAdapter } : null;
 		};
 		const linkParser = createLinkParser({
 			logger: log,
@@ -563,42 +694,53 @@ export async function startStandaloneServer(
 			api: runtimeEngines.api,
 			renderer: () => runtimeEngines.imageRenderer,
 			presentation: () => runtimeEngines.linkCardPresentation(),
-			// 能力走 sink 那条适配器寻址(健康探测与 /api/adapters/capabilities 用的是同一份),
+			// 能力走 sink 那条连接寻址(健康探测与 /api/connections/capabilities 用的是同一份),
 			// 别在接线层再手写一条 —— 两条路会各自漂。
-			capabilities: ({ adapterId }) => runtimeEngines.adapterCapabilities(adapterId),
-			probeCapabilities: ({ adapterId }) => runtimeEngines.probeAdapterCapabilities(adapterId),
-			send: async ({ platform, adapterId, groupId }, payload) => {
-				const route = replyRoute(platform, adapterId);
+			capabilities: ({ connectionId }) => runtimeEngines.connectionCapabilities(connectionId),
+			probeCapabilities: ({ connectionId }) =>
+				runtimeEngines.probeConnectionCapabilities(connectionId),
+			send: async ({ platform, connectionId, groupId }, payload) => {
+				const route = replyRoute(connectionId);
 				if (!route) {
-					return { ok: false, latencyMs: 0, err: `adapter not found: adapterId=${adapterId}` };
+					return {
+						ok: false,
+						latencyMs: 0,
+						err: `connection not found: connectionId=${connectionId}`,
+					};
 				}
-				const { adapter, platformAdapter } = route;
+				const { connection, platformAdapter } = route;
 				const common = {
 					id: `link-reply:${groupId}`,
 					name: "链接解析回复",
-					adapterId,
+					connectionId,
+					kind: "session" as const,
 					scope: "group" as const,
 					enabled: true,
 				};
-				return platformAdapter.send(
-					adapter,
-					platform === "onebot"
-						? { ...common, platform: "onebot", session: groupSessionFor("onebot", groupId) }
-						: {
-								...common,
-								platform: "qq-official",
-								session: groupSessionFor("qq-official", groupId),
-							},
-					payload,
-				);
+				// 地址收成一格之后这里不再按平台分岔:群目标的地址就是群号 / 群 openid。
+				// 用哪个 bot 回由连接说了算 —— 一条连接就是一个 bot,桥那一支也一样。
+				return platformAdapter.send(connection, { ...common, platform, address: groupId }, payload);
 			},
 		});
 
-		// 两个 adapter 交出来的是同一个形状:私聊进指令分发,群进链接解析。哪个平台来的
-		// 只有链接解析关心(回到来源群要按平台造目标),所以在这儿补上。
-		onInboundPrivate = (msg) => void commandDispatcher.handleMessage(msg);
-		onInboundGroup = (platform, msg, meta) =>
-			void linkParser.handleMessage({ platform, adapterId: meta.adapterId, ...msg });
+		// adapter 们交出来的是同一个形状:私聊进指令分发,群进链接解析。「从哪儿来」全在
+		// `meta` 里 —— 平台曾经由接线层另传一个参数补上,那是把同一件事说了两遍,而且那个
+		// 参数是闭集,桥后面挂着的平台塞不进去。
+		onInboundPrivate = (msg, meta) => void commandDispatcher.handleMessage(msg, meta);
+		onInboundGroup = (msg, meta) => {
+			// The raw OneBot hook owns video replies while custom parsing is enabled.
+			if (
+				meta.platform === "onebot" &&
+				runtime.configStore.getGlobals().groupCommands.videoParse.enabled
+			) {
+				return;
+			}
+			void linkParser.handleMessage({
+				...msg,
+				platform: meta.platform,
+				connectionId: meta.connectionId,
+			});
+		};
 
 		roastScheduler.start();
 		runtime.bus.on("config-changed", (scope) => {
@@ -680,8 +822,69 @@ export async function startStandaloneServer(
 					configStore: runtime.configStore,
 					cookieStore: authSystem.storage.cookieStore,
 					onCookiesRestored: () => authSystem?.reloadCookiesFromStore(),
+					// 拓展声明成密钥的 config 键,按 id 分格。**现取** —— 拓展会被拨开关加载 /
+					// 卸载,而且备份服务比装载早一步建起来。空表 = 一个都没跑起来 = 每条拓展
+					// 连接的 config 整片当密钥(见 sanitize 的 ExtensionSecretCodes)。
+					extensionSecretCodes: () => loadedExtensions?.secretConfigCodes() ?? {},
 				})
 			: undefined;
+
+		// 拓展装载。**在 createApp 之前**:总入口要随 app 一起挂上,而拓展在 `activate`
+		// 里注册的路由是往那张活表里写的,先后都行 —— 但名单要在路由建起来时就拿得到。
+		const extensionMounts = createExtensionMounts();
+		const extensionUpgrades = createExtensionUpgrades();
+		loadedExtensions = await loadExtensions({
+			// **一个根**:拓展是装进来的(市场下载 / 主人手放 / 开发版由 devtools 链进来),
+			// 本体一个都不带。见 `extensions/discover.ts` 文件头。
+			root: extensionsRoot,
+			host: runtime.serviceCtx,
+			mounts: extensionMounts,
+			// 现读配置:开关是主人在面板上按的,不是开机那一刻的快照。
+			isEnabled: (id) => isExtensionEnabled(runtime.configStore.getGlobals(), id),
+			maxFailures: EXTENSION_MAX_LOAD_FAILURES,
+			// 拓展拿它报给对家看(桥在 `welcome` 帧里告诉插件 BN 是哪一版)。
+			hostVersion: payloadVersion,
+			// 拓展注册的推送源进的是**没包装过**那份注册表 —— dev 下 devtools 那层视图
+			// 会在 `list()` 时现包(见 devtools/index.ts)。
+			adapters: adapterRegistry,
+			connections: () => runtime.configStore.getConnections(),
+			connection: (connectionId) => runtime.configStore.getConnection(connectionId),
+			// ⛔ bus 不给拓展:宿主替它订,只把「动过了」这件事转过去。
+			onConnectionsChanged: (fn) =>
+				runtime.bus.on("config-changed", (scope) => {
+					if (scope === "connections") fn();
+				}),
+			// 拓展自己那份设置住 globals;是不是自己这一格动了由 ctx 比内容判。
+			settings: (id) => runtime.configStore.getGlobals().extensions[id]?.settings,
+			onSettingsChanged: (fn) =>
+				runtime.bus.on("config-changed", (scope) => {
+					if (scope === "globals") fn();
+				}),
+			// 拓展喊「面板数据变了」→ bus → WS `state` 频道 → 面板按 id 失效缓存(不用切页)。
+			onStatusChanged: (id) => runtime.bus.emit("extension-status-changed", id),
+			inbound: {
+				onInboundPrivate: (msg, meta) => onInboundPrivate?.(msg, meta),
+				onInboundGroup: (msg, meta) => onInboundGroup?.(msg, meta),
+			},
+			upgrades: extensionUpgrades,
+		});
+		for (const entry of loadedExtensions.list()) {
+			if (entry.state === "running")
+				// 软链那份把落点也印出来:开发版跑的其实是仓里的工作树,日志里看不出来的话
+				// 「我改的那个到底跑没跑」还得再查一遍。
+				log.info(`[ext] ${entry.id} 已加载${entry.linkedTo ? `(→ ${entry.linkedTo})` : ""}`);
+			else if (entry.state !== "disabled")
+				log.warn(
+					`[ext] ${entry.id} 没加载(${entry.state})${entry.detail ? `:${entry.detail}` : ""}`,
+				);
+		}
+
+		// 拨开关即热装卸(决策 10)。`sync()` 自己吞异常、自己排队,这里只负责把「全局配置
+		// 动过了」转过去 —— 它认的是开关**变没变**,别的全局设置存一百次也不会惊动拓展。
+		const extensions = loadedExtensions;
+		runtime.bus.on("config-changed", (scope) => {
+			if (scope === "globals") void extensions.sync();
+		});
 
 		const app = createApp(runtime, {
 			// devtools 给的话是套了 Proxy 的那份:`status()` 可注入假登录态,别的原样。
@@ -690,6 +893,11 @@ export async function startStandaloneServer(
 			// 就会绕过 devtools 的 api 覆盖(假直播时预览渲染的还是真房间)。
 			api: devtools?.api ?? authSystem.api,
 			backupService,
+			cardSkins: {
+				store: skins,
+				fallbacks: () => cardSkinFallbacks.list(),
+				clearFallbacks: () => cardSkinFallbacks.clear(),
+			},
 			basicAuthCredentials,
 			sessionCodec,
 			puppeteer,
@@ -707,6 +915,27 @@ export async function startStandaloneServer(
 			allowedOrigins,
 			desktopToken,
 			qqSessionRegistry,
+			extensions: {
+				mounts: extensionMounts,
+				loaded: () => loadedExtensions?.list() ?? [],
+				status: (id) => loadedExtensions?.status(id),
+				descriptor: (id) => loadedExtensions?.descriptor(id),
+				configFields: (id) => loadedExtensions?.configFields(id),
+				bots: (id) => loadedExtensions?.bots(id),
+				// 拨完开关面板紧接着刷这一口:先把还没落地的那一下落实掉再报状态。
+				settle: async () => {
+					await loadedExtensions?.sync();
+				},
+				// 面板上传装拓展:落到唯一那个装载根,装完当场重扫(新装的于是立刻跑起来)。
+				install: {
+					root: extensionsRoot,
+					rescan: async () => {
+						await loadedExtensions?.rescan();
+					},
+					restartAbility,
+				},
+				marketplace,
+			},
 			// 注册表交给路由:别名冲突检查与 `GET /api/commands` 都照它来,
 			// 面板上那张指令卡片不必再手写一份清单。
 			commands,
@@ -722,19 +951,14 @@ export async function startStandaloneServer(
 				startedAt: STARTED_AT,
 				// 应用 = 优雅停机 + 退 0,由进程管理器把新版本拉起来。**退出码必须是 0**:
 				// 非 0 会被编排系统当成崩溃,退避重启甚至进 CrashLoopBackOff。
-				applyUpdate: async () => {
-					try {
-						await close("update apply");
-					} catch (err) {
-						// close() 是 rethrow 的。停机里某一处 dispose 抛了也得退 0:这时进程
-						// 反正要没了,非 0 只会让编排系统当成崩溃去退避重启。
-						log.error(
-							`update apply: graceful close failed, exiting anyway: ${err instanceof Error ? err.message : String(err)}`,
-						);
-					} finally {
-						process.exit(0);
-					}
-				},
+				applyUpdate: () => stopAndExit("update apply"),
+			},
+			// 「重启一下」走的是同一条路 —— 差别只在**为什么**关,不在怎么关。
+			system: {
+				ability: restartAbility,
+				startedAt: STARTED_AT,
+				version: payloadVersion,
+				restart: () => stopAndExit("restart requested"),
 			},
 		});
 		await new Promise<void>((resolveServe) => {
@@ -757,10 +981,14 @@ export async function startStandaloneServer(
 		// log channel is then installed back onto the serviceCtx via setLogHook so
 		// every subsequent `logger.<level>(...)` call also lands on the `log` channel.
 		const httpServer = server as unknown as HttpServer;
+		// 拓展的 upgrade 分发从这一刻起开始收连接(`ws://<BN>/ext/<id>`)。放在这儿而不是
+		// 构造那会儿:HTTP server 要等 serve()。
+		extensionUpgrades.attach(httpServer);
 		wsServer = createWsServer({
 			httpServer,
 			bus: runtime.bus,
 			serviceCtx: runtime.serviceCtx,
+			resources: resourceMonitor,
 			authRequired: !!basicAuthCredentials,
 			wsTicketStore,
 			allowedOrigins,

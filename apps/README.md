@@ -98,7 +98,6 @@ slim 变体的卡片图片渲染改由 `BN_CHROME_ENDPOINT` 指向的**远程浏
 | `NODE_OPTIONS` | `--max-old-space-size=512` | V8 堆上限,压住 RSS 浮高;compose 可覆盖 |
 | `TZ` | `Asia/Shanghai` | 容器时区(影响日志 / 历史按日切文件) |
 | `BN_LOG_LEVEL` | `info` | 日志级别;引擎启动后被 dashboard 配置接管 |
-| `BN_MEMORY_PROBE_SECONDS` | 未设(=600) | 内存自检日志的采样间隔(秒);`0` = 关闭,下限 30 |
 | `BN_DASHBOARD_USER` / `BN_DASHBOARD_PASS` | 未设 | dashboard 登录凭据(首启动 seed 源) |
 | `BN_COOKIE_KEY` | 未设 | secrets 加密密钥(首启动 seed 源) |
 
@@ -138,7 +137,7 @@ environment:
 ```
 
 但抬上限只是止痛 —— 堆要是**慢慢涨**上去的,抬完只是把崩溃推迟。想分清是哪一种,
-翻日志里的 `[mem]` 行(默认 10 分钟一条,一并报出弹幕收集器占的规模):
+翻日志里的 `[mem]` 行(开着的话 10 分钟一条,一并报出弹幕收集器占的规模):
 
 ```
 [mem] heap 210/512MB (41%, 已提交 250MB) rss 340MB external 12MB | 弹幕 3 房/12000 词/8000 人
@@ -149,8 +148,11 @@ environment:
 所以别照堆上限去设 `mem_limit`,否则会从撞 V8 上限变成被系统 OOM 杀。
 
 一开机就接近上限 → 是容量不够,抬上限就对了;几个小时一路爬上去 → 是泄漏,
-请带上这几行开 issue。堆用量超过上限 85% 时这条会升成 `warn` 并附上处理办法;
-不想要这条日志可设 `BN_MEMORY_PROBE_SECONDS=0` 关掉。
+请带上这几行开 issue。
+
+这行日志**默认不写**,要它请到控制台「系统 → Core · 应用 → 内存自检打印」拨开;
+概览页的「系统资源」卡不靠它,随时都能看实时值。堆用量超过上限 85% 时无论开关如何
+都会有一条 `warn` 并附上处理办法。
 
 ### 故障排查
 
@@ -164,7 +166,7 @@ environment:
 
 ```
 /data
-├── state/      globals.json / subscriptions.json / targets.json / adapters.json
+├── state/      globals.json / subscriptions.json / targets.json / connections.json
 ├── secrets/    加密的 B 站 cookie / AI apiKey
 ├── history/    推送历史(按日 jsonl)
 ├── logs/       日志归档(按日 jsonl)
@@ -188,13 +190,50 @@ B 站 cookie 与 AI apiKey 存在 `<dataDir>/secrets/`,AES-256-GCM 加密。密�
 
 ## 接入 OneBot(NapCat)
 
-控制台 **推送目标** → 新建适配器,platform 选 `onebot`,连接方式三选一:
+控制台 **推送目标** → 新建连接,platform 选 `onebot`,连接方式三选一:
 
 - **HTTP** —— 填 bot 的 HTTP API `baseUrl`,如 `http://napcat:3000`。
 - **正向 WS** —— 填 bot 的 WS 地址,如 `ws://napcat:3001`。
 - **反向 WS** —— 填一个监听端口,bot 主动连入;该端口需在 compose `ports:` 额外映射。
+  面板会把 bot 那头该填的完整地址印出来(形如 `ws://<BN 主机>:<端口>/onebot`)—— **末尾的路径随便填**,
+  不填也行,从 koishi 转过来的人照抄 `/onebot` 即可。
 
 `docker-compose.example.yaml` 含注释掉的 NapCat 边车段落。
+
+## 拓展
+
+拓展是**装进来才有**的外挂模块 —— 本体一个都不带。而且**装完默认是关着的**,到它那张卡上把开关拨开才会跑;拨开关当场生效,不用重启。
+
+控制台 **拓展**,右上「装拓展」,两条来路:
+
+- **拓展市场** —— 这一页最底下那一节。官方源的条目点「装」就行,装完当场生效。
+- **传一个包上来** —— 把 `.zip` 拖进「装拓展」弹窗。**只装信得过的**:拓展在 BN 进程里跑,装的时候不验签。
+
+还有第三条不走面板的路:把解开的目录放进 `<数据目录>/extensions/<id>/`(里面只能有 `extension.json` 与 `index.mjs`)。**这条要重启一次**才认得到。
+
+| 形态 | 数据目录 |
+| --- | --- |
+| Docker | `/data` —— 即 `/data/extensions/`,在 volume 里 |
+| 桌面 macOS | `~/Library/Application Support/bilibili-notify/data` |
+| 桌面 Windows | `%LOCALAPPDATA%\bilibili-notify\data` |
+
+**盖掉一份已经装着的也要重启一次** —— 旧代码已经被这个进程认下了,在进程里换不掉。面板会就地给那颗重启按钮;这台机器上按了回不来的话(开发版 / 自己在终端里裸跑),它不给按钮,但会写清楚为什么。
+
+### 接上 koishi(机器人框架桥接)
+
+把你 koishi 里**已经配好的 bot 借给 BN 发推送** —— Telegram / Discord / KOOK 这些平台于是不必由 BN 各写一份适配。
+
+1. 控制台 **拓展** → 装上「机器人框架桥接」→ 在它那张卡上**把开关拨开**。
+2. 卡片右下「管理 ›」→「桥接入」→ **新建接入**:桥的种类选 `koishi`,起个名字,弹窗会当场生成一条 token。
+   ⚠️ **token 全文只在这一刻看得到**,存下之后面板只显示头尾。忘了就重新生成一条 —— 旧的立刻作废,对面当场掉线。
+3. 弹窗底下那个盒子里,**BN 地址**与 **token** 成对摆着,各带一颗复制钮。这两样就是要填进插件的全部。
+4. koishi 那侧装 [`koishi-plugin-bilibili-notify-bridge`](https://www.npmjs.com/package/koishi-plugin-bilibili-notify-bridge),把 `url` 与 `token` 填进去保存。**桥主动连 BN,BN 从不反过来连 koishi** —— koishi 跑在内网 / NAS / 家宽后面都不用开端口。
+5. 连上之后那张接入卡变绿,并列出这台 koishi 借出来的 bot。
+6. **还没完**:回到控制台 **推送目标** → 新建连接 → 平台挑「机器人框架桥接」→ 从借来的 bot 里挑一个 → 保存。**一条连接就是一个 bot**,要用几个 bot 就建几条;之后才谈得上给它挂群和私聊。
+
+⚠️ **「BN 地址」是按你打开面板时浏览器地址栏算出来的。** 在 BN 那台机器上用 `http://localhost:8787` 开面板,复制出来的就是 `ws://localhost:8787/ext/bridge` —— 填进另一台机器(或另一个容器)里的 koishi 必然连不上,而且报出来只是一句「连不上」,最难查。要填**桥那台机器访问得到的地址**,如 `ws://192.168.1.5:8787/ext/bridge`;BN 挂在 https 反代后面则用 `wss://`。
+
+连不上时,那张接入卡会印出两句判据:**填错 token 的话插件收到 401;地址不通则是连不上** —— 两种都不会在 BN 这侧留下记录。
 
 ## 开发
 

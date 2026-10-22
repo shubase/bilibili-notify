@@ -9,40 +9,49 @@
  *
  * 旧镜像时代的 `*Full` / `*Override` 命名以别名保留,消费者无需改动:
  * `XxxFull` = internal 的全量类型,`XxxOverride` = internal 的 `XxxPartial`
- * (cardLayout / messageLayout 例外:per-UP 是「整份覆盖」,Override = 全量)。
+ * (messageLayout 例外:per-UP 是「整份覆盖」,Override = 全量)。
  */
 
-import type { SubscriptionDTO } from "@bilibili-notify/contract";
+import type { ExtensionBotView, SubscriptionDTO } from "@bilibili-notify/contract";
 import type {
-	OnebotAdapterConfig,
+	Connection,
+	ConnectionPlatform,
+	DirectConnection,
+	ExtensionConnection,
+	OnebotConnectionConfig,
 	OnebotTransport,
-	PushAdapter,
 	PushTarget,
-	PushTargetPlatform,
-	WebhookProvider,
+	WebhookPlatform,
 } from "@bilibili-notify/internal";
 import {
+	CONNECTION_PLATFORMS,
 	countsAsDelivery,
 	countsAsFailure,
 	DEFAULT_FEATURE_FLAGS,
 	DEFAULT_ROAST_SCHEDULE,
+	defaultConnectorFor,
+	EXTRA_KEYS,
+	type ExtraKey,
 	FEATURE_KEYS,
 	type FeatureKey,
 	isTargetPaused,
-	LIVE_END_EXTRA_KEYS,
-	type LiveEndExtraKey,
+	isWebhookConnection,
 	ONEBOT_FORWARD_MIN_TIMEOUT_MS,
 	ONEBOT_IMAGE_MIN_TIMEOUT_MS,
+	PLATFORM_REGISTRY,
+	PUSH_EXTRAS,
 } from "@bilibili-notify/internal/constants";
 
-export type { FeatureKey, LiveEndExtraKey };
+export type { ExtraKey, FeatureKey };
 export {
 	countsAsDelivery,
 	countsAsFailure,
 	DEFAULT_FEATURE_FLAGS,
+	EXTRA_KEYS,
 	FEATURE_KEYS,
 	isTargetPaused,
-	LIVE_END_EXTRA_KEYS,
+	isWebhookConnection,
+	PUSH_EXTRAS,
 };
 
 /**
@@ -53,32 +62,29 @@ export type Subscription = SubscriptionDTO;
 
 export type {
 	AIOverride,
-	CardBlock as CardBlockFull,
-	// per-UP 卡片版式是「整份覆盖」(fork 全局后编辑),不是 Partial。
-	CardLayout as CardLayoutFull,
+	// 推送平台类型直接用 internal 的定义:将来薄插件桥接进来的平台加进那条 union 就自动出现在这里。
+	Connection,
+	ConnectionPlatform,
 	ContentFiltersPartial as ContentFiltersOverride,
+	DirectConnection,
+	ExtensionConnection,
 	ImageGroupSettingsPartial as ImageGroupOverride,
 	MessageBlock as MessageBlockFull,
 	MessageKindLayout as MessageKindLayoutFull,
-	// per-UP 消息版式同 cardLayout:整份覆盖,不是 Partial。
+	// per-UP 消息版式是「整份覆盖」(fork 全局后编辑),不是 Partial。
 	MessageLayout as MessageLayoutOverride,
-	OnebotAdapterConfig,
-	OnebotSession,
+	OnebotConnectionConfig,
 	OnebotTransport,
-	// 推送平台类型直接用 internal 的定义:将来薄插件桥接进来的平台加进那条 union 就自动出现在这里。
-	PushAdapter,
 	PushTarget,
-	PushTargetPlatform,
 	PushTargetScope,
-	QQOfficialAdapterConfig,
 	QQOfficialBotType,
-	QQOfficialSession,
+	QQOfficialConnectionConfig,
 	ScheduleConfigPartial as ScheduleOverride,
 	SpecialUser,
 	SubscriptionOverrides as OverridesShape,
 	SubscriptionRouting,
 	TemplateBundlePartial as TemplateOverride,
-	WebhookProvider,
+	WebhookPlatform,
 } from "@bilibili-notify/internal";
 
 // ---- UI 文案 -----------------------------------------------------------
@@ -93,27 +99,8 @@ export const FEATURE_LABELS: Record<FeatureKey, string> = {
 	specialUserEnter: "特别用户进房",
 };
 
-/** 下播的两个附加项(像开播的 @全体,挂在下播下面)。 */
-export const LIVE_END_EXTRA_LABELS: Record<LiveEndExtraKey, string> = {
-	wordcloud: "弹幕词云",
-	liveSummary: "AI 总结",
-};
-
-export const WEBHOOK_PROVIDERS: ReadonlyArray<{ value: WebhookProvider; label: string }> = [
-	{ value: "generic", label: "Generic JSON" },
-	{ value: "dingtalk", label: "钉钉机器人" },
-	{ value: "feishu", label: "飞书机器人" },
-	{ value: "wecom", label: "企业微信机器人" },
-];
-
-export function webhookProviderLabel(provider: WebhookProvider | undefined): string {
-	return (
-		WEBHOOK_PROVIDERS.find((p) => p.value === (provider ?? "generic"))?.label ?? "Generic JSON"
-	);
-}
-
-export function webhookUrlPlaceholder(provider: WebhookProvider | undefined): string {
-	switch (provider ?? "generic") {
+export function webhookUrlPlaceholder(platform: WebhookPlatform): string {
+	switch (platform) {
 		case "dingtalk":
 			return "https://oapi.dingtalk.com/robot/send?access_token=...";
 		case "feishu":
@@ -125,8 +112,8 @@ export function webhookUrlPlaceholder(provider: WebhookProvider | undefined): st
 	}
 }
 
-export function webhookSecretHint(provider: WebhookProvider | undefined): string {
-	switch (provider ?? "generic") {
+export function webhookSecretHint(platform: WebhookPlatform): string {
+	switch (platform) {
 		case "dingtalk":
 			return "钉钉加签密钥 SEC...；填写后自动追加 timestamp/sign";
 		case "feishu":
@@ -149,17 +136,61 @@ export function maskWebhookUrl(url: string): string {
 	}
 }
 
-export const KNOWN_PLATFORMS: ReadonlyArray<{ value: PushTargetPlatform; label: string }> = [
-	{ value: "onebot", label: "OneBot v11" },
-	{ value: "qq-official", label: "QQ 官方机器人" },
-	{ value: "webhook", label: "Webhook" },
-];
+/**
+ * 平台选择器的候选 —— 顺序与显示名都从 {@link PLATFORM_REGISTRY} 取。
+ *
+ * webhook 那一族原先不在这里,它们是 webhook 连接 config 里那个 `provider` 下拉的选项。
+ * webhook 降格成连接器之后,「飞书还是钉钉」跟「OneBot 还是官机」是同一个问题,
+ * 摆成两级选择只是在复述旧数据模型的形状。
+ */
+export const KNOWN_PLATFORMS: ReadonlyArray<{ value: ConnectionPlatform; label: string }> =
+	CONNECTION_PLATFORMS.map((value) => ({ value, label: PLATFORM_REGISTRY[value].label }));
 
 // ---- Factories --------------------------------------------------------
 
 /**
- * 生成 RFC 4122 v4 UUID。后端 schema 的 `id` / `adapterId` 都是 `z.uuid()` 严格
- * 校验,必须返回标准 8-4-4-4-12 格式,否则创建订阅 / 适配器 / 目标的 POST 全 400。
+ * 一条挂在某个拓展名下的连接 —— **就是主人挑中的那个 bot**(ADR-0012 决策 45)。拓展在
+ * `listBots` 里交出来的 config 原样存进连接,平台从 bot 上抄;这里不认得任何具体拓展。
+ * 显示名默认用 bot 的名字,主人没填的话。
+ */
+export function makeEmptyExtensionConnection(
+	extensionId: string,
+	bot: ExtensionBotView,
+	name: string,
+): ExtensionConnection {
+	return {
+		id: newId(),
+		name: name || bot.name || "",
+		enabled: true,
+		kind: "extension",
+		extensionId,
+		platform: bot.platform,
+		config: bot.config,
+	};
+}
+
+/**
+ * 刚挑了拓展、还没挑 bot 的那条草稿:平台空着,**存不了**(弹窗按它灰掉保存钮)。别在这儿
+ * 编一个平台名 —— 目标的平台正要从这里抄。
+ */
+export function makeExtensionConnectionDraft(
+	extensionId: string,
+	name: string,
+): ExtensionConnection {
+	return {
+		id: newId(),
+		name,
+		enabled: true,
+		kind: "extension",
+		extensionId,
+		platform: "",
+		config: undefined,
+	};
+}
+
+/**
+ * 生成 RFC 4122 v4 UUID。后端 schema 的 `id` / `connectionId` 都是 `z.uuid()` 严格
+ * 校验,必须返回标准 8-4-4-4-12 格式,否则创建订阅 / 连接 / 目标的 POST 全 400。
  *
  * 刻意**不用** `crypto.randomUUID()` —— 它只在 **secure context**(HTTPS 或
  * localhost)可用;独立端 docker 部署常经 `http://<内网IP>:8787` 访问 = 非 secure
@@ -181,6 +212,13 @@ function emptyRouting(): Subscription["routing"] {
 	return out as Subscription["routing"];
 }
 
+/** 附加项的 per-目标 三态表:四把键各一张空表 = 每个目标都跟随上一层。 */
+function emptyExtras(): Subscription["extras"] {
+	const out: Partial<Subscription["extras"]> = {};
+	for (const k of EXTRA_KEYS) out[k] = {};
+	return out as Subscription["extras"];
+}
+
 export function makeEmptySubscription(uid: string): Subscription {
 	return {
 		id: newId(),
@@ -190,8 +228,7 @@ export function makeEmptySubscription(uid: string): Subscription {
 		notes: undefined,
 		cachedProfile: undefined,
 		routing: emptyRouting(),
-		atAllDefaults: { dynamic: false, live: true },
-		atAll: { dynamic: {}, live: {} },
+		extras: emptyExtras(),
 		overrides: {},
 		// 新订阅不自带定时锐评 —— 加一个 UP 不该顺手给群里排一条周期推送。
 		// 与服务端的 makeEmptySubscription 保持一致。
@@ -205,11 +242,20 @@ export function makeEmptySubscription(uid: string): Subscription {
 	};
 }
 
-export function makeEmptyAdapter(platform: PushTargetPlatform, name: string): PushAdapter {
-	const base = { id: newId(), name, enabled: true } as const;
+/**
+ * 新建一条连接 —— 回的是**直连**那一支:面板这张表单只建直连,桥接入在拓展页建
+ * (它要的是 BN 地址 + token,跟这里问的东西完全不同)。收窄返回类型让调用方
+ * 直接拿得到 `platform` 与那一档的 config,不用再自己 narrow 一次。
+ */
+export function makeEmptyConnection(platform: ConnectionPlatform, name: string): DirectConnection {
+	// connector 的初值走 internal 那份 defaultConnectorFor —— 与迁移同一个答案,
+	// 免得「新建的」和「迁移来的」从不同默认值出发。它按平台重载,所以每一支拿到的
+	// 是那一档的字面量类型,正好对得上 schema 里逐支收窄过的 `connector`。
+	const base = { id: newId(), name, enabled: true, kind: "direct" } as const;
 	if (platform === "onebot") {
 		return {
 			...base,
+			connector: defaultConnectorFor(platform),
 			platform: "onebot",
 			config: {
 				transport: "http",
@@ -227,20 +273,23 @@ export function makeEmptyAdapter(platform: PushTargetPlatform, name: string): Pu
 	if (platform === "qq-official") {
 		return {
 			...base,
+			connector: defaultConnectorFor(platform),
 			platform: "qq-official",
 			config: { appId: "", appSecret: "", sandbox: false, botType: "public", logReconnects: false },
 		};
 	}
+	// 剩下的都是 webhook 那一族 —— 平台不同、连法与配置形状一模一样。
 	return {
 		...base,
-		platform: "webhook",
-		config: { url: "https://example.com/hook", provider: "generic", headers: {} },
+		connector: defaultConnectorFor(platform),
+		platform,
+		config: { url: "https://example.com/hook", headers: {} },
 	};
 }
 
 /** OneBot 三种连接方式(transport)共用的连接字段。 */
-type OnebotAdapterConfigCommon = Pick<
-	OnebotAdapterConfig,
+type OnebotConnectionConfigCommon = Pick<
+	OnebotConnectionConfig,
 	| "accessToken"
 	| "protocolVersion"
 	| "timeoutMs"
@@ -251,15 +300,15 @@ type OnebotAdapterConfigCommon = Pick<
 >;
 
 /**
- * 切换 OneBot 适配器的连接方式 —— 整体替换 config(branch schema 是 strict,不能
+ * 切换 OneBot 连接的连法 —— 整体替换 config(branch schema 是 strict,不能
  * 留上一个 transport 的残字段),保留 accessToken / 超时 / 重试等共用字段。切到
  * ws / ws-reverse 时,若 retryTimes 还是 0 则提到 3(bot 偶发重连不丢首条推送)。
  */
 export function switchOnebotTransport(
-	cfg: OnebotAdapterConfig,
+	cfg: OnebotConnectionConfig,
 	transport: OnebotTransport,
-): OnebotAdapterConfig {
-	const common: OnebotAdapterConfigCommon = {
+): OnebotConnectionConfig {
+	const common: OnebotConnectionConfigCommon = {
 		accessToken: cfg.accessToken,
 		protocolVersion: cfg.protocolVersion ?? "v11",
 		timeoutMs: cfg.timeoutMs,
@@ -277,13 +326,20 @@ export function switchOnebotTransport(
 	return { ...common, transport: "ws-reverse", port: 9797 };
 }
 
-export function makeEmptyTarget(adapter: PushAdapter, name: string): PushTarget {
-	const base = { id: newId(), name, adapterId: adapter.id, enabled: true } as const;
-	if (adapter.platform === "onebot") {
-		return { ...base, platform: "onebot", scope: "group", session: {} };
+export function makeEmptyTarget(connection: Connection, name: string): PushTarget {
+	// 地址留空:新建时还没填群号 / openid,发的时候才检查(见 schema 的 address 那段)。
+	const base = { id: newId(), name, connectionId: connection.id, enabled: true } as const;
+	if (connection.kind !== "direct") {
+		// 拓展提供的连接就是一个 bot,平台跟着连接走(ADR-0012 决策 45)—— 与直连同一套逻辑,
+		// 目标只填地址。曾经在这里 `throw` —— 异常抛在点击处理器里,主人看到的是「点了没反应」。
+		return { ...base, kind: "session", platform: connection.platform, scope: "group", address: "" };
 	}
-	if (adapter.platform === "qq-official") {
-		return { ...base, platform: "qq-official", scope: "group", session: {} };
+	if (connection.platform === "onebot") {
+		return { ...base, kind: "session", platform: "onebot", scope: "group", address: "" };
 	}
-	return { ...base, platform: "webhook", scope: "channel", session: {} };
+	if (connection.platform === "qq-official") {
+		return { ...base, kind: "session", platform: "qq-official", scope: "group", address: "" };
+	}
+	// webhook 那一族:目标是连接的单向终点,平台跟着连接走,地址烧在连接的 config 里。
+	return { ...base, kind: "endpoint", platform: connection.platform, scope: "channel" };
 }

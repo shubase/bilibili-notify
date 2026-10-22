@@ -1,6 +1,14 @@
 import { readFileSync } from "node:fs";
 import { join as joinPath } from "node:path";
 import type { BilibiliAPI } from "@bilibili-notify/api";
+import type {
+	CardSkinFallback,
+	ExtensionBotView,
+	ExtensionConfigField,
+	ExtensionDescriptorDTO,
+	RestartAbility,
+} from "@bilibili-notify/contract";
+import type { CardSkinKind } from "@bilibili-notify/internal";
 import { serveStatic } from "@hono/node-server/serve-static";
 import { Hono } from "hono";
 import { HTTPException } from "hono/http-exception";
@@ -11,15 +19,21 @@ import { createIpRateLimiter } from "./auth/ip-rate-limit.js";
 import type { SessionCodec } from "./auth/session.js";
 import type { WsTicketStore } from "./auth/ws-ticket.js";
 import type { BackupService } from "./backup/service.js";
+import { CardSkinStore } from "./card-skins/store.js";
 import type { ChromeSource } from "./config/persist.js";
+import type { ExtensionEntry } from "./extensions/loader.js";
+import type { Marketplace } from "./extensions/marketplace.js";
+import { EXTENSION_MOUNT_PREFIX, type ExtensionMounts } from "./extensions/mount.js";
 import { MaidSkillStore } from "./maid-skills/store.js";
 import type { QQSessionRegistry } from "./platforms/qq-official.js";
-import { createAdaptersRoute } from "./routes/adapters.js";
 import { createAiRoute } from "./routes/ai.js";
 import { createAuthRoute } from "./routes/auth.js";
 import { createBackupRoute } from "./routes/backup.js";
+import { createCardSkinsRoute } from "./routes/card-skins.js";
 import { createCardsRoute } from "./routes/cards.js";
 import { createCommandsRoute } from "./routes/commands.js";
+import { createConnectionsRoute } from "./routes/connections.js";
+import { createExtensionsRoute } from "./routes/extensions.js";
 import { createFansRoute } from "./routes/fans.js";
 import { createGlobalsRoute } from "./routes/globals.js";
 import { createHealthRoute } from "./routes/health.js";
@@ -33,6 +47,7 @@ import { createSessionRoute } from "./routes/session.js";
 import { createSkinsRoute } from "./routes/skins.js";
 import { createStatsRoute } from "./routes/stats.js";
 import { createSubsRoute } from "./routes/subs.js";
+import { type CreateSystemRouteInput, createSystemRoute } from "./routes/system.js";
 import { createTargetsRoute } from "./routes/targets.js";
 import type { RouteDeps } from "./routes/types.js";
 import { createUpdateRoute } from "./routes/update.js";
@@ -58,6 +73,51 @@ export interface CreateAppOptions {
 	api?: BilibiliAPI | null;
 	/** Optional backup/restore service; when present /api/backup/* is mounted. */
 	backupService?: BackupService;
+	/**
+	 * 卡片皮肤库(ADR-0014)。**必填,而且必须与出图那头是同一家店** —— 面板、出图
+	 * (engines 的 ImageRenderer)、卡片预览三处问的都是它。
+	 *
+	 * ⚠️ **从前它是可选的,缺省时自建一家读同一个目录的店** —— 那正是这段话说绝不能
+	 * 发生的拓扑:面板装得进、列得出,而出图那头拿的仍是宿主传给引擎的那一家,于是
+	 * 「装了新皮肤、推送不变」,**且症状完全静默**。生产侧一直传了,所以没出过真事故;
+	 * 2026-09-20 主人拍板改成必填,把那个口子焊死。没有店可传的宿主用
+	 * {@link createCardSkinStore} 按 `<dataDir>` 约定开一家。
+	 */
+	cardSkins: {
+		store: CardSkinStore;
+		/** 出图回落的账本;列表接口带上它(决策 19 的「回落必须可见」)。 */
+		fallbacks?: () => CardSkinFallback[];
+		/** 面板上那句「知道了」把账本翻篇。 */
+		clearFallbacks?: () => void;
+	};
+	/**
+	 * 开机装载起来的拓展。在 `index.ts` 组装(那里才知道 `<dataDir>`)。
+	 *
+	 * `mounts` 是那条动态挂载点的总入口,`loaded` 是拓展页要列的那份名单。不给就当这台
+	 * 机器一个拓展都没装:`/ext/*` 一律 404,拓展页空着。
+	 */
+	extensions?: {
+		mounts: ExtensionMounts;
+		loaded: () => readonly ExtensionEntry[];
+		/** 某个拓展交上来的面板数据(`ctx.publishStatus`)。没交过 / 没跑就是 undefined。 */
+		status: (id: string) => unknown;
+		/** 某个拓展注册推送源时报的面板元信息。没跑就是 undefined。 */
+		descriptor: (id: string) => ExtensionDescriptorDTO | undefined;
+		/** 它交的 config 字段表(决策 33)。没跑就是 undefined。 */
+		configFields: (id: string) => readonly ExtensionConfigField[] | undefined;
+		/** 某条连接上能绑目标的 bot。没跑 / 它没给就是 undefined。 */
+		bots: (id: string) => readonly ExtensionBotView[] | undefined;
+		/** 把还没落地的开关落实掉,再回答「现在什么状态」。见 routes/extensions.ts。 */
+		settle?: () => Promise<void>;
+		/** 面板上传装拓展那条路要的:装载根、装完重扫、以及「这台机器重启回不回得来」。 */
+		install?: {
+			root: string;
+			rescan: () => Promise<void>;
+			restartAbility: RestartAbility;
+		};
+		/** 拓展市场(ADR-0013)。没接 → 那两口 404。 */
+		marketplace?: Marketplace;
+	};
 	/**
 	 * Configured dashboard credentials. When provided, every request under
 	 * `/api/*` (including `/api/health`, excluding `/api/session/*`) requires a
@@ -163,12 +223,31 @@ export interface CreateAppOptions {
 		applyUpdate: () => Promise<void>;
 	};
 	/**
+	 * 系统级动作(现在只有「重启一下」)。同样由 index.ts 构建 —— 只有它知道怎么优雅地
+	 * 关掉自己,以及这台机器上退了之后有没有人拉。省略 → `/api/system` 不挂载。
+	 */
+	system?: CreateSystemRouteInput;
+	/**
 	 * devtools(造状态 / 造事件)的 `/api/dev` 子应用,由 `devtools/index.ts` 建好交过来。
 	 * 这里**只收一个 Hono**、不 import 任何 devtools 模块:整套 devtools 只从 `src/index.ts`
 	 * 那一处引,构建时把那个入口换成空桩,整棵树就从产物里消失(构建后自检会 grep 一遍)。
 	 * 省略 → 不挂载、404 —— 发出去的构建里不该向外承认有这么个口。
 	 */
 	devtools?: Hono;
+}
+
+/**
+ * 按约定开一家卡片皮肤店:`<dataDir>/card-skins`。**这个目录名只声明在这一处** ——
+ * 宿主与测试共用它,两边各抄一份字面量迟早会漂。
+ *
+ * 目录叫 `card-skins` 而不是 `skins`:与隔壁 dashboard 皮肤分开 —— 两种包长得像
+ * (都是 zip + 一份 JSON),混在一个目录里 init 会互相报「格式不对」。
+ *
+ * ⚠️ 开一家**不等于**可以随手开:全进程只该有一家(见 `CreateAppOptions.cardSkins`)。
+ * 这个函数是给「还没有店的那个宿主」用的,不是给已经有店的调用方再开一家。
+ */
+export function createCardSkinStore(dataDir: string): CardSkinStore {
+	return new CardSkinStore({ dir: joinPath(dataDir, "card-skins") });
 }
 
 /**
@@ -182,7 +261,7 @@ export interface CreateAppOptions {
  *
  * Sink wiring follows in 2.5+.
  */
-export function createApp(runtime: AppRuntime, options: CreateAppOptions = {}): Hono {
+export function createApp(runtime: AppRuntime, options: CreateAppOptions): Hono {
 	const app = new Hono();
 	const deps: RouteDeps = {
 		runtime,
@@ -284,7 +363,7 @@ export function createApp(runtime: AppRuntime, options: CreateAppOptions = {}): 
 	app.route("/api/globals", createGlobalsRoute(deps));
 	app.route("/api/commands", createCommandsRoute(deps));
 	app.route("/api/subs", createSubsRoute(deps));
-	app.route("/api/adapters", createAdaptersRoute(deps));
+	app.route("/api/connections", createConnectionsRoute(deps));
 	app.route("/api/targets", createTargetsRoute(deps));
 	app.route("/api/live", createLiveRoute(deps));
 	app.route("/api/history", createHistoryRoute(deps));
@@ -301,7 +380,25 @@ export function createApp(runtime: AppRuntime, options: CreateAppOptions = {}): 
 		dir: joinPath(runtime.bootstrap.dataDir, "maid-skills"),
 	});
 	app.route("/api/maid-skills", createMaidSkillsRoute({ skillStore }));
-	app.route("/api/ai", createAiRoute(deps, { skinStore, skillStore }));
+	// 卡片皮肤库(ADR-0014)。**只用传进来的那一家**,这里不 `new`(理由见
+	// `CreateAppOptions.cardSkins`)。读盘推迟到首个请求(createApp 是同步装配),
+	// 凭据记在店上,见 `ensureReady`。
+	const cardSkinStore = options.cardSkins.store;
+	/**
+	 * 卡片工坊 `look_card` 的截图口。握着 Chrome 的是 `/api/cards`,而它装配在聊天路由之后 ——
+	 * 这里先放一个晚绑定的口子,卡片路由建好时把真的交进来(见 `onSkinShot`)。
+	 */
+	let shootCardSkin: ((skinId: string, kind: CardSkinKind) => Promise<string | null>) | null = null;
+	app.route(
+		"/api/ai",
+		createAiRoute(deps, {
+			skinStore,
+			skillStore,
+			// 与 `/api/card-skins` 同一家店:工坊做出来的皮肤,皮肤页当场就看得见。
+			cardSkinStore,
+			cardSkinShot: (skinId, kind) => shootCardSkin?.(skinId, kind) ?? Promise.resolve(null),
+		}),
+	);
 	app.route("/api/fans", createFansRoute(deps));
 	const statsRoute = createStatsRoute(deps, {
 		...(options.runRoastNow ? { runRoastNow: options.runRoastNow } : {}),
@@ -309,11 +406,38 @@ export function createApp(runtime: AppRuntime, options: CreateAppOptions = {}): 
 	app.route("/api/stats", statsRoute);
 	options.onStatsRoute?.(statsRoute);
 	app.route("/api/qq", createQQRoute(deps));
+	// 面板那一侧的拓展口。URL 面用短词 `ext`(ADR-0012 决策 38),代码面照旧全称。
+	app.route(
+		"/api/ext",
+		createExtensionsRoute({
+			store: deps.store,
+			extensions: () => options.extensions?.loaded() ?? [],
+			status: (id) => options.extensions?.status(id),
+			descriptor: (id) => options.extensions?.descriptor(id),
+			configFields: (id) => options.extensions?.configFields(id),
+			bots: (id) => options.extensions?.bots(id),
+			settle: options.extensions?.settle,
+			install: options.extensions?.install,
+			marketplace: options.extensions?.marketplace,
+		}),
+	);
 	app.route(
 		"/api/skins",
 		createSkinsRoute({
 			skinStore,
 			// 热读:engines 是后挂的,ai-edit 每次现取,不做快照。
+			commentary: () => runtime.engines?.commentary ?? null,
+		}),
+	);
+	app.route(
+		"/api/card-skins",
+		createCardSkinsRoute({
+			store: cardSkinStore,
+			config: deps.store,
+			logger: runtime.serviceCtx.logger,
+			fallbacks: options.cardSkins.fallbacks,
+			clearFallbacks: options.cardSkins.clearFallbacks,
+			// 同 dashboard 皮肤库:热读,engines 是后挂的。
 			commentary: () => runtime.engines?.commentary ?? null,
 		}),
 	);
@@ -327,6 +451,12 @@ export function createApp(runtime: AppRuntime, options: CreateAppOptions = {}): 
 			onPuppeteerEnabled: options.onPuppeteerEnabled,
 			chromeIdleTimeoutMs: options.chromeIdleTimeoutMs,
 			initialChromeSource: options.chromeSource,
+			// 预览自己建一个 ImageRenderer(样式烤进 config),皮肤得问同一家店 ——
+			// 否则「预览是这套皮肤、推出去是另一副样子」。
+			cardSkins: cardSkinStore,
+			onSkinShot: (shoot) => {
+				shootCardSkin = shoot;
+			},
 		}),
 	);
 	if (options.authSystem) {
@@ -346,9 +476,20 @@ export function createApp(runtime: AppRuntime, options: CreateAppOptions = {}): 
 		app.route("/api/update", createUpdateRoute(options.update));
 	}
 
+	if (options.system) {
+		app.route("/api/system", createSystemRoute(options.system));
+	}
+
 	// devtools。同样在 index.ts 组装(那里才知道载荷版本)后注入;不给就不挂。
 	if (options.devtools) {
 		app.route("/api/dev", options.devtools);
+	}
+
+	// 拓展的动态挂载点。**刻意不在 `/api/*` 底下** —— 上面那道 dashboard 鉴权中间件是按
+	// `/api/*` 挂的,而拓展的对家(桥、回调)手里只有一条 URL、没有会话。谁能进来由拓展
+	// 自己在 handler 里判。面板要的数据走 `/api/ext/:id/status`,那条才吃得到会话鉴权。
+	if (options.extensions) {
+		app.route(EXTENSION_MOUNT_PREFIX, options.extensions.mounts.route);
 	}
 
 	// Static dashboard. Mounted last so /api/* always wins routing. The cookie

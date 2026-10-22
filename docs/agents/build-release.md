@@ -74,6 +74,10 @@ GitHub Release 的正文由 `create-standalone-github-release.sh` 拼(desktop-re
 
 两个 workflow 都先校验 tag commit 可从 `origin/dev` 到达,再从 tag 读取版本并运行 `sync-standalone-version.sh`;Docker 与 Desktop 依赖同一个版本 tag,但彼此不再互相等待。某个 workflow 失败时只重跑对应 workflow。
 
+拓展与本体分开发布(ADR-0013):
+
+- `.github/workflows/extension-release.yml` —— tag `extension/<id>@<version>` 触发:构建那个拓展、打成拓展包(`scripts/pack-extension.mjs`,必装 `extension.json` + `index.mjs`,另收可选的 `README.md` / `CHANGELOG.md`,打包可复现)、挂到同名的不可变 release 上,再把这一条并进官方索引(`scripts/marketplace-index.mjs`,同一把 `BN_UPDATE_SIGNING_KEY`)、覆盖到滚动 tag `extension-marketplace` 上的 `marketplace.json`。tag 与 `extensions/<id>/extension.json` 的 `version` 对不上直接红;条目的 `notes` 从 `extensions/<id>/CHANGELOG.md` 抽。详见 [extension-marketplace.md](./extension-marketplace.md)。
+
 不由 tag 触发、只手动跑的还有一条:
 
 - `.github/workflows/revoke-update.yml` —— **撤回一个已经发出去的坏版本**。重签渠道清单把它列进 `revoked`,并把用户指向该在的那一版。与 `update-payload` 共用一个 concurrency 组(两者都在改 `update-channel` 上那两份清单)。默认 dry-run,不跑门禁。用法见 [self-update.md](./self-update.md)。
@@ -143,7 +147,7 @@ image-release run 在相同 build job 里顺带构建(同 buildx 实例复用 bu
 
 ### Dockerfile
 
-`apps/Dockerfile` 多阶段:builder 跑 `vp pm ci` + 按需构建(`packages/*` → `apps/web` → `apps/server` 的 `build:bundle` + `scripts/assemble-server-bundle.mjs`);runtime `FROM` 自建 chromium base,只 COPY server 的**自包含 bundle**(`apps/server/dist`,~15MB:入口 + 若干 hash 分块 + wasm / worker / 词云 static / package.json)+ web dist。镜像里**没有 node_modules**。
+`apps/Dockerfile` 多阶段:builder 跑 `vp pm ci` + 按需构建(`packages/*` → `apps/web` → `apps/server` 的 `build:bundle` + `scripts/assemble-server-bundle.mjs`);runtime `FROM` 自建 chromium base,只 COPY server 的**自包含 bundle**(`apps/server/dist`,~15MB:入口 + 若干 hash 分块 + wasm / worker / 词云 static / package.json)+ web dist。镜像里**没有 node_modules**。⛔ **镜像一个拓展都不带**:拓展走下载或主人手放进 `<dataDir>/extensions/`。
 
 **chromium base 镜像**(`apps/base.Dockerfile` → `akokk0/bilibili-notify-base`):node-slim + chromium + CJK/emoji 字体 + tini,~300MB 冻结在 base、digest 只随显式重建而变 —— 用户拉一次、之后每次升级只下 app 小层。重建走 `base-image.yml`(workflow_dispatch,不可变递增 tag `b1`/`b2`/… + `:latest`,双 arch 经 QEMU),刷新后 bump `apps/Dockerfile` 的 `ARG BN_BASE_IMAGE`。**时序**:新 base tag 必须先推上 registry,image-release(含 dry-run)才构建得动。
 

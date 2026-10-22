@@ -1,7 +1,9 @@
 import {
+	AI_CARD_WORKSHOP_TOOLS,
 	AI_TOOL_CREATE_SKIN,
 	type AiChatMode,
 	type AiConversationDTO,
+	type AiSkinTarget,
 } from "@bilibili-notify/contract";
 import type { GlobalConfig } from "@bilibili-notify/internal";
 import { resolveActivePersona, resolveAIProfile } from "@bilibili-notify/internal/constants";
@@ -9,6 +11,7 @@ import { ErrorNote, Icon, TabBar } from "@bilibili-notify/ui";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useRef, useState } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
+import { CARD_SKINS_KEY } from "../../pages/cards/card-skins-query";
 import {
 	chatImageUrl,
 	conversationQueryKey,
@@ -151,15 +154,42 @@ type SendVars = {
 	face: ChatFace;
 };
 
+/**
+ * 离底部多近还算「停在底部」px。留一点余量:触控板惯性、缩放取整都会差出几像素,
+ * 差一点就不跟了会让人以为贴底坏了。
+ */
+const STICK_SLACK_PX = 48;
+
 /** 技能还没拉到时的稳定空表 —— 每次渲染现造一个 `[]` 会让 Composer 白白重渲。 */
 const EMPTY_SKILLS: readonly MaidSkillDTO[] = [];
 
-/** 一场对话的面孔:模式 + 带不带人格。开局定死,见 contract 的 AiChatMode。 */
-type ChatFace = { mode: AiChatMode; persona: boolean };
+/**
+ * 一场对话的面孔:模式 + 带不带人格 + 工坊做哪种皮肤。开局定死,见 contract 的
+ * AiChatMode / AiSkinTarget。
+ */
+type ChatFace = { mode: AiChatMode; persona: boolean; skinTarget: AiSkinTarget };
 
-const DEFAULT_FACE: ChatFace = { mode: "chat", persona: true };
+const DEFAULT_FACE: ChatFace = { mode: "chat", persona: true, skinTarget: "dashboard" };
 /** 工坊那副面孔。**不带人格** —— 那条路整段顶掉 system,人格本来就不在场。 */
-const SKIN_FACE: ChatFace = { mode: "skin", persona: false };
+const SKIN_FACE: ChatFace = { mode: "skin", persona: false, skinTarget: "dashboard" };
+
+/**
+ * 工坊做哪种皮肤那一档(ADR-0015 决策 11)—— 与人格那一档同一个形态:**只在工坊的空态
+ * 摆一次**,开口即锁。按下「新建皮肤工坊」的时候主人未必想好了做哪种,在这儿选比让他先
+ * 认两颗入口省事。
+ */
+const WORKSHOP_TABS = [
+	{ id: "dashboard" as const, label: "界面皮肤", icon: <Icon.palette size={14} /> },
+	{ id: "card" as const, label: "推送卡片", icon: <Icon.image size={14} /> },
+];
+
+/** 卡片工坊里会改动皮肤库的那几把 —— 做成了就让皮肤库的缓存过期。 */
+const CARD_WRITE_TOOLS: ReadonlySet<string> = new Set([
+	AI_CARD_WORKSHOP_TOOLS.writeCard,
+	AI_CARD_WORKSHOP_TOOLS.setBlock,
+	AI_CARD_WORKSHOP_TOOLS.removeBlock,
+	AI_CARD_WORKSHOP_TOOLS.setSkinMeta,
+]);
 
 /**
  * 人格那一档的两段 —— **只在空态摆一次**。
@@ -226,6 +256,19 @@ export function ChatPage() {
 	const [error, setError] = useState<string | null>(null);
 	const qc = useQueryClient();
 	const scrollRef = useRef<HTMLDivElement>(null);
+	/**
+	 * 主人是不是停在消息流底部。只有停在底部时,新长出来的内容才把视图往下带。
+	 *
+	 * 从前每来一片就无条件贴底:思考很长时,主人往上翻着读,下一片一到就被拽回底部,
+	 * 「内容一直在向下扯」(2026-09-17 真机反馈)。判据在**滚动的那一刻**记下,不在
+	 * 内容长高之后现算 —— 长高本身就会拉开与底部的距离,那时再算,永远算成「翻上去了」。
+	 */
+	const stickRef = useRef(true);
+	const onScroll = () => {
+		const el = scrollRef.current;
+		if (!el) return;
+		stickRef.current = el.scrollHeight - el.scrollTop - el.clientHeight <= STICK_SLACK_PX;
+	};
 
 	const globalsQuery = useQuery({
 		queryKey: ["globals"],
@@ -350,9 +393,12 @@ export function ChatPage() {
 		? {
 				mode: activeQuery.data?.mode ?? activeMeta?.mode ?? DEFAULT_FACE.mode,
 				persona: activeQuery.data?.persona ?? activeMeta?.persona ?? DEFAULT_FACE.persona,
+				skinTarget:
+					activeQuery.data?.skinTarget ?? activeMeta?.skinTarget ?? DEFAULT_FACE.skinTarget,
 			}
 		: pendingFace;
 	const skinMode = activeFace.mode === "skin";
+	const cardWorkshop = skinMode && activeFace.skinTarget === "card";
 	// 空态与会话态两个 Composer 用同一份 —— 各写一遍的话,加第三颗胶囊只改到
 	// 一处,问候屏和聊天里的工具栏就长得不一样了(正是本文件头警告过的分裂态)。
 	//
@@ -422,6 +468,14 @@ export function ChatPage() {
 								// 拉失败就维持现状:皮肤已经在库里了,主人去皮肤页照样看得到。
 							});
 							void qc.invalidateQueries({ queryKey: ["skins"] });
+						}
+						// 卡片工坊动了皮肤库:皮肤页与回复下面的预览读的都是那份缓存。
+						else if (
+							ev.phase === "end" &&
+							ev.ok &&
+							CARD_WRITE_TOOLS.has(toolNames.get(ev.id) ?? "")
+						) {
+							void qc.invalidateQueries({ queryKey: CARD_SKINS_KEY });
 						}
 						setPending((p) => {
 							if (!p) return p; // 已经切走 / 撤掉了,这一拍没人要
@@ -550,30 +604,45 @@ export function ChatPage() {
 	const empty = messages.length === 0 && pending === null;
 
 	/**
-	 * 人格那一档 —— **只在空态摆**,而且只给日常聊天。
+	 * 空态那一档 —— **只在空态摆**,会话一旦开口就撤掉:面孔锁定,留着一个点不动的
+	 * 切换器更让人困惑。
 	 *
-	 * 皮肤工坊那条路整段顶掉 system,人格本来就不在场;在那儿摆个开关是承诺一件
-	 * 做不到的事。会话一旦开口就撤掉:面孔锁定,留着一个点不动的切换器更让人困惑。
+	 * 日常聊天选人格;皮肤工坊选做哪种皮肤。工坊那条路整段顶掉 system,人格本来就不在场,
+	 * 在那儿摆人格开关是承诺一件做不到的事。
 	 */
-	const personaPicker =
-		empty && !skinMode ? (
-			<div className="mx-auto mb-2.5 w-fit">
-				<TabBar
-					items={PERSONA_TABS}
-					value={pendingFace.persona ? "on" : "off"}
-					onChange={(v) => setPendingFace((f) => ({ ...f, persona: v === "on" }))}
-				/>
-			</div>
-		) : null;
+	const facePicker = !empty ? null : skinMode ? (
+		<div className="mx-auto mb-2.5 w-fit">
+			<TabBar
+				items={WORKSHOP_TABS}
+				value={pendingFace.skinTarget}
+				onChange={(v) => setPendingFace((f) => ({ ...f, skinTarget: v }))}
+			/>
+		</div>
+	) : (
+		<div className="mx-auto mb-2.5 w-fit">
+			<TabBar
+				items={PERSONA_TABS}
+				value={pendingFace.persona ? "on" : "off"}
+				onChange={(v) => setPendingFace((f) => ({ ...f, persona: v === "on" }))}
+			/>
+		</div>
+	);
 
-	// 内容一长就贴底。依赖里带上 `pending.draft.length` 是要紧的:流式回复是逐字
-	// 长出来的,只盯消息数的话,整段生成过程中视图纹丝不动,新字全长在视野之外。
-	// 思考流同理 —— 它先于正文长出来,不跟着它滚,思考阶段就全长在视野之外。
+	// 换了一场对话 → 从底部看起。**要写在贴底那条 effect 前面**:同一次提交里 effect
+	// 按声明顺序跑,这一格得先归位,那条才会把新会话带到底。
+	// biome-ignore lint/correctness/useExhaustiveDependencies: activeId 只作触发条件
+	useEffect(() => {
+		stickRef.current = true;
+	}, [activeId]);
+
+	// 内容一长就贴底 —— **只在主人本来就停在底部时**(见 stickRef)。依赖里带上
+	// `pending.draft.length` 是要紧的:流式回复是逐字长出来的,只盯消息数的话,整段
+	// 生成过程中视图纹丝不动,新字全长在视野之外。思考流同理 —— 它先于正文长出来。
 	// biome-ignore lint/correctness/useExhaustiveDependencies: 这几个值只作触发条件,不在函数体内读
 	useEffect(() => {
 		const el = scrollRef.current;
-		if (el) el.scrollTop = el.scrollHeight;
-	}, [busy, messages.length, pending?.draft.length, pending?.think.length]);
+		if (el && stickRef.current) el.scrollTop = el.scrollHeight;
+	}, [activeId, busy, messages.length, pending?.draft.length, pending?.think.length]);
 
 	const submit = (text?: string) => {
 		const raw = text ?? input;
@@ -582,11 +651,15 @@ export function ChatPage() {
 		const outgoing = resolveOutgoing(raw, skills);
 		// 只有图、一个字没打也算数 —— 图本身就是问题。
 		if ((!outgoing.text && attachments.length === 0) || busy) return;
+		// 刚发出的这句和它的回复,主人一定要看 —— 翻到哪儿都先回到底部。
+		stickRef.current = true;
 		// 技能不再点名面孔(它声明不了模式,见 ADR-0001 决策 11),所以这一问永远
 		// 发去当下这场;进皮肤工坊的唯一入口是侧栏那颗「新建皮肤工坊」。
 		const reuse = activeId !== null;
 		const outgoingFace: ChatFace =
-			activeFace.mode === "skin" ? SKIN_FACE : { ...pendingFace, mode: "chat" };
+			activeFace.mode === "skin"
+				? { ...SKIN_FACE, skinTarget: activeFace.skinTarget }
+				: { ...pendingFace, mode: "chat", skinTarget: "dashboard" };
 		// 附件快照必须在**这里**取。`mutationFn` 是在 `onMutate` 之后才跑的
 		// (onMutate 的返回值被 await,那一让步足够 React 把重渲染 flush 掉),
 		// 那时 `setAttachments([])` 已经生效 —— 从 mutationFn 的闭包里读
@@ -688,12 +761,14 @@ export function ChatPage() {
 									</span>
 								</h1>
 								<div className="text-bn-md text-bn-text-secondary">
-									{skinMode
-										? "说说想要什么样的界面皮肤吧 —— 氛围、主色、深浅都可以聊;想要壁纸就把图发过来,她自己找不了图"
-										: `今天想让${persona.self}帮${persona.user}做点什么呢?`}
+									{cardWorkshop
+										? "说说推送卡片想换成什么样吧 —— 氛围、主色、先改哪几种卡都可以聊;她会一张一张写好,回复下面就能看到样子"
+										: skinMode
+											? "说说想要什么样的界面皮肤吧 —— 氛围、主色、深浅都可以聊;想要壁纸就把图发过来,她自己找不了图"
+											: `今天想让${persona.self}帮${persona.user}做点什么呢?`}
 								</div>
 							</div>
-							{personaPicker}
+							{facePicker}
 							<Composer
 								value={input}
 								onChange={setInput}
@@ -728,7 +803,11 @@ export function ChatPage() {
 					</div>
 				) : (
 					<>
-						<div ref={scrollRef} className="flex-1 overflow-y-auto px-6 pb-2 pt-15.5">
+						<div
+							ref={scrollRef}
+							onScroll={onScroll}
+							className="flex-1 overflow-y-auto px-6 pb-2 pt-15.5"
+						>
 							<MessageList
 								messages={messages}
 								pending={pending}

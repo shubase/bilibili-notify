@@ -49,6 +49,7 @@ const GROUPS: ReadonlyArray<{ id: DevScenarioGroup; label: string; icon: ReactNo
 	{ id: "timer", label: "定时", icon: <Icon.refresh size={15} /> },
 	{ id: "capture", label: "截流", icon: <Icon.filter size={15} /> },
 	{ id: "web", label: "前端", icon: <Icon.eye size={15} /> },
+	{ id: "ext", label: "拓展", icon: <Icon.extension size={15} /> },
 ];
 
 /** 场景自带的图标名优先(同组两个快捷位得分得开),没给就按分组取。 */
@@ -328,7 +329,7 @@ function stripBlank(fields: DevParamField[], values: DevParamValues): DevParamVa
 	for (const f of fields) {
 		const v = values[f.key];
 		if (v === undefined) continue;
-		if ((f.kind === "sub" || f.kind === "target" || f.kind === "adapter") && v === "") continue;
+		if ((f.kind === "sub" || f.kind === "target" || f.kind === "connection") && v === "") continue;
 		out[f.key] = v;
 	}
 	return out;
@@ -455,7 +456,7 @@ function ParamControl({
 			break;
 		case "sub":
 		case "target":
-		case "adapter":
+		case "connection":
 			control = (
 				<PickSelect
 					kind={field.kind}

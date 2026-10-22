@@ -14,19 +14,19 @@
 /**
  * 面板左栏的五组。`web` 是浏览器里跑的那半,其余四组都在服务端。
  */
-export type DevScenarioGroup = "event" | "state" | "timer" | "capture" | "web";
+export type DevScenarioGroup = "event" | "state" | "timer" | "capture" | "web" | "ext";
 
 /**
  * 一个参数字段。六种,面板照 `kind` 画控件:
  *
- * - `sub` / `target` / `adapter` —— 从站内既有列表里挑一个(订阅 / 推送目标 / 适配器),
+ * - `sub` / `target` / `connection` —— 从站内既有列表里挑一个(订阅 / 推送目标 / 连接),
  *   值是它们的 id。**省略时的默认值住服务端**(`sub` = 第一个启用的订阅),面板不猜。
  * - `number` / `enum` / `text` —— 自带默认值。
  */
 export type DevParamField =
 	| { key: string; label: string; kind: "sub" }
 	| { key: string; label: string; kind: "target" }
-	| { key: string; label: string; kind: "adapter" }
+	| { key: string; label: string; kind: "connection" }
 	| { key: string; label: string; kind: "number"; default: number; min?: number; max?: number }
 	| {
 			key: string;
@@ -107,8 +107,8 @@ export interface DevCapturedDelivery {
 	id: string;
 	/** 拦下的时刻(ms)。 */
 	at: number;
-	adapterId: string;
-	adapterName: string;
+	connectionId: string;
+	connectionName: string;
 	platform: string;
 	targetId: string;
 	targetName: string;

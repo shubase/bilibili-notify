@@ -15,12 +15,12 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { TInput } from "../../components/forms";
 import {
 	DEFAULT_FEATURE_FLAGS,
+	EXTRA_KEYS,
+	type ExtraKey,
 	FEATURE_KEYS,
 	FEATURE_LABELS,
 	type FeatureKey,
-	LIVE_END_EXTRA_KEYS,
-	LIVE_END_EXTRA_LABELS,
-	type LiveEndExtraKey,
+	PUSH_EXTRAS,
 	type PushTarget,
 	type Subscription,
 } from "../../types/domain";
@@ -59,16 +59,38 @@ const FEATURE_GROUPS: ReadonlyArray<{
 ];
 
 /**
- * 哪些 feature 支持 @全体 修饰符。dynamic → atAll.dynamic;live → atAll.live(仅开播,
- * 不冲 liveEnd/SC/上舰/词云/总结)。两层:订阅级默认 `atAllDefaults.X` + per-target Map
- * 显式覆写 `atAll.X[targetId]`。`refine(keys(atAll.X) ⊆ routing.X)` 由后端强制。
+ * 挂在某把主特性那一行下面的附加项(ADR-0016:四把键一视同仁)。@全体 与下播的词云 /
+ * 总结从这里起走同一段代码 —— 表由注册表自己说了算,加一把键不用回这个文件补分支。
+ *
+ * 三层:全局默认 + per-UP 覆盖 `overrides.features.extras.X`(两层合起来就是
+ * {@link effExtra})+ per-target 三态表 `extras.X[targetId]`。「key ⊆ 主特性目标」由后端
+ * schema 强制,所以主特性没给这个目标时这儿的开关一律禁用。
+ *
+ * 这个函数也是「关掉某把主特性的路由时,跟着作废哪几把覆写」的依据。
  */
-const AT_ALL_FEATURES: ReadonlyArray<{ feature: FeatureKey; scope: "dynamic" | "live" }> = [
-	{ feature: "dynamic", scope: "dynamic" },
-	{ feature: "live", scope: "live" },
-];
+function extrasUnder(feature: FeatureKey): ExtraKey[] {
+	return EXTRA_KEYS.filter((k) => PUSH_EXTRAS[k].feature === feature);
+}
 
-type AtAllScope = "dynamic" | "live";
+/**
+ * 每把附加项在面板上的一句说明。注册表里只放领域事实(挂哪、叫什么、默认值),界面措辞
+ * 留在界面这一层;缺了也不炸 —— 新加的键先走兜底那句,补文案是另一回事。
+ */
+const EXTRA_HINTS: Partial<Record<ExtraKey, string>> = {
+	atAllDynamic: "动态推送时附加 @全体",
+	atAllLive: "开播推送时附加 @全体(SC / 上舰 / 词云 / 总结 不 @)",
+	wordcloud: "下播时作为附加消息一起推",
+	liveSummary: "下播时作为附加消息一起推",
+};
+
+function extraHint(k: ExtraKey): string {
+	return EXTRA_HINTS[k] ?? `推送「${FEATURE_LABELS[PUSH_EXTRAS[k].feature]}」时附加一条`;
+}
+
+/** 主特性关着时的 tooltip —— 说清楚「先开哪个」,而不是干巴巴一句「不可用」。 */
+function extraOffHint(k: ExtraKey): string {
+	return `需先开启「${FEATURE_LABELS[PUSH_EXTRAS[k].feature]}」才能推这个附加项`;
+}
 
 export interface UpDialogProps {
 	sub: Subscription | null;
@@ -113,9 +135,9 @@ function effFeature(sub: Subscription, k: FeatureKey): boolean {
 	return sub.overrides.features?.[k] ?? DEFAULT_FEATURE_FLAGS[k];
 }
 
-/** 下播附加项的生效值:per-UP 覆盖 ?? 全局默认。 */
-function effExtra(sub: Subscription, k: LiveEndExtraKey): boolean {
-	return sub.overrides.features?.liveEndExtras?.[k] ?? DEFAULT_FEATURE_FLAGS.liveEndExtras[k];
+/** 附加项的生效值:per-UP 覆盖 ?? 全局默认。 */
+function effExtra(sub: Subscription, k: ExtraKey): boolean {
+	return sub.overrides.features?.extras?.[k] ?? DEFAULT_FEATURE_FLAGS.extras[k];
 }
 
 type FeaturesOverride = NonNullable<Subscription["overrides"]["features"]>;
@@ -125,9 +147,9 @@ type FeaturesOverride = NonNullable<Subscription["overrides"]["features"]>;
  * 与默认值相同的开关不落 override,schema 里不留壳。
  */
 function compactFeatures(f: FeaturesOverride): FeaturesOverride | undefined {
-	const { liveEndExtras, ...flags } = f;
-	const extras = liveEndExtras && Object.keys(liveEndExtras).length > 0 ? liveEndExtras : undefined;
-	const out: FeaturesOverride = extras ? { ...flags, liveEndExtras: extras } : flags;
+	const { extras, ...flags } = f;
+	const kept = extras && Object.keys(extras).length > 0 ? extras : undefined;
+	const out: FeaturesOverride = kept ? { ...flags, extras: kept } : flags;
 	return Object.keys(out).length > 0 ? out : undefined;
 }
 
@@ -158,14 +180,14 @@ export function detachTargetFromDraft(d: Subscription, targetId: string): Subscr
 	for (const k of FEATURE_KEYS) {
 		routing[k] = routing[k].filter((id) => id !== targetId);
 	}
-	let atAll = d.atAll;
-	for (const scope of ["dynamic", "live"] as const) {
-		if (targetId in atAll[scope]) {
-			const { [targetId]: _gone, ...rest } = atAll[scope];
-			atAll = { ...atAll, [scope]: rest };
+	let extras = d.extras;
+	for (const k of EXTRA_KEYS) {
+		if (targetId in extras[k]) {
+			const { [targetId]: _gone, ...rest } = extras[k];
+			extras = { ...extras, [k]: rest };
 		}
 	}
-	return { ...d, routing, atAll };
+	return { ...d, routing, extras };
 }
 
 export function UpDialog({
@@ -275,21 +297,20 @@ export function UpDialog({
 	}
 
 	/**
-	 * 下播的附加项(词云 / AI 总结):只写 `overrides.features.liveEndExtras.<k>` 那一个键,
-	 * 与全局默认相同就不落。它们没有自己的路由,跟着下播的开关与目标走。
+	 * 附加项的 per-UP 值(@全体 / 词云 / AI 总结):只写 `overrides.features.extras.<k>`
+	 * 那一个键,与全局默认相同就不落。它们没有自己的路由,跟着各自的主特性走。
 	 */
-	function setExtraEnabled(k: LiveEndExtraKey, on: boolean): void {
+	function setExtraEnabled(k: ExtraKey, on: boolean): void {
 		setDraft((d) => {
 			if (!d) return d;
 			const cur = d.overrides.features ?? {};
-			const { [k]: _drop, ...extras } = cur.liveEndExtras ?? {};
-			const nextExtras =
-				on === DEFAULT_FEATURE_FLAGS.liveEndExtras[k] ? extras : { ...extras, [k]: on };
+			const { [k]: _drop, ...extras } = cur.extras ?? {};
+			const nextExtras = on === DEFAULT_FEATURE_FLAGS.extras[k] ? extras : { ...extras, [k]: on };
 			return {
 				...d,
 				overrides: {
 					...d.overrides,
-					features: compactFeatures({ ...cur, liveEndExtras: nextExtras }),
+					features: compactFeatures({ ...cur, extras: nextExtras }),
 				},
 			};
 		});
@@ -349,8 +370,8 @@ export function UpDialog({
 	 * Toggle one feature on a single target. Only ever invoked in custom mode
 	 * (the UI does not show the per-feature toggles in follow mode).
 	 *
-	 * Side effect:关掉 dynamic / live 时,同步把该 target 从对应 atAll.X Map 里删掉
-	 * ——schema refine 强制 `keys(atAll.X) ⊆ routing.X`,留着会 parse 失败。
+	 * Side effect:关掉某把主特性时,同步把该 target 从它名下附加项的三态表里删掉
+	 * ——schema 强制「附加项的 key ⊆ 主特性目标」,留着会 parse 失败。
 	 */
 	function toggleRouteForTarget(targetId: string, k: FeatureKey, on: boolean): void {
 		setDraft((d) => {
@@ -360,44 +381,41 @@ export function UpDialog({
 			const next =
 				on && !has ? [...list, targetId] : !on && has ? list.filter((id) => id !== targetId) : list;
 			const routing = { ...d.routing, [k]: next };
-			let atAll = d.atAll;
-			if (!on && (k === "dynamic" || k === "live")) {
-				const scope = k;
-				if (targetId in atAll[scope]) {
-					const { [targetId]: _gone, ...rest } = atAll[scope];
-					atAll = { ...atAll, [scope]: rest };
+			let extras = d.extras;
+			if (!on) {
+				for (const ek of extrasUnder(k)) {
+					if (!(targetId in extras[ek])) continue;
+					const { [targetId]: _gone, ...rest } = extras[ek];
+					extras = { ...extras, [ek]: rest };
 				}
 			}
-			return { ...d, routing, atAll };
+			return { ...d, routing, extras };
 		});
 	}
 
-	/** 订阅级默认 atAll 切换(在 "订阅项 · 默认推送内容" section 里使用)。 */
-	function setAtAllDefault(scope: AtAllScope, on: boolean): void {
-		setDraft((d) => (d ? { ...d, atAllDefaults: { ...d.atAllDefaults, [scope]: on } } : d));
-	}
-
 	/**
-	 * Per-target @全体 显式覆写(写 atAll.X Map)。父 feature 关闭时也不允许写。
-	 * `explicit === undefined` 表示重置回 inherit(删 Map key)。
+	 * 某个目标上某把附加项的显式覆写(写 extras.X Map)。主特性没给这个目标时不允许写 ——
+	 * 后端 schema 那条「key ⊆ routing[主特性]」本来就不收。
+	 * `explicit === undefined` 表示重置回跟随(删 Map key)。
 	 */
-	function setAtAllExplicit(
+	function setExtraExplicit(
 		targetId: string,
-		scope: AtAllScope,
+		extraKey: ExtraKey,
 		explicit: boolean | undefined,
 	): void {
 		setDraft((d) => {
 			if (!d) return d;
-			if (explicit !== undefined && !d.routing[scope].includes(targetId)) return d;
-			const map = d.atAll[scope];
+			const feature = PUSH_EXTRAS[extraKey].feature;
+			if (explicit !== undefined && !d.routing[feature].includes(targetId)) return d;
+			const map = d.extras[extraKey];
 			if (explicit === undefined) {
 				if (!(targetId in map)) return d;
 				const { [targetId]: _gone, ...rest } = map;
-				return { ...d, atAll: { ...d.atAll, [scope]: rest } };
+				return { ...d, extras: { ...d.extras, [extraKey]: rest } };
 			}
 			return {
 				...d,
-				atAll: { ...d.atAll, [scope]: { ...map, [targetId]: explicit } },
+				extras: { ...d.extras, [extraKey]: { ...map, [targetId]: explicit } },
 			};
 		});
 	}
@@ -407,7 +425,7 @@ export function UpDialog({
 	 * - To custom: routing 对齐订阅项生效特性(routingAlignedToFeatures)——「从跟随
 	 *   订阅项现状起步」再由用户在矩阵里微调,而非默认全 9 项全开。
 	 * - To follow: 把 target 加回所有 9 个 features 的 routing(完整 = follow 的标志);
-	 *   per-target atAll 显式覆写一并清掉,回归「跟订阅默认走」。
+	 *   per-target 的附加项显式覆写一并清掉,回归「跟订阅默认走」。
 	 */
 	function switchTargetMode(targetId: string, toCustom: boolean): void {
 		setCustomSet((prev) => {
@@ -418,19 +436,21 @@ export function UpDialog({
 		});
 		setDraft((d) => {
 			if (!d) return d;
-			let atAll = d.atAll;
-			const clearAtAll = (scope: "dynamic" | "live"): void => {
-				if (targetId in atAll[scope]) {
-					const { [targetId]: _gone, ...rest } = atAll[scope];
-					atAll = { ...atAll, [scope]: rest };
+			let extras = d.extras;
+			const clearExtras = (feature: FeatureKey): void => {
+				for (const ek of extrasUnder(feature)) {
+					if (!(targetId in extras[ek])) continue;
+					const { [targetId]: _gone, ...rest } = extras[ek];
+					extras = { ...extras, [ek]: rest };
 				}
 			};
 			if (toCustom) {
 				const routing = routingAlignedToFeatures(d, targetId);
-				// 对齐时若把 target 移出 dynamic / live,其 atAll 显式覆写一并作废。
-				if (!routing.dynamic.includes(targetId)) clearAtAll("dynamic");
-				if (!routing.live.includes(targetId)) clearAtAll("live");
-				return { ...d, routing, atAll };
+				// 对齐时若把 target 移出某把主特性,它名下附加项的显式覆写一并作废。
+				for (const k of FEATURE_KEYS) {
+					if (!routing[k].includes(targetId)) clearExtras(k);
+				}
+				return { ...d, routing, extras };
 			}
 			let routing = d.routing;
 			for (const k of FEATURE_KEYS) {
@@ -438,10 +458,9 @@ export function UpDialog({
 					routing = { ...routing, [k]: [...routing[k], targetId] };
 				}
 			}
-			// 切回 follow:per-target atAll 显式覆写清掉,回归「跟订阅默认走」。
-			clearAtAll("dynamic");
-			clearAtAll("live");
-			return { ...d, routing, atAll };
+			// 切回 follow:per-target 的附加项显式覆写清掉,回归「跟订阅默认走」。
+			for (const k of FEATURE_KEYS) clearExtras(k);
+			return { ...d, routing, extras };
 		});
 	}
 
@@ -555,7 +574,6 @@ export function UpDialog({
 								</div>
 								<div className="grid grid-cols-2 gap-x-4 gap-y-2 px-3 py-2">
 									{g.keys.map(({ key, sub: featSub }) => {
-										const atAllScope = AT_ALL_FEATURES.find((a) => a.feature === key)?.scope;
 										const parentOn = effFeature(draft, key);
 										return (
 											<div key={key}>
@@ -565,21 +583,12 @@ export function UpDialog({
 													value={parentOn}
 													onChange={(on) => setFeatureEnabled(key, on)}
 												/>
-												{atAllScope ? (
-													<AtAllInlineToggle
-														value={draft.atAllDefaults[atAllScope]}
-														parentOn={parentOn}
-														scope={atAllScope}
-														onChange={(on) => setAtAllDefault(atAllScope, on)}
-													/>
-												) : null}
-												{key === "liveEnd" ? (
-													<LiveEndExtrasToggles
-														parentOn={parentOn}
-														value={(k) => effExtra(draft, k)}
-														onChange={setExtraEnabled}
-													/>
-												) : null}
+												<ExtraInlineToggles
+													feature={key}
+													parentOn={parentOn}
+													value={(k) => effExtra(draft, k)}
+													onChange={setExtraEnabled}
+												/>
 											</div>
 										);
 									})}
@@ -609,7 +618,7 @@ export function UpDialog({
 										sub={draft}
 										onToggleMode={(toCustom) => switchTargetMode(t.id, toCustom)}
 										onToggleRoute={(k, on) => toggleRouteForTarget(t.id, k, on)}
-										onSetAtAll={(scope, explicit) => setAtAllExplicit(t.id, scope, explicit)}
+										onSetExtra={(extraKey, explicit) => setExtraExplicit(t.id, extraKey, explicit)}
 										onDetach={() => detachTarget(t.id)}
 									/>
 								))
@@ -851,104 +860,88 @@ function SubToggleRow({
 	);
 }
 
-function LiveEndExtrasToggles({
+/**
+ * per-UP 默认那一层的附加项开关(默认 panel 用):挂在该主特性那一行下面,一把键一行,
+ * 一把都没有就整块不渲染。写 `overrides.features.extras.X`,作用于所有跟随态的目标。
+ */
+function ExtraInlineToggles({
+	feature,
 	parentOn,
 	value,
 	onChange,
 }: {
+	feature: FeatureKey;
 	parentOn: boolean;
-	value: (k: LiveEndExtraKey) => boolean;
-	onChange: (k: LiveEndExtraKey, on: boolean) => void;
+	value: (k: ExtraKey) => boolean;
+	onChange: (k: ExtraKey, on: boolean) => void;
 }) {
+	const keys = extrasUnder(feature);
+	if (keys.length === 0) return null;
 	return (
 		<div className="mt-0.5 ml-9 flex flex-col gap-1 text-bn-xs">
-			{LIVE_END_EXTRA_KEYS.map((k) => (
+			{keys.map((k) => (
 				<SubToggleRow
 					key={k}
 					parentOn={parentOn}
 					value={value(k)}
 					onChange={(on) => onChange(k, on)}
-					label={LIVE_END_EXTRA_LABELS[k]}
-					ariaLabel={LIVE_END_EXTRA_LABELS[k]}
-					hint="下播时作为附加消息一起推"
-					offHint="需先开启下播才能推附加项"
+					label={PUSH_EXTRAS[k].label}
+					// 带上所属主特性:@全体 在动态与开播下各有一枚,光一句「@全体」读屏分不清
+					// 是哪一枚 —— 同一屏里两个同名控件,按名字找必然找错一个。
+					ariaLabel={`${PUSH_EXTRAS[k].label} · ${FEATURE_LABELS[feature]}`}
+					hint={extraHint(k)}
+					offHint={extraOffHint(k)}
 				/>
 			))}
 		</div>
 	);
 }
 
-// ── @全体 sub-toggles ────────────────────────────────────────────────────────
+// ── per-target 三态 ──────────────────────────────────────────────────────────
 
 /**
- * 订阅级默认 atAll toggle(默认 panel 用)。父 feature 关闭时 disabled。
- * 写 `Subscription.atAllDefaults.X`,作用于所有 inherit-state 的 target。
- */
-function AtAllInlineToggle({
-	value,
-	parentOn,
-	scope,
-	onChange,
-}: {
-	value: boolean;
-	parentOn: boolean;
-	scope: AtAllScope;
-	onChange: (on: boolean) => void;
-}) {
-	const hint =
-		scope === "live"
-			? "开播推送时附加 @全体(SC / 上舰 / 词云 / 总结 不 @)"
-			: "动态推送时附加 @全体";
-	return (
-		<div className="mt-0.5 ml-9 text-bn-xs">
-			<SubToggleRow
-				parentOn={parentOn}
-				value={value}
-				onChange={onChange}
-				label="@全体"
-				hint={hint}
-				offHint="需先开启父订阅项才能 @全体"
-			/>
-		</div>
-	);
-}
-
-/**
- * Per-target tristate @全体 toggle(自定义 panel 矩阵用)。
+ * 某个推送目标自己的附加项开关(自定义 panel 矩阵用),三态:
  * - 显示值 = `explicit ?? inheritedValue`
- * - 点 Toggle = 切到 explicit 反向值(写 atAll Map)
- * - explicit !== undefined 时旁边出 reset 图标(⟲),点击清掉 Map key = 重置为 inherit
- * - parentOn=false 时整行 disabled
- * - unsupported(QQ 官方,平台不支持 @全体)时强制禁用、显示为关、不出 reset,并在父项
- *   已开时补一行说明。数据(atAll Map)不动 —— 仅 UI 拦截,后端本就 best-effort 跳过。
+ * - 点 Toggle = 切到 explicit 反向值(写 extras.X Map)
+ * - explicit !== undefined 时旁边出 reset 图标(⟲),点击清掉 Map key = 重置为跟随
+ * - parentOn=false(主特性没给这个目标)时整行 disabled —— 后端 schema 那条子集约束
+ *   本来就不收,能点才是骗人
+ * - unsupported 时强制禁用、显示为关、不出 reset,并在主特性已开时补一行说明。数据
+ *   (extras.X Map)不动 —— 仅 UI 拦截,后端本就 best-effort 跳过。这一档只可能来自
+ *   **平台能力**(今天只有 QQ 官机不支持 @全体),与配置面的三态是两回事。
+ *
+ * aria-label 带上目标名:一次能展开好几个目标,光一句「弹幕词云」读屏和测试都分不清
+ * 是哪个群的。
  */
-function AtAllPerTargetToggle({
-	scope,
+function ExtraPerTargetToggle({
+	extraKey,
+	targetName,
 	parentOn,
 	explicit,
 	inheritedValue,
 	unsupported,
 	onSet,
 }: {
-	scope: AtAllScope;
+	extraKey: ExtraKey;
+	targetName: string;
 	parentOn: boolean;
 	explicit: boolean | undefined;
 	inheritedValue: boolean;
 	unsupported: boolean;
 	onSet: (explicit: boolean | undefined) => void;
 }) {
+	const label = PUSH_EXTRAS[extraKey].label;
 	const isExplicit = explicit !== undefined;
 	const blocked = unsupported || !parentOn;
 	const display = !unsupported && parentOn && (explicit ?? inheritedValue);
+	const follow = `跟随订阅默认 · 当前 ${inheritedValue ? "ON" : "OFF"}`;
 	const hint = unsupported
-		? "QQ 官方机器人不支持 @全体,发送时会自动跳过"
+		? UNSUPPORTED_AT_ALL_NOTE
 		: !parentOn
-			? "需先开启父订阅项才能 @全体"
+			? extraOffHint(extraKey)
 			: isExplicit
 				? `已显式设置为 ${explicit ? "ON" : "OFF"}(订阅默认为 ${inheritedValue ? "ON" : "OFF"})`
-				: scope === "live"
-					? `跟随订阅默认 · 当前 ${inheritedValue ? "ON" : "OFF"} · 仅开播 @,SC / 上舰 / 词云 / 总结 不 @`
-					: `跟随订阅默认 · 当前 ${inheritedValue ? "ON" : "OFF"}`;
+				: `${follow} · ${extraHint(extraKey)}`;
 	return (
 		<div className="mt-0.5 ml-9">
 			<div
@@ -960,27 +953,29 @@ function AtAllPerTargetToggle({
 					onChange={(on) => !blocked && onSet(on)}
 					size="sm"
 					disabled={blocked}
+					ariaLabel={`${label} · ${targetName}`}
 				/>
 				<span className={isExplicit && !unsupported ? "font-semibold text-bn-text-primary" : ""}>
-					+ @全体
+					+ {label}
 				</span>
 				{isExplicit && parentOn && !unsupported ? (
 					<IconButton
 						icon={<Icon.refresh size={10} />}
-						label="重置为跟随订阅默认"
+						label={`重置 ${label} 为跟随订阅默认`}
 						size="xs"
 						onClick={() => onSet(undefined)}
 					/>
 				) : null}
 			</div>
 			{unsupported && parentOn ? (
-				<div className="mt-0.5 text-bn-2xs text-bn-text-tertiary">
-					QQ 官方机器人不支持 @全体,发送时会自动跳过
-				</div>
+				<div className="mt-0.5 text-bn-2xs text-bn-text-tertiary">{UNSUPPORTED_AT_ALL_NOTE}</div>
 			) : null}
 		</div>
 	);
 }
+
+/** 平台不支持 @全体 时那一句 —— tooltip 与行下说明共用,别各写一份。 */
+const UNSUPPORTED_AT_ALL_NOTE = "QQ 官方机器人不支持 @全体,发送时会自动跳过";
 
 // ── Target routing card (master switch + collapsed details) ──────────────────
 
@@ -990,7 +985,7 @@ function TargetRoutingCard({
 	sub,
 	onToggleMode,
 	onToggleRoute,
-	onSetAtAll,
+	onSetExtra,
 	onDetach,
 }: {
 	target: PushTarget;
@@ -998,7 +993,7 @@ function TargetRoutingCard({
 	sub: Subscription;
 	onToggleMode: (toCustom: boolean) => void;
 	onToggleRoute: (k: FeatureKey, on: boolean) => void;
-	onSetAtAll: (scope: AtAllScope, explicit: boolean | undefined) => void;
+	onSetExtra: (extraKey: ExtraKey, explicit: boolean | undefined) => void;
 	onDetach: () => void;
 }) {
 	const enabledCount = isCustom
@@ -1045,15 +1040,8 @@ function TargetRoutingCard({
 							<SectionHeader label={g.label} />
 							<div className="grid grid-cols-2 gap-x-4 gap-y-1.5">
 								{g.keys.map(({ key, sub: featSub }) => {
-									// 仅 dynamic / live 行下方挂 "+ @全体" 子开关(tristate:explicit / inherit)。
-									const atAllScope = AT_ALL_FEATURES.find((a) => a.feature === key)?.scope;
+									// 这一行下面挂的附加项由注册表说了算:动态 / 开播是 @全体,下播是词云与 AI 总结。
 									const parentOn = sub.routing[key].includes(target.id);
-									const explicit: boolean | undefined = atAllScope
-										? Object.hasOwn(sub.atAll[atAllScope], target.id)
-											? sub.atAll[atAllScope][target.id]
-											: undefined
-										: undefined;
-									const inheritedValue = atAllScope ? sub.atAllDefaults[atAllScope] : false;
 									return (
 										<div key={key}>
 											<FeatureToggleRow
@@ -1062,16 +1050,26 @@ function TargetRoutingCard({
 												value={parentOn}
 												onChange={(on) => onToggleRoute(key, on)}
 											/>
-											{atAllScope ? (
-												<AtAllPerTargetToggle
-													scope={atAllScope}
+											{extrasUnder(key).map((ek) => (
+												<ExtraPerTargetToggle
+													key={ek}
+													extraKey={ek}
+													targetName={target.name}
 													parentOn={parentOn}
-													explicit={explicit}
-													inheritedValue={inheritedValue}
-													unsupported={!platformSupportsAtAll(target.platform)}
-													onSet={(val) => onSetAtAll(atAllScope, val)}
+													explicit={
+														Object.hasOwn(sub.extras[ek], target.id)
+															? sub.extras[ek][target.id]
+															: undefined
+													}
+													inheritedValue={effExtra(sub, ek)}
+													// 要不要看平台能力由注册表说了算(别拿 label 判,那是文案)。
+													unsupported={
+														PUSH_EXTRAS[ek].capability === "atAll" &&
+														!platformSupportsAtAll(target.platform)
+													}
+													onSet={(val) => onSetExtra(ek, val)}
 												/>
-											) : null}
+											))}
 										</div>
 									);
 								})}

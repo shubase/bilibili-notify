@@ -2,7 +2,7 @@
  * 新手导览的判据核心 —— 纯函数,不碰 react/query,测试在 __tests__/derive.test.ts。
  *
  * 2026-08-29 grilling 定案:5 步全机器判据、按**结果态**建模(不是操作流程):
- * ①B站登录 ②适配器存在且 test 通过 ③启用的推送目标存在 ④target 测试推送
+ * ①B站登录 ②连接存在且 test 通过 ③启用的推送目标存在 ④target 测试推送
  * 成功 ⑤订阅数>0。可选尾巴(图片渲染/AI)不计毕业。
  *
  * 顺序是五轮定稿(主人拍板):**先打通推送通道,订阅放最后** —— 订阅表单里
@@ -12,7 +12,7 @@
  * 它收回去 —— 但 target 步会退回未完成,active 指回它。
  */
 
-export type OnboardingStepKey = "login" | "adapter" | "target" | "test" | "subs";
+export type OnboardingStepKey = "login" | "connection" | "target" | "test" | "subs";
 export type OnboardingTailKey = "image" | "ai";
 
 interface TestStatusLike {
@@ -24,7 +24,7 @@ interface TestStatusLike {
 export interface OnboardingInputs {
 	biliLoggedIn: boolean;
 	subsCount: number;
-	adapters: readonly { enabled: boolean; testStatus?: TestStatusLike | undefined }[];
+	connections: readonly { enabled: boolean; testStatus?: TestStatusLike | undefined }[];
 	targets: readonly { enabled: boolean; testStatus?: TestStatusLike | undefined }[];
 	/** `/api/health` 的 modules 快照;还没回来时 undefined → 尾巴按未完成显示。 */
 	modules: { image: boolean; ai: boolean } | undefined;
@@ -36,11 +36,11 @@ export interface OnboardingView {
 	/** 第一个未完成步;全绿为 null。导览靠它高亮「现在该做哪步」。 */
 	activeKey: OnboardingStepKey | null;
 	/**
-	 * 建过适配器(不问测没测通)。adapter 主步的**子步**判据:保存适配器的那一刻
+	 * 建过连接(不问测没测通)。adapter 主步的**子步**判据:保存连接的那一刻
 	 * 导览要从「新建」翻到「测试连通」并把灯移到测试按钮上 —— 主步 done(测通)
 	 * 太晚,灯会在建完到测通之间断档(真机踩过)。
 	 */
-	hasAdapter: boolean;
+	hasConnection: boolean;
 	doneCount: number;
 	allDone: boolean;
 	/**
@@ -64,8 +64,8 @@ export function deriveOnboarding(inputs: OnboardingInputs): OnboardingView {
 	const steps: OnboardingView["steps"] = [
 		{ key: "login", done: inputs.biliLoggedIn },
 		{
-			key: "adapter",
-			done: inputs.adapters.some((a) => a.enabled && a.testStatus?.ok === true),
+			key: "connection",
+			done: inputs.connections.some((a) => a.enabled && a.testStatus?.ok === true),
 		},
 		{ key: "target", done: inputs.targets.some((t) => t.enabled) },
 		{
@@ -83,8 +83,8 @@ export function deriveOnboarding(inputs: OnboardingInputs): OnboardingView {
 		// 启用着的目标,被禁用目标上周留下的旧账既不是他的问题也不是他改得动的东西,
 		// 拿它当当前失败讲纯属误导(2026-08-31 审查)。
 		failNote:
-			activeKey === "adapter"
-				? failNoteFrom(inputs.adapters.filter((a) => a.enabled))
+			activeKey === "connection"
+				? failNoteFrom(inputs.connections.filter((a) => a.enabled))
 				: activeKey === "test"
 					? failNoteFrom(inputs.targets.filter((t) => t.enabled))
 					: null,
@@ -93,7 +93,7 @@ export function deriveOnboarding(inputs: OnboardingInputs): OnboardingView {
 			{ key: "ai", done: inputs.modules?.ai === true },
 		],
 		activeKey,
-		hasAdapter: inputs.adapters.length > 0,
+		hasConnection: inputs.connections.length > 0,
 		doneCount,
 		allDone: doneCount === steps.length,
 	};

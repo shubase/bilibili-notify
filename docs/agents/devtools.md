@@ -30,13 +30,13 @@
 
 左下角玻璃药丸(`DockPill`,与右下 AI 胶囊同基线)+ 底边升起的整宽面板(`DockPanel`,
 拖顶边改高、记在 localStorage、ESC 收)。两件都在 `packages/ui`,走 `z-bn-dock`(45)。
-左栏五组:事件 / 状态 / 定时 / 截流 / 前端;顶部「当前生效」条一键收摊。药丸上的快捷位只给
+左栏六组:事件 / 状态 / 定时 / 截流 / 前端 / 拓展;顶部「当前生效」条一键收摊。药丸上的快捷位只给
 最常按的五个(更新 / 截流 / 开播 / 下播 / 发动态),按默认值跑。
 
 ## 注册表:两半合一份
 
 声明类型在 `apps/contract/src/devtools.ts`(`DevScenario`:id / group / title / desc /
-params / quick / icon)。参数 **schema 驱动**,六种字段:`sub` / `target` / `adapter`(面板画
+params / quick / icon)。参数 **schema 驱动**,六种字段:`sub` / `target` / `connection`(面板画
 选择器,值是 id,留空 = 服务端默认)、`number` / `enum` / `text`(自带默认值)。
 
 - 服务端那半:`apps/server/src/devtools/scenarios/*.ts`,经 `createDevRegistry` 汇总,
@@ -47,6 +47,21 @@ params / quick / icon)。参数 **schema 驱动**,六种字段:`sub` / `target` 
 
 加一个场景 = 写一个 `DevScenarioDef` 塞进 `createDevtools` 那张表,面板一行不改。
 
+**「拓展」那一组是个例外,它做的是真事**(`scenarios/extensions.ts`):装载器只认
+`<dataDir>/extensions/` 一个根,于是「开发时怎么让仓里那份跑起来」从宿主的一条特例变成了
+这里的三个动作 —— **装**(把仓里构建好的 `dist` 软链进那个根)、**卸**(只删自己链的那条,
+真目录不碰)、**重载**(收摊 → 换个 URL 重新 import → 重新 activate,不用重启)。
+三条都**当场生效**:装 / 卸完自己叫装载器 `rescan()` 再扫一遍盘(新出现的 id 从没被 import 过,
+装它与「拨开关第一次启用」是同一档事实),换代码那条走 `reload()`。这几条**不是假状态**,
+所以不进「当前生效」条、也不参与一键收摊(同「真动作不清」那条规矩)。
+
+第四条 **「改完自动重载」**是把「重载」那一下也去掉:盯着装进来那份的 `index.mjs`,一变就自己
+`reload()`。`vp run dev:apps` 顺带给仓里每个拓展起了 `vp pack -w`(30ms 一次重建),所以拨开它
+之后就是**保存即生效** —— 我们自己这一侧的热开发。它**是状态类**(盯着是 devtools 造的状态):
+进「当前生效」条、归一键收摊,重载次数与上次失败的理由都挂在那一格上。
+⚠️ **每重载一次漏一份旧模块**(ESM 的模块注册表删不掉,ADR-0012 决策 39),所以它默认关着 ——
+挂成常开等于让它无声地漏。重载失败**不掐监听**:改一行崩一次就得重新点一遍的话,开发循环当场卡死。
+
 ## 注入高度:既有边界上套装饰器,引擎一行不动
 
 | 要造什么 | 装饰在哪 | 文件 |
@@ -56,10 +71,12 @@ params / quick / icon)。参数 **schema 驱动**,六种字段:`sub` / `target` 
 | 开播 / 下播 / 弹幕 / SC / 上舰 / 礼物 / 进场 | blive 的 `observeLiveConnections` 观察钩子拿到房间的 `emit`,与真帧同一条回调;假直播期间 `getLiveRoomInfo` 对那个房间打补丁(live_status=1、live_time=现在) | `live-rooms.ts`、`scenarios/live*.ts` |
 | 四类动态 | 传给引擎的 `api` 套 Proxy(`api-overrides.ts`,按方法名盖、`this` 绑回真对象;每个方法一份**稳定**的包装,盖没盖在调用时查 —— 引擎构造时存下的方法引用也吃得到覆盖),`getAllDynamic` 结果最前并进假动态,`DynamicEngine.detectNow()` 立刻跑一轮,跑完撤 | `scenarios/dynamic.ts` |
 | 私聊指令 / 群链接 | 直接调接线层的两个入站口(与 adapter 收到真帧后调的是同一个函数) | `scenarios/inbound.ts` |
+| 一条桥接进来 | **不装饰任何东西** —— 拿那条桥接入自己的 token 连一条**真 WS** 回 BN 身上(`ws://127.0.0.1:<自己的端口>/ext/bridge`),所以 upgrade / 鉴权 / 握手 / `publishStatus` / 推送 adapter / 回执全是真的,假的只有「后面没有 bot」。🔴 帧是照 `extensions/bridge/PROTOCOL.md` **手写的第二份**(核心 import 不到拓展,ADR-0012 决策 42),漂了没门禁会红 —— 所以 `src/__tests__/devtools-fake-bridge-e2e.test.ts` 把真桥装进装载根让两边真说一次话 | `fake-bridge.ts`、`scenarios/bridge.ts` |
 | 引擎错误 / 登录失效 / 恢复 | 直接 `bus.emit`(发射不是转发,不碰 MessageBus 铁律);auth-lost 会**真的**停引擎,看完记得 restored | `scenarios/bus-events.ts` |
 | 扫码登录六态 | 盖 `authSystem.status()` + 总线发同一份 `login-status-report`;假二维码走 `qrcode` 包(与真登录同一条渲染路),扫出来是一句「devtools 的假货」 | `scenarios/login-state.ts`、`fake-qr.ts` |
-| 适配器能力三态 | 包 `capabilities` / `probeCapabilities`(只对有能力概念的平台)。两个 adapter 包装器都是 `{ ...inner, … }` 展开叠上去的,靠的是「adapter 方法不吃 `this`」这条写在 `PlatformAdapter` 上的契约 | `capability-injection.ts` |
+| 连接能力三态 | 包 `capabilities` / `probeCapabilities`(只对有能力概念的平台)。两个 adapter 包装器都是 `{ ...inner, … }` 展开叠上去的,靠的是「adapter 方法不吃 `this`」这条写在 `PlatformAdapter` 上的契约 | `capability-injection.ts` |
 | 免扰 / 静音 | 免扰:`BilibiliPush.quietHoursNow` 单点时钟(**不是假时钟**);静音:真调 `muteFor`,并**记住自己写进去的到期时刻** —— 只认领 / 只解除这一次,主人自己 `/mute` 出来的不碰(收摊只收 devtools 造的东西) | `clock.ts`、`scenarios/timers.ts` |
+| 堆逼近上限 | 包真 `process.memoryUsage()`,按注入的占比 × 堆上限造 `heapUsed`(顺带把 `heapTotal` 抬到不低于它)。注的是**读数**不是显示值 —— 概览页那两个环的染色、近 5 分钟曲线、服务端「已逼近堆上限」那条 warn 全照真的算一遍。包好的读数由 `createDevtools` 交回去(`index.ts` 只许从 `./devtools/index.js` 引 devtools,多一个 import 就多一条漏进产物的路) | `heap-injection.ts`、`scenarios/heap.ts` |
 | 「现在就跑」 | 各引擎 / 运行时自己暴露的一个口:`closeIdleNow` / `repushNow` / `detectNow` / `pollNow` / `healthCheckNow` | 同上 |
 
 副作用规矩:**默认真发,可截流**。造事件之前先开截流,推送就只进列表不出网。

@@ -70,7 +70,8 @@ export async function awaitRestartedServer(input: AwaitRestartInput): Promise<Re
  */
 export interface RestartMark {
 	target: string;
-	mode: "update" | "rollback";
+	/** `restart` = 什么都不换、只是重来一次(系统页那一节按的)。 */
+	mode: "update" | "rollback" | "restart";
 }
 
 const RESTART_MARK_KEY = "bn.update.restarted";
@@ -93,7 +94,7 @@ export function takeRestartMark(): RestartMark | null {
 		if (typeof parsed !== "object" || parsed === null) return null;
 		const { target, mode } = parsed as Record<string, unknown>;
 		if (typeof target !== "string") return null;
-		if (mode !== "update" && mode !== "rollback") return null;
+		if (mode !== "update" && mode !== "rollback" && mode !== "restart") return null;
 		return { target, mode };
 	} catch {
 		return null;
@@ -105,6 +106,13 @@ export function takeRestartMark(): RestartMark | null {
  * 重启的结果,不能拿来报喜。
  */
 export function restartNotice(mark: RestartMark): NoticeView {
+	if (mark.mode === "restart") {
+		return {
+			id: `restarted:${mark.target}`,
+			title: "已重启",
+			body: `BN 回来了,跑的还是 ${mark.target} 这一版。`,
+		};
+	}
 	return mark.mode === "rollback"
 		? {
 				id: `restarted:${mark.target}`,
@@ -132,6 +140,15 @@ export interface RestartWait {
 	intervalMs: number;
 	timeoutMs: number;
 }
+
+/**
+ * 每秒探一次,最多等 90 秒。优雅停机最多 10 秒,加上容器把进程拉起来、载荷启动到
+ * 开始 listen,几十秒都算正常;一分半还没回来,多半就不是慢了。
+ *
+ * 系统页的「立即重启并应用」与装完拓展那颗「重启一次」共用这一份 —— 重启的代价两边
+ * 一样,各拍各的只会让其中一边先放弃、另一边还在等。
+ */
+export const DEFAULT_RESTART_WAIT: RestartWait = { intervalMs: 1_000, timeoutMs: 90_000 };
 
 /** 按下「立即重启并应用」那一刻记下的:要换到哪、是升是退、要换掉的进程是哪个。 */
 export interface RestartIntent extends RestartMark {

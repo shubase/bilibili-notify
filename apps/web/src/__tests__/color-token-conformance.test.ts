@@ -8,7 +8,7 @@
  * 直接编译成空。于是 `bg-bn-accent`(一个从不存在的 token)会让按钮**没有背景色**,
  * 配上 `text-white` 就是白字白底、彻底隐形;而 typecheck 管不着(那是字符串)、Biome
  * 管不着、组件测试只查 role/文本也管不着 —— **整套门禁全绿,按钮却看不见**。只能靠
- * 肉眼发现,这正是 `bn-accent` 在 Targets / BlockListEditor / MessageLayoutEditor
+ * 肉眼发现,这正是 `bn-accent` 在 Targets / MessageLayoutEditor
  * 里死了 6 处(拖拽高亮边框根本不显示)却一直没人察觉的原因。
  *
  * 只管**颜色类**前缀:`rounded-bn-card`(--radius-bn-*)、`shadow-bn-elev`
@@ -305,16 +305,17 @@ describe("强调色属性走 token,不写同值 hex", () => {
 });
 
 /**
- * 平台标识色只有库里那一份。
+ * 平台标识色只有注册表那一份。
  *
- * 库导出了 `PlatformIcon` / `platformLabel`,唯独没导出色 —— 于是 Targets 照着库里的
+ * 起因:库导出了 `PlatformIcon` 与短名,唯独没导出色 —— 于是 Targets 照着库里的
  * `PLATFORM_META` 又抄了一份 `PLATFORM_TINT`,三个色加一个 `#888` 兜底逐字节相同。
- * 现在色走 `platformTint()`,兜底也换成了静默档 token。
+ * 先是色也从库里出、兜底换成静默档 token;后来整张表挪进 `@bilibili-notify/internal`
+ * 的 `PLATFORM_REGISTRY`(库改成注入式),站点这边只剩一处把它喂给库。
  *
  * 判据与家族色守卫一致:**凑齐三个才算**。单独一个不作数 —— `#22c55e` 是通用的
  * 「成功绿」,`#3b82f6` 是通用的「信息蓝」,它们各自出现和平台表无关。
  */
-describe("平台标识色只有库里那一份", () => {
+describe("平台标识色只有注册表那一份", () => {
 	const PLATFORM_HEXES = ["#3b82f6", "#14b8a6", "#22c55e"];
 
 	it("站点源码里不再出现成套的平台色", () => {

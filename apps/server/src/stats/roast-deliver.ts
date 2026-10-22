@@ -36,7 +36,7 @@ export interface DeliverOutcome {
 	/** 成功送达的 targetId。 */
 	sent: string[];
 	/**
-	 * 因为停用而没发的 targetId(目标自己停用,或它的适配器停用)。**不算失败**:停用是
+	 * 因为停用而没发的 targetId(目标自己停用,或它的连接停用)。**不算失败**:停用是
 	 * 主人自己按的,不该换来一条失败通知;以前把它扔给管线,要退避重试到上限才报「持续
 	 * 不可达」。判定与链接解析同一份(internal 的 `isTargetPaused`)。
 	 */
@@ -124,14 +124,18 @@ export async function buildRoastPayload(
 	const imageWanted = renderer !== null && deps.store.getGlobals().defaults.cardStyle.enabled;
 	if (!imageWanted || !renderer) return { mode: "text", payload: { kind: "text", text }, text };
 
+	// 锐评卡与词云卡同源:不属于任何单个 UP,吃的是全局那套皮肤(ADR-0014)。
+	const cardSkin = deps.store.getGlobals().defaults.cardSkin;
 	try {
 		const buffer =
 			opts.kind === "board"
 				? await renderer.generateRoastBoardCard(
 						boardCardData(opts.result as BoardLike, opts.days, upMeta),
+						{ cardSkin },
 					)
 				: await renderer.generateRoastSoloCard(
 						soloCardData(opts.result as SoloLike, opts.days, upMeta),
+						{ cardSkin },
 					);
 		// caption 不是装饰:图挂了 / 客户端不展图时,那段文字是唯一还读得到的东西。
 		return {
@@ -160,13 +164,13 @@ export async function deliverRoast(
 	const { mode, payload, text } = await buildRoastPayload(deps, opts);
 
 	const targetsById = new Map(deps.store.getTargets().map((t) => [t.id, t]));
-	const adapters = deps.store.getAdapters();
+	const connections = deps.store.getConnections();
 	const sent: string[] = [];
 	const skipped: string[] = [];
 	const failed: DeliverOutcome["failed"] = [];
 	for (const targetId of opts.targetIds) {
 		const target = targetsById.get(targetId);
-		if (target && isTargetPaused(target, adapters)) {
+		if (target && isTargetPaused(target, connections)) {
 			skipped.push(targetId);
 			continue;
 		}

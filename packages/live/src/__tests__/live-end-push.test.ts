@@ -29,7 +29,7 @@ function makeSub(over: Partial<SubItemView> = {}): SubItemView {
 		liveEnd: true,
 		liveGuardBuy: false,
 		superchat: false,
-		liveEndExtras: { wordcloud: true, liveSummary: true },
+		extras: { atAllDynamic: false, atAllLive: true, wordcloud: true, liveSummary: true },
 		target: {},
 		customCardStyle: { enable: false },
 		customLiveMsg: { enable: false },
@@ -53,7 +53,9 @@ function makeCtx() {
 		setTimeout: () => ({ dispose() {} }),
 		onDispose: () => {},
 	};
-	const sendLiveNotifyCard = vi.fn(async (_params: { pushId?: string; liveType: LiveType }) => {});
+	const sendLiveNotifyCard = vi.fn(
+		async (_params: { pushId?: string; liveType: LiveType; cardSkin?: string }) => {},
+	);
 	const broadcastToTargets = vi.fn(
 		async (_uid: string, _content: unknown, _type: LivePushType, _opts?: unknown) => {},
 	);
@@ -132,6 +134,18 @@ describe("handleLiveEnd — 下播卡 + 附加项共用 pushId", () => {
 		]);
 	});
 
+	// 三处 sendLiveNotifyCard(开播 / 直播中 / 下播)都得把 sub 的皮肤递出去;漏一处的
+	// 症状是「那一类推送不跟着皮肤走」,而且全绿(那个参数是可选的)。
+	it("下播卡把 per-UP 皮肤 id 一起交给 sendLiveNotifyCard", async () => {
+		const { ctx, sendLiveNotifyCard } = makeCtx();
+		const sub = makeSub();
+		(sub as SubItemView).cardSkin = "k4ddd-0ddba11";
+		await liveSession(ctx, sub).handleLiveEnd("ws");
+		// 验红:把 room-session-base.ts 里那句 `cardSkin: this.sub.cardSkin` 删掉,这条红。
+		const card = sendLiveNotifyCard.mock.calls[0]?.[0] as { cardSkin?: string } | undefined;
+		expect(card?.cardSkin).toBe("k4ddd-0ddba11");
+	});
+
 	it("两场下播各自一个 pushId", async () => {
 		const { ctx, sendLiveNotifyCard } = makeCtx();
 		await liveSession(ctx, makeSub()).handleLiveEnd("ws");
@@ -157,7 +171,9 @@ describe("handleLiveEnd — 下播卡 + 附加项共用 pushId", () => {
 		const { ctx, broadcastToTargets, wordcloud } = makeCtx();
 		await liveSession(
 			ctx,
-			makeSub({ liveEndExtras: { wordcloud: false, liveSummary: true } }),
+			makeSub({
+				extras: { atAllDynamic: false, atAllLive: true, wordcloud: false, liveSummary: true },
+			}),
 		).handleLiveEnd("ws");
 		expect(wordcloud).not.toHaveBeenCalled();
 		expect(broadcastToTargets.mock.calls.map((c) => c[2])).toEqual([LivePushType.LiveSummary]);
@@ -167,7 +183,9 @@ describe("handleLiveEnd — 下播卡 + 附加项共用 pushId", () => {
 		const { ctx, sendLiveNotifyCard, broadcastToTargets, wordcloud, summary } = makeCtx();
 		await liveSession(
 			ctx,
-			makeSub({ liveEndExtras: { wordcloud: false, liveSummary: false } }),
+			makeSub({
+				extras: { atAllDynamic: false, atAllLive: true, wordcloud: false, liveSummary: false },
+			}),
 		).handleLiveEnd("ws");
 		expect(sendLiveNotifyCard).toHaveBeenCalledTimes(1);
 		expect(broadcastToTargets).not.toHaveBeenCalled();
@@ -258,12 +276,27 @@ describe("sendLiveNotifyCard — pushId 透传给推送层", () => {
 
 describe("wantsLiveEndExtras — 弹幕采集的门", () => {
 	it.each<[string, Partial<SubItemView>, boolean]>([
-		["下播开、词云开", { liveEndExtras: { wordcloud: true, liveSummary: false } }, true],
-		["下播开、只开总结", { liveEndExtras: { wordcloud: false, liveSummary: true } }, true],
-		["下播开、子项全关", { liveEndExtras: { wordcloud: false, liveSummary: false } }, false],
+		[
+			"下播开、词云开",
+			{ extras: { atAllDynamic: false, atAllLive: true, wordcloud: true, liveSummary: false } },
+			true,
+		],
+		[
+			"下播开、只开总结",
+			{ extras: { atAllDynamic: false, atAllLive: true, wordcloud: false, liveSummary: true } },
+			true,
+		],
+		[
+			"下播开、子项全关",
+			{ extras: { atAllDynamic: false, atAllLive: true, wordcloud: false, liveSummary: false } },
+			false,
+		],
 		[
 			"下播关、子项开着",
-			{ liveEnd: false, liveEndExtras: { wordcloud: true, liveSummary: true } },
+			{
+				liveEnd: false,
+				extras: { atAllDynamic: false, atAllLive: true, wordcloud: true, liveSummary: true },
+			},
 			false,
 		],
 	])("%s", (_name, over, expected) => {

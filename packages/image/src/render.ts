@@ -70,7 +70,8 @@ const GENERIC_FAMILIES: ReadonlySet<string> = new Set([
 ]);
 
 /** 缺字体时的兜底链,恒挂在最后 —— 少了它缺字形会渲染成一排方块。 */
-const FALLBACK_FAMILIES = '"Microsoft YaHei", "Source Han Sans", "Noto Sans CJK", sans-serif';
+export const FALLBACK_FAMILIES =
+	'"Microsoft YaHei", "Source Han Sans", "Noto Sans CJK", sans-serif';
 
 /**
  * 主人自带字体在 CSS 里的家族名。
@@ -90,6 +91,24 @@ export const USER_FONT_FAMILY = "bn-user-font";
  */
 export function buildFontFace(dataUrl: string): string {
 	return `@font-face{font-family:"${USER_FONT_FAMILY}";src:url("${dataUrl}");font-display:block}`;
+}
+
+/**
+ * `<style>` 在 HTML 里是 RAWTEXT:里头**唯一**能终止它的就是 `</style`。所以任何拼进
+ * 去的 CSS 只要带着 `</`,就能提前关掉样式表,后面那截照 HTML 解析 —— `<script>` 就
+ * 成了真的脚本节点,而出图跑的是 `--no-sandbox` 的 puppeteer、那页 JS 还必须开着
+ * (`waitForCondition` 靠它)。
+ *
+ * `extraCss` 今天来自卡片皮肤,上游(`apps/server` 的清洗器)已经整份拒掉 `</` 了。
+ * 这里再封一道,是因为**这个函数看不见那个承诺**:`renderCard` 是 `packages/image` 的
+ * 公共入口,谁都能喂它一段 CSS,而「拼出去之后还是不是一个 style 元素」只有拼的人
+ * 判得了(2026-09-19 审查)。
+ *
+ * 换成 `<\/` 而不是删掉:CSS 字符串字面量里 `\/` 就是 `/`,画出来一模一样,只是 HTML
+ * 解析器再也看不见那个终止符。不含 `</` 的 CSS 一个字节都不动,所以像素基准不受影响。
+ */
+function sealStyleBody(css: string): string {
+	return css.includes("</") ? css.replaceAll("</", "<\\/") : css;
 }
 
 /**
@@ -127,9 +146,14 @@ export async function renderCard(
 		 * 解析成 data URL 内联,与背景图同一条路:`packages/image` 不碰文件系统)。
 		 */
 		fontFace?: string;
+		/**
+		 * 追加在 UnoCSS 之后的样式表 —— 卡片皮肤(ADR-0014)翻译好的那段。**排在最后**
+		 * 是刻意的:皮肤要能盖掉块自带的 Uno 类,同等特异度下后写的赢。
+		 */
+		extraCss?: string;
 	} = {},
 ): Promise<string> {
-	const { title = "通知", font = "sans-serif", htmlWidth, fontFace } = options;
+	const { title = "通知", font = "sans-serif", htmlWidth, fontFace, extraCss } = options;
 
 	const uno = await getUno();
 	const app = createSSRApp({ render: () => h(component, props) });
@@ -137,8 +161,23 @@ export async function renderCard(
 	const { css } = await uno.generate(classTokens(body), { preflights: true });
 
 	const families = [cssFontFamily(font), FALLBACK_FAMILIES].filter(Boolean).join(", ");
+	// 字体挂在 `html` 上而**不是** `*` 上(2026-09-15 修的回归)。`*` 是给每个元素各设一份,
+	// 于是谁也不从祖先继承 —— 皮肤(以及默认皮肤的字体旋钮)在外框上写的 `font-family`
+	// 一路到不了文字。挂在根上之后它成了继承的**起点**,中途任何一层都盖得住。
+	//
+	// 算出来的值不变:从前靠 `*` 直接拿到链的元素,现在照样继承到同一条链;本来就有自己
+	// 那份声明的(UnoCSS preflight 给 `code, kbd, samp, pre` 的等宽)两种写法下都赢,
+	// 别顺手给它们补 `inherit` —— 那才会真的改掉出的图。
+	//
+	// 选择器写成 `html:root` 这副怪样子是有原因的:UnoCSS 的 preflight 自己往
+	// `html, :host` 上写了一条 font-family,而这段 baseCSS 拼在 uno 产物**之前**,同
+	// 特异度就轮它赢。偏偏这条的特异度**两种实现算得不一样** —— 逐分支算 `html` 是
+	// (0,0,1),按整组取最大算(jsdom 就是)则是 `:host` 的 (0,1,0)。`html:root` 是
+	// (0,1,1),两种算法下都压得过,免得这条修法建在某一个实现的脾气上。
+	// 结果与从前一致:那时 `*` 直接落在每个元素上,preflight 的继承值本来就够不着。
 	const baseCSS = /* css */ `
-		* { margin: 0; padding: 0; box-sizing: border-box; font-family: ${families}; }
+		* { margin: 0; padding: 0; box-sizing: border-box; }
+		html:root { font-family: ${families}; }
 		html { width: ${htmlWidth ? `${htmlWidth}px` : "fit-content"}; height: auto; }
 	`;
 
@@ -148,7 +187,7 @@ export async function renderCard(
 			<head>
 				<meta charset="utf-8">
 				<title>${title}</title>
-				<style>${fontFace ?? ""}${baseCSS}${css}</style>
+				<style>${sealStyleBody(`${fontFace ?? ""}${baseCSS}${css}${extraCss ?? ""}`)}</style>
 			</head>
 			<body>${body}</body>
 		</html>

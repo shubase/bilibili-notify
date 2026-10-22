@@ -1,16 +1,29 @@
 /**
- * 纯常量模块 —— 必须保持**零 import、零副作用**:它经 `@bilibili-notify/internal/constants`
- * 子路径直供浏览器端(apps/web)运行时消费,不能把 zod 或任何 schema
- * 模块拽进前端 bundle。schema/common.ts 反向引用这里(`z.enum(FEATURE_KEYS)`)并从根
- * 入口重导出,后端消费者(server)照旧从根入口拿 —— 两条路径同一份值。
+ * 零依赖的核心词表 —— 常量,加上**只碰几个字段就能答**的纯形状判断(见文件末尾那组连接
+ * 谓词)。
+ *
+ * 🔴 **只许有 `import type`,值级 import 一条都不许**:它经
+ * `@bilibili-notify/internal/constants` 子路径**直供浏览器端(apps/web)运行时消费**,
+ * 一条值级 import 就能把 zod 与它拽着的整张 schema 图拉进前端 bundle —— 而症状不是报错,
+ * 是产物悄悄胖一圈。`import type` 编译后整条擦掉,所以类型随便引。
+ * 这条不是靠这段话拦着的,是靠 `constants-imports.test.ts`。
+ *
+ * schema/common.ts 反向引用这里(`z.enum(FEATURE_KEYS)`)并从根入口重导出,后端消费者
+ * (server)照旧从根入口拿 —— 两条路径同一份值。
  */
+import type {
+	Connection,
+	DirectConnection,
+	ExtensionConnection,
+	WebhookConnection,
+} from "./schema/targets.js";
 
 /**
  * 全部可订阅的特性键 —— 每一把都是一类**能单独开关、能配路由**的推送。新增或删除会扩散到
  * FeatureFlags、SubscriptionRouting、Subscription.overrides。
  *
- * 词云与 AI 总结不在这里:它们是下播的两个附加项(见 {@link LIVE_END_EXTRA_KEYS}),
- * 跟着下播的开关与目标走,自己没有路由。
+ * 附加项(@全体 / 词云 / AI 总结)不在这里:它们各自挂在某把主特性下面(见
+ * {@link PUSH_EXTRAS}),跟着那把特性的开关与目标走,自己没有路由。
  */
 export const FEATURE_KEYS = [
 	"dynamic",
@@ -25,17 +38,60 @@ export const FEATURE_KEYS = [
 export type FeatureKey = (typeof FEATURE_KEYS)[number];
 
 /**
- * 下播推送的附加项:像开播的 @全体那样挂在下播下面 —— 下播关了它们一起关,下播推到
- * 哪儿它们就跟到哪儿。卡片本体先发,词云 / 总结算好了作为同一次推送的后续消息追加。
+ * 附加项的键。加一个附加项 = 这里加一行 + {@link PUSH_EXTRAS} 里加一行(ADR-0016 决策 1)。
  */
-export const LIVE_END_EXTRA_KEYS = ["wordcloud", "liveSummary"] as const;
+export const EXTRA_KEYS = ["atAllDynamic", "atAllLive", "wordcloud", "liveSummary"] as const;
 
-export type LiveEndExtraKey = (typeof LIVE_END_EXTRA_KEYS)[number];
+export type ExtraKey = (typeof EXTRA_KEYS)[number];
 
-export type LiveEndExtras = Record<LiveEndExtraKey, boolean>;
+/**
+ * 按 {@link EXTRA_KEYS} 摊一张「每把附加项一格」的表 —— 出厂值、两张 schema、一张全空的
+ * per-目标表,四处共用这一份。
+ *
+ * 它存在只为收断言:`Object.fromEntries` 的返回类型永远是宽的(`{[k: string]: T}`),
+ * 所以从前四个调用点各自补一发 `as`,四种写法还各不相同;其中两处更把 zod 的内部类型
+ * (`ZodDefault<ZodRecord<ZodUUID, ZodBoolean>>`)抄进了断言里 —— 那串跟着 zod 升级一漂,
+ * 断言就会静默把错误的类型按住。收进泛型之后 `T` 由 `make` 的返回值推断,没有可抄错的东西。
+ *
+ * 住在零依赖的 constants 里:它是纯函数、一条依赖都不引入(见文件头那条硬规矩),
+ * 而消费它的 schema 侧都带 zod。
+ */
+export const extrasRecord = <T>(make: (k: ExtraKey) => T): Record<ExtraKey, T> =>
+	Object.fromEntries(EXTRA_KEYS.map((k) => [k, make(k)])) as Record<ExtraKey, T>;
 
-/** 每个特性的开关 + 下播的两个附加项。schema 本体在 schema/common.ts(`FeatureFlagsSchema`)。 */
-export type FeatureFlagValues = Record<FeatureKey, boolean> & { liveEndExtras: LiveEndExtras };
+/**
+ * 附加项:挂在某个主特性下面、与本体分开发的一条消息(历史行里 `role: "extra"`)。ADR-0016。
+ *
+ * 主特性关了它们一起关,主特性推到哪儿它们就跟到哪儿(目标是主特性目标的子集)。
+ * 键是**一维**的 —— 每把键自己声明挂在哪把主特性下、面板上叫什么、出厂开不开。@全体
+ * 在动态与开播下的出厂值本就不同(动态 OFF、开播 ON),走二维(`extras[附加项][主特性]`)
+ * 的话还得再开一层「同一把键在不同特性下默认不同」。
+ *
+ * `capability` 是这把附加项对**平台能力**的要求(ADR-0016 决策 4 的「有没有平台限制」):
+ * 填了就表示目标平台不报这项能力时这把附加项发不出去 —— 面板据此禁用它的开关,推送层
+ * 据此跳过。⚠️ 这是能力面,与配置面的三态无关:用户关不掉、也开不了它。不填 = 无限制,
+ * 词云 / 总结就是普通消息,哪个平台都发得出去。**别拿 `label` 去判这件事** —— 那是
+ * 显示文案,改一次措辞守卫就静默失效。
+ *
+ * 表里只放代码真读的这几样。**排在本体前还是后、等不等它算完,归各自的发送路**
+ * (@全体 在推送层排本体前且不 await;词云 / 总结是直播引擎算完后另发的两次广播)——
+ * 见 ADR-0016 决策 4。抄进这张表只会变成没人读的死数据。
+ */
+export const PUSH_EXTRAS: Record<
+	ExtraKey,
+	{ feature: FeatureKey; label: string; default: boolean; capability?: "atAll" }
+> = {
+	atAllDynamic: { feature: "dynamic", label: "@全体", default: false, capability: "atAll" },
+	atAllLive: { feature: "live", label: "@全体", default: true, capability: "atAll" },
+	wordcloud: { feature: "liveEnd", label: "弹幕词云", default: true },
+	liveSummary: { feature: "liveEnd", label: "AI 总结", default: true },
+};
+
+/** 四把附加项开关。全局一份、per-UP 一份 partial(schema 见 schema/common.ts)。 */
+export type PushExtras = Record<ExtraKey, boolean>;
+
+/** 每个特性的开关 + 四个附加项。schema 本体在 schema/common.ts(`FeatureFlagsSchema`)。 */
+export type FeatureFlagValues = Record<FeatureKey, boolean> & { extras: PushExtras };
 
 /** 默认全局值；resolve() 在 per-UP overrides 缺失字段时回退到这里。 */
 export const DEFAULT_FEATURE_FLAGS: FeatureFlagValues = {
@@ -46,14 +102,246 @@ export const DEFAULT_FEATURE_FLAGS: FeatureFlagValues = {
 	superchat: false,
 	specialDanmaku: false,
 	specialUserEnter: false,
-	liveEndExtras: { wordcloud: true, liveSummary: true },
+	// 出厂值只写在注册表里 —— 两处各抄一份迟早漂。
+	extras: extrasRecord((k) => PUSH_EXTRAS[k].default),
 };
 
 /**
- * 推送目标平台词表。schema 本体在 schema/targets.ts(`PushTargetPlatformSchema`),那边从
- * 这里取值 —— 与 FEATURE_KEYS 同一套安排:词表住零依赖模块,前端也拿得到。
+ * 直连连接器词表 —— 「**怎么**连」这一轴,与「连到**哪个**平台」正交。
+ *
+ * 今天它的值住在 OneBot config 的 `transport` 里,所以「加一个平台」要连带抄一份传输分支;
+ * 提到连接自己身上之后,tencent 走 ws、feishu 走 webhook 这类组合就是两根轴的叉乘,不用再各抄一份。
+ * 桥(koishi / astrbot)是这根轴上的另外两档,等接桥那期再进词表。
  */
-export const PUSH_TARGET_PLATFORMS = ["onebot", "webhook", "qq-official"] as const;
+export const DIRECT_CONNECTORS = ["http", "ws", "ws-reverse", "webhook"] as const;
+export type DirectConnector = (typeof DIRECT_CONNECTORS)[number];
+
+/**
+ * 推送目标的会话种类。`schema/targets.ts` 的 `PushTargetScopeSchema` 从这里取值 ——
+ * 词表住零依赖模块,前端才拿得到运行时的那一份(见文件头 FEATURE_KEYS 那套安排)。
+ */
+export const PUSH_TARGET_SCOPES = ["group", "private", "channel"] as const;
+export type PushTargetScope = (typeof PUSH_TARGET_SCOPES)[number];
+
+/**
+ * 推送目标的两支形态 —— `session` 是一个会话(有地址、收得到入站),
+ * `endpoint` 是一个单向出站终点(地址烧在连接的 config 里,目标只是个壳)。
+ */
+export const PUSH_TARGET_KINDS = ["session", "endpoint"] as const;
+export type PushTargetKind = (typeof PUSH_TARGET_KINDS)[number];
+
+/**
+ * **连接**能连的平台。schema 本体在 schema/targets.ts(`ConnectionPlatformSchema`),
+ * 那边从这里取值 —— 与 FEATURE_KEYS 同一套安排:词表住零依赖模块,前端也拿得到。
+ *
+ * 这是**闭集**,因为每一档都要有一份 config schema、一个 server adapter、一排面板控件。
+ * 它以前叫 `PUSH_TARGET_PLATFORMS`,同时也是推送目标那一格的词表 —— 但**目标那边是开的**:
+ * 桥驮进来的平台(telegram、discord…)枚举不了,列进闭集等于要求先改词表才能收到它们。
+ * 一个类型糊着开、闭两套词表,总有一边是错的,所以拆了。
+ */
+export const CONNECTION_PLATFORMS = [
+	"onebot",
+	"qq-official",
+	"feishu",
+	"dingtalk",
+	"wecom",
+	"generic",
+] as const;
+export type ConnectionPlatform = (typeof CONNECTION_PLATFORMS)[number];
+
+/**
+ * 一个平台的全部事实 —— 面板怎么叫它、走哪些连接器、它的目标长什么样、收不收得到回复。
+ *
+ * 这些事实原先散在**六处**各说各的:连接侧闭集与 webhook 那一族(本文件)、入站能力词表
+ * (本文件)、面板的平台选择器(`apps/web/src/types/domain.ts` 的 `KNOWN_PLATFORMS`)、
+ * 组件库里的色与短名(`packages/ui` 的 `PLATFORM_META`)、目标表单的会话种类与地址称呼
+ * (`apps/web/src/pages/Targets.tsx`)、以及 server 那边每个 adapter 自报的 `platforms`。
+ * 六份的代价不是重复本身,是**加一个平台要记得改六个地方**,漏掉哪一处都没有编译错 ——
+ * 少了色就退灰、少了会话种类就只给通用三档,全都是「能跑但不对」。
+ *
+ * 所以事实收在这一张表里,那六处改成从它取。色与图标名也在这儿:一个十六进制串是数据、
+ * 不是组件,把它留在组件库等于让纯展示件库认识业务平台(那正是 `PlatformIcon` 要改成
+ * 注入式的原因)。
+ */
+export interface PlatformDescriptor {
+	/** 面板上的全名 —— 平台选择器那一排写这个。 */
+	label: string;
+	/** 短名 —— 胶囊、一行小字里写这个;没有图标时的方章取它的**首字**。 */
+	shortLabel: string;
+	/** 标识色。认不出的平台在展示层退静默档,不在这儿兜底。 */
+	tint: string;
+	/** 图标名(组件库图标表里的键)。留空 = 走首字母方章。 */
+	icon?: string;
+	/** 这个平台走得通的连接器,**第一个是默认**(新建连接与迁移回落共用这个答案)。 */
+	connectors: readonly DirectConnector[];
+	/** 它名下的推送目标是哪一支形态。 */
+	targetKind: PushTargetKind;
+	/** 会话目标能选的会话种类。endpoint 那一族只有一档,目标本来就没得选。 */
+	scopes: readonly PushTargetScope[];
+	/** 地址那一格在这个平台叫什么(按会话种类)。缺的那档走通用称呼。 */
+	addressNouns: Partial<Record<PushTargetScope, string>>;
+	/** 主人在这个平台上回一句话,女仆**真的收得到**吗 —— 不是「协议上可行」。 */
+	inbound: boolean;
+	/** 能不能 @全体成员。 */
+	atAll: boolean;
+}
+
+/**
+ * 平台注册表。加一个平台从这里开始 —— 少一格是编译错,不是静默的默认值。
+ *
+ * `feishu` / `dingtalk` / `wecom` / `generic` 这一族原先是 webhook 连接 config 里的一个
+ * `provider` 字段 —— 因为「webhook」被当成了平台,真平台只好降级成它的一个属性。可
+ * webhook 从来不是平台,它是**怎么连**:飞书和钉钉是两个平台,只是恰好都用「往一个 URL
+ * POST 一段 JSON」这种连法。所以 provider 升格成平台,webhook 挪进 {@link DIRECT_CONNECTORS}。
+ * `generic` 是承认的疤:主人贴的 URL 可能是自建服务,那就没有平台可言 —— 面板上写
+ * 「未指明的 HTTP 端点」,不假装它是个什么。
+ */
+export const PLATFORM_REGISTRY: Readonly<Record<ConnectionPlatform, PlatformDescriptor>> = {
+	onebot: {
+		label: "OneBot v11",
+		shortLabel: "OneBot",
+		tint: "#3b82f6",
+		icon: "qq",
+		connectors: ["http", "ws", "ws-reverse"],
+		targetKind: "session",
+		// OneBot 没有频道概念 —— 只给群与私聊两档。
+		scopes: ["group", "private"],
+		addressNouns: { group: "群", private: "用户" },
+		inbound: true,
+		atAll: true,
+	},
+	"qq-official": {
+		label: "QQ 官方机器人",
+		shortLabel: "QQ官方",
+		tint: "#14b8a6",
+		icon: "qq",
+		// 官机只有 WS 网关一条路。
+		connectors: ["ws"],
+		targetKind: "session",
+		scopes: ["group", "private", "channel"],
+		addressNouns: { group: "群 openid", private: "C2C", channel: "子频道" },
+		inbound: true,
+		// 群里 @全体要特殊权限,适配器对 at-all 段一律丢弃。
+		atAll: false,
+	},
+	feishu: {
+		label: "飞书机器人",
+		shortLabel: "飞书",
+		tint: "#3370ff",
+		icon: "feishu",
+		connectors: ["webhook"],
+		targetKind: "endpoint",
+		scopes: ["channel"],
+		addressNouns: {},
+		inbound: false,
+		atAll: true,
+	},
+	dingtalk: {
+		label: "钉钉机器人",
+		shortLabel: "钉钉",
+		tint: "#00c2ff",
+		icon: "dingtalk",
+		connectors: ["webhook"],
+		targetKind: "endpoint",
+		scopes: ["channel"],
+		addressNouns: {},
+		inbound: false,
+		atAll: true,
+	},
+	wecom: {
+		label: "企业微信机器人",
+		shortLabel: "企微",
+		tint: "#07c160",
+		icon: "wecom",
+		connectors: ["webhook"],
+		targetKind: "endpoint",
+		scopes: ["channel"],
+		addressNouns: {},
+		inbound: false,
+		atAll: true,
+	},
+	generic: {
+		label: "未指明的 HTTP 端点",
+		shortLabel: "HTTP 端点",
+		// 没有品牌可借,给一档中性的板岩灰。
+		tint: "#94a3b8",
+		connectors: ["webhook"],
+		targetKind: "endpoint",
+		scopes: ["channel"],
+		addressNouns: {},
+		inbound: false,
+		atAll: true,
+	},
+};
+
+/** 认不认识这个平台 —— 认识就把它的那一行交出来。目标侧的平台是开放词表,常常认不出。 */
+export function platformDescriptor(platform: string): PlatformDescriptor | undefined {
+	return (PLATFORM_REGISTRY as Record<string, PlatformDescriptor>)[platform];
+}
+
+/**
+ * 出站 webhook 那一族平台。
+ *
+ * 它是注册表的一个**投影**,写成字面量只因为 `z.enum` 与类型都要求可枚举的元组 ——
+ * 两边会不会漂由 `platform-registry.test.ts` 钉着。判据本身在注册表:走 webhook 连的
+ * 就是这一族,别在各处手写四个平台名。
+ */
+export const WEBHOOK_PLATFORMS = ["feishu", "dingtalk", "wecom", "generic"] as const;
+export type WebhookPlatform = (typeof WEBHOOK_PLATFORMS)[number];
+
+/**
+ * 分发键 —— 「该由哪套实现处理这条连接」。
+ *
+ * 直连就是它的平台(一条直连就是一个平台,那套协议是我们自己说的);拓展提供的连接
+ * 用**拓展 id** —— 一个拓展一个推送源(ADR-0012 决策 28),后面挂着哪些平台是它运行时
+ * 才知道的事,枚举不了。
+ *
+ * 它是**算出来的**,不落盘:落一格分发键就等于把「连到哪」与「谁来处理」又焊回一起,
+ * 而那两件事正是这次重构拆开的。
+ *
+ * 入参按形状收(与 {@link isTargetPaused} 同一套安排),免得为了一个类型把 schema
+ * 拖进这个零依赖模块 —— 前端要**运行时**用它。
+ */
+export function connectionDispatchKey(
+	connection: { kind: "direct"; platform: string } | { kind: "extension"; extensionId: string },
+): string {
+	return connection.kind === "direct" ? connection.platform : connection.extensionId;
+}
+
+/** 这个平台是不是靠 webhook 连的。 */
+export function isWebhookPlatform(platform: string): platform is WebhookPlatform {
+	return platformDescriptor(platform)?.connectors[0] === "webhook";
+}
+
+/**
+ * 一个平台默认走哪个连接器 —— 注册表里 `connectors` 的第一档。
+ *
+ * 两个用处共用这一份:迁移时老 OneBot 条目没有 `transport` 字段的回落(与 schema 的
+ * `.default("http")` 同一个答案),以及前端新建连接时的初值。两处各写一份的话,
+ * 「新建的连接」与「迁移过来的连接」会从不同的默认值出发,而且没人会发现。
+ * 住零依赖的 constants 是因为前端要**运行时**用它 —— 从带 zod 的 schema 里导会把
+ * zod 拖进 web 产物(见 apps/web/src/types/domain.ts 顶上那段)。
+ */
+export function defaultConnectorFor(platform: "onebot"): "http";
+export function defaultConnectorFor(platform: "qq-official"): "ws";
+export function defaultConnectorFor(platform: WebhookPlatform): "webhook";
+export function defaultConnectorFor(platform: string): DirectConnector | undefined;
+export function defaultConnectorFor(platform: string): DirectConnector | undefined {
+	return platformDescriptor(platform)?.connectors[0];
+}
+
+/**
+ * 这个平台的这种会话,地址那一格该叫什么。
+ *
+ * 认不出的平台(桥驮进来的)走通用称呼 —— 不认识不等于说不出话,「群 / 用户 / 子频道」
+ * 对任何一个聊天平台都成立。
+ */
+export function addressNounFor(platform: string, scope: PushTargetScope): string {
+	const named = platformDescriptor(platform)?.addressNouns[scope];
+	if (named) return named;
+	if (scope === "channel") return "子频道";
+	return scope === "private" ? "用户" : "群";
+}
 
 // ---------------------------------------------------------------------------
 // UP 主强调色
@@ -686,12 +974,15 @@ export const DEFAULT_ROAST_SCHEDULE = {
  *
  * webhook 天生不可能:它就是个出站 HTTP POST,没有回程。将来薄插件桥接进来的平台
  * 协议上收得到、只是还没接时 —— 说法见 {@link inboundGapReason},别写成平台的毛病。
+ *
+ * 与 {@link WEBHOOK_PLATFORMS} 一样是 {@link PLATFORM_REGISTRY} 的**投影**,写成字面量
+ * 只因为 `LinkSourcePlatform` 要从它取联合类型;两边漂了由注册表的守卫测试报红。
  */
 export const INBOUND_CAPABLE_PLATFORMS = ["onebot", "qq-official"] as const;
 
 /** 这个平台收不收得到主人的回复。审批开关能不能用就看它。 */
 export function platformCanReceiveReply(platform: string): boolean {
-	return (INBOUND_CAPABLE_PLATFORMS as readonly string[]).includes(platform);
+	return platformDescriptor(platform)?.inbound === true;
 }
 
 /**
@@ -703,7 +994,7 @@ export function platformCanReceiveReply(platform: string): boolean {
  * 反复怀疑自己配错了。
  */
 export function inboundGapReason(platform: string): string {
-	return platform === "webhook"
+	return isWebhookPlatform(platform)
 		? "webhook 只是一个出站 HTTP 请求、没有回程，主人没法在上面回话"
 		: `女仆还没在 ${platform} 上接入站消息，主人回的 y 送不到女仆手里`;
 }
@@ -714,24 +1005,26 @@ export function inboundGapReason(platform: string): string {
  * 失败),UP 抽屉里这种目标的 @全体开关也据此禁用并写着「发送时会自动跳过」。两边必须是
  * 同一份判断,界面上说跳过就得真的跳过。
  */
-export function platformSupportsAtAll(platform: (typeof PUSH_TARGET_PLATFORMS)[number]): boolean {
-	return platform !== "qq-official";
+export function platformSupportsAtAll(platform: string): boolean {
+	// 入参收 string 而不是闭集:它吃的是**目标**的平台,而那是开放词表。桥驮进来的平台
+	// 默认按「能 @全体」算 —— 真不能的话,能力位会在桥探测时说,推送层据能力位跳过。
+	return platformDescriptor(platform)?.atAll ?? true;
 }
 
 /**
- * 「这个推送目标现在算不算暂停」。目标自己的开关关了,或它挂在一个已停用的适配器下面
+ * 「这个推送目标现在算不算暂停」。目标自己的开关关了,或它挂在一条已停用的连接下面
  * (投递层对这两种情况一律回不可达),都算。
  *
  * 住在这里而不是服务端:面板上的「已停用」标记与运行时的「跳过」必须是同一句话 ——
- * 前端只看 `target.enabled` 的话,适配器停用的目标在选择器里显示为启用,发的时候却被
+ * 前端只看 `target.enabled` 的话,连接停用的目标在选择器里显示为启用,发的时候却被
  * 跳过。入参按形状收,免得为了两个类型把 schema 拖进这个零依赖模块。
  */
 export function isTargetPaused(
-	target: { enabled: boolean; adapterId: string },
-	adapters: readonly { id: string; enabled: boolean }[],
+	target: { enabled: boolean; connectionId: string },
+	connections: readonly { id: string; enabled: boolean }[],
 ): boolean {
 	if (!target.enabled) return true;
-	return !adapters.find((a) => a.id === target.adapterId)?.enabled;
+	return !connections.find((a) => a.id === target.connectionId)?.enabled;
 }
 
 /**
@@ -797,3 +1090,634 @@ export const MIRROR_PREFIX_RE = /^https:\/\/[^\s/]+/;
 export function isMirrorPrefix(value: string): boolean {
 	return MIRROR_PREFIX_RE.test(value);
 }
+
+/* -------------------------------------------------------------------------- */
+/* 连接的形状判断 —— 只看 `kind` / `connector` 两个字段,一点 zod 都用不上          */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * ⚠️ 这几个谓词**刻意住在这里而不是 `schema/targets.ts`**:面板(apps/web)也要问同样的
+ * 问题,而它只能 `import type` 域模型 —— 谓词留在带 zod 的那一侧,web 就只能自己再抄一份,
+ * 于是同一句话有两份实现、改判据要记得改两处。搬到这个零依赖模块之后只剩一份。
+ *
+ * (`isConnectionOn` 留在 schema 那边:它 narrow 到某个平台的 **config 形状**,那是 schema
+ * 自己的事。)
+ */
+
+/**
+ * 这条连接自己就是一个平台吗 —— 是的话把平台名交出来。
+ *
+ * 读点写 `connection.platform` 的地方**大多真正想问的是这个**:桥接入没有单一平台,
+ * 该走的是「问桥报了哪些」那条路。留这个谓词是为了让那些地方显式说出「认不出就没有」,
+ * 而不是靠一个可选字段悄悄变 `undefined`。
+ */
+export function isDirectConnection(connection: Connection): connection is DirectConnection {
+	return connection.kind === "direct";
+}
+
+/**
+ * 这条连接是不是 webhook 那种**单向投递**。
+ *
+ * 从前全仓 20 处写的是 `connection.connector === "webhook"` —— 那是把一个字段当接口用:
+ * 拓展那一支没有 `connector`,于是每一处都要先想一遍「它有没有这一格」。问题本来就只有
+ * 一个,答案也只有一份,所以收成这一句。
+ */
+export function isWebhookConnection(connection: Connection): connection is WebhookConnection {
+	return connection.kind === "direct" && connection.connector === "webhook";
+}
+
+/**
+ * 这条连接归不归某个拓展 —— 不给 id 就是问「是不是拓展提供的」。
+ *
+ * ctx 交给拓展的那份快照就是拿它筛的(决策 30):**归属是宿主的判断**,所以筛这一步
+ * 只有一份实现。
+ */
+export function isExtensionConnection(
+	connection: Connection,
+	extensionId?: string,
+): connection is ExtensionConnection {
+	if (connection.kind !== "extension") return false;
+	return extensionId === undefined || connection.extensionId === extensionId;
+}
+
+// ---- 卡片皮肤(ADR-0014)的零依赖词表 ----------------------------------------
+
+/**
+ * 七种卡。前四种有块可排;后三种(AI 周报榜单 / 单人锐评 / 弹幕词云)各自整张是**一个固定
+ * 内置块**,皮肤只管外框(ADR-0014 决策 3)。
+ */
+export const CARD_SKIN_KINDS = [
+	"live",
+	"dynamic",
+	"sc",
+	"guard",
+	"roastBoard",
+	"roastSolo",
+	"wordcloud",
+] as const;
+export type CardSkinKind = (typeof CARD_SKIN_KINDS)[number];
+
+/**
+ * 七种卡的中文名。卡片工坊的提示词与聊天里的工具小条共用这一份 —— 各写一份的话,
+ * 加第八种卡时总有一边漏掉,而漏掉的那边是静默的。
+ */
+export const CARD_SKIN_KIND_NAMES: Readonly<Record<CardSkinKind, string>> = {
+	live: "直播卡",
+	dynamic: "动态卡",
+	sc: "醒目留言卡",
+	guard: "上舰卡",
+	roastBoard: "锐评榜单卡",
+	roastSolo: "单人锐评卡",
+	wordcloud: "弹幕词云卡",
+};
+
+// ---- 预览场景 ---------------------------------------------------------------
+
+/**
+ * 编辑器实时预览里,一种卡可选的「场景」—— 同一张卡在不同状态下长得不一样(直播卡的
+ * 直播中 / 下播、动态卡的纯文字 / 视频投稿 / 图文 / 转发),皮肤得挨个看过才知道有没有
+ * 写塌。
+ */
+export interface PreviewScene {
+	/** 稳定的机器名,进 URL / 请求体。小写 kebab。 */
+	id: string;
+	/** 面板上显示的中文短名,如「直播中」。 */
+	label: string;
+}
+
+/**
+ * 每种卡可选的场景,**第一项是默认**(没带 scene、或带了不认识的名字都落回它);面板照
+ * 数组顺序显示。
+ *
+ * 住在 internal 而不是 `packages/image`,是依赖方向定的:面板(`apps/web`)要拿这张表画
+ * 那排场景按钮,它经 `apps/contract` 借类型,而 contract 只准从 internal 借、`packages/*`
+ * 又不许反向依赖 contract —— 只有 internal 这一份是出图端与面板都够得着的。所以它和
+ * `CARD_SKIN_FIELDS` 是同一类东西:**契约常量**。场景对应的示例 props 是另一回事,那是
+ * 出图端的活,住在 `packages/image` 的 `preview/sample-cards.ts`,面板一个字都不碰。
+ */
+export const CARD_PREVIEW_SCENES: Readonly<Record<CardSkinKind, readonly PreviewScene[]>> = {
+	// 直播卡两态各画各的(角标、时间行、粉丝行都不同);默认落在「直播中」—— 那是最常被
+	// 看到的一张。「开播」不单列:它与直播中 `liveStatus` 都是 1,只差一句文案,出图端分不开,
+	// 留着就只能是别名(ADR-0014 决策 10 的 2026-09-19 🔗)。
+	live: [
+		{ id: "streaming", label: "直播中" },
+		{ id: "ended", label: "下播" },
+	],
+	// 四场按主媒体分,每一场就是出图端分得出来的一种卡:纯文字是底档(正文 + 话题 + 附加
+	// 内容都在这儿看);「视频投稿」是真机上 UP 发视频推过来的那张 —— 只有头部、视频五块和
+	// 互动数,没有正文、话题、附加内容(群里贴视频链接出的卡也是这个形状);「图文」是带图的
+	// 那一种,图廊只有它看得到;转发单给一场:它里头是**另一整张卡**(转发框 + 跟着同一份
+	// 皮肤摆的块),不单列的话皮肤作者在面板上一眼都看不到这一层。
+	// 从前的「全字段」(视频 + 正文 + 话题)砍了 —— 它在出图端与「视频投稿」是同一种卡。
+	dynamic: [
+		{ id: "text", label: "纯文字" },
+		{ id: "video", label: "视频投稿" },
+		{ id: "pics", label: "图文" },
+		{ id: "forward", label: "转发" },
+	],
+	sc: [{ id: "default", label: "醒目留言" }],
+	guard: [{ id: "default", label: "上舰" }],
+	roastBoard: [{ id: "default", label: "锐评榜单" }],
+	roastSolo: [{ id: "default", label: "单人锐评" }],
+	wordcloud: [{ id: "default", label: "词云" }],
+};
+
+/**
+ * 请求里那个场景名 → 真正要用的场景。**认不出就回落到第一个**,不报错:场景名从 URL /
+ * 请求体来,面板换过一版、链接被人存过书签都会送来旧名字,为这个给张错误页不值。
+ *
+ * 收成一处是因为有**两个**调用方(出图端挑示例数据、预览路由回报「实际用了哪个」),
+ * 各写一遍 `find ?? 第一个` 的话,哪天回落规则改了就只改得动其中一边。
+ */
+export function resolvePreviewScene(kind: CardSkinKind, scene?: string): PreviewScene {
+	const scenes = CARD_PREVIEW_SCENES[kind];
+	// biome-ignore lint/style/noNonNullAssertion: 表里每种卡都至少一个场景,有测试钉着
+	return scenes.find((s) => s.id === scene) ?? scenes[0]!;
+}
+
+/**
+ * 块在网格里的位置(与 `CardSkinBlockSchema` 的 `grid` 同形)。声明在这里而不是 schema 里,
+ * 是为了让**零依赖**的 {@link rowMapOf} 也能用上 —— 画布经 `/constants` 子路径运行时
+ * 消费它,不能把 zod 拖进前端 bundle(与 {@link AIProviderProfileShape} 同一条理由)。
+ */
+export interface CardSkinGrid {
+	row: number;
+	column: number;
+	span: number;
+	rowSpan?: number;
+	z?: number;
+}
+
+/**
+ * **压行**:把一组块**占到**的行按从小到大重编成 1..n,回一张「真行号 → 压后行号」的表。
+ * 占到 ≠ 起在:跨行的块把中间那几行也占着,漏掉它们就会把下一块压进它身上;一个块占的
+ * 行因此恒是连着的一段,`rowSpan` 不用跟着改。整行没块的行不在表里 —— 那就是被压掉的行。
+ *
+ * 出图端与画布**共用这一处**(ADR-0014 决策 10 的 2026-09-19 🔗「画布与出图一样紧」):
+ * 各写一遍的话,编辑器里看着紧贴的两块,真画出来中间多一条缝,或者反过来。
+ */
+export function rowMapOf(
+	grids: Iterable<Pick<CardSkinGrid, "row" | "rowSpan">>,
+): Map<number, number> {
+	const occupied = new Set<number>();
+	for (const { row, rowSpan } of grids) {
+		for (let r = row; r < row + (rowSpan ?? 1); r++) occupied.add(r);
+	}
+	const map = new Map<number, number>();
+	for (const r of [...occupied].sort((a, b) => a - b)) map.set(r, map.size + 1);
+	return map;
+}
+
+/**
+ * **皮肤自定义旋钮**(ADR-0014 决策 16 的 🔗,2026-09-14:主人推翻自己「被否:皮肤自定义
+ * 旋钮」那一条)。皮肤声明几枚旋钮,面板照声明生成控件,用户拧出来的值注成
+ * `--bn-knob-<key>`,皮肤 CSS 里 `var(--bn-knob-<key>, <自己的默认>)` 引用。
+ *
+ * 固定变量表({@link CARD_SKIN_VARIABLES})管的是**用户的资产**(背景图)与**数据**
+ * (档位色):皮肤换了它们还在。旋钮管的是**这套皮肤自己的调色板**:皮肤换了就换一套。
+ *
+ * 🔴 **`default` 不注入**。它只是面板控件的起始位置;用户没动过就什么都不注,皮肤 CSS 里
+ * 那个 `var(…, 兜底)` 的兜底生效(「存覆盖不存值」,决策 16 的第二个 🔗)。这条不是省事:
+ * 默认皮肤的玻璃白纱各卡基线不同(直播 .82 / SC .75 / 锐评 .86),注了就只能注一个数、
+ * 三档立刻塌成一档;不注,各卡 CSS 写各自的兜底,用户一拧才统一覆盖。
+ */
+export const CARD_SKIN_KNOB_LIMITS = {
+	/** 一套皮肤最多几枚旋钮(面板一屏能拧完的量)。 */
+	maxKnobs: 16,
+	/** 下拉最多几个候选。 */
+	maxOptions: 8,
+	/** 旋钮 / 候选的人话名长度。 */
+	label: { max: 24 },
+	/** key 长度(变量名要人能读)。 */
+	key: { max: 32 },
+	/** 下拉候选 / 开关两端那种字面量的长度。 */
+	value: { max: 80 },
+	/** 一枚图片旋钮最多选几张(多张按推送轮换)。与皮肤包内资产同量级。 */
+	maxImages: 12,
+} as const;
+
+/**
+ * key:小写字母起头的 kebab。它直接拼进变量名,所以大写(CSS 自定义属性大小写敏感,
+ * 面板与 CSS 各写一种就永远对不上)、下划线、非 ASCII 都不收。
+ */
+export const CARD_SKIN_KNOB_KEY_RE = /^[a-z][a-z0-9-]*$/;
+
+/** 数值旋钮的单位。固定几种 —— 单位直接拼在数字后面进 CSS,不能是自由文本。 */
+export const CARD_SKIN_KNOB_UNITS = ["px", "%", "em", "rem", "deg", "s", "ms"] as const;
+export type CardSkinKnobUnit = (typeof CARD_SKIN_KNOB_UNITS)[number];
+
+// ---- 上限 -------------------------------------------------------------------
+
+/** 取值域的唯一事实源:server 的清洗 / 装包与 web 的编辑器都从这里读。 */
+export const CARD_SKIN_LIMITS = {
+	/** 网格列数,固定(CSS grid 惯例,2 / 3 / 4 等分都整除)。 */
+	columns: 12,
+	/** 卡宽 px。下限要装得下上舰卡的徽章 + 两行字,上限是截图与群里看图的常识。 */
+	width: { min: 240, max: 1200 },
+	/** 行 / 列间距 px。 */
+	gap: { min: 0, max: 64 },
+	/**
+	 * **出血** px —— 卡片四周留给辉光的那圈余量(2026-09-14 主人拍板)。
+	 *
+	 * 存在的理由:出图截的是 `html` 的 boundingBox,而 `box-shadow` / `filter` 的辉光
+	 * **不参与布局、不撑大任何盒子**,所以画在卡外的那一圈在成品里一个像素都没有。
+	 * 皮肤要辉光就得自己声明留多宽,以及那圈底什么色(JPEG 没有 alpha,不给色就是白边)。
+	 *
+	 * 上限跟 `gap` 同一个数:64 已经是 600 宽的卡外扩到 728,再宽就不像一张卡了。
+	 */
+	bleed: { min: 0, max: 64 },
+	/** 一张卡最多几个块。 */
+	maxBlocks: 40,
+	/** 网格最多几行(块的 row 上限)。 */
+	maxRows: 60,
+	/**
+	 * **一行多高** px。画布按它画格子,出图按它给「单张图」那类块算真高度
+	 * ({@link CardSkinBuiltinBlock.heightFromRows},2026-09-18 主人拍板)。
+	 *
+	 * 两边必须是同一个数:画布上量着 3 行摆好的封面,出图得也是那么高 —— 各写一份的话,
+	 * 编辑器里摆的和真画出来的迟早是两回事(这一摊已经栽过)。
+	 *
+	 * 56 是画布先定的:再矮,块名与那行 `id · 列区间` 的小字就挤不下了。它同时也就成了
+	 * 作者调图高的**步长**,粗是粗了点,但网格本来就是格子。
+	 */
+	rowHeight: 56,
+	/**
+	 * **层次** —— 两个块占同一片格子时谁压在上面(2026-09-15 主人拍板「重叠是特性」)。
+	 *
+	 * 网格允许两个块的列区间相交,那是 CSS Grid 的正常行为,也真有人要
+	 * (角标压在封面上)。但不写层次的话,谁压谁只看块在数组里的先后 —— 想调就得去
+	 * 改块的顺序,而那同时会改掉别的东西。
+	 *
+	 * 上限 9:十层足够表达一张卡里的任何前后关系,而数字一大,面板上那个框就开始
+	 * 像个能填 9999 的东西了。**不给负数** —— 0 是地面,要沉底就把别的抬高,
+	 * 留负数只会让「默认 0」变成一个有上有下的中间层,平白多一种想不清楚的状态。
+	 */
+	layer: { min: 0, max: 9 },
+	/**
+	 * 每块 CSS 的字节上限(含根块)。**按 UTF-8 字节算**,量的人是
+	 * {@link cardSkinBytes} —— 三层(清洗器 / schema / 面板计数器)必须同一把尺。
+	 */
+	maxCssBytes: 16 * 1024,
+	/** 每个自定义块 HTML 的字节上限(同上,UTF-8 字节)。 */
+	maxHtmlBytes: 8 * 1024,
+	/** 包名 / 作者 / 描述的长度。 */
+	name: { min: 1, max: 40 },
+	author: { max: 40 },
+	description: { max: 200 },
+	/** 包内资产数量与单个体积(与 dashboard 皮肤同量级)。 */
+	maxAssets: 12,
+	maxAssetBytes: 5 * 1024 * 1024,
+	/** 根 / 块各自那张「资产变量表」最多几项(ADR-0014 决策 13 的 🔗:`--bn-asset-<名>`)。 */
+	maxAssetVars: 8,
+	/** 皮肤级 `fonts` 最多几款。 */
+	maxFonts: 4,
+	/**
+	 * 出图后的卡片最大高度 px(ADR-0014 决策 19「卡片有最大高度,超了算失败」)。
+	 *
+	 * 4000 是从**两头**夹出来的:今天最高的一张真卡是九图动态(600 宽 × 约 1800 高),
+	 * 留一倍余量让长图文动态不误伤;另一头,截图是 `page.screenshot` 一次性出一张 JPEG,
+	 * 600 × 4000 已是 240 万像素、几兆内存,而镜像里 V8 的 old-space 只有 512MB ——
+	 * 再往上一个数量级(一条 `height:100vh` 写错的皮肤 CSS 就能做到)会把浏览器和
+	 * 本进程一起拖垮,而症状只是「推送莫名其妙停了」。
+	 *
+	 * 超限只回落默认皮肤重画一次,**不拒发**:内容本来就长的时候默认皮肤也会超,那是
+	 * 内容的问题不是皮肤的,照发。
+	 */
+	maxHeight: 4000,
+} as const;
+
+/**
+ * 皮肤里那几道体积闸量的**同一把尺**:UTF-8 字节。
+ *
+ * 三层都得用它 —— server 的清洗器、`CardSkinBlockSchema` 的长度闸、面板上那个
+ * 「3000 / 8192」计数器。用 `s.length` 量的是 UTF-16 单元数,一个汉字才记 1:
+ * 中文密集的自定义块会在面板上显示得好好的、也过得了 schema,存的时候被清洗器
+ * 退回来。挑字节当权威是因为存盘与 zip 预算算的本来就是字节。
+ *
+ * `TextEncoder` 浏览器与 Node 都有;server 那两处用的 `Buffer.byteLength(s, "utf8")`
+ * 结果相同,不必改回来。
+ */
+const UTF8 = new TextEncoder();
+
+export function cardSkinBytes(s: string): number {
+	return UTF8.encode(s).length;
+}
+
+// ---- 卡片皮肤的数据契约 ----------------------------------------------------------------
+
+export type CardSkinFieldType = "text" | "number" | "bool" | "image";
+
+/** 一个对外字段:路径、类型、人话名。`image` 类型才准出现在 `<img src="{…}">` 里。 */
+export interface CardSkinField {
+	path: string;
+	type: CardSkinFieldType;
+	label: string;
+}
+
+const f = (path: string, type: CardSkinFieldType, label: string): CardSkinField => ({
+	path,
+	type,
+	label,
+});
+
+const AUTHOR_FIELDS = (who: string) => [
+	f("up.name", "text", `${who}名`),
+	f("up.face", "image", `${who}头像`),
+];
+
+/**
+ * 每种卡对外承诺的字段(ADR-0014 决策 14)。**只增不删不改名。**
+ * 已格式化的文本(「1.2 万」「已开播 1 小时」)直接给,占位符不带过滤器。
+ * `is*` / `has*` 一律 bool,是 `showIf` 的目标。
+ */
+export const CARD_SKIN_FIELDS: Record<CardSkinKind, readonly CardSkinField[]> = {
+	live: [
+		...AUTHOR_FIELDS("主播"),
+		f("live.title", "text", "直播标题"),
+		f("live.area", "text", "分区"),
+		f("live.time", "text", "开播时长 / 下播时间那句"),
+		f("live.description", "text", "房间简介(纯文本)"),
+		f("live.cover", "image", "封面(生效的那张)"),
+		f("live.hasCover", "bool", "有没有封面"),
+		f("live.isStreaming", "bool", "正在直播"),
+		f("live.isEnded", "bool", "已下播"),
+		f("stats.popularity", "text", "人气(直播中)/ 点赞(下播)"),
+		f("stats.area", "text", "分区(同 live.area,给数据行用)"),
+		f("stats.fans", "text", "粉丝数(直播中)/ 累计观看(下播)"),
+		f("stats.fansChanged", "text", "粉丝变化(下播才有)"),
+		f("stats.hasFansChanged", "bool", "有没有粉丝变化"),
+	],
+	dynamic: [
+		...AUTHOR_FIELDS("UP 主"),
+		f("up.isVip", "bool", "是大会员"),
+		f("dynamic.type", "text", "动态类型(DYNAMIC_TYPE_*)"),
+		f("dynamic.action", "text", "「投稿了视频」这类动作标签"),
+		f("dynamic.time", "text", "发布时间"),
+		f("dynamic.topic", "text", "话题"),
+		f("dynamic.hasTopic", "bool", "有没有话题"),
+		f("dynamic.isForward", "bool", "是转发"),
+		f("dynamic.hasAdditional", "bool", "有没有附加内容(预约 / 商品…)"),
+		f("dynamic.hasVideo", "bool", "带视频卡"),
+		f("dynamic.hasPics", "bool", "带图"),
+		f("video.title", "text", "视频标题"),
+		f("video.desc", "text", "视频简介"),
+		f("video.cover", "image", "视频封面"),
+		f("video.duration", "text", "视频时长"),
+		f("video.views", "text", "播放量"),
+		f("video.danmaku", "text", "弹幕数"),
+		f("pics.count", "number", "图片张数"),
+		f("pics.first", "image", "第一张图"),
+		f("stats.forward", "text", "转发数"),
+		f("stats.comment", "text", "评论数"),
+		f("stats.like", "text", "点赞数"),
+	],
+	sc: [
+		f("sender.name", "text", "发送者名"),
+		f("sender.face", "image", "发送者头像"),
+		f("master.name", "text", "主播名"),
+		f("master.face", "image", "主播头像"),
+		f("sc.price", "text", "金额(带货币符号)"),
+		f("sc.priceValue", "number", "金额数字"),
+		f("sc.duration", "text", "留言时长"),
+		f("sc.level", "number", "价位档(0~5)"),
+		f("sc.text", "text", "留言"),
+	],
+	guard: [
+		f("user.name", "text", "上舰用户名"),
+		f("user.face", "image", "上舰用户头像"),
+		f("user.isAdmin", "bool", "是房管"),
+		f("master.name", "text", "主播名"),
+		f("master.face", "image", "主播头像"),
+		f("guard.level", "number", "舰长等级(1 总督 / 2 提督 / 3 舰长)"),
+		f("guard.levelName", "text", "舰长 / 提督 / 总督"),
+		f("guard.badge", "image", "徽章图"),
+		f("guard.text", "text", "文字信息那句"),
+	],
+	roastBoard: [f("master.name", "text", "主播名"), f("report.days", "number", "统计天数")],
+	roastSolo: [
+		f("up.name", "text", "UP 主名"),
+		f("up.face", "image", "UP 主头像"),
+		f("report.days", "number", "统计天数"),
+	],
+	wordcloud: [f("master.name", "text", "主播名"), f("master.face", "image", "主播头像")],
+};
+
+/**
+ * 每块 CSS 里指「块自己」的挂点。皮肤写 `[data-bn="self"]`,渲染器把它翻成该块的真实
+ * 选择器 —— 与 dashboard 皮肤同一套「按 hook 存盘、注入时翻译」的哲学。
+ */
+export const CARD_SKIN_SELF_HOOK = "self";
+
+/**
+ * 根块(卡片外框)的两层挂点。外层是渐变 / 背景图那层(带 15px 内边距),内层是玻璃层
+ * (圆角 / 阴影 / 白纱 / 模糊)。块都画在玻璃层里。
+ */
+export const CARD_SKIN_FRAME_HOOKS = {
+	frame: "外框(渐变 / 背景图那一层)",
+	glass: "玻璃层(圆角、阴影、白纱、模糊)",
+} as const;
+export type CardSkinFrameHook = keyof typeof CARD_SKIN_FRAME_HOOKS;
+
+/** 主人自己传上来的资产在旋钮值里的前缀。**对外 API**,只增不改。 */
+export const CARD_SKIN_UPLOAD_PREFIX = "upload:";
+
+/**
+ * 字体旋钮的值 → 宿主要做什么。
+ *
+ * - `upload:<资产 id>` —— 主人传的字体文件,宿主读盘拼 `@font-face`(与 `cardStyle.fontAsset`
+ *   从前同一条路);
+ * - 别的非空字符串 —— 一个家族名(系统字体、手填的、或者皮肤自带的那几款);
+ * - 空串 / 别的类型 —— 没什么要注的(跟着兜底链走)。
+ */
+export function parseCardSkinFontKnobValue(
+	value: unknown,
+): { upload: string } | { family: string } | null {
+	if (typeof value !== "string" || value === "") return null;
+	if (value.startsWith(CARD_SKIN_UPLOAD_PREFIX)) {
+		const id = value.slice(CARD_SKIN_UPLOAD_PREFIX.length);
+		return id === "" ? null : { upload: id };
+	}
+	return { family: value };
+}
+
+/**
+ * 图片旋钮的值 → 一串资产 id(多张按推送轮换)。空列表与「没拧过」同义,回 null。
+ *
+ * 混进来的空串 / 非字符串**剔掉**而不是整条作废:存量里被手改过的值不该让一整张卡的
+ * 背景凭空消失。
+ */
+export function parseCardSkinImageKnobValue(value: unknown): string[] | null {
+	if (!Array.isArray(value)) return null;
+	const ids = value.filter((v): v is string => typeof v === "string" && v !== "");
+	return ids.length > 0 ? ids : null;
+}
+
+/** 一个内置块的目录条目:人话名 + 它内部可分别挂 CSS 的部件。 */
+export interface CardSkinBuiltinBlock {
+	label: string;
+	/** 是复合块(头像 + 名字 + 时间捆一起)还是原子块(只画一样)。编辑器分组用。 */
+	atom?: true;
+	/**
+	 * 内部挂点 → 人话名。皮肤写 `[data-bn="avatar"]`。
+	 *
+	 * `self` 是渲染器包在块外面那层 wrapper(网格里的格子),**不是块自己的根元素**。所以
+	 * 2026-09-19 起(ADR-0014 决策 7 的 🔗)原子块的根也挂一个:它长什么样(字号、字色、圆角、
+	 * 胶囊底色)全写在默认皮肤这个挂点的规则里,渲染器只留结构。根挂点的名字只有几个,按
+	 * 「它是什么」取:图 `image`、文字 `text`、胶囊 / 角标 `pill`、留言气泡 `bubble`、分割线
+	 * `line`;根之外的部件照旧各有各的名(正文文字里的 `body`、图廊里的 `pic`、互动数里的
+	 * `icon`)。`atom` 只管编辑器分组,不代表「没有挂点」。
+	 */
+	hooks: Record<string, string>;
+	/**
+	 * 这块画的是**一张有确定尺寸的图**,它的高度由 `grid.rowSpan` 说了算
+	 * (`rowSpan × ` {@link CARD_SKIN_LIMITS.rowHeight}),不由内容撑;图按
+	 * `object-fit:cover` 填满那块地方(按比例裁,不压扁)。2026-09-18 主人拍板。
+	 *
+	 * **只标单张图。**文字块的高度取决于真实数据(标题一行还是三行、简介几行),写死就是
+	 * 裁字或压到下一块身上 —— 那正是 ADR-0014 决策 6 否掉「绝对坐标排版」的理由;图廊
+	 * 同理,它多高取决于有几张图。没标的块 `rowSpan` 照旧只是给画布看的一句声明。
+	 *
+	 * 画布照它决定上下两条边画不画把手:拉得动的,拉完出图就真的跟着变。
+	 */
+	heightFromRows?: true;
+	/**
+	 * 这块**只属于这几场**(`CARD_PREVIEW_SCENES[kind]` 里的 id;ADR-0014 决策 10 的
+	 * 2026-09-19 🔗)。不写 = 共有块,每一场都有它。
+	 *
+	 * 只给编辑器用:画布切到哪一场就只摆这一场会有的块,加块目录上给独有块挂个小标。
+	 * **出图端不读它** —— 图廊在视频那场本来就没数据、整块不画,目录只是把这件事提前
+	 * 告诉画布。所以皮肤格式里没有任何场景名单:共有块改了处处改,没有「专属本场」。
+	 */
+	scenes?: readonly string[];
+}
+
+/**
+ * 分割线块的块名。原来住在旧版式那份 schema 里(它退役了,见 ADR-0014 决策 17 的
+ * 2026-09-18 🔗),但渲染器要靠它认出分割线 —— 「开头的收起、悬空的收起、末尾的弹掉」
+ * 那套规矩就是按它判的。**单点定义**:块目录、皮肤渲染器、四份块库认的是同一个字符串。
+ */
+export const DIVIDER_TYPE = "divider";
+
+/** 四种可编辑卡共用的分割线。 */
+const DIVIDER_BLOCK: CardSkinBuiltinBlock = { label: "分割线", atom: true, hooks: { line: "线" } };
+
+/**
+ * 内置块目录:每种卡有哪些块、每块内部有哪些挂点。**块名与挂点名是对外 API。**
+ *
+ * **只有原子块与天生拆不动的块**(ADR-0014 决策 8 的 2026-09-18 🔗):复合块整批退役了 ——
+ * 用户多是从默认皮肤复制一份再改,目录里留着「一块顶半张卡」的东西,能挪的就只有整行。
+ *
+ * `atom` 分的是**「这块画一样东西,还是捆了好几样」**,不是「能不能再拆」:转发框里确实
+ * 套着一整张内层卡、图廊里确实有好几张图,但搬动时它们各是一件,所以是原子块。剩下的
+ * 非原子块是一份**闭集**,由 `card-blocks.test.ts` 钉着:附加内容(预约 / 商品 / 通用 /
+ * 关联视频四种形态结构各异、字段不在契约里,主人拍板不拆)与三种不可编辑卡的整卡块。
+ */
+export const CARD_SKIN_BUILTIN_BLOCKS: Record<
+	CardSkinKind,
+	Record<string, CardSkinBuiltinBlock>
+> = {
+	live: {
+		// 角标与封面**占同一片格子**、层次更高,不再嵌在封面里(决策 8 的 2026-09-18 🔗)。
+		// ⚠️ `image` 挂点是拆封面之前就有的**公开 API**,拆的时候连同 `<img>` 上那个
+		// `data-bn` 一起掉了一次(`5fa842ca`)—— 挂点名只增不改不删,而且没有它,皮肤连
+		// 「把封面压矮一点」都写不出来(`[data-bn="self"]` 是外面那层 div,在它上面写
+		// height 图会直接溢出去)。
+		cover: { label: "封面图", atom: true, heightFromRows: true, hooks: { image: "封面图片" } },
+		status: { label: "直播状态", atom: true, hooks: { pill: "胶囊" } },
+		title: { label: "直播标题", atom: true, hooks: { text: "文字" } },
+		desc: { label: "简介", atom: true, hooks: { text: "文字" } },
+		[DIVIDER_TYPE]: DIVIDER_BLOCK,
+		avatar: { label: "头像", atom: true, hooks: { image: "头像图片" } },
+		name: { label: "主播名", atom: true, hooks: { text: "文字" } },
+		time: { label: "开播时间", atom: true, hooks: { text: "文字" } },
+		// 数据区的三件(ADR-0014 决策 16 的 🔗):从前由三个显隐开关管,而开关管的是复合块
+		// **内部的一行**、块级的 `showIf` 够不着 —— 所以拆成原子块,想少显示哪件就删哪块。
+		popularity: { label: "人气 / 点赞", atom: true, hooks: { text: "文字" } },
+		area: { label: "分区", atom: true, hooks: { text: "文字" } },
+		fans: { label: "粉丝行", atom: true, hooks: { text: "文字" } },
+	},
+	dynamic: {
+		additional: {
+			label: "附加内容",
+			hooks: { card: "附加卡", cover: "附加卡封面", button: "按钮" },
+		},
+		[DIVIDER_TYPE]: DIVIDER_BLOCK,
+		avatar: { label: "头像", atom: true, hooks: { image: "头像图片" } },
+		name: { label: "UP 主名", atom: true, hooks: { text: "文字" } },
+		time: { label: "发布时间", atom: true, hooks: { text: "文字" } },
+		// 文字与媒体是呈现态里分开的几份(`DynamicNode.text` / `.video` / `.pics`)。
+		topic: { label: "话题", atom: true, hooks: { text: "文字" } },
+		// 正文富文本整段留在渲染器(决策 7 的 2026-09-19 🔗),所以这块没有根挂点 ——
+		// `body` 是富文本自己的根,样子也归它。
+		text: { label: "正文文字", atom: true, hooks: { body: "正文" } },
+		// 投稿视频那张卡拆成的五块。外面那圈灰底圆角容器不是块,是皮肤用 CSS 拼的 ——
+		// 三段文字各带一段灰底、首尾分担圆角(决策 8 的 2026-09-18 🔗)。
+		// 三组独有块各自只属于一场(`scenes`):画布切到别的场就不摆它们。
+		videoCover: {
+			label: "视频封面",
+			atom: true,
+			heightFromRows: true,
+			hooks: { image: "封面图片" },
+			scenes: ["video"],
+		},
+		videoDuration: { label: "视频时长", atom: true, hooks: { pill: "角标" }, scenes: ["video"] },
+		videoTitle: { label: "视频标题", atom: true, hooks: { text: "文字" }, scenes: ["video"] },
+		videoDesc: { label: "视频简介", atom: true, hooks: { text: "文字" }, scenes: ["video"] },
+		videoStats: {
+			label: "播放 · 弹幕数",
+			atom: true,
+			hooks: { text: "文字", stat: "一项数据" },
+			scenes: ["video"],
+		},
+		// 图廊张数是动态的,拆不开,整块画。
+		pics: {
+			label: "图廊",
+			atom: true,
+			hooks: { pics: "图廊", pic: "图廊里的一张图" },
+			scenes: ["pics"],
+		},
+		// 根就是转发框,它的样子挂在 `bubble` 上;框里是一整张内层卡,那些部件归内层卡
+		// 自己的块管,这里不声明。
+		forward: { label: "转发框", atom: true, hooks: { bubble: "转发框" }, scenes: ["forward"] },
+		forwardCount: { label: "转发数", atom: true, hooks: { text: "文字", icon: "图标" } },
+		commentCount: { label: "评论数", atom: true, hooks: { text: "文字", icon: "图标" } },
+		likeCount: { label: "点赞数", atom: true, hooks: { text: "文字", icon: "图标" } },
+	},
+	sc: {
+		// 留言的根是一层撑满格子的壳(居中靠块的 `self` 说),气泡与文字各一个挂点。
+		message: { label: "留言", atom: true, hooks: { bubble: "留言气泡", text: "留言文本" } },
+		[DIVIDER_TYPE]: DIVIDER_BLOCK,
+		// 头像的根是那个把图裁圆的框,`image` 挂在框上 —— 尺寸与圆都归它,里头的 img 填满即可。
+		avatar: { label: "发送者头像", atom: true, hooks: { image: "头像图片" } },
+		name: { label: "发送者名", atom: true, hooks: { pill: "胶囊" } },
+		price: { label: "金额", atom: true, hooks: { text: "文字" } },
+		duration: { label: "时长胶囊", atom: true, hooks: { pill: "胶囊" } },
+		to: {
+			label: "「SC to」那一行",
+			atom: true,
+			hooks: {
+				text: "文字",
+				label: "「SC to」三个字",
+				master: "主播那一组",
+				masterAvatar: "主播小头像",
+				masterName: "主播名",
+			},
+		},
+	},
+	guard: {
+		badge: { label: "舰长徽章", atom: true, hooks: { image: "舰长徽章图" } },
+		text: { label: "文字信息", atom: true, hooks: { text: "文字" } },
+		[DIVIDER_TYPE]: DIVIDER_BLOCK,
+		// 头像的根是那个把图裁圆的框,`image` 挂在框上 —— 尺寸与圆都归它。
+		avatar: { label: "头像", atom: true, hooks: { image: "头像图片" } },
+		user: { label: "用户名胶囊", atom: true, hooks: { pill: "胶囊", text: "文字" } },
+		master: {
+			label: "主播胶囊",
+			atom: true,
+			hooks: { pill: "胶囊", masterAvatar: "主播小头像", masterName: "主播名" },
+		},
+	},
+	roastBoard: { body: { label: "周报榜单", hooks: {} } },
+	roastSolo: { body: { label: "单人锐评", hooks: {} } },
+	wordcloud: { body: { label: "弹幕词云", hooks: {} } },
+};

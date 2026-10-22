@@ -11,7 +11,12 @@
  */
 
 import { describe, expect, it } from "vite-plus/test";
-import { INBOUND_CAPABLE_PLATFORMS, inboundGapReason, platformCanReceiveReply } from "./constants";
+import {
+	INBOUND_CAPABLE_PLATFORMS,
+	inboundGapReason,
+	platformCanReceiveReply,
+	WEBHOOK_PLATFORMS,
+} from "./constants";
 
 describe("platformCanReceiveReply", () => {
 	it("列进表里的平台放行", () => {
@@ -26,19 +31,21 @@ describe("platformCanReceiveReply", () => {
 	});
 
 	it("没实现入站的平台一律拦下 —— 宁可少列", () => {
-		for (const p of ["webhook", "someday-bridge", ""]) {
+		for (const p of [...WEBHOOK_PLATFORMS, "someday-telegram", ""]) {
 			expect(platformCanReceiveReply(p)).toBe(false);
 		}
 	});
 });
 
 describe("inboundGapReason", () => {
-	it("webhook:说的是它天生没有回程", () => {
-		expect(inboundGapReason("webhook")).toMatch(/没有回程|出站/);
+	it.each(WEBHOOK_PLATFORMS)("%s:说的是 webhook 天生没有回程", (platform) => {
+		// 飞书 / 钉钉自己的机器人是收得到消息的 —— 收不到的是**这条 webhook 通道**。
+		// 判据落在词表上,新加一档 webhook 平台会自动进这条用例。
+		expect(inboundGapReason(platform)).toMatch(/没有回程|出站/);
 	});
 
 	it("还没接的平台:说的是我们还没接,不能说成通道收不到", () => {
-		const why = inboundGapReason("someday-bridge");
+		const why = inboundGapReason("someday-telegram");
 		// 这两句是这条测试的全部意义 —— 反过来写就是主人当初抓到的那个错:
 		// 把「女仆没实现」写成「这个通道只能发不能收」,主人会去查自己的配置。
 		expect(why).toMatch(/还没/);
@@ -46,6 +53,6 @@ describe("inboundGapReason", () => {
 	});
 
 	it("理由里带上平台名 —— 主人得知道说的是哪条通道", () => {
-		expect(inboundGapReason("someday-bridge")).toContain("someday-bridge");
+		expect(inboundGapReason("someday-telegram")).toContain("someday-telegram");
 	});
 });

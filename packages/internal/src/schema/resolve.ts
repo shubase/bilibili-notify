@@ -1,5 +1,4 @@
 import { resolveActivePersona, resolveAIProfile } from "../constants";
-import { type CardLayout, normalizeCardLayout } from "./card-layout";
 import type {
 	AIPersona,
 	AISettings,
@@ -17,8 +16,7 @@ import { type MessageLayout, normalizeMessageLayout } from "./message-layout";
 import type {
 	AIOverride,
 	Subscription,
-	SubscriptionAtAll,
-	SubscriptionAtAllDefaults,
+	SubscriptionExtras,
 	SubscriptionOverrides,
 	SubscriptionRouting,
 } from "./subscriptions";
@@ -35,8 +33,8 @@ export interface EffectiveSubscription {
 	groups: string[];
 	notes: string | undefined;
 	routing: SubscriptionRouting;
-	atAllDefaults: SubscriptionAtAllDefaults;
-	atAll: SubscriptionAtAll;
+	/** 附加项的 per-目标 三态表(原样带过来,没有可合并的上一层)。 */
+	extras: SubscriptionExtras;
 	specialUsers: Subscription["specialUsers"];
 
 	features: FeatureFlags;
@@ -45,7 +43,8 @@ export interface EffectiveSubscription {
 	templates: TemplateBundle;
 	ai: ResolvedAI;
 	cardStyle: CardStyle;
-	cardLayout: CardLayout;
+	/** 生效的卡片皮肤 id(per-UP 指了就用它,否则全局)。 */
+	cardSkin: string;
 	messageLayout: MessageLayout;
 	imageGroup: ImageGroupSettings;
 }
@@ -73,18 +72,18 @@ function merge<T extends object>(base: T, override: Partial<T> | undefined): T {
 }
 
 /**
- * features 的合并比别的多一层:下播的附加项是个小对象,per-UP 只关词云时不该把总结
- * 一起盖掉 —— 七把开关浅合并,`liveEndExtras` 再往里合一层。
+ * features 的合并比别的多一层:附加项是个小对象,per-UP 只关词云时不该把总结
+ * 一起盖掉 —— 七把开关浅合并,`extras` 再往里合一层。
  */
 function mergeFeatures(
 	base: FeatureFlags,
 	override: FeatureFlagsPartial | undefined,
 ): FeatureFlags {
 	if (!override) return base;
-	const { liveEndExtras, ...flags } = override;
+	const { extras, ...flags } = override;
 	return {
 		...merge(base, flags),
-		liveEndExtras: merge(base.liveEndExtras, liveEndExtras),
+		extras: merge(base.extras, extras),
 	};
 }
 
@@ -152,7 +151,7 @@ export function resolveCardStyleForKind(
 export function resolve(sub: Subscription, defaults: GlobalDefaults): EffectiveSubscription {
 	const ov = sub.overrides;
 	// P2:merge() 在 override 缺失时直接返回 base 引用,且 {...base} 仅浅拷贝 ——
-	// routing/atAll/specialUsers 又是 sub 的直接引用,filters.blockKeywords
+	// routing/extras/specialUsers 又是 sub 的直接引用,filters.blockKeywords
 	// 等嵌套数组与 defaults 共享。任一消费方就地改 EffectiveSubscription 即污染
 	// 全局默认 / 原始 sub。structuredClone 整体深隔离(schema 全为纯数据,无函数)。
 	return structuredClone<EffectiveSubscription>({
@@ -163,8 +162,7 @@ export function resolve(sub: Subscription, defaults: GlobalDefaults): EffectiveS
 		groups: sub.groups,
 		notes: sub.notes,
 		routing: sub.routing,
-		atAllDefaults: sub.atAllDefaults,
-		atAll: sub.atAll,
+		extras: sub.extras,
 		specialUsers: sub.specialUsers,
 
 		features: mergeFeatures(defaults.features, ov.features),
@@ -173,11 +171,10 @@ export function resolve(sub: Subscription, defaults: GlobalDefaults): EffectiveS
 		templates: merge(defaults.templates, ov.templates),
 		ai: resolveAI(defaults.ai, ov.ai),
 		cardStyle: merge(defaults.cardStyle, ov.cardStyle),
-		// 卡片版式整份覆盖:有 per-UP override 则用它(并 normalize 做向前兼容),
-		// 否则继承全局。数组型描述符不走 merge() 的浅合并。
-		cardLayout: ov.cardLayout
-			? normalizeCardLayout(ov.cardLayout, defaults.cardLayout)
-			: defaults.cardLayout,
+		// 皮肤是整份引用,没有合并可言:指了就是它。旧的 `cardLayout` 不再折进来 ——
+		// 出图只认皮肤,而那个键连同折它进来的开机迁移已一并删掉(ADR-0014 决策 17 的
+		// 2026-09-18 🔗:没选过皮肤的一律用出厂默认)。
+		cardSkin: ov.cardSkin ?? defaults.cardSkin,
 		// 消息版式同 cardLayout:per-UP 整份覆盖(带 normalize 向前兼容),否则继承全局。
 		messageLayout: ov.messageLayout
 			? normalizeMessageLayout(ov.messageLayout, defaults.messageLayout)

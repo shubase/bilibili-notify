@@ -25,7 +25,7 @@ import { api } from "../../services/api";
 import type { GlobalConfig } from "../../types/globals";
 import { externalLinkClick } from "../../utils/externalLink";
 import { MirrorPicker } from "./mirror-picker";
-import { type RestartWait, useRestartStore } from "./restart";
+import { DEFAULT_RESTART_WAIT, type RestartWait, useRestartStore } from "./restart";
 import { phaseLabel, UPDATE_QUERY_KEY, UPDATE_SECTION_HASH, useUpdateStatus } from "./status";
 
 /**
@@ -75,12 +75,6 @@ const ERROR_COPY: Record<UpdateErrorReason, string> = {
 /** 唯一弹红字的一条。其余一律中性旁注 —— 把代理站抽风渲染成安全警告只会训练用户忽略它。 */
 const DANGEROUS_REASON: UpdateErrorReason = "untrusted";
 
-/**
- * 每秒探一次,最多等 90 秒。优雅停机最多 10 秒,加上容器把进程拉起来、载荷启动到
- * 开始 listen,几十秒都算正常;一分半还没回来,多半就不是慢了。
- */
-const DEFAULT_RESTART_WAIT: RestartWait = { intervalMs: 1_000, timeoutMs: 90_000 };
-
 export interface UpdateSectionProps {
 	/** 只给测试压短等待;正常挂载不传。 */
 	restartWait?: RestartWait;
@@ -91,11 +85,14 @@ export function UpdateSection({ restartWait = DEFAULT_RESTART_WAIT }: UpdateSect
 	// 按下重启之后的进度住在模块级 store 里(理由见 restart.ts):用户中途离开系统页,
 	// 等待照样进行、换成了照样刷新;回来看到的还是同一份进度。
 	const {
-		view: restart,
+		view,
 		begin: beginRestart,
 		retry: retryRestart,
 		dismiss: dismissRestart,
 	} = useRestartStore();
+	// 「重启一下」那一节按出来的等待归它自己显示 —— 这里只管更新 / 回退带来的那一次,
+	// 否则同一份状态会被两节各画一遍,而且这一节的措辞讲的是「换到哪一版」。
+	const restart = view?.intent.mode === "restart" ? null : view;
 	const statusQuery = useUpdateStatus();
 	const globalsQuery = useQuery({
 		queryKey: ["globals"],
@@ -183,7 +180,8 @@ export function UpdateSection({ restartWait = DEFAULT_RESTART_WAIT }: UpdateSect
 	}
 
 	const { state } = status;
-	const restarting = restart?.kind === "waiting";
+	// 忙不忙看的是**任何一种**重启:进程都要没了,这一节的按钮全都不该还能按。
+	const restarting = view?.kind === "waiting";
 	const busy = act.isPending || apply.isPending || restarting;
 	// 和服务端 `POST /api/update/apply` 那道门用的是同一个判定,见契约。
 	const canApply = canApplyUpdate(state);

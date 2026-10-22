@@ -222,6 +222,9 @@ importers:
 
   apps/contract:
     dependencies:
+      '@bilibili-notify/extension':
+        specifier: workspace:*
+        version: link:../../packages/extension
       '@bilibili-notify/internal':
         specifier: workspace:*
         version: link:../../packages/internal
@@ -286,6 +289,9 @@ importers:
       '@bilibili-notify/dynamic':
         specifier: workspace:*
         version: link:../../packages/dynamic
+      '@bilibili-notify/extension':
+        specifier: workspace:*
+        version: link:../../packages/extension
       '@bilibili-notify/image':
         specifier: workspace:*
         version: link:../../packages/image
@@ -319,6 +325,9 @@ importers:
       hono:
         specifier: ^4.13.5
         version: 4.13.5
+      parse5:
+        specifier: ^8.0.1
+        version: 8.0.1
       pino:
         specifier: ^10.3.1
         version: 10.3.1
@@ -377,9 +386,9 @@ importers:
       '@tanstack/react-query':
         specifier: ^5.102.7
         version: 5.102.7(react@19.2.8)
-      fflate:
-        specifier: 'catalog:'
-        version: 0.8.3
+      css-tree:
+        specifier: ^3.2.1
+        version: 3.2.1(patch_hash=7bbaf7328d644be70c5f8c641ef205806f630e85b3207b14c863dfc359bb1ec7)
       motion:
         specifier: ^13.1.1
         version: 13.1.1(react-dom@19.2.8(react@19.2.8))(react@19.2.8)
@@ -423,6 +432,9 @@ importers:
       '@testing-library/user-event':
         specifier: 'catalog:'
         version: 14.6.1(@testing-library/dom@10.4.1)
+      '@types/css-tree':
+        specifier: ^3.2.0
+        version: 3.2.0
       '@types/react':
         specifier: 'catalog:'
         version: 19.2.18
@@ -441,6 +453,22 @@ importers:
       vite:
         specifier: npm:@voidzero-dev/vite-plus-core@0.3.0
         version: '@voidzero-dev/vite-plus-core@0.3.0(@types/node@24.13.3)(esbuild@0.28.2)(jiti@2.7.0)(sass@1.99.0)(tsx@4.23.12)(typescript@5.9.3)(yaml@2.9.0)'
+
+  extensions/bridge:
+    dependencies:
+      '@bilibili-notify/extension':
+        specifier: workspace:*
+        version: link:../../packages/extension
+      ws:
+        specifier: 'catalog:'
+        version: 8.21.3
+      zod:
+        specifier: 'catalog:'
+        version: 4.4.3
+    devDependencies:
+      '@types/ws':
+        specifier: 'catalog:'
+        version: 8.18.1
 
   packages/ai:
     dependencies:
@@ -525,6 +553,15 @@ importers:
       '@types/luxon':
         specifier: 'catalog:'
         version: 3.7.5
+
+  packages/extension:
+    dependencies:
+      '@bilibili-notify/internal':
+        specifier: workspace:*
+        version: link:../internal
+      zod:
+        specifier: 'catalog:'
+        version: 4.4.3
 
   packages/image:
     dependencies:

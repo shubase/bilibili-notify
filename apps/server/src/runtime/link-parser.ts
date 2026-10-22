@@ -1,24 +1,23 @@
 /**
  * 链接解析 —— 群里有人贴 B 站视频链接,机器人自动回一张视频卡片。
  *
- * 与指令分发器并列挂在 OneBot 入站帧上,但它**不是指令**:没有前缀、不认主人、
- * 群里谁贴都算。正因为谁都能触发,它默认关着、有冷却、失败不回话 —— 群里没人
- * 要求解析,失败了还回一句只是噪音,而且等于把「机器人在这个群里」广播出去。
+ * 与指令分发器并列挂在群消息上,但它**不是指令**:没有前缀、不认主人、群里谁贴都算。
+ * 正因为谁都能触发,它默认关着、有冷却、失败不回话 —— 群里没人要求解析,失败了还回
+ * 一句只是噪音,而且等于把「机器人在这个群里」广播出去。
  *
- * 回到来源群不走推送目标表:用收到这一帧的那个 adapter 直接发,群不必配成推送目标。
+ * 回到来源群不走推送目标表:用收到这一帧的那条连接直接发,群不必配成推送目标。
  *
- * 两个平台两个入口:OneBot 的原始帧走 {@link LinkParser.handle},官机网关已经解析好的群消息
- * 走 {@link LinkParser.handleMessage} —— 同一套闸门与流程,只有「怎么拿到文本」不同。
+ * **只有一个入口** {@link LinkParser.handleMessage}:进来的已经是 adapter 归一化好的群
+ * 消息,平台的原始帧长什么样到这里已经不可见了 —— 桥后面那些平台我们连帧都没见过。
  */
 
 import type { VideoInfo, VideoRef } from "@bilibili-notify/api";
 import type { CardColorOptions, Dynamic, RenderPriority } from "@bilibili-notify/image";
+import type { InboundGroupMessage } from "@bilibili-notify/internal";
 import {
-	type AdapterCapabilities,
-	type CardBlock,
+	type ConnectionCapabilities,
 	type DeliveryResult,
 	extractVideoLinks,
-	type INBOUND_CAPABLE_PLATFORMS,
 	LINK_LIMITS,
 	type LinkLimits,
 	type LinkParsingConfig,
@@ -28,7 +27,6 @@ import {
 	type VideoLinkRef,
 	videoLinkKey,
 } from "@bilibili-notify/internal";
-import type { InboundGroupMessage } from "../platforms/types.js";
 import { RecencyTable } from "../util/recency-table.js";
 import { linkScopeKey } from "./link-scope.js";
 import { videoToDynamic } from "./video-card.js";
@@ -39,28 +37,30 @@ const MAX_LINKS_PER_MESSAGE = 3;
 const BUDGET_WINDOW_MS = 60_000;
 
 /**
- * 链接从哪个平台来 —— 就是「我们真的收得到入站消息」的那批平台,别另立一份名单:
- * 加第三个平台时只改一处的话,它能审批却解析不了群链接,而且哪儿都不报错。
+ * 回复往哪儿发。**用哪个 adapter 由 `connectionId` 决定,不是这里的 `platform`** ——
+ * 桥后面挂着 telegram 时平台报的是 `telegram`,而认领它的 adapter 声明的是 `bridge`。
+ *
+ * 平台这一格留着是因为它还担着两件事:逐群例外的键(`linkScopeKey`)、以及回卡时那个
+ * 临时目标的平台格。`groupId` 在 OneBot 是群号、在官机是群 openid、在桥那边是桥自己
+ * 报的那套编号 —— 三者都只要求「与用户在面板上填的是同一套」。
  */
-export type LinkSourcePlatform = (typeof INBOUND_CAPABLE_PLATFORMS)[number];
-
-/** 回复往哪儿发:平台决定用哪个适配器,`groupId` 在 OneBot 是群号、在官机是群 openid。 */
 export interface LinkReplyDestination {
-	platform: LinkSourcePlatform;
-	adapterId: string;
+	platform: string;
+	connectionId: string;
 	groupId: string;
 }
 
 /** adapter 归一化好的一条群消息,再带上它从哪个平台、哪条连接来。 */
 export interface InboundLinkMessage extends InboundGroupMessage {
-	platform: LinkSourcePlatform;
-	adapterId: string;
+	platform: string;
+	connectionId: string;
 }
 
 /** 一张链接卡的呈现;缺省项交给渲染器的全局配置兜底。 */
 export interface LinkCardPresentation {
 	colors?: CardColorOptions;
-	layout?: CardBlock[];
+	/** 用哪套卡片皮肤(ADR-0014)。链接卡没有 UP 可言,吃的是全局那套。 */
+	cardSkin?: string;
 }
 
 export interface LinkParserOptions {
@@ -82,12 +82,11 @@ export interface LinkParserOptions {
 		generateDynamicCard(
 			data: Dynamic,
 			colors?: CardColorOptions,
-			layout?: CardBlock[],
 			options?: { priority?: RenderPriority },
 		): Promise<Buffer>;
 	} | null;
 	/**
-	 * 这张卡怎么画:配色(含图廊轮到的那张背景)+ 版式。**每张卡取一次**,由引擎按推送
+	 * 这张卡怎么画:配色(含图廊轮到的那张背景)+ 皮肤。**每张卡取一次**,由引擎按推送
 	 * 动态卡在没有 per-UP 覆盖时的同一条规则算出来 —— 链接解析没有 UP 可言,吃的就是
 	 * 全局那份。各算一份的话,主人在卡片页给「动态」调的样式只有推送卡认。
 	 */
@@ -95,12 +94,12 @@ export interface LinkParserOptions {
 	/** 往来源群发 —— 由接线层用收到这一帧的那个 adapter 实现。 */
 	send: (dest: LinkReplyDestination, payload: NotificationPayload) => Promise<DeliveryResult>;
 	/**
-	 * 目的地所在适配器的平台能力(探测结果的缓存);没有能力概念的平台(官机)回 undefined =
+	 * 目的地那条连接上、那个平台的能力(探测结果的缓存);没有能力概念的平台(官机)回 undefined =
 	 * 什么都发不了。形式选了小程序卡时据它决定发小程序卡还是回落图片卡。
 	 */
-	capabilities: (dest: LinkReplyDestination) => AdapterCapabilities | undefined;
+	capabilities: (dest: LinkReplyDestination) => ConnectionCapabilities | undefined;
 	/** 还没探出来时主动探一次(零副作用);不实现就当探不了。 */
-	probeCapabilities?: (dest: LinkReplyDestination) => Promise<AdapterCapabilities | undefined>;
+	probeCapabilities?: (dest: LinkReplyDestination) => Promise<ConnectionCapabilities | undefined>;
 	now?: () => number;
 	/** 硬上限,缺省 {@link LINK_LIMITS};测试用小数字把边界拉到眼前。 */
 	limits?: Partial<LinkLimits>;
@@ -114,9 +113,9 @@ export interface LinkParser {
 export function createLinkParser(opts: LinkParserOptions): LinkParser {
 	const now = opts.now ?? (() => Date.now());
 	const limits: LinkLimits = { ...LINK_LIMITS, ...opts.limits };
-	/** `平台:adapterId:群:视频` → 上次开始处理的时刻。冷却关着(0)时不碰它。 */
+	/** `平台:connectionId:群:视频` → 上次开始处理的时刻。冷却关着(0)时不碰它。 */
 	const lastSeen = new RecencyTable<number>(limits.tableCap);
-	/** `平台:adapterId:群` → 最近一分钟里开始处理的时刻。 */
+	/** `平台:connectionId:群` → 最近一分钟里开始处理的时刻。 */
 	const groupStarts = new RecencyTable<number[]>(limits.tableCap);
 	/** 全局正在处理(取信息 / 渲染 / 发送)的链接数。 */
 	let inflight = 0;
@@ -215,10 +214,12 @@ export function createLinkParser(opts: LinkParserOptions): LinkParser {
 		if (!renderer) return;
 		// 低优先级:谁都能触发的卡,不能排在开播 / 动态卡前面。让路由渲染队列按车道做
 		// (渲染器那级与浏览器闸那级都认),不靠这里数自己发了几张。
-		const { colors, layout } = opts.presentation();
-		const buffer = await renderer.generateDynamicCard(videoToDynamic(info), colors, layout, {
-			priority: "low",
-		});
+		const { colors, cardSkin } = opts.presentation();
+		const buffer = await renderer.generateDynamicCard(
+			videoToDynamic(info),
+			{ ...colors, cardSkin },
+			{ priority: "low" },
+		);
 		const result = await opts.send(dest, { kind: "image", image: { buffer, mime: "image/jpeg" } });
 		if (!result.ok) {
 			opts.logger.warn(`[link] 视频卡片发送失败 group=${dest.groupId} ${info.bvid}: ${result.err}`);
@@ -238,6 +239,9 @@ export function createLinkParser(opts: LinkParserOptions): LinkParser {
 			// 自己发的消息不解析 —— 机器人自己发的东西里若有链接,那是它自己贴的。
 			if (msg.selfId !== undefined && msg.userId === msg.selfId) return;
 			// 正文里的与分享卡里的一起找;卡片链接排在正文之后,与消息里的先后一致。
+			// `miniAppCardLinks` 刻意不读:进来的本身就是一张能点开播放的 B 站小程序卡,再回一张
+			// (图片卡也算)都是重复 —— 主人 2026-09-07 拍板一律不回,而且不留痕(不记冷却),
+			// 随后有人把同一条链接以文字贴出来照常出卡。
 			const refs = extractVideoLinks([msg.text, ...msg.cardLinks].join(" ")).slice(
 				0,
 				MAX_LINKS_PER_MESSAGE,
@@ -247,17 +251,17 @@ export function createLinkParser(opts: LinkParserOptions): LinkParser {
 			if (!config.enabled) return;
 			// 逐群答案在渲染器之前、记账之前:不解析的群什么都不该留下 —— 冷却也不记,
 			// 主人随后把群打开,刚才那条链接再贴一次就该出卡。
-			const scope = linkScopeKey(msg.platform, msg.adapterId, msg.groupId);
+			const scope = linkScopeKey(msg.platform, msg.connectionId, msg.groupId);
 			const policy = opts.policyFor(scope);
 			if (!policy.parse) return;
 			const dest: LinkReplyDestination = {
 				platform: msg.platform,
-				adapterId: msg.adapterId,
+				connectionId: msg.connectionId,
 				groupId: msg.groupId,
 			};
-			// 这条消息里的链接真能发出什么:小程序卡要形式选了且这个适配器签得了,签不了就
+			// 这条消息里的链接真能发出什么:小程序卡要形式选了且这条连接签得了,签不了就
 			// 回落图片卡 —— 而图片卡又没渲染器(没装 Chrome)的话,一张也发不出来,整条静默
-			// 走人。问在记账之前:什么都发不出去的链接不该白吃冷却与群额度,不然适配器一恢复,
+			// 走人。问在记账之前:什么都发不出去的链接不该白吃冷却与群额度,不然连接一恢复,
 			// 同一条链接还得等冷却过去。形式是图片卡时短路,不会为它去问适配器。
 			const useMiniApp = policy.form === "miniapp" && (await canSendMiniAppCard(dest));
 			if (!useMiniApp && !opts.renderer()) return;

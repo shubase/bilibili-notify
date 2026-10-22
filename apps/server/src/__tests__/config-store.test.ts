@@ -5,19 +5,22 @@ import { join } from "node:path";
 import {
 	type BiliEvents,
 	type ConfigScope,
+	type Connection,
+	connectionDispatchKey,
 	type Disposable,
 	deterministicUuid,
 	FEATURE_KEYS,
+	isDirectConnection,
 	type MessageBus,
 	makeDefaultGlobalConfig,
 	makeEmptySubscription,
-	type PushAdapter,
 	type PushTarget,
 	type ServiceContext,
 	type Subscription,
 	SubscriptionSchema,
 } from "@bilibili-notify/internal";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
+import { createBackupService } from "../backup/service.js";
 import type { BootstrapConfig } from "../config/schema.js";
 import { type ConfigStore, ConfigValidationError, createConfigStore } from "../config/store.js";
 
@@ -79,25 +82,31 @@ function makeSampleSubscription(uid = "12345"): Subscription {
 	return makeEmptySubscription({ id: randomUUID(), uid });
 }
 
-function makeWebhookAdapter(
-	overrides: Partial<Extract<PushAdapter, { platform: "webhook" }>> = {},
+function makeWebhookConnection(
+	overrides: Partial<Extract<Connection, { connector: "webhook" }>> = {},
 ) {
 	return {
 		id: randomUUID(),
 		name: "团队 Webhook",
-		platform: "webhook" as const,
+		platform: "feishu" as const,
 		enabled: true,
-		config: { url: "https://example.com/hook", provider: "generic" as const, headers: {} },
+		kind: "direct" as const,
+		connector: "webhook" as const,
+		config: { url: "https://example.com/hook", headers: {} },
 		...overrides,
 	};
 }
 
-function makeOnebotAdapter(overrides: Partial<Extract<PushAdapter, { platform: "onebot" }>> = {}) {
+function makeOnebotConnection(
+	overrides: Partial<Extract<Connection, { platform: "onebot" }>> = {},
+) {
 	return {
 		id: randomUUID(),
 		name: "NapCat",
 		platform: "onebot" as const,
 		enabled: true,
+		kind: "direct" as const,
+		connector: "http" as const,
 		config: {
 			transport: "http" as const,
 			baseUrl: "http://127.0.0.1:3000",
@@ -114,14 +123,15 @@ function makeOnebotAdapter(overrides: Partial<Extract<PushAdapter, { platform: "
 }
 
 function makeWebhookTarget(
-	adapter: Extract<PushAdapter, { platform: "webhook" }>,
-	overrides: Partial<Extract<PushTarget, { platform: "webhook" }>> = {},
+	connection: Extract<Connection, { connector: "webhook" }>,
+	overrides: Partial<Extract<PushTarget, { kind: "endpoint" }>> = {},
 ) {
 	return {
 		id: randomUUID(),
 		name: "手动 Webhook",
-		adapterId: adapter.id,
-		platform: "webhook" as const,
+		connectionId: connection.id,
+		kind: "endpoint" as const,
+		platform: connection.platform,
 		scope: "channel" as const,
 		enabled: true,
 		session: {},
@@ -129,8 +139,8 @@ function makeWebhookTarget(
 	};
 }
 
-function managedWebhookTargetId(adapterId: string): string {
-	return deterministicUuid(`push-target:webhook-adapter:${adapterId}`);
+function managedWebhookTargetId(connectionId: string): string {
+	return deterministicUuid(`push-target:webhook-adapter:${connectionId}`);
 }
 
 // ---------------------------------------------------------------------------
@@ -401,16 +411,17 @@ describe("ConfigStore", () => {
 	});
 
 	it("targets CRUD: upsert / patch / delete with proper events", async () => {
-		const adapter = makeOnebotAdapter();
-		await store.upsertAdapter(adapter);
+		const connection = makeOnebotConnection();
+		await store.upsertConnection(connection);
 		const target = {
 			id: randomUUID(),
 			name: "t1",
-			adapterId: adapter.id,
+			connectionId: connection.id,
+			kind: "session" as const,
 			platform: "onebot" as const,
 			scope: "group" as const,
 			enabled: true,
-			session: { groupId: "10001" },
+			address: "10001",
 		};
 		await store.upsertTarget(target);
 		expect(store.getTargets()).toHaveLength(1);
@@ -424,35 +435,37 @@ describe("ConfigStore", () => {
 		expect(store.getTargets()).toHaveLength(0);
 	});
 
-	it("deleteTarget 级联清理订阅 routing / atAll 并保持 schema 自洽", async () => {
-		const adapter = makeOnebotAdapter();
-		await store.upsertAdapter(adapter);
+	it("deleteTarget 级联清理订阅 routing / extras 并保持 schema 自洽", async () => {
+		const connection = makeOnebotConnection();
+		await store.upsertConnection(connection);
 		const target = {
 			id: randomUUID(),
 			name: "群聊",
-			adapterId: adapter.id,
+			connectionId: connection.id,
+			kind: "session" as const,
 			platform: "onebot" as const,
 			scope: "group" as const,
 			enabled: true,
-			session: { groupId: "10001" },
+			address: "10001",
 		};
 		const keptTarget = {
 			id: randomUUID(),
 			name: "私聊",
-			adapterId: adapter.id,
+			connectionId: connection.id,
+			kind: "session" as const,
 			platform: "onebot" as const,
 			scope: "private" as const,
 			enabled: true,
-			session: { userId: "20002" },
+			address: "20002",
 		};
 		await store.upsertTarget(target);
 		await store.upsertTarget(keptTarget);
 		const sub = makeSampleSubscription("77777");
 		for (const k of FEATURE_KEYS) sub.routing[k] = [target.id, keptTarget.id];
-		sub.atAll.dynamic[target.id] = true;
-		sub.atAll.dynamic[keptTarget.id] = false;
-		sub.atAll.live[target.id] = false;
-		sub.atAll.live[keptTarget.id] = true;
+		sub.extras.atAllDynamic[target.id] = true;
+		sub.extras.atAllDynamic[keptTarget.id] = false;
+		sub.extras.atAllLive[target.id] = false;
+		sub.extras.atAllLive[keptTarget.id] = true;
 		await store.upsertSubscription(sub);
 		bus.events.length = 0;
 
@@ -465,39 +478,247 @@ describe("ConfigStore", () => {
 			expect(nextSub?.routing[k]).not.toContain(target.id);
 			expect(nextSub?.routing[k]).toContain(keptTarget.id);
 		}
-		expect(nextSub?.atAll.dynamic).toEqual({ [keptTarget.id]: false });
-		expect(nextSub?.atAll.live).toEqual({ [keptTarget.id]: true });
+		expect(nextSub?.extras.atAllDynamic).toEqual({ [keptTarget.id]: false });
+		expect(nextSub?.extras.atAllLive).toEqual({ [keptTarget.id]: true });
 		expect(SubscriptionSchema.safeParse(nextSub).success).toBe(true);
 		const scopes = bus.events.filter(([e]) => e === "config-changed").map(([, args]) => args[0]);
 		expect(scopes).toEqual(["targets", "subscriptions"]);
 	});
 
-	it("upsertAdapter(webhook) 自动创建系统托管 target", async () => {
-		const adapter = makeWebhookAdapter();
-		await store.upsertAdapter(adapter);
+	it("upsertConnection(webhook) 自动创建系统托管 target", async () => {
+		const connection = makeWebhookConnection();
+		await store.upsertConnection(connection);
 
 		const targets = store.getTargets();
 		expect(targets).toHaveLength(1);
 		expect(targets[0]).toMatchObject({
-			id: managedWebhookTargetId(adapter.id),
-			name: adapter.name,
-			adapterId: adapter.id,
+			id: managedWebhookTargetId(connection.id),
+			name: connection.name,
+			connectionId: connection.id,
+			kind: "endpoint",
+			// 托管目标的平台跟着连接走。
+			platform: connection.platform,
+			scope: "channel",
+			enabled: true,
+			managedBy: "connection",
+		});
+		const scopes = bus.events.filter(([e]) => e === "config-changed").map(([, args]) => args[0]);
+		expect(scopes).toEqual(["connections", "targets"]);
+	});
+
+	it("load() 把老形状的 connections.json 就地迁移并回写 —— 主人盘上那份没有 kind/connector", async () => {
+		// 这是这次形状变更**唯一真会炸主人机器**的路径:schema 一旦要求 kind/connector,
+		// 存量连接就 parse 不过、开机直接 ConfigValidationError。夹具刻意写成
+		// 「史前」形状(连 transport 都没有),走的是与 schema `.default("http")` 同一个回落。
+		const dir2 = await mkdtemp(join(tmpdir(), "bn-config-migrate-"));
+		const state2 = join(dir2, "state");
+		await mkdir(state2, { recursive: true });
+		const legacy = {
+			id: randomUUID(),
+			name: "老 NapCat",
+			platform: "onebot",
+			enabled: true,
+			config: { baseUrl: "http://127.0.0.1:3000", accessToken: "tok" },
+		};
+		await writeFile(join(state2, "connections.json"), JSON.stringify([legacy]), "utf8");
+		await writeFile(join(state2, "targets.json"), JSON.stringify([]), "utf8");
+
+		const store2 = createConfigStore({
+			bootstrap: makeBootstrap(dir2),
+			bus: makeFakeBus(),
+			serviceCtx: makeFakeServiceCtx(),
+		});
+		await store2.load();
+
+		expect(store2.getConnections()).toEqual([
+			expect.objectContaining({ id: legacy.id, kind: "direct", connector: "http" }),
+		]);
+		// 回写到盘上,而不是每次开机都在内存里补一遍 —— 否则任何一次 upsert 都会把
+		// 没迁移的那份原样写回去。
+		const onDisk = JSON.parse(await readFile(join(state2, "connections.json"), "utf8"));
+		expect(onDisk[0]).toMatchObject({ kind: "direct", connector: "http" });
+		// 迁移前的原件留一份 —— 迁移错了主人还能自己捞回来。
+		const bak = JSON.parse(await readFile(join(state2, "connections.json.bak"), "utf8"));
+		expect(bak).toEqual([legacy]);
+	});
+
+	it("load() 把老形状的 targets.json 就地迁移并回写 —— 主人盘上那份没有 kind", async () => {
+		// 与连接侧同一条路径:schema 一旦要求 kind,存量 targets.json 就 parse 不过、
+		// 开机直接炸。两支各验一条 —— webhook 那条要落到 endpoint、群那条要落到 session。
+		const dir2 = await mkdtemp(join(tmpdir(), "bn-target-migrate-"));
+		const state2 = join(dir2, "state");
+		await mkdir(state2, { recursive: true });
+		const connection = makeOnebotConnection();
+		const legacyTarget = {
+			id: randomUUID(),
+			name: "老群目标",
+			adapterId: connection.id,
+			platform: "onebot",
+			scope: "group",
+			enabled: true,
+			session: { groupId: "10001" },
+		};
+		await writeFile(join(state2, "connections.json"), JSON.stringify([connection]), "utf8");
+		await writeFile(join(state2, "targets.json"), JSON.stringify([legacyTarget]), "utf8");
+
+		const store2 = createConfigStore({
+			bootstrap: makeBootstrap(dir2),
+			bus: makeFakeBus(),
+			serviceCtx: makeFakeServiceCtx(),
+		});
+		await store2.load();
+
+		expect(store2.getTargets()).toEqual([
+			expect.objectContaining({ id: legacyTarget.id, kind: "session" }),
+		]);
+		const onDisk = JSON.parse(await readFile(join(state2, "targets.json"), "utf8"));
+		expect(onDisk[0]).toMatchObject({ kind: "session" });
+		const bak = JSON.parse(await readFile(join(state2, "targets.json.bak"), "utf8"));
+		expect(bak).toEqual([legacyTarget]);
+		// 连接那份已经是新形状 —— 别顺手也给它留一份 .bak。
+		await expect(readFile(join(state2, "connections.json.bak"), "utf8")).rejects.toThrow();
+	});
+
+	it("load() 把老 webhook 目标迁成 endpoint —— 托管同步认的是形态,迁错就会重造一张", async () => {
+		const dir2 = await mkdtemp(join(tmpdir(), "bn-target-migrate-wh-"));
+		const state2 = join(dir2, "state");
+		await mkdir(state2, { recursive: true });
+		const connection = makeWebhookConnection();
+		const legacyId = managedWebhookTargetId(connection.id);
+		const legacyTarget = {
+			id: legacyId,
+			name: connection.name,
+			adapterId: connection.id,
 			platform: "webhook",
 			scope: "channel",
 			enabled: true,
 			managedBy: "adapter",
 			session: {},
+		};
+		await writeFile(join(state2, "connections.json"), JSON.stringify([connection]), "utf8");
+		await writeFile(join(state2, "targets.json"), JSON.stringify([legacyTarget]), "utf8");
+
+		const store2 = createConfigStore({
+			bootstrap: makeBootstrap(dir2),
+			bus: makeFakeBus(),
+			serviceCtx: makeFakeServiceCtx(),
 		});
-		const scopes = bus.events.filter(([e]) => e === "config-changed").map(([, args]) => args[0]);
-		expect(scopes).toEqual(["adapters", "targets"]);
+		await store2.load();
+
+		expect(store2.getTargets()).toEqual([
+			expect.objectContaining({ id: legacyId, kind: "endpoint", managedBy: "connection" }),
+		]);
+	});
+
+	it("load() 对已经是新形状的 connections.json 不回写 —— 也就不会每次开机都留一份 .bak", async () => {
+		const dir2 = await mkdtemp(join(tmpdir(), "bn-config-nomigrate-"));
+		const state2 = join(dir2, "state");
+		await mkdir(state2, { recursive: true });
+		await writeFile(
+			join(state2, "connections.json"),
+			JSON.stringify([makeOnebotConnection()]),
+			"utf8",
+		);
+		await writeFile(join(state2, "targets.json"), JSON.stringify([]), "utf8");
+
+		const store2 = createConfigStore({
+			bootstrap: makeBootstrap(dir2),
+			bus: makeFakeBus(),
+			serviceCtx: makeFakeServiceCtx(),
+		});
+		await store2.load();
+		await expect(readFile(join(state2, "connections.json.bak"), "utf8")).rejects.toThrow();
+	});
+
+	// 连接那份从 adapters.json 改叫 connections.json。搬法是「读老的、写新的、老的一动不动」:
+	// 老那份既是原件备份,也让回退到旧载荷仍然开得了机 —— 旧构建找的正是它,且它还是迁移前
+	// 的形状。所以这几条盯的是「新的写出来了」「老的没被动」这两件事。
+	describe("连接文件改名 adapters.json → connections.json", () => {
+		async function loadFrom(dir2: string) {
+			const store2 = createConfigStore({
+				bootstrap: makeBootstrap(dir2),
+				bus: makeFakeBus(),
+				serviceCtx: makeFakeServiceCtx(),
+			});
+			await store2.load();
+			return store2;
+		}
+
+		it("只有老文件名时照样读得到连接,并写出一份 connections.json", async () => {
+			const dir2 = await mkdtemp(join(tmpdir(), "bn-config-rename-"));
+			const state2 = join(dir2, "state");
+			await mkdir(state2, { recursive: true });
+			const connection = makeOnebotConnection();
+			await writeFile(join(state2, "adapters.json"), JSON.stringify([connection]), "utf8");
+			await writeFile(join(state2, "targets.json"), JSON.stringify([]), "utf8");
+
+			const store2 = await loadFrom(dir2);
+
+			expect(store2.getConnections()).toEqual([expect.objectContaining({ id: connection.id })]);
+			const onDisk = JSON.parse(await readFile(join(state2, "connections.json"), "utf8"));
+			expect(onDisk).toEqual([expect.objectContaining({ id: connection.id })]);
+			await rm(dir2, { recursive: true, force: true });
+		});
+
+		it("老文件原地不动 —— 它就是回退那条路要读的东西,不留 .bak 也不删", async () => {
+			const dir2 = await mkdtemp(join(tmpdir(), "bn-config-rename-keep-"));
+			const state2 = join(dir2, "state");
+			await mkdir(state2, { recursive: true });
+			// 刻意用**老形状**:回退回去的旧构建认得的正是这个形状。
+			const legacy = {
+				id: randomUUID(),
+				name: "老连接",
+				platform: "onebot",
+				enabled: true,
+				config: { transport: "http", baseUrl: "http://127.0.0.1:5700" },
+			};
+			await writeFile(join(state2, "adapters.json"), JSON.stringify([legacy]), "utf8");
+			await writeFile(join(state2, "targets.json"), JSON.stringify([]), "utf8");
+
+			const store2 = await loadFrom(dir2);
+
+			// 先证明这一趟真的走了老文件名那条路 —— 否则「老文件没被动」是空过的。
+			expect(store2.getConnections().map((c) => c.id)).toEqual([legacy.id]);
+			expect(JSON.parse(await readFile(join(state2, "adapters.json"), "utf8"))).toEqual([legacy]);
+			await expect(readFile(join(state2, "connections.json.bak"), "utf8")).rejects.toThrow();
+			await rm(dir2, { recursive: true, force: true });
+		});
+
+		it("两个文件都在时只认新的 —— 老的是快照,不该再被读", async () => {
+			const dir2 = await mkdtemp(join(tmpdir(), "bn-config-rename-both-"));
+			const state2 = join(dir2, "state");
+			await mkdir(state2, { recursive: true });
+			const current = makeOnebotConnection();
+			const stale = makeOnebotConnection({ id: randomUUID(), name: "升级前那份" });
+			await writeFile(join(state2, "connections.json"), JSON.stringify([current]), "utf8");
+			await writeFile(join(state2, "adapters.json"), JSON.stringify([stale]), "utf8");
+			await writeFile(join(state2, "targets.json"), JSON.stringify([]), "utf8");
+
+			const store2 = await loadFrom(dir2);
+
+			expect(store2.getConnections().map((c) => c.id)).toEqual([current.id]);
+			await rm(dir2, { recursive: true, force: true });
+		});
+
+		it("两个都没有、targets.json 也没有 = 全新安装,建的是 connections.json", async () => {
+			const dir2 = await mkdtemp(join(tmpdir(), "bn-config-rename-fresh-"));
+			const state2 = join(dir2, "state");
+			await mkdir(state2, { recursive: true });
+
+			await loadFrom(dir2);
+
+			expect(JSON.parse(await readFile(join(state2, "connections.json"), "utf8"))).toEqual([]);
+			await expect(readFile(join(state2, "adapters.json"), "utf8")).rejects.toThrow();
+			await rm(dir2, { recursive: true, force: true });
+		});
 	});
 
 	it("load() 回填缺失的 webhook 托管 target", async () => {
 		const dir2 = await mkdtemp(join(tmpdir(), "bn-config-managed-empty-"));
 		const state2 = join(dir2, "state");
 		await mkdir(state2, { recursive: true });
-		const adapter = makeWebhookAdapter();
-		await writeFile(join(state2, "adapters.json"), JSON.stringify([adapter]), "utf8");
+		const connection = makeWebhookConnection();
+		await writeFile(join(state2, "connections.json"), JSON.stringify([connection]), "utf8");
 		await writeFile(join(state2, "targets.json"), JSON.stringify([]), "utf8");
 
 		const store2 = createConfigStore({
@@ -508,9 +729,9 @@ describe("ConfigStore", () => {
 		await store2.load();
 		expect(store2.getTargets()).toEqual([
 			expect.objectContaining({
-				id: managedWebhookTargetId(adapter.id),
-				adapterId: adapter.id,
-				managedBy: "adapter",
+				id: managedWebhookTargetId(connection.id),
+				connectionId: connection.id,
+				managedBy: "connection",
 			}),
 		]);
 		await rm(dir2, { recursive: true, force: true });
@@ -527,8 +748,8 @@ describe("ConfigStore", () => {
 		const dir2 = await mkdtemp(join(tmpdir(), "bn-config-drop-removed-"));
 		const state2 = join(dir2, "state");
 		await mkdir(state2, { recursive: true });
-		const webhook = makeWebhookAdapter();
-		const adapter = {
+		const webhook = makeWebhookConnection();
+		const connection = {
 			id: randomUUID(),
 			name: stale.platform,
 			platform: stale.platform,
@@ -538,13 +759,17 @@ describe("ConfigStore", () => {
 		const target = {
 			id: randomUUID(),
 			name: "stale",
-			adapterId: adapter.id,
+			adapterId: connection.id,
 			platform: stale.platform,
 			scope: "group",
 			enabled: true,
 			session: stale.session,
 		};
-		await writeFile(join(state2, "adapters.json"), JSON.stringify([adapter, webhook]), "utf8");
+		await writeFile(
+			join(state2, "connections.json"),
+			JSON.stringify([connection, webhook]),
+			"utf8",
+		);
 		await writeFile(join(state2, "targets.json"), JSON.stringify([target]), "utf8");
 
 		const store2 = createConfigStore({
@@ -553,9 +778,176 @@ describe("ConfigStore", () => {
 			serviceCtx: makeFakeServiceCtx(),
 		});
 		await store2.load(); // 不应抛错
-		expect(store2.getAdapters().map((a) => a.platform)).toEqual(["webhook"]);
+		// 活下来的只剩那条 webhook 直连(平台即分发键)。
+		expect(store2.getConnections().map((a) => connectionDispatchKey(a))).toEqual(["feishu"]);
 		// 撤下平台的 target 被丢弃;只剩 webhook 自动托管 target
-		expect(store2.getTargets().every((t) => t.platform === "webhook")).toBe(true);
+		expect(store2.getTargets().every((t) => t.kind === "endpoint")).toBe(true);
+		await rm(dir2, { recursive: true, force: true });
+	});
+
+	/**
+	 * 拓展连接曾经没有 `platform`(那时它是「一条桥接入」);改成「一个 bot」之后必填。
+	 * 老形状没发过版、不写迁移 —— 当作已撤下的形状丢掉;新形状(带开放词表的 platform)
+	 * 必须活下来。两条一起才把那个判据钉住:只丢老形状,不丢桥借来的 telegram bot。
+	 */
+	it("load() 丢掉没有 platform 的老拓展连接,留下带 platform 的新形状", async () => {
+		const dir2 = await mkdtemp(join(tmpdir(), "bn-config-ext-shape-"));
+		const state2 = join(dir2, "state");
+		await mkdir(state2, { recursive: true });
+		const stale = {
+			id: randomUUID(),
+			name: "家里那台(老形状)",
+			enabled: true,
+			kind: "extension",
+			extensionId: "bridge",
+			config: { token: "t0ken", bridgeKind: "koishi" },
+		};
+		const bot = {
+			id: randomUUID(),
+			name: "阿库娅",
+			enabled: true,
+			kind: "extension",
+			extensionId: "bridge",
+			platform: "telegram",
+			config: { link: stale.id, botId: "telegram:42" },
+		};
+		await writeFile(join(state2, "connections.json"), JSON.stringify([stale, bot]), "utf8");
+		await writeFile(join(state2, "targets.json"), JSON.stringify([]), "utf8");
+
+		const store2 = createConfigStore({
+			bootstrap: makeBootstrap(dir2),
+			bus: makeFakeBus(),
+			serviceCtx: makeFakeServiceCtx(),
+		});
+		await store2.load();
+		expect(store2.getConnections().map((c) => c.id)).toEqual([bot.id]);
+		await rm(dir2, { recursive: true, force: true });
+	});
+
+	/**
+	 * 桥借来的 bot 平台抄到 `onebot` 时,形状迁移不许把它当成「没有 connector 的史前直连」
+	 * 去戴 `kind: "direct"` —— 戴上就过不了 schema,开机直接挂;上一条用例用的 telegram
+	 * 恰好躲开了这一枪(迁移不认得的平台原样放行),所以这里非用 onebot 不可。
+	 */
+	it("load() 不把桥借来的 onebot bot 当成史前直连去迁移", async () => {
+		const dir2 = await mkdtemp(join(tmpdir(), "bn-config-ext-onebot-"));
+		const state2 = join(dir2, "state");
+		await mkdir(state2, { recursive: true });
+		const bot = {
+			id: randomUUID(),
+			name: "koishi 上那只 onebot",
+			enabled: true,
+			kind: "extension",
+			extensionId: "bridge",
+			platform: "onebot",
+			config: { link: "link-home", botId: "onebot:10086" },
+		};
+		const written = JSON.stringify([bot]);
+		await writeFile(join(state2, "connections.json"), written, "utf8");
+		await writeFile(join(state2, "targets.json"), JSON.stringify([]), "utf8");
+
+		const store2 = createConfigStore({
+			bootstrap: makeBootstrap(dir2),
+			bus: makeFakeBus(),
+			serviceCtx: makeFakeServiceCtx(),
+		});
+		await store2.load();
+		expect(store2.getConnections().map((c) => c.id)).toEqual([bot.id]);
+		// 没有东西要迁,盘上一个字都不该动(也就没有 .bak)。
+		expect(await readFile(join(state2, "connections.json"), "utf8")).toBe(written);
+		await rm(dir2, { recursive: true, force: true });
+	});
+
+	it("load() 留下形状正确、平台却不认得的 target —— 桥驮来的就长这样", async () => {
+		// 目标的平台开放之后,「认不认识」不能再靠词表答:telegram 不在任何词表里,
+		// 但它是合法的。判据换成「认不得的平台**又** parse 不过才是存量」,所以这一条
+		// 必须活下来 —— 上一条用例(已撤下平台)与这一条一起才把那个判据钉住。
+		const dir2 = await mkdtemp(join(tmpdir(), "bn-config-open-platform-"));
+		const state2 = join(dir2, "state");
+		await mkdir(state2, { recursive: true });
+		const connection = makeOnebotConnection();
+		const bridged = {
+			id: randomUUID(),
+			name: "桥上的 telegram 群",
+			connectionId: connection.id,
+			kind: "session",
+			platform: "telegram",
+			scope: "group",
+			enabled: true,
+			address: "-1001234567890",
+		};
+		await writeFile(join(state2, "connections.json"), JSON.stringify([connection]), "utf8");
+		await writeFile(join(state2, "targets.json"), JSON.stringify([bridged]), "utf8");
+
+		const store2 = createConfigStore({
+			bootstrap: makeBootstrap(dir2),
+			bus: makeFakeBus(),
+			serviceCtx: makeFakeServiceCtx(),
+		});
+		await store2.load();
+		expect(store2.getTargets()).toEqual([expect.objectContaining({ platform: "telegram" })]);
+		await rm(dir2, { recursive: true, force: true });
+	});
+
+	it("load() 对认得的平台上坏掉的 target 照旧抛错 —— 别把真损坏当存量吃掉", async () => {
+		const dir2 = await mkdtemp(join(tmpdir(), "bn-config-broken-target-"));
+		const state2 = join(dir2, "state");
+		await mkdir(state2, { recursive: true });
+		const connection = makeOnebotConnection();
+		const broken = {
+			id: randomUUID(),
+			name: "坏的",
+			connectionId: connection.id,
+			kind: "session",
+			platform: "onebot",
+			scope: "群",
+			enabled: true,
+			address: "1",
+		};
+		await writeFile(join(state2, "connections.json"), JSON.stringify([connection]), "utf8");
+		await writeFile(join(state2, "targets.json"), JSON.stringify([broken]), "utf8");
+
+		const store2 = createConfigStore({
+			bootstrap: makeBootstrap(dir2),
+			bus: makeFakeBus(),
+			serviceCtx: makeFakeServiceCtx(),
+		});
+		await expect(store2.load()).rejects.toBeInstanceOf(ConfigValidationError);
+		await rm(dir2, { recursive: true, force: true });
+	});
+
+	/**
+	 * 🔴 **目标的平台是开放词表,不许拿连接那份闭集去判「认不认得」。**
+	 *
+	 * 判据从前是连接与目标共用的一条:「平台不在 `CONNECTION_PLATFORMS` 里 + parse 不过
+	 * = 已撤下的存量」。桥借来的 telegram 目标本来就不在那份闭集里,于是它上面**任何**
+	 * 真实损坏都被当成存量静默丢掉,而且下一次任何写入会把这个丢弃永久写实到盘上 ——
+	 * 同样的损坏在 onebot 目标上是照旧抛错(上一条用例)。两条一起才把判据钉住。
+	 */
+	it("load() 对桥驮来的 telegram 目标上的真损坏照旧抛错 —— 别拿连接的闭集判目标", async () => {
+		const dir2 = await mkdtemp(join(tmpdir(), "bn-config-broken-bridged-"));
+		const state2 = join(dir2, "state");
+		await mkdir(state2, { recursive: true });
+		const connection = makeOnebotConnection();
+		const broken = {
+			id: randomUUID(),
+			name: "坏的桥目标",
+			connectionId: connection.id,
+			kind: "session",
+			platform: "telegram",
+			scope: "群",
+			enabled: true,
+			address: "1",
+		};
+		await writeFile(join(state2, "connections.json"), JSON.stringify([connection]), "utf8");
+		await writeFile(join(state2, "targets.json"), JSON.stringify([broken]), "utf8");
+
+		const store2 = createConfigStore({
+			bootstrap: makeBootstrap(dir2),
+			bus: makeFakeBus(),
+			serviceCtx: makeFakeServiceCtx(),
+		});
+		await expect(store2.load()).rejects.toBeInstanceOf(ConfigValidationError);
 		await rm(dir2, { recursive: true, force: true });
 	});
 
@@ -563,11 +955,11 @@ describe("ConfigStore", () => {
 		const dir2 = await mkdtemp(join(tmpdir(), "bn-config-managed-existing-"));
 		const state2 = join(dir2, "state");
 		await mkdir(state2, { recursive: true });
-		const adapter = makeWebhookAdapter();
-		const target = makeWebhookTarget(adapter, { id: randomUUID(), name: "旧 Webhook" });
+		const connection = makeWebhookConnection();
+		const target = makeWebhookTarget(connection, { id: randomUUID(), name: "旧 Webhook" });
 		const sub = makeSampleSubscription("44444");
 		sub.routing.dynamic = [target.id];
-		await writeFile(join(state2, "adapters.json"), JSON.stringify([adapter]), "utf8");
+		await writeFile(join(state2, "connections.json"), JSON.stringify([connection]), "utf8");
 		await writeFile(join(state2, "targets.json"), JSON.stringify([target]), "utf8");
 		await writeFile(join(state2, "subscriptions.json"), JSON.stringify([sub]), "utf8");
 
@@ -580,90 +972,141 @@ describe("ConfigStore", () => {
 		const managed = store2.getTargets()[0];
 		expect(managed).toMatchObject({
 			id: target.id,
-			name: adapter.name,
-			adapterId: adapter.id,
-			managedBy: "adapter",
+			name: connection.name,
+			connectionId: connection.id,
+			managedBy: "connection",
 			scope: "channel",
 		});
 		expect(store2.getSubscriptions()[0]?.routing.dynamic).toEqual([target.id]);
 		await rm(dir2, { recursive: true, force: true });
 	});
 
-	it("patchAdapter(webhook) 同步托管 target 名称与启用状态", async () => {
-		const adapter = makeWebhookAdapter();
-		await store.upsertAdapter(adapter);
-		const patched = await store.patchAdapter(adapter.id, { name: "飞书 Webhook", enabled: false });
+	it("patchConnection(webhook) 同步托管 target 名称与启用状态", async () => {
+		const connection = makeWebhookConnection();
+		await store.upsertConnection(connection);
+		const patched = await store.patchConnection(connection.id, {
+			name: "飞书 Webhook",
+			enabled: false,
+		});
 		expect(patched.name).toBe("飞书 Webhook");
 
 		const target = store.getTargets()[0];
 		expect(target).toMatchObject({
-			id: managedWebhookTargetId(adapter.id),
+			id: managedWebhookTargetId(connection.id),
 			name: "飞书 Webhook",
 			enabled: false,
-			managedBy: "adapter",
-			session: {},
+			managedBy: "connection",
 		});
 	});
 
-	it("patchAdapter / upsertAdapter 拒绝变更既有 adapter platform", async () => {
-		const adapter = makeWebhookAdapter();
-		await store.upsertAdapter(adapter);
-		const onebot = makeOnebotAdapter({ id: adapter.id, name: adapter.name });
+	it("patchConnection / upsertConnection 拒绝变更既有 adapter platform", async () => {
+		const connection = makeWebhookConnection();
+		await store.upsertConnection(connection);
+		const onebot = makeOnebotConnection({ id: connection.id, name: connection.name });
 
 		await expect(
-			store.patchAdapter(adapter.id, { platform: "onebot", config: onebot.config } as never),
+			store.patchConnection(connection.id, { platform: "onebot", config: onebot.config } as never),
 		).rejects.toBeInstanceOf(ConfigValidationError);
-		await expect(store.upsertAdapter(onebot)).rejects.toBeInstanceOf(ConfigValidationError);
-		expect(store.getAdapters()[0]?.platform).toBe("webhook");
+		await expect(store.upsertConnection(onebot)).rejects.toBeInstanceOf(ConfigValidationError);
+		const kept = store.getConnections()[0];
+		expect(kept && isDirectConnection(kept) && kept.platform).toBe(connection.platform);
 		expect(store.getTargets()).toHaveLength(1);
 	});
 
-	it("deleteAdapter(webhook) 级联删除托管 target 并清理订阅 routing / atAll", async () => {
-		const adapter = makeWebhookAdapter();
-		await store.upsertAdapter(adapter);
+	it("deleteConnection(webhook) 级联删除托管 target 并清理订阅 routing / extras", async () => {
+		const connection = makeWebhookConnection();
+		await store.upsertConnection(connection);
 		const targetId = store.getTargets()[0]?.id;
 		expect(targetId).toBeDefined();
 		const sub = makeSampleSubscription("55555");
 		sub.routing.dynamic = [targetId as string];
 		sub.routing.live = [targetId as string];
-		sub.atAll.dynamic[targetId as string] = true;
-		sub.atAll.live[targetId as string] = true;
+		sub.extras.atAllDynamic[targetId as string] = true;
+		sub.extras.atAllLive[targetId as string] = true;
 		await store.upsertSubscription(sub);
 		bus.events.length = 0;
 
-		await expect(store.deleteAdapter(adapter.id)).resolves.toBe(true);
-		expect(store.getAdapters()).toHaveLength(0);
+		await expect(store.deleteConnection(connection.id)).resolves.toBe(true);
+		expect(store.getConnections()).toHaveLength(0);
 		expect(store.getTargets()).toHaveLength(0);
 		const nextSub = store.getSubscriptions()[0];
 		expect(nextSub?.routing.dynamic).toEqual([]);
 		expect(nextSub?.routing.live).toEqual([]);
-		expect(nextSub?.atAll.dynamic).toEqual({});
-		expect(nextSub?.atAll.live).toEqual({});
+		expect(nextSub?.extras.atAllDynamic).toEqual({});
+		expect(nextSub?.extras.atAllLive).toEqual({});
 		const scopes = bus.events.filter(([e]) => e === "config-changed").map(([, args]) => args[0]);
-		expect(scopes).toEqual(["adapters", "targets", "subscriptions"]);
+		expect(scopes).toEqual(["connections", "targets", "subscriptions"]);
 	});
 
-	it("deleteAdapter(onebot) 仍在被 target 引用时拒绝", async () => {
-		const adapter = makeOnebotAdapter();
-		await store.upsertAdapter(adapter);
+	// 目标的平台开放之后,「挂在 onebot 连接下、平台写着 telegram」这种目标**schema 收得下**
+	// —— 从前是闭集,它连 parse 都过不去。挡住它的只剩 store 里那条不变式,而那条不变式
+	// 在这两条路上各写了一份(逐条 upsert / 整体 replaceSections),原先一条测试都没有:
+	// 整个删掉,全仓 5986 个测试照样绿。
+	it("upsertTarget 拒绝平台与连接对不上的目标", async () => {
+		const connection = makeOnebotConnection();
+		await store.upsertConnection(connection);
+		await expect(
+			store.upsertTarget({
+				id: randomUUID(),
+				name: "冒充的",
+				connectionId: connection.id,
+				kind: "session",
+				platform: "telegram",
+				scope: "group",
+				enabled: true,
+				address: "1",
+			}),
+		).rejects.toBeInstanceOf(ConfigValidationError);
+		expect(store.getTargets()).toHaveLength(0);
+	});
+
+	it("replaceSections 也拒绝 —— 恢复备份走的是这一条,不能只挡住手工那条", async () => {
+		const connection = makeOnebotConnection();
+		await store.upsertConnection(connection);
+		await expect(
+			store.replaceSections({
+				connections: [connection],
+				targets: [
+					{
+						id: randomUUID(),
+						name: "冒充的",
+						connectionId: connection.id,
+						kind: "session",
+						platform: "telegram",
+						scope: "group",
+						enabled: true,
+						address: "1",
+					} as PushTarget,
+				],
+			}),
+		).rejects.toBeInstanceOf(ConfigValidationError);
+		expect(store.getTargets()).toHaveLength(0);
+	});
+
+	it("deleteConnection(onebot) 仍在被 target 引用时拒绝", async () => {
+		const connection = makeOnebotConnection();
+		await store.upsertConnection(connection);
 		await store.upsertTarget({
 			id: randomUUID(),
 			name: "群聊",
-			adapterId: adapter.id,
+			connectionId: connection.id,
+			kind: "session",
 			platform: "onebot",
 			scope: "group",
 			enabled: true,
-			session: { groupId: "10001" },
+			address: "10001",
 		});
 
-		await expect(store.deleteAdapter(adapter.id)).rejects.toBeInstanceOf(ConfigValidationError);
-		expect(store.getAdapters()).toHaveLength(1);
+		await expect(store.deleteConnection(connection.id)).rejects.toBeInstanceOf(
+			ConfigValidationError,
+		);
+		expect(store.getConnections()).toHaveLength(1);
 		expect(store.getTargets()).toHaveLength(1);
 	});
 
 	it("deleteTarget(managed) 拒绝直接删除托管 target", async () => {
-		const adapter = makeWebhookAdapter();
-		await store.upsertAdapter(adapter);
+		const connection = makeWebhookConnection();
+		await store.upsertConnection(connection);
 		const targetId = store.getTargets()[0]?.id;
 		expect(targetId).toBeDefined();
 
@@ -674,17 +1117,63 @@ describe("ConfigStore", () => {
 	});
 
 	it("upsertTarget(webhook) 拒绝外部手动创建 webhook target", async () => {
-		const adapter = makeWebhookAdapter();
-		await store.upsertAdapter(adapter);
-		const manual = makeWebhookTarget(adapter, { id: randomUUID(), name: "额外 Webhook" });
+		const connection = makeWebhookConnection();
+		await store.upsertConnection(connection);
+		const manual = makeWebhookTarget(connection, { id: randomUUID(), name: "额外 Webhook" });
 
 		await expect(store.upsertTarget(manual)).rejects.toBeInstanceOf(ConfigValidationError);
 		expect(store.getTargets()).toHaveLength(1);
 	});
 
+	it("备份往返:getTargets() 吐得出来的,upsertTarget() 就必须吃得下", async () => {
+		// 备份导出走 getTargets()(必然含托管 target),恢复走 upsertTarget() —— 两头对不上
+		// 的话,**任何含 webhook 连接的备份都恢复不了**。而恢复是逐条 await、没有事务也
+		// 没有回滚的:炸在 targets 这步时 globals / 订阅 / adapters 已经落盘,配置变成半新
+		// 半旧,订阅里还引用着从未创建的 target id,而原状态已被覆盖。
+		//
+		// 托管 target 的 id 不能靠「导出时丢掉、恢复时重建」绕过去:makeManagedWebhookTarget
+		// 取的是 `existing?.id ?? 确定性id`,老记录会永远保留自己那个非确定性 id,重建就换了
+		// 身份,订阅 routing 当场断。
+		const connection = makeWebhookConnection();
+		await store.upsertConnection(connection);
+		const managed = store.getTargets().find((t) => t.managedBy === "connection");
+		expect(managed).toBeDefined();
+
+		await expect(store.upsertTarget(managed as PushTarget)).resolves.toBeUndefined();
+		expect(store.getTargets()).toHaveLength(1);
+		expect(store.getTargets()[0]?.id).toBe(managed?.id);
+	});
+
+	it("备份往返:恢复回来的老 id 与当前托管 target 并存 → 合并,订阅引用迁过去", async () => {
+		// 恢复的顺序是 订阅 → adapters → targets:adapter 一落盘就先生成了确定性 id 的托管
+		// target,随后送回来的那条却带着备份里的**老 id**(老记录会一直保留自己的 id)。两条
+		// 同主并存时必须合并成一条,并把订阅里的老 id 改写过去 —— 否则用户恢复完会看到两个
+		// 一模一样的 webhook 目标,而订阅指着那个被吞掉的。
+		const connection = makeWebhookConnection();
+		const legacyId = randomUUID();
+		const sub = makeSampleSubscription("77777");
+		sub.routing.dynamic = [legacyId];
+		sub.extras.atAllDynamic[legacyId] = true;
+		await store.upsertSubscription(sub);
+		await store.upsertConnection(connection);
+
+		const managedId = store.getTargets()[0]?.id;
+		expect(managedId).toBe(managedWebhookTargetId(connection.id));
+
+		await store.upsertTarget(
+			makeWebhookTarget(connection, { id: legacyId, managedBy: "connection" }) as PushTarget,
+		);
+
+		expect(store.getTargets()).toHaveLength(1);
+		expect(store.getTargets()[0]?.id).toBe(managedId);
+		const nextSub = store.getSubscriptions().find((s) => s.id === sub.id);
+		expect(nextSub?.routing.dynamic).toEqual([managedId]);
+		expect(nextSub?.extras.atAllDynamic).toEqual({ [managedId as string]: true });
+	});
+
 	it("patchTarget(managed) 拒绝外部修改，recordTargetTestStatus 允许内部状态写回", async () => {
-		const adapter = makeWebhookAdapter();
-		await store.upsertAdapter(adapter);
+		const connection = makeWebhookConnection();
+		await store.upsertConnection(connection);
 		const target = store.getTargets()[0];
 		expect(target).toBeDefined();
 
@@ -704,19 +1193,308 @@ describe("ConfigStore", () => {
 		expect(patched.testStatus).toMatchObject({ ok: true, latencyMs: 12 });
 	});
 
+	it("端到端:含 webhook 连接的备份,导出后能在一台干净机器上恢复回来", async () => {
+		// 这条住在这里,是因为真 ConfigStore 的夹具只有这个文件有 —— 而 backup-service
+		// 那边用的是替身,替身把 upsertTarget 打成空函数,正是它把这个 bug 整个盖住了。
+		// 源机器刻意造成「老装机」:托管 target 带的是**非确定性 id**(makeManagedWebhookTarget
+		// 取 `existing?.id ?? 确定性id`,老记录会一直保留自己的)。这一步是承重的 —— 否则
+		// 「把备份里的 target 恢复回来」和「照 adapter 重新生成一个」会得到同一个 id,测试
+		// 分不出这两件事,也就钉不住任何东西。
+		const connection = makeWebhookConnection();
+		const legacyId = randomUUID();
+		const sub = makeSampleSubscription("22222");
+		sub.routing.dynamic = [legacyId];
+		const dirA = await mkdtemp(join(tmpdir(), "bn-config-backup-src-"));
+		const stateA = join(dirA, "state");
+		await mkdir(stateA, { recursive: true });
+		await writeFile(join(stateA, "connections.json"), JSON.stringify([connection]), "utf8");
+		await writeFile(
+			join(stateA, "targets.json"),
+			JSON.stringify([makeWebhookTarget(connection, { id: legacyId, managedBy: "connection" })]),
+			"utf8",
+		);
+		await writeFile(join(stateA, "subscriptions.json"), JSON.stringify([sub]), "utf8");
+		const source = createConfigStore({
+			bootstrap: makeBootstrap(dirA),
+			bus: makeFakeBus(),
+			serviceCtx: makeFakeServiceCtx(),
+		});
+		await source.load();
+		const managedId = source.getTargets()[0]?.id;
+		expect(managedId).toBe(legacyId);
+		expect(managedId).not.toBe(managedWebhookTargetId(connection.id));
+
+		const noCookies = { load: async () => null, save: async () => {} };
+		const env = await createBackupService({
+			configStore: source,
+			cookieStore: noCookies,
+		}).exportBackup({ kind: "sanitized" });
+		// 导出必然带着托管 target —— 正是老写法恢复不回去的那一条
+		expect(env.sections.targets?.some((t) => t.managedBy === "connection")).toBe(true);
+
+		const dir2 = await mkdtemp(join(tmpdir(), "bn-config-restore-"));
+		const fresh = createConfigStore({
+			bootstrap: makeBootstrap(dir2),
+			bus: makeFakeBus(),
+			serviceCtx: makeFakeServiceCtx(),
+		});
+		await fresh.load();
+		await createBackupService({ configStore: fresh, cookieStore: noCookies }).importBackup({
+			envelope: env,
+			mode: "overwrite",
+		});
+
+		expect(fresh.getConnections()).toHaveLength(1);
+		expect(fresh.getTargets()).toHaveLength(1);
+		// 恢复回来的是**备份里那一条**,不是照 adapter 重新生成的 —— 订阅还指着这个 id
+		expect(fresh.getTargets()[0]?.id).toBe(legacyId);
+		expect(fresh.getSubscriptions()[0]?.routing.dynamic).toEqual([legacyId]);
+		await rm(dir2, { recursive: true, force: true });
+		await rm(dirA, { recursive: true, force: true });
+	});
+
+	/**
+	 * 🔴 只勾了 targets 那一段导出的老备份:v1 的 `platform: "webhook"` 得跟着**它那条
+	 * 连接**降格成飞书 / 钉钉,而连接不在这份备份里 —— 迁移那一步于是查不到表,整份目标
+	 * 落成 `generic`,落地时被 `assertTargetOwner` 判「平台对不上」**整份拒掉**
+	 * (`syncManagedWebhookTargets` 救不回来:它排在那道校验之后)。
+	 *
+	 * 备份没有的那一段,拿**现在盘上那份**补位。
+	 */
+	it("只导了 targets 的老备份:webhook 目标跟着现有连接降格,不落成 generic", async () => {
+		const connection = makeWebhookConnection();
+		await store.upsertConnection(connection);
+		const legacyId = randomUUID();
+		const noCookies = { load: async () => null, save: async () => {} };
+
+		await createBackupService({ configStore: store, cookieStore: noCookies }).importBackup({
+			envelope: {
+				format: "bilibili-notify-backup",
+				schemaVersion: 1,
+				kind: "sanitized",
+				createdAt: "t",
+				sections: {
+					targets: [
+						{
+							id: legacyId,
+							name: "老 webhook 目标",
+							adapterId: connection.id,
+							platform: "webhook",
+							scope: "channel",
+							enabled: true,
+							managedBy: "adapter",
+							session: {},
+						},
+					],
+				},
+			} as never,
+			mode: "overwrite",
+		});
+
+		expect(store.getTargets()).toEqual([
+			expect.objectContaining({ connectionId: connection.id, platform: connection.platform }),
+		]);
+	});
+
+	/**
+	 * 🔴 **拓展连接的 platform 同样是身份轴。**
+	 *
+	 * 「一条连接 = 一个借来的 bot」(ADR-0012 决策 45)之后,拓展连接**有** `platform`,
+	 * 目标的平台正是从它抄的。而两道校验(改连接时的身份轴、目标↔连接的平台一致)都还停在
+	 * 「桥接入没有 platform」那一版,对拓展连接一律早退 —— 于是把一条桥连接从 QQ bot 换成
+	 * telegram bot 能保存成功,底下的 QQ 群目标平台原地不动,投递却跑去了 telegram。
+	 */
+	const bridgeConnection = (platform: string) => ({
+		id: "11111111-1111-4111-8111-111111111111",
+		name: "阿库娅",
+		enabled: true,
+		kind: "extension" as const,
+		extensionId: "bridge",
+		platform,
+		config: { botId: `${platform}:42` },
+	});
+
+	it("拓展连接也不许换 platform —— 底下的目标还挂在原来那个平台上", async () => {
+		await store.upsertConnection(bridgeConnection("onebot") as never);
+		await expect(store.upsertConnection(bridgeConnection("telegram") as never)).rejects.toThrow(
+			/platform cannot be changed/,
+		);
+		expect(store.getConnections()[0]?.platform).toBe("onebot");
+	});
+
+	it("拓展连接底下的目标平台必须和它一致", async () => {
+		const connection = bridgeConnection("telegram");
+		await store.upsertConnection(connection as never);
+		await expect(
+			store.upsertTarget({
+				id: randomUUID(),
+				name: "对不上的群",
+				connectionId: connection.id,
+				kind: "session",
+				platform: "onebot",
+				scope: "group",
+				enabled: true,
+				address: "123",
+			} as never),
+		).rejects.toBeInstanceOf(ConfigValidationError);
+	});
+
+	/**
+	 * 🔴 **恢复用的回滚副本不许和迁移留的救命原件同名。**
+	 *
+	 * v1→v2 迁移会把动过的那份原件留成 `<scope>.json.bak`(「迁移错了主人还能自己捞回去」)。
+	 * `replaceSections` 落盘前也留一份同名的回滚副本,并且**在 `finally` 里无条件删掉** ——
+	 * 于是恢复一次备份(或者任何一次整体替换)就把那份救命原件顺手抹了,而且没有一行日志。
+	 */
+	it("replaceSections 不碰迁移留下的 .bak 原件", async () => {
+		const dir2 = await mkdtemp(join(tmpdir(), "bn-config-bak-collide-"));
+		const state2 = join(dir2, "state");
+		await mkdir(state2, { recursive: true });
+		// 老形状(没有 kind / connector)→ 开机迁移,原件留成 connections.json.bak。
+		const legacy = {
+			id: randomUUID(),
+			name: "老 NapCat",
+			platform: "onebot",
+			enabled: true,
+			config: { transport: "http", baseUrl: "http://127.0.0.1:3000" },
+		};
+		await writeFile(join(state2, "connections.json"), JSON.stringify([legacy]), "utf8");
+		await writeFile(join(state2, "targets.json"), JSON.stringify([]), "utf8");
+
+		const store2 = createConfigStore({
+			bootstrap: makeBootstrap(dir2),
+			bus: makeFakeBus(),
+			serviceCtx: makeFakeServiceCtx(),
+		});
+		await store2.load();
+		const rescued = await readFile(join(state2, "connections.json.bak"), "utf8");
+		expect(JSON.parse(rescued)).toEqual([legacy]);
+
+		await store2.replaceSections({ connections: store2.getConnections() });
+
+		expect(JSON.parse(await readFile(join(state2, "connections.json.bak"), "utf8"))).toEqual([
+			legacy,
+		]);
+		await rm(dir2, { recursive: true, force: true });
+	});
+
+	it("replaceSections:任一分区校验不过 → 一个字节都不写", async () => {
+		// 这是这个方法存在的理由。老写法逐条 upsert,炸在 targets 那步时 globals / 订阅 /
+		// adapters 已经落盘,配置只剩半新半旧且原状态已被覆盖。
+		const connection = makeOnebotConnection();
+		await store.upsertConnection(connection);
+		await store.upsertSubscription(makeSampleSubscription("88888"));
+		const before = {
+			subs: store.getSubscriptions(),
+			connections: store.getConnections(),
+			targets: store.getTargets(),
+			cron: store.getGlobals().app.dynamicCron,
+		};
+
+		await expect(
+			store.replaceSections({
+				globals: {
+					...store.getGlobals(),
+					app: { ...store.getGlobals().app, dynamicCron: "*/9 * * * *" },
+				},
+				subscriptions: [],
+				connections: [connection],
+				// scope 不在词表里 → schema 当场拒绝
+				targets: [
+					{
+						id: randomUUID(),
+						name: "坏目标",
+						connectionId: connection.id,
+						platform: "onebot",
+						scope: "nope",
+						enabled: true,
+						session: { groupId: "1" },
+					} as unknown as PushTarget,
+				],
+			}),
+		).rejects.toBeInstanceOf(ConfigValidationError);
+
+		expect(store.getSubscriptions()).toEqual(before.subs);
+		expect(store.getConnections()).toEqual(before.connections);
+		expect(store.getTargets()).toEqual(before.targets);
+		expect(store.getGlobals().app.dynamicCron).toBe(before.cron);
+	});
+
+	it("replaceSections:target 指向不存在的 adapter → 拒绝,且不写", async () => {
+		const connection = makeOnebotConnection();
+		await store.upsertConnection(connection);
+		const before = store.getConnections();
+
+		await expect(
+			store.replaceSections({
+				connections: [connection],
+				targets: [
+					{
+						id: randomUUID(),
+						name: "孤儿目标",
+						connectionId: randomUUID(),
+						kind: "session",
+						platform: "onebot",
+						scope: "group",
+						enabled: true,
+						address: "1",
+					} as PushTarget,
+				],
+			}),
+		).rejects.toBeInstanceOf(ConfigValidationError);
+		expect(store.getTargets()).toHaveLength(0);
+		expect(store.getConnections()).toEqual(before);
+	});
+
+	it("replaceSections:缺席的分区保持不动,给空数组才是真清空", async () => {
+		const connection = makeOnebotConnection();
+		await store.upsertConnection(connection);
+		await store.upsertSubscription(makeSampleSubscription("99999"));
+
+		// 只给 targets:订阅与 adapters 不该被碰
+		await store.replaceSections({ targets: [] });
+		expect(store.getSubscriptions()).toHaveLength(1);
+		expect(store.getConnections()).toHaveLength(1);
+
+		// 给空数组 → 真清空
+		await store.replaceSections({ subscriptions: [] });
+		expect(store.getSubscriptions()).toHaveLength(0);
+	});
+
+	it("replaceSections:webhook 托管目标照样归一化,订阅引用跟着迁", async () => {
+		const connection = makeWebhookConnection();
+		const legacyId = randomUUID();
+		const sub = makeSampleSubscription("11111");
+		sub.routing.live = [legacyId];
+		await store.upsertSubscription(sub);
+
+		await store.replaceSections({
+			connections: [connection],
+			targets: [
+				makeWebhookTarget(connection, { id: legacyId, managedBy: "connection" }) as PushTarget,
+			],
+		});
+
+		expect(store.getTargets()).toHaveLength(1);
+		// 只有一条时它就是留下的那条 —— 老 id 保住,不会被换成确定性 id
+		expect(store.getTargets()[0]?.id).toBe(legacyId);
+		expect(store.getTargets()[0]?.managedBy).toBe("connection");
+		expect(store.getSubscriptions()[0]?.routing.live).toEqual([legacyId]);
+	});
+
 	it("load() 合并同一 webhook adapter 下多余 targets 并把订阅引用迁到托管 id", async () => {
 		const dir2 = await mkdtemp(join(tmpdir(), "bn-config-managed-duplicates-"));
 		const state2 = join(dir2, "state");
 		await mkdir(state2, { recursive: true });
-		const adapter = makeWebhookAdapter();
-		const primary = makeWebhookTarget(adapter, { id: randomUUID(), name: "主 Webhook" });
-		const extra = makeWebhookTarget(adapter, { id: randomUUID(), name: "多余 Webhook" });
+		const connection = makeWebhookConnection();
+		const primary = makeWebhookTarget(connection, { id: randomUUID(), name: "主 Webhook" });
+		const extra = makeWebhookTarget(connection, { id: randomUUID(), name: "多余 Webhook" });
 		const sub = makeSampleSubscription("66666");
 		sub.routing.dynamic = [extra.id, primary.id];
 		sub.routing.live = [extra.id];
-		sub.atAll.dynamic[extra.id] = true;
-		sub.atAll.live[extra.id] = false;
-		await writeFile(join(state2, "adapters.json"), JSON.stringify([adapter]), "utf8");
+		sub.extras.atAllDynamic[extra.id] = true;
+		sub.extras.atAllLive[extra.id] = false;
+		await writeFile(join(state2, "connections.json"), JSON.stringify([connection]), "utf8");
 		await writeFile(join(state2, "targets.json"), JSON.stringify([primary, extra]), "utf8");
 		await writeFile(join(state2, "subscriptions.json"), JSON.stringify([sub]), "utf8");
 
@@ -728,13 +1506,13 @@ describe("ConfigStore", () => {
 		await store2.load();
 
 		expect(store2.getTargets()).toEqual([
-			expect.objectContaining({ id: primary.id, managedBy: "adapter", name: adapter.name }),
+			expect.objectContaining({ id: primary.id, managedBy: "connection", name: connection.name }),
 		]);
 		const nextSub = store2.getSubscriptions()[0];
 		expect(nextSub?.routing.dynamic).toEqual([primary.id]);
 		expect(nextSub?.routing.live).toEqual([primary.id]);
-		expect(nextSub?.atAll.dynamic).toEqual({ [primary.id]: true });
-		expect(nextSub?.atAll.live).toEqual({ [primary.id]: false });
+		expect(nextSub?.extras.atAllDynamic).toEqual({ [primary.id]: true });
+		expect(nextSub?.extras.atAllLive).toEqual({ [primary.id]: false });
 		await rm(dir2, { recursive: true, force: true });
 	});
 

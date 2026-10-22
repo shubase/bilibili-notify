@@ -7,11 +7,11 @@
  * 显式值;「跟默认」发的是删除哨兵(null),不是把默认值抄一份进例外。
  */
 
-import type { AdapterCapabilitiesMap } from "@bilibili-notify/contract";
+import type { ConnectionCapabilitiesMap } from "@bilibili-notify/contract";
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vite-plus/test";
-import type { PushAdapter, PushTarget } from "../../types/domain";
+import type { Connection, DirectConnection, PushTarget } from "../../types/domain";
 import type { GlobalConfig } from "../../types/globals";
 import { LinkParsingSettings } from "../link-parsing-settings";
 
@@ -37,40 +37,44 @@ function target(id: string, name: string, over: Partial<PushTarget> = {}): PushT
 	return {
 		id,
 		name,
-		adapterId: "11111111-1111-4111-8111-111111111111",
+		connectionId: "11111111-1111-4111-8111-111111111111",
 		scope: "group",
 		enabled: true,
+		kind: "session",
 		platform: "onebot",
-		session: { groupId: "123" },
+		address: "123",
 		...over,
 	} as PushTarget;
 }
 
 const TARGETS: PushTarget[] = [
 	target(T_A, "群 A"),
-	target(T_B, "官机群 B", { platform: "qq-official", session: { groupOpenid: "op" } } as never),
-	target(T_PRIVATE, "主人私聊", { scope: "private", session: { userId: "1" } } as never),
-	target(T_WEBHOOK, "钩子", { platform: "webhook", session: {} } as never),
+	target(T_B, "官机群 B", { platform: "qq-official", address: "op" } as never),
+	target(T_PRIVATE, "主人私聊", { scope: "private", address: "1" } as never),
+	target(T_WEBHOOK, "钩子", { kind: "endpoint", platform: "feishu" } as never),
 ];
 
 const A_OB = "11111111-1111-4111-8111-111111111111";
 const A_OB2 = "22222222-2222-4222-8222-222222222222";
 const A_QQ = "33333333-3333-4333-8333-333333333333";
 
-function adapter(id: string, name: string, platform: PushAdapter["platform"]): PushAdapter {
-	return { id, name, platform, enabled: true, config: {} } as unknown as PushAdapter;
+function connection(id: string, name: string, platform: DirectConnection["platform"]): Connection {
+	return { id, name, kind: "direct", platform, enabled: true, config: {} } as unknown as Connection;
 }
 
-const ADAPTERS: PushAdapter[] = [
-	adapter(A_OB, "NapCat 主号", "onebot"),
-	adapter(A_OB2, "Lagrange 备用", "onebot"),
-	adapter(A_QQ, "官机", "qq-official"),
+const ADAPTERS: Connection[] = [
+	connection(A_OB, "NapCat 主号", "onebot"),
+	connection(A_OB2, "Lagrange 备用", "onebot"),
+	connection(A_QQ, "官机", "qq-official"),
 ];
 
-const CAPS: AdapterCapabilitiesMap = {
-	[A_OB]: { miniAppCard: { state: "supported", checkedAt: 1 } },
+/** 两级索引:连接 id → 平台名 → 能力。第二级是开放词表,读它的一侧自己带着平台名。 */
+const CAPS: ConnectionCapabilitiesMap = {
+	[A_OB]: { onebot: { miniAppCard: { state: "supported", checkedAt: 1 } } },
 	[A_OB2]: {
-		miniAppCard: { state: "unsupported", reason: "这个实现没有 get_mini_app_ark", checkedAt: 1 },
+		onebot: {
+			miniAppCard: { state: "unsupported", reason: "这个实现没有 get_mini_app_ark", checkedAt: 1 },
+		},
 	},
 };
 
@@ -78,7 +82,7 @@ function renderCard(
 	draft: GlobalConfig,
 	onPatch = vi.fn(),
 	targets: PushTarget[] = TARGETS,
-	extra: { adapters?: PushAdapter[]; capabilities?: AdapterCapabilitiesMap } = {},
+	extra: { connections?: Connection[]; capabilities?: ConnectionCapabilitiesMap } = {},
 ) {
 	render(
 		<MemoryRouter>
@@ -86,7 +90,7 @@ function renderCard(
 				draft={draft}
 				onPatch={onPatch}
 				targets={targets}
-				adapters={extra.adapters ?? ADAPTERS}
+				connections={extra.connections ?? ADAPTERS}
 				capabilities={extra.capabilities ?? CAPS}
 			/>
 		</MemoryRouter>,
@@ -120,7 +124,7 @@ describe("LinkParsingSettings", () => {
 					draft={draftWith({ enabled: false })}
 					onPatch={() => {}}
 					targets={TARGETS}
-					adapters={ADAPTERS}
+					connections={ADAPTERS}
 					capabilities={CAPS}
 				/>
 			</MemoryRouter>,
@@ -132,7 +136,7 @@ describe("LinkParsingSettings", () => {
 					draft={draftWith({ enabled: true, cooldownSeconds: 90 })}
 					onPatch={() => {}}
 					targets={TARGETS}
-					adapters={ADAPTERS}
+					connections={ADAPTERS}
 					capabilities={CAPS}
 				/>
 			</MemoryRouter>,
@@ -147,7 +151,7 @@ describe("LinkParsingSettings", () => {
 					})}
 					onPatch={() => {}}
 					targets={TARGETS}
-					adapters={ADAPTERS}
+					connections={ADAPTERS}
 					capabilities={CAPS}
 				/>
 			</MemoryRouter>,
@@ -184,6 +188,66 @@ describe("LinkParsingSettings", () => {
 			expect(screen.getByRole("group", { name: "群 A" })).toBeTruthy();
 			fireEvent.click(screen.getByRole("button", { name: "收起" }));
 			expect(screen.queryByRole("group", { name: "群 A" })).toBeNull();
+		});
+
+		/**
+		 * 🔴 桥借来的平台(telegram / discord …)是**握手时才知道的开放字符串**,平台注册表
+		 * 里压根没有它 —— 按注册表筛,这些群整批被漏掉,而运行时照样会解析它们发的链接。
+		 * 判据只能是「这条连接是拓展借来的」。
+		 */
+		it("拓展连接底下的群也算候选 —— 它的平台不在注册表里,但链接照样会被解析", () => {
+			const EXT = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
+			renderCard(
+				draftWith(),
+				vi.fn(),
+				[target(T_A, "电报群", { connectionId: EXT, platform: "telegram" } as never)],
+				{
+					connections: [
+						{
+							id: EXT,
+							name: "小电视",
+							kind: "extension",
+							extensionId: "bridge",
+							platform: "telegram",
+							enabled: true,
+							config: {},
+						} as unknown as Connection,
+					],
+				},
+			);
+			openGroups();
+			expect(screen.getByRole("group", { name: "电报群" })).toBeTruthy();
+		});
+
+		it("拓展连接上的**私聊**目标还是不列 —— 例外表讲的只是群", () => {
+			const EXT = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
+			renderCard(
+				draftWith(),
+				vi.fn(),
+				[
+					target(T_A, "电报群", { connectionId: EXT, platform: "telegram" } as never),
+					target(T_PRIVATE, "电报私聊", {
+						connectionId: EXT,
+						platform: "telegram",
+						scope: "private",
+					} as never),
+				],
+				{
+					connections: [
+						{
+							id: EXT,
+							name: "小电视",
+							kind: "extension",
+							extensionId: "bridge",
+							platform: "telegram",
+							enabled: true,
+							config: {},
+						} as unknown as Connection,
+					],
+				},
+			);
+			openGroups();
+			expect(screen.queryByRole("group", { name: "电报私聊" })).toBeNull();
 		});
 
 		it("只列群类且收得到入站消息的目标:私聊与 webhook 不出现,官机群算", () => {
@@ -238,14 +302,14 @@ describe("LinkParsingSettings", () => {
 			expect(onPatch).toHaveBeenCalledWith({ linkParsing: { groups: { [T_A]: { form: null } } } });
 		});
 
-		it("停用的目标照列,标「已停用」;适配器停用的也算(运行时一样不解析)", () => {
+		it("停用的目标照列,标「已停用」;连接停用的也算(运行时一样不解析)", () => {
 			renderCard(draftWith(), vi.fn(), [target(T_A, "群 A", { enabled: false })]);
 			openGroups();
 			expect(row("群 A").getByText("已停用")).toBeTruthy();
 			cleanup();
 
 			renderCard(draftWith(), vi.fn(), [target(T_A, "群 A")], {
-				adapters: [{ ...ADAPTERS[0], enabled: false } as PushAdapter, ...ADAPTERS.slice(1)],
+				connections: [{ ...ADAPTERS[0], enabled: false } as Connection, ...ADAPTERS.slice(1)],
 			});
 			openGroups();
 			expect(row("群 A").getByText("已停用")).toBeTruthy();
@@ -264,12 +328,12 @@ describe("LinkParsingSettings", () => {
 			expect(screen.getByRole("link", { name: /推送目标/ }).getAttribute("href")).toBe("/targets");
 		});
 	});
-	describe("适配器支持情况", () => {
-		it("只列 OneBot 适配器,三态各有说法:支持 / 不支持带原因 / 未探测", () => {
+	describe("连接支持情况", () => {
+		it("只列 OneBot 连接,三态各有说法:支持 / 不支持带原因 / 未探测", () => {
 			renderCard(draftWith(), vi.fn(), TARGETS, {
 				capabilities: { ...CAPS, [A_OB2]: CAPS[A_OB2] as never },
 			});
-			const panel = within(screen.getByRole("region", { name: "适配器支持情况" }));
+			const panel = within(screen.getByRole("region", { name: "连接支持情况" }));
 			expect(panel.getByText("NapCat 主号")).toBeTruthy();
 			expect(panel.getByText("支持小程序卡")).toBeTruthy();
 			expect(panel.getByText("Lagrange 备用")).toBeTruthy();
@@ -278,23 +342,42 @@ describe("LinkParsingSettings", () => {
 			expect(panel.queryByText("官机")).toBeNull();
 		});
 
-		it("表里没有的 OneBot 适配器(引擎还没探)显示「未探测」", () => {
+		it("一条连接底下挂着两个平台时,读的是这一行自己那个平台", () => {
+			// 能力是**平台**的属性,不是连接的。一条连接驮多个平台是桥接那档的常态
+			// (一条 koishi 连接底下同时挂着 QQ 与别的),只按连接 id 查会把隔壁平台的
+			// 答案读过来 —— 面板照样渲染、照样不报错,只是说反了。
+			renderCard(draftWith(), vi.fn(), TARGETS, {
+				capabilities: {
+					[A_OB]: {
+						"qq-official": {
+							miniAppCard: { state: "unsupported", reason: "隔壁的", checkedAt: 1 },
+						},
+						onebot: { miniAppCard: { state: "supported", checkedAt: 1 } },
+					},
+				},
+			});
+			const panel = within(screen.getByRole("region", { name: "连接支持情况" }));
+			expect(panel.getByText("支持小程序卡")).toBeTruthy();
+			expect(panel.queryByText(/隔壁的/)).toBeNull();
+		});
+
+		it("表里没有的 OneBot 连接(引擎还没探)显示「未探测」", () => {
 			renderCard(draftWith(), vi.fn(), TARGETS, { capabilities: {} });
-			const panel = within(screen.getByRole("region", { name: "适配器支持情况" }));
+			const panel = within(screen.getByRole("region", { name: "连接支持情况" }));
 			expect(panel.getAllByText("未探测")).toHaveLength(2);
 		});
 
-		it("官机与 webhook 用一句话说明不支持;没有 OneBot 适配器时只剩这句", () => {
-			renderCard(draftWith(), vi.fn(), TARGETS, { adapters: [ADAPTERS[2] as PushAdapter] });
-			const panel = within(screen.getByRole("region", { name: "适配器支持情况" }));
+		it("官机与 webhook 用一句话说明不支持;没有 OneBot 连接时只剩这句", () => {
+			renderCard(draftWith(), vi.fn(), TARGETS, { connections: [ADAPTERS[2] as Connection] });
+			const panel = within(screen.getByRole("region", { name: "连接支持情况" }));
 			expect(panel.getByText(/QQ 官方机器人与 webhook 不支持小程序卡/)).toBeTruthy();
-			expect(panel.getByText(/还没有 OneBot 适配器/)).toBeTruthy();
+			expect(panel.getByText(/还没有 OneBot 连接/)).toBeTruthy();
 		});
 
-		it("群所在的适配器不支持 → 那一行形式格旁提示会回落图片卡;支持的不提示", () => {
+		it("群所在的连接不支持 → 那一行形式格旁提示会回落图片卡;支持的不提示", () => {
 			renderCard(draftWith(), vi.fn(), [
-				target(T_A, "群 A", { adapterId: A_OB2 } as never),
-				target(T_B, "群 B", { adapterId: A_OB } as never),
+				target(T_A, "群 A", { connectionId: A_OB2 } as never),
+				target(T_B, "群 B", { connectionId: A_OB } as never),
 			]);
 			openGroups();
 			expect(row("群 A").getByText(/会回落图片卡/)).toBeTruthy();

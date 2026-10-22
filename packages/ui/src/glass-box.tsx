@@ -13,8 +13,22 @@ export interface GlassBoxProps {
 	title: ReactNode;
 	subtitle?: ReactNode;
 	accent?: string;
+	/** 图标位上那枚 accent 渐变芯片里的图形。 */
 	icon?: ReactNode;
+	/**
+	 * **自绘**的图标位 —— 整块由调用方给,不套 accent 芯片。
+	 *
+	 * 桥接页的接入卡是这么用的:卡的角光跟连接状态走(绿 / 黄 / 灰),而左上那枚方块
+	 * 印的是「哪一种桥」(灰底两个字母),两者**不该是同一种颜色**。有 `mark` 时 `icon` 不画。
+	 */
+	mark?: ReactNode;
+	/** 标题旁那枚 accent 色的小徽章。 */
 	badge?: ReactNode;
+	/**
+	 * 徽章之后、同一行里再摆的东西(状态点 + 一句「已连接」那种)—— 它们不是 accent 色,
+	 * 所以进不了 `badge`。
+	 */
+	aside?: ReactNode;
 	right?: ReactNode;
 	dense?: boolean;
 	children: ReactNode;
@@ -26,7 +40,9 @@ export function GlassBox({
 	subtitle,
 	accent = "var(--color-bn-pink)",
 	icon,
+	mark,
 	badge,
+	aside,
 	right,
 	dense,
 	children,
@@ -36,11 +52,16 @@ export function GlassBox({
 	const iconChip = accentChip(accent);
 	return (
 		<div
-			className={`bn-glass relative overflow-hidden rounded-bn-card shadow-bn-card ${className ?? ""}`}
+			// flex-col + 下面那个 flex-1 的正文:卡被摆进等高的 grid 行时(概览页「系统资源」
+			// 与「各模块」并排),给它 `h-full` 正文就跟着长满,不会在底下留一大片空玻璃。
+			// 不给高度时 flex-col 与块级排布完全等价,存量调用点一处不受影响。
+			className={`bn-glass relative flex flex-col overflow-hidden rounded-bn-card shadow-bn-card ${className ?? ""}`}
 		>
 			<div className="pointer-events-none absolute right-0 top-0 h-40 w-40" style={radial} />
 			<div className="relative flex items-center gap-3 border-b border-bn-border-subtle px-[18px] pb-3 pt-3.5">
-				{icon ? (
+				{mark ? (
+					mark
+				) : icon ? (
 					<div
 						className="grid h-8 w-8 place-items-center rounded-bn-sm text-bn-base font-bold text-bn-on-solid"
 						style={iconChip}
@@ -58,6 +79,7 @@ export function GlassBox({
 								{badge}
 							</Pill>
 						) : null}
+						{aside}
 					</div>
 					{subtitle ? (
 						<div className="mt-0.5 text-bn-xs text-bn-text-secondary">{subtitle}</div>
@@ -65,7 +87,9 @@ export function GlassBox({
 				</div>
 				{right}
 			</div>
-			<div className={`relative ${dense ? "px-[18px] pb-3.5 pt-2" : "px-[18px] pb-4 pt-2.5"}`}>
+			<div
+				className={`relative flex-1 ${dense ? "px-[18px] pb-3.5 pt-2" : "px-[18px] pb-4 pt-2.5"}`}
+			>
 				{children}
 			</div>
 		</div>

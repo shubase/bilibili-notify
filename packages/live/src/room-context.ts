@@ -6,6 +6,8 @@ import type { LiveContentBuilder } from "./content-builder";
 import type { DanmakuCollector } from "./danmaku-collector";
 import type { LiveSummaryRequester } from "./live-summary-requester";
 import {
+	type CustomGuardBuyLike,
+	type GuardTierKey,
 	LIVE_ROOM_MASTER_KEYS,
 	type LiveMasterFeature,
 	type PickCardBackground,
@@ -27,6 +29,14 @@ export const GUARD_LEVEL_IMG: Record<GuardLevel, string> = {
 		"https://s1.hdslb.com/bfs/static/blive/live-pay-mono/relation/relation/assets/governor-DpDXKEdA.png",
 };
 
+/** Guard-level → 自定义上舰配置里对应的那一档(B 站 guard_level:1 总督 / 2 提督 / 3 舰长)。 */
+export const GUARD_LEVEL_TIER: Record<GuardLevel, GuardTierKey | undefined> = {
+	[GuardLevel.None]: undefined,
+	[GuardLevel.Governor]: "governor",
+	[GuardLevel.Admiral]: "commander",
+	[GuardLevel.Captain]: "captain",
+};
+
 /**
  * 模板 / 渲染层全局配置,listener-manager + room-session 共用。
  *
@@ -34,13 +44,7 @@ export const GUARD_LEVEL_IMG: Record<GuardLevel, string> = {
  * per-UP 字段,adapter build SubItemView 时已折算好,引擎直接读 `SubItemView.X`。
  */
 export interface ListenerManagerConfig {
-	customGuardBuy: {
-		enable: boolean;
-		guardBuyMsg?: string;
-		captainImgUrl?: string;
-		supervisorImgUrl?: string;
-		governorImgUrl?: string;
-	};
+	customGuardBuy: CustomGuardBuyLike;
 	customLiveMsg: {
 		enable: boolean;
 		customLiveStart?: string;
@@ -54,12 +58,6 @@ export interface ListenerManagerConfig {
 	 * 直播开播 / SC / 上舰 等路径自然走 `if (renderer?.generateXxx)` 落入文字回退。缺省视为 true。
 	 */
 	imageEnabled?: boolean;
-	/**
-	 * 全局默认卡片背景图廊(`defaults.cardStyle.backgroundImages`)。live/sc/guard
-	 * 均无 per-UP / per-kind 覆盖时,`resolvedCardStyle` 拿它做「每次推送轮换」的
-	 * 兜底列表 —— 否则这些 UP 会一直渲染同一张图(渲染器自身只认单图静态配置)。
-	 */
-	defaultBackgroundImages?: string[];
 	/**
 	 * 全局默认直播封面列表(`defaults.cardStyle.liveCoverImages`,独立端专属)。
 	 * 该 UP 无覆盖时 `resolvedCardStyle("live")` 拿它做封面轮换兜底,语义同上。

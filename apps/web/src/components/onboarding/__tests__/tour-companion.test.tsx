@@ -25,7 +25,7 @@ vi.mock("../../../services/api", () => ({ api: { get: apiGet, patch: apiPatch } 
 interface Scenario {
 	loggedIn?: boolean;
 	subs?: unknown[];
-	adapters?: unknown[];
+	connections?: unknown[];
 	targets?: unknown[];
 	route?: string;
 	/** globals 里那笔 `onboarding.skipped` —— `null` = 配置缺失(还没问过,该弹
@@ -44,7 +44,7 @@ async function mount(s: Scenario) {
 	});
 	apiGet.mockImplementation(async (path: string) => {
 		if (path === "/api/subs") return s.subs ?? [];
-		if (path === "/api/adapters") return s.adapters ?? [];
+		if (path === "/api/connections") return s.connections ?? [];
 		if (path === "/api/targets") return s.targets ?? [];
 		if (path === "/api/health")
 			return { status: "ok", uptime: 1, modules: { image: false, ai: false } };
@@ -114,7 +114,7 @@ describe("TourCompanion 常驻小卡", () => {
 	 *
 	 * 缺失 = 还没问过 → 屏幕中间弹询问框(新用户开始指引 / 老用户跳过);
 	 * false = 要指引 → 导览照常;true = 不要 → **整个导览不渲染**(标签也没有,
-	 * 对「永久常驻」的修订),系统页可重开。判据认「按过测试」才算配好适配器,
+	 * 对「永久常驻」的修订),系统页可重开。判据认「按过测试」才算配好连接,
 	 * 存量老用户升级后会被判成没配完 —— 询问框就是他们的出口,选一次记一世。
 	 */
 	describe("三态询问框", () => {
@@ -181,7 +181,7 @@ describe("TourCompanion 常驻小卡", () => {
 			await mount({ route: "/system", skipped: true });
 			await waitFor(() => expect(apiGet).toHaveBeenCalledWith("/api/globals"));
 			await new Promise((r) => setTimeout(r, 50));
-			for (const path of ["/api/subs", "/api/adapters", "/api/targets", "/api/health"]) {
+			for (const path of ["/api/subs", "/api/connections", "/api/targets", "/api/health"]) {
 				expect(apiGet, `${path} 不该被问`).not.toHaveBeenCalledWith(path);
 			}
 		});
@@ -223,7 +223,7 @@ describe("TourCompanion 常驻小卡", () => {
 		it("走完五步毕业 → 自动记下 true,🎉 卡演完点「收起」才消失", async () => {
 			const s: Scenario = {
 				subs: [{ id: "s1" }],
-				adapters: [{ id: "a1", enabled: true, testStatus: { ok: true } }],
+				connections: [{ id: "a1", enabled: true, testStatus: { ok: true } }],
 				targets: [{ id: "t1", enabled: true, testStatus: { ok: true } }],
 				route: "/system",
 			};
@@ -258,7 +258,7 @@ describe("TourCompanion 常驻小卡", () => {
 		it("同一会话里毕业过、再重新开启指引:🎉 卡的「收起」照样谢幕,不是一颗死钮", async () => {
 			const s: Scenario = {
 				subs: [{ id: "s1" }],
-				adapters: [{ id: "a1", enabled: true, testStatus: { ok: true } }],
+				connections: [{ id: "a1", enabled: true, testStatus: { ok: true } }],
 				targets: [{ id: "t1", enabled: true, testStatus: { ok: true } }],
 				route: "/system",
 			};
@@ -350,7 +350,7 @@ describe("TourCompanion 常驻小卡", () => {
 		document.body.appendChild(anchorEl);
 		await mount({
 			subs: [{ id: "s1" }],
-			adapters: [{ id: "a1", enabled: true, testStatus: { ok: true } }],
+			connections: [{ id: "a1", enabled: true, testStatus: { ok: true } }],
 			targets: [{ id: "t1", enabled: true, testStatus: { ok: true } }],
 			route: "/system",
 		});
@@ -383,7 +383,7 @@ describe("TourCompanion 常驻小卡", () => {
 			document.body.appendChild(anchorEl);
 			await mount({
 				subs: [{ id: "s1" }],
-				adapters: [{ id: "a1", enabled: true, testStatus: { ok: true } }],
+				connections: [{ id: "a1", enabled: true, testStatus: { ok: true } }],
 				targets: [{ id: "t1", enabled: true, testStatus: { ok: true } }],
 				route: "/system",
 			});
@@ -520,26 +520,26 @@ describe("TourCompanion 常驻小卡", () => {
 
 	/**
 	 * 子步层的判据回退(2026-08-30 真机反馈)。主步 activeKey 的前进回退早有
-	 * (reconcileTourPos),但子步曾只进不退:删掉适配器后 activeKey 仍是 adapter,
+	 * (reconcileTourPos),但子步曾只进不退:删掉连接后 activeKey 仍是 adapter,
 	 * 手动位停在「测试连通」—— 聚光灯靠链回落指对了「+ 新建」,小卡文案却还在讲
 	 * 测试。规则:只盯**从真变假的转变沿** —— 当前位之前有带 doneWhen 的子步判据
 	 * 被破坏 → 退回那一子步。「为假就退」会把手动「下一步」的提前预读当场按回去
 	 * (下一条「子步只向前翻页」测试钉着那半);纯说明步无 doneWhen,不做回退目标。
 	 */
-	it("子步判据回退:删掉适配器 → 小卡从「测试连通」退回「新建」", async () => {
+	it("子步判据回退:删掉连接 → 小卡从「测试连通」退回「新建」", async () => {
 		const s: Scenario = {
 			loggedIn: true,
-			adapters: [{ id: "a1", enabled: true }],
+			connections: [{ id: "a1", enabled: true }],
 			route: "/targets",
 		};
 		const { qc } = await mount(s);
-		// hasAdapter=true → 「新建」子步的 doneWhen 已满足,自动翻到「测试连通」
-		await screen.findByText("测试适配器连通");
-		s.adapters = [];
+		// hasConnection=true → 「新建」子步的 doneWhen 已满足,自动翻到「测试连通」
+		await screen.findByText("测试连通性");
+		s.connections = [];
 		await act(async () => {
-			await qc.invalidateQueries({ queryKey: ["adapters"] });
+			await qc.invalidateQueries({ queryKey: ["connections"] });
 		});
-		await screen.findByText("新建推送适配器");
+		await screen.findByText("新建推送连接");
 	});
 
 	/**
@@ -550,7 +550,7 @@ describe("TourCompanion 常驻小卡", () => {
 	describe("测试失败兜底", () => {
 		const failScenario = (at: string): Scenario => ({
 			loggedIn: true,
-			adapters: [{ id: "a1", enabled: true, testStatus: { ok: true } }],
+			connections: [{ id: "a1", enabled: true, testStatus: { ok: true } }],
 			targets: [
 				{ id: "t1", enabled: true, testStatus: { ok: false, err: "发送超时", lastCheckedAt: at } },
 			],
@@ -783,22 +783,22 @@ describe("TourCompanion 常驻小卡", () => {
 
 	it("adapter 主步 · 抵达即流转:身在 /targets 时说明步直接翻过,灯与文案同步进动手子步", async () => {
 		await mount({ loggedIn: true, route: "/targets" });
-		expect(await screen.findByText("新建推送适配器")).toBeTruthy();
+		expect(await screen.findByText("新建推送连接")).toBeTruthy();
 		expect(screen.queryByText("先选一条接入路线")).toBeNull();
 		// 说明步被翻过也不丢选型入口 —— 动手子步上同样挂着「选型指引」
 		expect(screen.getByRole("button", { name: "选型指引" })).toBeTruthy();
 	});
 
-	it("适配器已落库(未测通)→ 子步判据对齐:直接站在「测试适配器连通」,灯指测试按钮", async () => {
+	it("连接已落库(未测通)→ 子步判据对齐:直接站在「测试连通性」,灯指测试按钮", async () => {
 		const testBtn = document.createElement("div");
-		testBtn.setAttribute("data-tour", "adapter-test");
+		testBtn.setAttribute("data-tour", "connection-test");
 		document.body.appendChild(testBtn);
-		// 保存适配器后的下一拍轮询就是这个状态 —— 灯不许断档(真机踩过)
-		await mount({ loggedIn: true, adapters: [{ id: "a1", enabled: true }], route: "/targets" });
-		expect(await screen.findByText("测试适配器连通")).toBeTruthy();
+		// 保存连接后的下一拍轮询就是这个状态 —— 灯不许断档(真机踩过)
+		await mount({ loggedIn: true, connections: [{ id: "a1", enabled: true }], route: "/targets" });
+		expect(await screen.findByText("测试连通性")).toBeTruthy();
 		await waitFor(() =>
 			expect(screen.getByTestId("tour-spotlight").getAttribute("data-target")).toBe(
-				'[data-tour="adapter-test"]',
+				'[data-tour="connection-test"]',
 			),
 		);
 	});
@@ -807,35 +807,35 @@ describe("TourCompanion 常驻小卡", () => {
 		// 两处入口给真实的、相离的矩形 —— jsdom 默认 0×0 会让两洞完全重合,
 		// 被「相交洞合并」(mergeIntersecting)并成一个,测的就不再是多实例了
 		const railBtn = document.createElement("div");
-		railBtn.setAttribute("data-tour", "adapter-add");
+		railBtn.setAttribute("data-tour", "connection-add");
 		railBtn.getBoundingClientRect = () => new DOMRect(20, 100, 80, 24);
 		document.body.appendChild(railBtn);
 		const cta = document.createElement("div");
-		cta.setAttribute("data-tour", "adapter-add");
+		cta.setAttribute("data-tour", "connection-add");
 		cta.getBoundingClientRect = () => new DOMRect(400, 300, 120, 60);
 		document.body.appendChild(cta);
 		await mount({ loggedIn: true, route: "/targets" });
-		await screen.findByText("新建推送适配器");
+		await screen.findByText("新建推送连接");
 		await waitFor(() => expect(screen.getAllByTestId("tour-spot-frame").length).toBe(2));
 	});
 
 	it("display:none 的同名实例不开洞 —— 响应式双形态的隐藏份曾在视口原点画出一枚粉弧", async () => {
 		const visible = document.createElement("div");
-		visible.setAttribute("data-tour", "adapter-add");
+		visible.setAttribute("data-tour", "connection-add");
 		document.body.appendChild(visible);
 		const hiddenEl = document.createElement("div");
-		hiddenEl.setAttribute("data-tour", "adapter-add");
+		hiddenEl.setAttribute("data-tour", "connection-add");
 		// 实例级覆盖模拟 display:none(无盒)
 		(hiddenEl as unknown as { getClientRects: () => DOMRectList }).getClientRects = () =>
 			[] as unknown as DOMRectList;
 		document.body.appendChild(hiddenEl);
 		await mount({ loggedIn: true, route: "/targets" });
-		await screen.findByText("新建推送适配器");
+		await screen.findByText("新建推送连接");
 		await waitFor(() => expect(screen.getAllByTestId("tour-spot-frame").length).toBe(1));
 	});
 
 	/**
-	 * 选中的适配器是 webhook 时,`target-add` **一处都不渲染** —— 右上「+ 新建推送
+	 * 选中的连接是 webhook 时,`target-add` **一处都不渲染** —— 右上「+ 新建推送
 	 * 目标」被 platform 判断掐掉,空态 AddCard 走的是另一条分支。链只有
 	 * `["target-form", "target-add"]` 的话解析不到任何元素:灯不亮、锁不铺,小卡却
 	 * 还在说「点高亮的『+ 新建』」;而人已经在 /targets 上,连「点亮起的页签前往」
@@ -847,7 +847,7 @@ describe("TourCompanion 常驻小卡", () => {
 		document.body.appendChild(list);
 		await mount({
 			loggedIn: true,
-			adapters: [{ id: "a1", enabled: true, testStatus: { ok: true } }],
+			connections: [{ id: "a1", enabled: true, testStatus: { ok: true } }],
 			targets: [{ id: "t1", enabled: false }],
 			route: "/targets",
 		});
@@ -861,9 +861,9 @@ describe("TourCompanion 常驻小卡", () => {
 
 	it("子步只向前翻页:永远没有「上一步」(单向流转定案)", async () => {
 		await mount({ loggedIn: true, route: "/targets" });
-		await screen.findByText("新建推送适配器");
+		await screen.findByText("新建推送连接");
 		fireEvent.click(screen.getByRole("button", { name: "下一步" }));
-		expect(await screen.findByText("测试适配器连通")).toBeTruthy();
+		expect(await screen.findByText("测试连通性")).toBeTruthy();
 		expect(screen.queryByRole("button", { name: "上一步" })).toBeNull();
 	});
 
@@ -873,7 +873,7 @@ describe("TourCompanion 常驻小卡", () => {
 		document.body.appendChild(addBtn);
 		await mount({
 			loggedIn: true,
-			adapters: [{ id: "a1", enabled: true, testStatus: { ok: true } }],
+			connections: [{ id: "a1", enabled: true, testStatus: { ok: true } }],
 			targets: [{ id: "t1", enabled: true, testStatus: { ok: true } }],
 			route: "/subs",
 		});
@@ -892,7 +892,7 @@ describe("TourCompanion 常驻小卡", () => {
 		// 除登录外全绿 —— 登录一完成即毕业,徽章与烟花一次验俩
 		await mount({
 			subs: [{ id: "s1" }],
-			adapters: [{ id: "a1", enabled: true, testStatus: { ok: true } }],
+			connections: [{ id: "a1", enabled: true, testStatus: { ok: true } }],
 			targets: [{ id: "t1", enabled: true, testStatus: { ok: true } }],
 			route: "/system",
 		});
@@ -960,7 +960,7 @@ describe("TourCompanion 常驻小卡", () => {
 		const s: Scenario = {
 			loggedIn: true,
 			subs: [{ id: "s1" }],
-			adapters: [{ id: "a1", enabled: true, testStatus: { ok: true } }],
+			connections: [{ id: "a1", enabled: true, testStatus: { ok: true } }],
 			targets: [{ id: "t1", enabled: true, testStatus: { ok: true } }],
 		};
 		apiPatch.mockImplementation(async (_p: string, body?: unknown) => {

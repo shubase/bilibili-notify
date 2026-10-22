@@ -4,7 +4,7 @@ import { HEALTH_QUERY_KEY, HEALTH_QUERY_OPTIONS } from "../../hooks/useBackendRe
 import { api } from "../../services/api";
 import { useAuthStore } from "../../store/auth";
 import { BiliLoginStatus } from "../../types/auth";
-import type { PushAdapter, PushTarget, Subscription } from "../../types/domain";
+import type { Connection, PushTarget, Subscription } from "../../types/domain";
 import { deriveOnboarding, type OnboardingView } from "./derive";
 import { useOnboardingInputsOverride } from "./inputs-override";
 
@@ -27,7 +27,7 @@ const POLL_MS = 3_000;
 const POLLED_KEYS: readonly (readonly unknown[])[] = [
 	["auth-status"],
 	["subscriptions"],
-	["adapters"],
+	["connections"],
 	["targets"],
 	HEALTH_QUERY_KEY,
 ];
@@ -66,9 +66,9 @@ export function useOnboardingState(opts?: { poll?: boolean; active?: boolean }):
 		queryFn: () => api.get<Subscription[]>("/api/subs"),
 		enabled,
 	});
-	const adaptersQ = useQuery({
-		queryKey: ["adapters"],
-		queryFn: () => api.get<PushAdapter[]>("/api/adapters"),
+	const connectionsQ = useQuery({
+		queryKey: ["connections"],
+		queryFn: () => api.get<Connection[]>("/api/connections"),
 		enabled,
 	});
 	const targetsQ = useQuery({
@@ -94,16 +94,16 @@ export function useOnboardingState(opts?: { poll?: boolean; active?: boolean }):
 		() =>
 			override
 				? deriveOnboarding(override)
-				: subsQ.data && adaptersQ.data && targetsQ.data
+				: subsQ.data && connectionsQ.data && targetsQ.data
 					? deriveOnboarding({
 							biliLoggedIn,
 							subsCount: subsQ.data.length,
-							adapters: adaptersQ.data,
+							connections: connectionsQ.data,
 							targets: targetsQ.data,
 							modules,
 						})
 					: null,
-		[override, biliLoggedIn, subsQ.data, adaptersQ.data, targetsQ.data, modules],
+		[override, biliLoggedIn, subsQ.data, connectionsQ.data, targetsQ.data, modules],
 	);
 
 	const pollActive = opts?.poll === true && view !== null && !view.allDone;

@@ -59,8 +59,8 @@ describe("buildStateHydrate", () => {
 		expect(env.data).toBeNull();
 	});
 
-	it("ALL_CHANNELS 即四频道注册表", () => {
-		expect(ALL_CHANNELS).toEqual(["auth", "push-events", "log", "state"]);
+	it("ALL_CHANNELS 即五频道注册表", () => {
+		expect(ALL_CHANNELS).toEqual(["auth", "push-events", "log", "state", "resources"]);
 	});
 });
 
@@ -239,6 +239,19 @@ describe("attachChannelWiring — config-changed 按 scope 带快照", () => {
 			expect(h.last()).toMatchObject({ type: "state", event: "config-changed" });
 			expect(h.last().data).toEqual({ scope });
 		}
+	});
+});
+
+describe("attachChannelWiring — 拓展喊「面板数据变了」", () => {
+	/**
+	 * 拓展交给面板的数据是现取的(`/api/ext/:id/status`),面板不知道什么时候该再取 ——
+	 * 桥那头握完手,面板上那张卡还灰着。这一帧只带 id:面板按 id 失效缓存、自己去取。
+	 */
+	it("extension-status-changed → state/extension-changed,只带 id", () => {
+		const h = wire();
+		h.bus.emit("extension-status-changed", "bridge");
+		expect(h.last()).toMatchObject({ type: "state", event: "extension-changed" });
+		expect(h.last().data).toEqual({ id: "bridge" });
 	});
 });
 

@@ -1,24 +1,37 @@
+import { getHeapStatistics } from "node:v8";
 import type { BilibiliAPI } from "@bilibili-notify/api";
 import { observeLiveConnections } from "@bilibili-notify/blive";
-import type { MessageBus, PushAdapter, PushTarget } from "@bilibili-notify/internal";
+import type {
+	ChatIdentity,
+	Connection,
+	GlobalConfig,
+	MessageBus,
+	PlatformAdapter,
+	PushTarget,
+} from "@bilibili-notify/internal";
 import type { Hono } from "hono";
 import type { AuthSystem } from "../auth/index.js";
 import type { HistoryStore } from "../history/store.js";
-import type { PlatformAdapter } from "../platforms/types.js";
+import type { AdapterRegistry } from "../platforms/registry.js";
 import type { MuteState } from "../runtime/mute-state.js";
+import type { MemoryUsageSample } from "../runtime/resource-monitor.js";
 import type { UpdateService } from "../update/service.js";
 import { isDevBuild } from "../update/version-order.js";
 import { overridableApi } from "./api-overrides.js";
 import { createCapabilityInjector } from "./capability-injection.js";
 import { createCaptureGate } from "./capture.js";
 import { createDevClock } from "./clock.js";
+import { heapInjector, injectedMemoryUsage } from "./heap-injection.js";
 import { createLiveRooms } from "./live-rooms.js";
 import { createDevRegistry, type DevRegistry } from "./registry.js";
 import { createDevRoute, type DevCapturesApi } from "./route.js";
+import { bridgeScenarios } from "./scenarios/bridge.js";
 import { busEventScenarios } from "./scenarios/bus-events.js";
 import { capabilityScenario } from "./scenarios/capability.js";
 import { pushCaptureScenario } from "./scenarios/capture.js";
 import { type DynamicEngineLike, dynamicScenarios } from "./scenarios/dynamic.js";
+import { extensionScenarios } from "./scenarios/extensions.js";
+import { heapPressureScenario } from "./scenarios/heap.js";
 import { type InboundHandlers, inboundScenarios } from "./scenarios/inbound.js";
 import { liveScenarios, type SubPick } from "./scenarios/live.js";
 import { liveEventScenarios } from "./scenarios/live-events.js";
@@ -45,8 +58,23 @@ export interface CreateDevtoolsInput {
 	 */
 	sourceRun: boolean;
 	updateService: UpdateService;
-	/** 推送出口。交回去的是包过截流闸的那份。 */
-	adapters: readonly PlatformAdapter[];
+	/** 推送出口的注册表。交回去的是包过截流闸的那份**视图**。 */
+	adapters: AdapterRegistry;
+	/**
+	 * 拓展那三条场景要的两个目录 + 装载器本体(**现取**,拓展比 devtools 后起来)。
+	 *
+	 * 装载器只认 `<dataDir>/extensions/` 一个根,所以「开发时怎么让仓里那份跑起来」
+	 * 从宿主的一条特例变成了这里的一个动作 —— 见 `scenarios/extensions.ts`。
+	 *
+	 * 要的两个把手:`rescan()` 让装 / 卸当场生效,`reload()` 换掉已经跑着那份的代码。
+	 */
+	extensions: {
+		/** 仓里那个 `extensions/`。 */
+		repoDir: string;
+		/** `<dataDir>/extensions/`。 */
+		installRoot: string;
+		loaded: () => { reload(id: string): Promise<void>; rescan(): Promise<void> } | undefined;
+	};
 	/** 「清掉截流期间历史行」要它。 */
 	historyStore: Pick<HistoryStore, "deleteRange">;
 	/** 传给引擎的 B 站 API。交回去的是套了 Proxy 的那份(假直播期间房间信息说在播)。 */
@@ -57,8 +85,15 @@ export interface CreateDevtoolsInput {
 	dynamic: () => DynamicEngineLike | undefined;
 	/** 入站口(私聊指令 / 群链接)。接线层后接,现取。 */
 	inbound: () => InboundHandlers | undefined;
-	commands: () => { prefix: string; masterUserId?: string };
-	adapterConfigs: () => PushAdapter[];
+	commands: () => { prefix: string; master?: ChatIdentity };
+	connectionConfigs: () => Connection[];
+	/** 全局配置,现读 —— 「假装一条桥连上来」从桥的设置里挑接入。 */
+	globals: () => Pick<GlobalConfig, "extensions">;
+	/**
+	 * BN 自己的 `host:port` —— 「假装一条桥连上来」拿它连回自己身上(那是条真 WS)。
+	 * **现取**:端口是 `serve()` 之后才知道的,而 devtools 比它先建。
+	 */
+	address: () => string | undefined;
 	targets: () => PushTarget[];
 	/** 引擎错误 / 登录失效 / 登录状态快照都从这条总线发。 */
 	bus: MessageBus;
@@ -84,9 +119,16 @@ export interface Devtools {
 	/** 交给 `/api/update` 路由的那份 —— 装饰过的。 */
 	updateService: UpdateService;
 	/** 交给引擎 / 链接回卡的那份 —— 包过截流闸的。 */
-	adapters: PlatformAdapter[];
+	adapters: AdapterRegistry;
 	/** 交给引擎的那份 —— 套了 Proxy 的。 */
 	api: BilibiliAPI;
+	/**
+	 * 交给采样器的堆读数口 —— 真 `process.memoryUsage()` 外面包了一层注入。
+	 *
+	 * 交出来的是**包好的读数**而不是注入口:`index.ts` 只许从 `./devtools/index.js` 这
+	 * 一处引 devtools(构建期整棵树靠它换空桩),多开一个 import 就多一条漏进产物的路。
+	 */
+	memoryUsage: () => MemoryUsageSample;
 	/** 交给路由的那份 —— `status()` 可注入。 */
 	authSystem: AuthSystem;
 	/** 交给推送引擎的免扰时钟(单点覆盖)。 */
@@ -105,6 +147,8 @@ export function createDevtools(input: CreateDevtoolsInput): Devtools | null {
 	const api = overridableApi(input.api);
 	const auth = overridableApi(input.authSystem);
 	const clock = createDevClock();
+	// 堆读数注入:交回去给采样器包在真 `process.memoryUsage()` 外面。
+	const heap = heapInjector();
 	// 直播间连接登记:blive 每建一条连接就报到这里。全进程只有 devtools 这一个观察者。
 	const rooms = createLiveRooms();
 	observeLiveConnections(rooms.observe);
@@ -122,6 +166,8 @@ export function createDevtools(input: CreateDevtoolsInput): Devtools | null {
 			return deleted;
 		},
 	};
+	/** 包好的出口按原 adapter 记一份 —— 见下面 `adapters` 那段。 */
+	const wrappedAdapters = new WeakMap<PlatformAdapter, PlatformAdapter>();
 	const registry = createDevRegistry([
 		updateStateScenario(update),
 		pushCaptureScenario(gate),
@@ -131,12 +177,31 @@ export function createDevtools(input: CreateDevtoolsInput): Devtools | null {
 		...inboundScenarios({
 			inbound: input.inbound,
 			commands: input.commands,
-			adapters: input.adapterConfigs,
+			connections: input.connectionConfigs,
 			targets: input.targets,
 		}),
 		...busEventScenarios({ bus: input.bus }),
+		// 桥是拓展,核心 import 不到它 —— 这几条说的协议是手写的第二份,那笔账在
+		// ADR-0012 决策 42(主人 2026-09-10 拍板)。
+		...bridgeScenarios({
+			settings: () => input.globals().extensions.bridge?.settings,
+			address: input.address,
+			commands: input.commands,
+		}),
 		loginStateScenario({ auth, bus: input.bus }),
-		capabilityScenario({ injector: caps, adapters: input.adapterConfigs }),
+		heapPressureScenario({ heap }),
+		// 方言给的是**没包装过**的那份:「哪些平台有能力这回事」是方言自己的事实,
+		// 不该经过装饰器那一层(它今天原样交回没能力的 adapter,但那是它的实现细节)。
+		capabilityScenario({
+			injector: caps,
+			connections: input.connectionConfigs,
+			dialects: () => input.adapters.list(),
+		}),
+		...extensionScenarios({
+			repoDir: input.extensions.repoDir,
+			installRoot: input.extensions.installRoot,
+			extensions: input.extensions.loaded,
+		}),
 		...timerScenarios({
 			clock,
 			subs: input.subs,
@@ -153,10 +218,31 @@ export function createDevtools(input: CreateDevtoolsInput): Devtools | null {
 		route: createDevRoute({ registry, captures }),
 		updateService: update.service,
 		// 两层叠着:截流闸在里、能力注入在外 —— 顺序无所谓,两者各管各的方法。
-		adapters: input.adapters.map((a) => caps.wrap(gate.wrap(a))),
+		//
+		// 是个**视图**不是一份拷贝:注册转交给真注册表,包装在 `list()` 那一刻现做。
+		// 拷一份的话,拓展后注册进来的出口在开发版里根本不存在 —— 而那正是「生产好好的、
+		// 本地一跑就不生效」那类假绿(ADR-0012 决策 29)。
+		// 包好的按原 adapter 记一份:每次 list 都新包一个的话,同一个出口在两次调用里
+		// 会是两个对象。
+		adapters: {
+			register: (adapter) => input.adapters.register(adapter),
+			list: () =>
+				input.adapters.list().map((adapter) => {
+					const cached = wrappedAdapters.get(adapter);
+					if (cached) return cached;
+					const wrapped = caps.wrap(gate.wrap(adapter));
+					wrappedAdapters.set(adapter, wrapped);
+					return wrapped;
+				}),
+		},
 		api: api.api,
 		authSystem: auth.api,
 		quietHoursNow: () => clock.now(),
+		memoryUsage: injectedMemoryUsage(
+			() => process.memoryUsage(),
+			heap,
+			() => getHeapStatistics().heap_size_limit,
+		),
 		captures,
 	};
 }

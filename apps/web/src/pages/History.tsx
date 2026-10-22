@@ -1,14 +1,16 @@
 import {
 	Avatar,
+	Btn,
 	DisclosurePill,
 	ErrorNote,
 	Icon,
+	IconButton,
 	Input,
 	LoadingBlock,
 	Picker,
 	Pill,
 } from "@bilibili-notify/ui";
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery } from "@tanstack/react-query";
 import { useMemo, useState } from "react";
 import {
 	familyTone,
@@ -21,6 +23,7 @@ import { api } from "../services/api";
 import {
 	type HistoryEntryView,
 	type HistoryMessageView,
+	type HistoryRepushResponse,
 	type HistoryResponse,
 	historyQueryKey,
 } from "../services/dashboard";
@@ -221,6 +224,7 @@ function HistoryRow({
 	isLast: boolean;
 }) {
 	const [open, setOpen] = useState(false);
+	const [repushOpen, setRepushOpen] = useState(false);
 	const tone = familyTone(entry.kind);
 	const status = PUSH_STATUS_META[entry.status];
 	// 优先 entry 写入期的 snapshot,订阅事后被删也能稳定显示。
@@ -231,6 +235,12 @@ function HistoryRow({
 	const count = messageCountOf(entry);
 	const expandable = hasDetails(entry);
 	const targetLabel = targetLabelOf(entry, target);
+	// 按钮长在 failed 与 partial 上(ADR-0017 决策 6)。**判据是行的状态,不是 `repush`
+	// 字段在不在** —— WS 推来的新行不带那个字段,可它恰恰是最该能补的那一种。
+	const canOfferRepush = entry.status === "failed" || entry.status === "partial";
+	// 不能补时按钮灰掉**并写上原因**,不是藏起来(决策 9)。字段缺省按「能补」处理。
+	const repushBlocked = entry.repush && !entry.repush.can ? entry.repush.reason : null;
+	const repushCounts = entry.repush?.can ? entry.repush : null;
 
 	return (
 		<div className={isLast ? "" : "border-b border-bn-border-subtle"}>
@@ -271,40 +281,168 @@ function HistoryRow({
 				<span className="truncate text-bn-xs text-bn-text-secondary" title={targetLabel}>
 					→ {targetLabel}
 				</span>
-				<Pill color={status.tone} subtle size="sm">
-					{status.label}
-				</Pill>
+				<div className="flex min-w-0 items-center gap-1">
+					<Pill color={status.tone} subtle size="sm">
+						{status.label}
+					</Pill>
+					{canOfferRepush ? (
+						<IconButton
+							size="sm"
+							icon={<Icon.refresh size={12} />}
+							label="补一次"
+							title={repushBlocked ?? "没送到的，让女仆再补一次"}
+							disabled={repushBlocked !== null}
+							ariaExpanded={repushOpen}
+							onClick={() => setRepushOpen((v) => !v)}
+						/>
+					) : null}
+				</div>
 			</div>
+			{repushOpen && canOfferRepush && repushBlocked === null ? (
+				<RepushBar entry={entry} counts={repushCounts} onClose={() => setRepushOpen(false)} />
+			) : null}
 			{open ? <MessageList entry={entry} /> : null}
 		</div>
 	);
 }
 
-/** 展开后的逐条明细:序号 / 本体还是附加项 / 文案 / 图缩略 / 这条的结果。 */
+/**
+ * **第二下**(ADR-0017 决策 8)。点了那颗钮之后在行下面展开的一条 —— 不是模态框:
+ * 一屏十几行,每行一个弹窗太重;但也不能点一下就发,误触的代价是群里多一条撤不回
+ * 的消息。
+ *
+ * `failed` 行只给一个选项:那一行本来就全没到,「整行重发」与「只补没到的」在这儿是
+ * 同一件事。条数是服务端按身份号算好交下来的,面板不自己算(自己算就是第二份实现)。
+ */
+function RepushBar({
+	entry,
+	counts,
+	onClose,
+}: {
+	entry: HistoryEntryView;
+	counts: { total: number; missing: number } | null;
+	onClose: () => void;
+}) {
+	const repush = useMutation<{ count: number }, Error, "all" | "missing">({
+		mutationFn: async (mode) => {
+			const res = await api.post<HistoryRepushResponse>(`/api/history/${entry.id}/repush`, {
+				ts: entry.ts,
+				mode,
+			});
+			// 非 2xx 由 `api` 抛,走到这儿的只可能是 202 —— 判别联合让这件事在类型上也
+			// 成立,成功那支不必再判一次「count 会不会是 undefined」。
+			if (!res.ok) throw new Error(res.err);
+			return { count: res.count };
+		},
+	});
+	const n = (v: number | undefined) => (v === undefined ? "" : `（${v} 条）`);
+	// 服务端回的是「收下了」,消息一条都还没发出去 —— 所以说「去补」不说「补好了」。
+	// 真正的结果随后经 WS 一条条回来,这一行会自己变。
+	if (repush.isSuccess) {
+		return (
+			<div className="flex items-center gap-2 border-t border-bn-border-subtle bg-bn-surface-muted/50 px-4 py-2 pl-38 text-bn-xs text-bn-text-secondary">
+				<span>女仆去补（{repush.data.count} 条）啦，好了这一行会自己更新～ (｡･ω･｡)ﾉ</span>
+				<Btn size="sm" variant="ghost" onClick={onClose}>
+					知道啦
+				</Btn>
+			</div>
+		);
+	}
+
+	const busy = repush.isPending;
+	return (
+		<div className="border-t border-bn-border-subtle bg-bn-surface-muted/50 px-4 py-2 pl-38">
+			<div className="flex flex-wrap items-center gap-2 text-bn-xs text-bn-text-secondary">
+				<span>{busy ? "女仆这就去～" : "要女仆补哪些呀？"}</span>
+				{entry.status === "failed" ? (
+					// 决策 8 只给这一行一颗钮,理由是「本来就全没到,两个选项是同一件事」——
+					// 可 `failed` 判的是**本体那一号**没 ok,不是全没到:@全体先落地且成功、
+					// 本体失败的行就是 failed,此时 total=2 而 missing=1。这颗钮发的是
+					// `missing`(把已经到了的 @全体再发一遍,群里就多 @ 一次全体,撤不回),
+					// 所以印的数也得是 missing —— 印 total 是当面说错话。
+					<Btn size="sm" variant="primary" disabled={busy} onClick={() => repush.mutate("missing")}>
+						重新推送{n(counts?.missing)}
+					</Btn>
+				) : (
+					<>
+						<Btn
+							size="sm"
+							variant="primary"
+							disabled={busy}
+							onClick={() => repush.mutate("missing")}
+						>
+							只补没到的{n(counts?.missing)}
+						</Btn>
+						<Btn size="sm" variant="outline" disabled={busy} onClick={() => repush.mutate("all")}>
+							整行重发{n(counts?.total)}
+						</Btn>
+					</>
+				)}
+				<Btn size="sm" variant="ghost" disabled={busy} onClick={onClose}>
+					先不用了
+				</Btn>
+			</div>
+			{repush.isError ? (
+				<ErrorNote size="sm" className="mt-1.5">
+					{repush.error.message}
+				</ErrorNote>
+			) : null}
+		</div>
+	);
+}
+
+/**
+ * 展开后的逐条明细:序号 / 本体还是附加项 / 文案 / 图缩略 / 这条的结果。
+ *
+ * **号不是数组下标,是 `retryOf ?? 下标`**(ADR-0017 决策 15 与「后果」那一节)。重推
+ * 是追加进原行的(决策 14),3 条的行补过之后展开是 6 条 —— 按位置印 1..6 的话,后三条
+ * 看上去就是三条凭空多出来的新消息,既看不出是谁的重投,也看不出前三条已经作废。
+ * 印它补的**那一号**、再标一句「女仆补的」,那份可追溯才落到界面上;`retryOf` 就是
+ * 这个标记的来源,不另开第二个字段。
+ *
+ * ⚠️ 「每一号只认它**最后那次**尝试」的判定**只在服务端有一份**(决策 16),面板不重做
+ * 一遍。「这条被顶掉了」用的是本地就看得见的那件事:**后面还有一条补这一号的**。
+ */
 function MessageList({ entry }: { entry: HistoryEntryView }) {
 	return (
 		<ol className="space-y-1.5 border-t border-bn-border-subtle bg-bn-surface-muted/50 px-4 py-2.5 pl-38">
-			{entry.messages.map((m, i) => (
-				<MessageItem
-					// biome-ignore lint/suspicious/noArrayIndexKey: 行内消息按序追加、从不重排删除,序号就是它的身份
-					key={`${entry.id}-${i}`}
-					index={i}
-					message={m}
-				/>
-			))}
+			{entry.messages.map((m, i) => {
+				const no = m.retryOf ?? i;
+				return (
+					<MessageItem
+						// biome-ignore lint/suspicious/noArrayIndexKey: 行内消息按序追加、从不重排删除,位置就是它在这一行里的身份
+						key={`${entry.id}-${i}`}
+						no={no}
+						message={m}
+						superseded={entry.messages.some((o, j) => j > i && o.retryOf === no)}
+					/>
+				);
+			})}
 		</ol>
 	);
 }
 
-function MessageItem({ index, message }: { index: number; message: HistoryMessageView }) {
+/**
+ * `no` = 这条顶的是哪一号(从 0 数,印出来 +1);`superseded` = 后面还有一条补这一号的,
+ * 也就是这条已经作废了 —— 压暗它,让「这条没成、下面那条是它的重投」一眼看得出来。
+ */
+function MessageItem({
+	no,
+	message,
+	superseded,
+}: {
+	no: number;
+	message: HistoryMessageView;
+	superseded: boolean;
+}) {
 	// 没有结果 = 没发出去(无目标那行的每一条都是这样);有结果就跟整行状态同一份词表。
 	const result =
 		message.ok === undefined
 			? { label: "未发送", tone: "var(--color-bn-inactive)" }
 			: PUSH_STATUS_META[message.ok ? "delivered" : "failed"];
 	return (
-		<li className="flex items-start gap-2.5 text-bn-xs">
-			<span className="w-4 shrink-0 tabular-nums text-bn-text-tertiary">{index + 1}</span>
+		<li className={`flex items-start gap-2.5 text-bn-xs${superseded ? " opacity-60" : ""}`}>
+			<span className="w-4 shrink-0 tabular-nums text-bn-text-tertiary">{no + 1}</span>
 			<span className="w-10 shrink-0 text-bn-text-tertiary">
 				{message.role === "main" ? "本体" : "附加"}
 			</span>
@@ -319,7 +457,16 @@ function MessageItem({ index, message }: { index: number; message: HistoryMessag
 			<span className="min-w-0 flex-1 break-words text-bn-text-secondary">
 				{message.text ?? <span className="text-bn-text-tertiary">（无内容）</span>}
 				{message.err ? <span className="ml-1.5 text-bn-danger">{message.err}</span> : null}
+				{superseded ? (
+					<span className="ml-1.5 text-bn-text-tertiary">女仆后来又补了一次～</span>
+				) : null}
 			</span>
+			{message.retryOf !== undefined ? (
+				// 这一条是女仆补的那次,不是当时发出去的那次。
+				<Pill subtle size="sm">
+					女仆补的
+				</Pill>
+			) : null}
 			<Pill color={result.tone} subtle size="sm">
 				{result.label}
 			</Pill>

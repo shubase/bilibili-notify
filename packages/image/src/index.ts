@@ -5,6 +5,21 @@ export type { Component, VNode } from "vue";
 // consumer's tree creates mismatched VNode / Component types — TS rejects the
 // argument because the two `Component` types are unrelated nominally.
 export { h } from "vue";
+// 块库:每种卡一张表,键名对齐 `CARD_SKIN_BUILTIN_BLOCKS`(ADR-0014 的卡片皮肤按块装配)。
+export { DYNAMIC_BLOCKS, type DynamicBlockProps } from "./blocks/dynamic";
+// 卡片外框(根块):皮肤渲染器给每张卡套的那两层壳。
+export {
+	type CardPropsByKind,
+	FRAMES,
+	type FrameExtra,
+	type FrameRenderer,
+} from "./blocks/frames";
+export { GUARD_BLOCKS } from "./blocks/guard";
+export { LIVE_BLOCKS } from "./blocks/live";
+export { ROAST_BOARD_BLOCKS, ROAST_SOLO_BLOCKS } from "./blocks/roast";
+export { SC_BLOCKS } from "./blocks/sc";
+export type { BlockRenderer } from "./blocks/types";
+export { WORDCLOUD_BLOCKS } from "./blocks/wordcloud";
 export { numberToStr } from "./format";
 export {
 	ImageRenderer,
@@ -13,6 +28,9 @@ export {
 	type RoastBoardData,
 	type RoastSoloData,
 } from "./image-renderer";
+// 出厂示例卡片数据 —— 皮肤编辑器的实时预览拿它当「假数据」出图(ADR-0014 决策 22)。
+// 刻意回 `unknown`:示例数据不是对外契约,别让调用方照它的形状写类型。
+export { sampleCard } from "./preview/sample-cards";
 export type {
 	BoundingBox,
 	ElementHandleLike,
@@ -28,17 +46,50 @@ export type {
 // `buildFontFace` / `USER_FONT_FAMILY` 给绕开 ImageRenderer 直接调 renderCard 的那条
 // 预览路径用 —— 两边必须拼出同一条 @font-face,否则「预览是这款、推出去是另一款」。
 export { buildFontFace, renderCard, USER_FONT_FAMILY } from "./render";
-export { DynamicCard, type DynamicCardProps, type DynamicNode } from "./templates/dynamic-card";
-export { GuardCard, type GuardCardProps } from "./templates/guard-card";
-export { LiveCard, type LiveCardProps } from "./templates/live-card";
+// 卡片皮肤的对外数据契约(ADR-0014 决策 14):内部 props → `CARD_SKIN_FIELDS` 那张表。
 export {
-	RoastBoardCard,
-	type RoastBoardCardProps,
-	type RoastCardUp,
-	RoastSoloCard,
-	type RoastSoloCardProps,
+	buildCardData,
+	type CardData,
+	type CardDataValue,
+	readCardField,
+} from "./skin/card-data";
+// 字体 / 图两档旋钮的**宿主解析**(ADR-0014 决策 16 的 🔗):这两档的值是主人资产库里的
+// 一个 id,要 await 读盘才变得成 CSS,所以 `cardSkinKnobCss` 那条同步路径上做不了。
+// **凡是自己拼 `renderCardWithSkin` 入参的调用方都得调它** —— 只传 `knobValues` 的话,
+// 别的旋钮照常生效,而字体与背景图这两枚静静地什么也不做(2026-09-19 面板预览栽过)。
+export {
+	CSS_CUSTOM_PROPERTY_MAX_CHARS,
+	IMAGE_URL_BUDGET,
+	type KnobAssetResolvers,
+	type ResolvedKnobAssets,
+	resolveKnobAssets,
+} from "./skin/knob-assets";
+// 皮肤渲染器(ADR-0014 决策 18):皮肤 JSON + props → VNode / 完整 HTML。
+// **出图的主入口是 `renderCardWithSkin`** —— 推送(ImageRenderer)与面板预览共用它。
+export {
+	BLOCKED_IMG_PLACEHOLDER,
+	cardOfManifest,
+	renderCardWithSkin,
+	renderSkinnedCard,
+	type SkinCardHtmlOptions,
+	type SkinRenderOptions,
+	type SkinRenderResult,
+	skinAssetRefs,
+} from "./skin/render-skin";
+// 超上限的图压进预算 —— 用 Chrome 自己当编码器,不引新依赖。凡是自己拼
+// `resolveKnobAssets` 入参的调用方都该把它接上,否则大图照旧静默不出。
+export { shrinkImageForCssVar } from "./skin/shrink-image";
+// 七种卡的 **props 契约**。整卡模板已退役(ADR-0014 决策 24 的 2026-09-18 🔗) ——
+// 出图一律走 `renderCardWithSkin`,这里只剩「一张卡要哪些数据」这层类型。
+export type { DynamicCardProps, DynamicNode } from "./templates/dynamic-card";
+export type { GuardCardProps } from "./templates/guard-card";
+export type { LiveCardProps } from "./templates/live-card";
+export type {
+	RoastBoardCardProps,
+	RoastCardUp,
+	RoastSoloCardProps,
 } from "./templates/roast-card";
-export { SCCard, type SCCardProps } from "./templates/sc-card";
+export type { SCCardProps } from "./templates/sc-card";
 export type {
 	CardColorOptions,
 	Dynamic,

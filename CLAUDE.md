@@ -6,7 +6,7 @@ Bilibili-Notify monorepo 的工作指引。详细参考见文末「深入参考�
 
 单 pnpm workspace monorepo:一套平台中立业务核心(`packages/`)+ 一个产品形态 —— **独立 Hono + React Dashboard**(`apps/`),发 Docker 镜像与 macOS / Windows 桌面应用,支持应用内自主升级。
 
-核心包**全部 `private`、不发 npm**,独立端经 `workspace:*` 消费;registry 上不再有任何包(所以也不需要 changesets)。Koishi 插件与 AstrBot 插件已从 dev 移除、暂停更新,两端的维护线在 `koishi-astrbot-maintenance` 分支;后续以「薄的适配插件桥接到跑着的独立端」的形式回归,接入点是 `packages/internal` 的推送平台词表(`constants.ts` 的 `PUSH_TARGET_PLATFORMS`,schema 在 `schema/targets.ts`)+ `apps/server/src/platforms/` 的 adapter 矩阵 —— 引擎层(`packages/dynamic` / `live` / `push` / `image`)只认独立端这一个宿主,别再给它们留可选钩子。
+核心包**全部 `private`、不发 npm**,独立端经 `workspace:*` 消费;registry 上不再有任何包(所以也不需要 changesets)。Koishi 插件与 AstrBot 插件已从 dev 移除、暂停更新,两端的维护线在 `koishi-astrbot-maintenance` 分支;后续以「薄的适配插件桥接到跑着的独立端」的形式回归,**接入点是 `extensions/bridge/`**(桥接是 BN 的第一个拓展,地址 `ws://<BN>/ext/bridge`,协议见 `extensions/bridge/PROTOCOL.md`,定案见 ADR-0012)。⚠️ **别再往 `CONNECTION_PLATFORMS` 里加档**:拓展提供的连接走 `kind: "extension"` 那一支 —— **一条连接就是一个借来的 bot**,它的 `platform` 是开放字符串(从桥报的 bot 上抄,枚举不了),桥的接入(token)住拓展自己的设置里,不是连接(ADR-0012 决策 45)。引擎层(`packages/dynamic` / `live` / `push` / `image`)只认独立端这一个宿主,别再给它们留可选钩子。
 
 ## 工具链与命令
 
@@ -18,7 +18,7 @@ vp run build           # 全 workspace 拓扑序构建
 vp run typecheck       # 全 workspace tsc --noEmit
 vp test                # vitest,全包;定向跑用 vp test <路径>(别用 vpx vitest,根不再声明 vitest,会 dlx 一份野的 runner)
 vp run check           # Biome lint + format 检查(check:fix 自动修)
-vp run dev:apps        # apps/server + apps/web 并行 dev
+vp run dev:apps        # apps/server + apps/web 并行 dev,顺带 watch 打包仓里的拓展
 vp run -F <pkg> build  # 构建单个包
 vp run build:update-payload   # server 自包含 bundle + 装配 + web dist(Docker / 桌面 / 应用内更新共用的载荷)
 ```
@@ -30,8 +30,9 @@ vp run build:update-payload   # server 自包含 bundle + 装配 + web dist(Dock
 ## 顶层布局
 
 ```
-packages/   平台中立业务核心(@bilibili-notify/*)
-apps/       Hono 服务端 + React Dashboard + Tauri 桌面壳 + wire 契约(apps/contract)
+packages/     平台中立业务核心(@bilibili-notify/*)
+apps/         Hono 服务端 + React Dashboard + Tauri 桌面壳 + wire 契约(apps/contract)
+extensions/   拓展 —— 经窄面 ctx 挂进宿主,不编在主程序里(第一个是机器人框架桥接)
 ```
 
 单 workspace、单 lockfile,pnpm 默认 isolated 布局;`apps/server` 经 pnpm `workspace:*` 消费业务核心。包清单与模块图见 `docs/agents/architecture.md`。
@@ -39,6 +40,8 @@ apps/       Hono 服务端 + React Dashboard + Tauri 桌面壳 + wire 契约(app
 ## 硬约束(违反即 bug)
 
 - **写前端 UI 前先查组件清单**:`packages/ui`(`@bilibili-notify/ui`)是纯展示基础件库,给 web / desktop 写任何 UI **之前必须先读 `packages/ui/README.md` 的组件清单**——清单里有的组件不许重写。新增纯展示件(零业务依赖)进库并**同步更新清单**;缠 api/store/react-query 的留在 `apps/web/src/components`。库是源码直出(exports 指 src,无构建步),消费方入口 CSS 要 `@import "@bilibili-notify/ui/theme.css"` + `@source` 库的 src。
+
+- **拓展只从一扇门拿 BN 的东西**:`extensions/<id>/` 底下第三方随便用,但我们自己的东西**只准从 `@bilibili-notify/extension` 进** —— 那个包列出来的就是契约的全部,直接依赖 `internal` 等于把契约放宽成「整个域模型」。反方向也一样:**核心不 import 拓展**。两条都由 `apps/server/src/extensions/__tests__/extension-import-boundary.test.ts` 真扫目录钉着,越界是静默的(类型、测试、构建全绿)。
 
 - **依赖卫生**:`src/` 里解析到运行时值(常量 / 类 / 函数)的 import,必须声明进该包 `package.json` 的 `dependencies`;`import type` 不用。类型增强(`declare module "x"`)也算 —— 解析不到就静默变成孤立声明。pnpm 是 isolated 布局,幻影依赖直接解析不到,不会像 hoisted 年代那样碰巧能跑。
 - **MessageBus**:`apps/server/src/runtime/message-bus.ts` 是唯一事件通道,绝不写 bus 与任何别的事件通道之间的转发器 —— 会自喂死循环爆栈。详见 `docs/agents/events.md`。
@@ -57,13 +60,15 @@ apps/       Hono 服务端 + React Dashboard + Tauri 桌面壳 + wire 契约(app
 
 - `architecture.md` —— 包清单、独立端模块图、服务依赖图
 - `events.md` —— BiliEvents 契约、MessageBus 语义、WS channel 契约
+- `push.md` —— 推送链路:引擎 → 适配 → 路由与闸 → 发送 → 投递 → 历史;闸的顺序、附加项的「生产 vs 推送」、不走这条链的三条旁路
 - `build-release.md` —— 工具链、分支模型、Docker 镜像与 tag 方案、桌面产物布局
 - `commands.md` —— 独立端私聊指令:入站链路、指令表、参数模型、可配置项;末尾是群里视频链接自动出卡片的「链接解析」
 - `self-update.md` —— 应用内自主升级:载荷布局、`boot.mjs` 选版、双密钥与渠道入口、撤回与自愈
 - `devtools.md` —— 开发版专属的 devtools(左下角药丸 + 底边面板):造状态 / 造事件的注册表、每种注入套在哪个边界上、真机验过什么
+- `extension-marketplace.md` —— 拓展市场:官方索引怎么签、怎么发(`extension/<id>@<ver>` tag),第三方怎么自己开一个源,id 的命名空间规矩
 
 ## Agent skills
 
 - **Issue tracker** —— GitHub Issues `Akokk0/bilibili-notify`,经 `gh` CLI;外部 PR 不作为 triage 来源。见 `docs/agents/issue-tracker.md`。
-- **Triage labels** —— 词表 `needs-triage` / `needs-info` / `ready-for-agent` / `ready-for-human` / `wontfix`;目前仓库只有 `wontfix`,其余首次用前需 `gh label create`。见 `docs/agents/triage-labels.md`。
+- **Triage labels** —— 三轴:流转 `needs-triage` / `needs-info` / `ready-for-agent` / `ready-for-human` / `wontfix`(每条 issue 恒有且只有一个,新开自动打 `needs-triage`)、类型(GitHub 默认)、模块 `area:*`。标签都已建好,词表见 `docs/agents/triage-labels.md`。
 - **Domain docs** —— 单 context 仓库,`CONTEXT.md` + `docs/adr/` 在仓库根(由 `/grill-with-docs` 按需创建)。见 `docs/agents/domain.md`。

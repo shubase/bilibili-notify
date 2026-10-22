@@ -10,8 +10,7 @@
 import type { VideoInfo, VideoRef } from "@bilibili-notify/api";
 import type { CardColorOptions, Dynamic, RenderPriority } from "@bilibili-notify/image";
 import type {
-	AdapterCapabilities,
-	CardBlock,
+	ConnectionCapabilities,
 	DeliveryResult,
 	LinkParsingConfig,
 	LinkParsingPolicy,
@@ -64,24 +63,21 @@ function groupFrame(text: string, over: Record<string, unknown> = {}) {
 async function feed(parser: LinkParser, frame: Record<string, unknown>): Promise<void> {
 	const msg = extractGroupMessage(frame);
 	if (!msg) return;
-	await parser.handleMessage({ platform: "onebot", adapterId: ADAPTER, ...msg });
+	await parser.handleMessage({ platform: "onebot", connectionId: ADAPTER, ...msg });
 }
 
-/** 主人在版式编辑器里改过的动态卡版式 —— 推送的动态卡吃它,链接解析出的卡也得吃它。 */
-const LAYOUT: CardBlock[] = [
-	{ id: "content", type: "content", visible: true },
-	{ id: "header", type: "header", visible: true, marginTop: 12 },
-];
-/** 卡片页里给「动态」这一类调的配色(含图廊轮到的那张背景)—— 同样两种卡都得吃。 */
-const COLORS: CardColorOptions = { cardColorStart: "#111111", backgroundImage: "bg-7" };
+/** 主人在卡片页选的那套皮肤 —— 推送的动态卡吃它,链接解析出的卡也得吃它。 */
+const SKIN = "skin-from-panel";
+/** 卡片页里给「动态」这一类调的配色 —— 同样两种卡都得吃。 */
+const COLORS: CardColorOptions = { font: "Comic Sans MS" };
 
 function makeParser(
 	over: Partial<LinkParsingConfig> = {},
 	limits?: Partial<LinkLimits>,
 	extra: {
 		policyFor?: (key: string) => LinkParsingPolicy;
-		capabilities?: (dest: LinkReplyDestination) => AdapterCapabilities | undefined;
-		probeCapabilities?: (dest: LinkReplyDestination) => Promise<AdapterCapabilities | undefined>;
+		capabilities?: (dest: LinkReplyDestination) => ConnectionCapabilities | undefined;
+		probeCapabilities?: (dest: LinkReplyDestination) => Promise<ConnectionCapabilities | undefined>;
 		/** 每条 payload 的投递结果;缺省全部成功。 */
 		sendResult?: (payload: NotificationPayload) => DeliveryResult;
 	} = {},
@@ -96,12 +92,8 @@ function makeParser(
 	const getVideoInfo = vi.fn(async (_ref: VideoRef) => VIDEO);
 	const resolveShortLink = vi.fn(async (_url: string): Promise<string | null> => null);
 	const generateDynamicCard = vi.fn(
-		async (
-			_data: Dynamic,
-			_colors?: CardColorOptions,
-			_layout?: CardBlock[],
-			_options?: { priority?: RenderPriority },
-		) => Buffer.from("png-bytes"),
+		async (_data: Dynamic, _colors?: CardColorOptions, _options?: { priority?: RenderPriority }) =>
+			Buffer.from("png-bytes"),
 	);
 	const sent: { dest: LinkReplyDestination; payload: NotificationPayload }[] = [];
 	const send = vi.fn(
@@ -124,7 +116,7 @@ function makeParser(
 		config: readConfig,
 		api: { getVideoInfo, resolveShortLink },
 		renderer,
-		presentation: () => ({ colors: COLORS, layout: LAYOUT }),
+		presentation: () => ({ colors: COLORS, cardSkin: SKIN }),
 		send,
 		now: () => now,
 		policyFor: extra.policyFor ?? (() => ({ parse: true, form: "image" })),
@@ -181,16 +173,15 @@ describe("createLinkParser", () => {
 			like: { count: 3000 },
 		});
 		// 呈现与推送的动态卡同一份:配色不传的话主人在卡片页给「动态」调的样式只有推送卡认,
-		// 版式不传的话渲染器退回出厂版式、主人在编辑器里排的顺序就丢了。
-		expect(h.generateDynamicCard.mock.calls[0]?.[1]).toBe(COLORS);
-		expect(h.generateDynamicCard.mock.calls[0]?.[2]).toBe(LAYOUT);
+		// 皮肤不传的话渲染器退回内置默认皮肤、主人选的那套排版就丢了。
+		expect(h.generateDynamicCard.mock.calls[0]?.[1]).toEqual({ ...COLORS, cardSkin: SKIN });
 		// 低优先级:群里谁都能触发的卡,不能排在开播 / 动态卡前面 —— 让路这件事由渲染
 		// 队列按车道做,不靠这里数自己发了几张。
-		expect(h.generateDynamicCard.mock.calls[0]?.[3]).toEqual({ priority: "low" });
+		expect(h.generateDynamicCard.mock.calls[0]?.[2]).toEqual({ priority: "low" });
 
 		expect(h.sent).toEqual([
 			{
-				dest: { platform: "onebot", adapterId: ADAPTER, groupId: String(GROUP) },
+				dest: { platform: "onebot", connectionId: ADAPTER, groupId: String(GROUP) },
 				payload: {
 					kind: "image",
 					image: { buffer: Buffer.from("png-bytes"), mime: "image/jpeg" },
@@ -395,17 +386,18 @@ describe("createLinkParser", () => {
 			const h = makeParser();
 			await h.parser.handleMessage({
 				platform: "qq-official",
-				adapterId: ADAPTER,
+				connectionId: ADAPTER,
 				groupId: "G_OPENID",
 				userId: "M_OPENID",
 				text: " https://www.bilibili.com/video/BV1zMtU6uEEb/",
 				cardLinks: [],
+				miniAppCardLinks: [],
 			});
 			expect(h.getVideoInfo).toHaveBeenCalledWith({ bvid: "BV1zMtU6uEEb" });
 			expect(h.sent).toHaveLength(1);
 			expect(h.sent[0]?.dest).toEqual({
 				platform: "qq-official",
-				adapterId: ADAPTER,
+				connectionId: ADAPTER,
 				groupId: "G_OPENID",
 			});
 		});
@@ -416,13 +408,64 @@ describe("createLinkParser", () => {
 			await feed(h.parser, groupFrame(LINK));
 			await h.parser.handleMessage({
 				platform: "qq-official",
-				adapterId: "22222222-2222-4222-8222-222222222222",
+				connectionId: "22222222-2222-4222-8222-222222222222",
 				groupId: "G_OPENID",
 				userId: "M",
 				text: LINK,
 				cardLinks: [],
+				miniAppCardLinks: [],
 			});
 			expect(h.sent).toHaveLength(2);
+		});
+	});
+
+	describe("进来的本身就是 B 站小程序卡", () => {
+		/** B 站 App「分享到 QQ」发出的那张卡,链接在 meta.detail_1.qqdocurl。 */
+		const MINIAPP_CARD = JSON.stringify({
+			app: "com.tencent.miniapp_01",
+			prompt: "[QQ小程序]哔哩哔哩",
+			meta: { detail_1: { appid: "1109937557", qqdocurl: "https://b23.tv/AbCdEf" } },
+		});
+		const cardFrame = () =>
+			groupFrame("", {
+				message: [{ type: "json", data: { data: MINIAPP_CARD } }],
+				raw_message: "[CQ:json,data=…]",
+			});
+
+		it("群里已经有那张卡了 → 一律不回,不管这个群选的是哪种形式;也不打接口", async () => {
+			for (const form of ["image", "miniapp"] as const) {
+				const h = makeParser({}, undefined, {
+					policyFor: () => ({ parse: true, form }),
+					capabilities: () => ({ miniAppCard: { state: "supported", checkedAt: 1 } }),
+				});
+				await feed(h.parser, cardFrame());
+				expect(h.sent).toHaveLength(0);
+				expect(h.resolveShortLink).not.toHaveBeenCalled();
+				expect(h.getVideoInfo).not.toHaveBeenCalled();
+			}
+		});
+
+		it("跳过不留痕:随后有人把同一条链接以文字贴出来,照常出卡", async () => {
+			const h = makeParser();
+			h.resolveShortLink.mockResolvedValue("https://www.bilibili.com/video/BV1zMtU6uEEb");
+			await feed(h.parser, cardFrame());
+			await feed(h.parser, groupFrame("https://b23.tv/AbCdEf"));
+			expect(h.sent).toHaveLength(1);
+		});
+
+		it("其它分享卡(灰色链接卡之类)不算,照常出卡", async () => {
+			const h = makeParser();
+			h.resolveShortLink.mockResolvedValue("https://www.bilibili.com/video/BV1zMtU6uEEb");
+			const card =
+				'{"app":"com.tencent.structmsg","meta":{"news":{"jumpUrl":"https://b23.tv/AbCdEf"}}}';
+			await feed(
+				h.parser,
+				groupFrame("", {
+					message: [{ type: "json", data: { data: card } }],
+					raw_message: "[CQ:json]",
+				}),
+			);
+			expect(h.sent).toHaveLength(1);
 		});
 	});
 
@@ -515,30 +558,32 @@ describe("createLinkParser", () => {
 			});
 			await h.parser.handleMessage({
 				platform: "qq-official",
-				adapterId: ADAPTER,
+				connectionId: ADAPTER,
 				groupId: "G_OPENID",
 				userId: "M_OPENID",
 				text: LINK,
 				cardLinks: [],
+				miniAppCardLinks: [],
 			});
 			expect(h.sent).toHaveLength(1);
 			await h.parser.handleMessage({
 				platform: "qq-official",
-				adapterId: ADAPTER,
+				connectionId: ADAPTER,
 				groupId: "G_OTHER",
 				userId: "M_OPENID",
 				text: LINK,
 				cardLinks: [],
+				miniAppCardLinks: [],
 			});
 			expect(h.sent).toHaveLength(1);
 		});
 	});
-	// 形式(图片卡 / 小程序卡)× 适配器能力 → 发什么、失败怎么回落。能力本身怎么探在
+	// 形式(图片卡 / 小程序卡)× 连接能力 → 发什么、失败怎么回落。能力本身怎么探在
 	// onebot 适配器那边守,这里只看解析器拿着答案做没做对。
 	describe("回复形式(图片卡 / 小程序卡)", () => {
 		const LINK = "https://www.bilibili.com/video/BV1zMtU6uEEb";
 		const miniapp = () => ({ parse: true, form: "miniapp" as const });
-		const caps = (state: "supported" | "unsupported" | "unknown"): AdapterCapabilities => ({
+		const caps = (state: "supported" | "unsupported" | "unknown"): ConnectionCapabilities => ({
 			miniAppCard:
 				state === "supported"
 					? { state, checkedAt: 1 }
@@ -556,7 +601,7 @@ describe("createLinkParser", () => {
 			jumpUrl: "https://www.bilibili.com/video/BV1zMtU6uEEb",
 		};
 
-		it("形式=小程序卡、适配器支持 → 发小程序卡,字段来自视频信息;不碰渲染器", async () => {
+		it("形式=小程序卡、连接支持 → 发小程序卡,字段来自视频信息;不碰渲染器", async () => {
 			const h = makeParser({}, undefined, {
 				policyFor: miniapp,
 				capabilities: () => caps("supported"),
@@ -567,7 +612,7 @@ describe("createLinkParser", () => {
 			expect(h.probeCapabilities).not.toHaveBeenCalled();
 		});
 
-		it("适配器不支持 → 回落图片卡,和形式=图片卡一样", async () => {
+		it("连接不支持 → 回落图片卡,和形式=图片卡一样", async () => {
 			const h = makeParser({}, undefined, {
 				policyFor: miniapp,
 				capabilities: () => caps("unsupported"),
@@ -587,7 +632,7 @@ describe("createLinkParser", () => {
 			expect(h.probeCapabilities).toHaveBeenCalledTimes(1);
 			expect(h.probeCapabilities).toHaveBeenCalledWith({
 				platform: "onebot",
-				adapterId: ADAPTER,
+				connectionId: ADAPTER,
 				groupId: String(GROUP),
 			});
 			expect(h.sent.map((s) => s.payload.kind)).toEqual(["miniapp-card"]);
@@ -620,11 +665,12 @@ describe("createLinkParser", () => {
 			const h = makeParser({}, undefined, { policyFor: miniapp, capabilities: () => undefined });
 			await h.parser.handleMessage({
 				platform: "qq-official",
-				adapterId: ADAPTER,
+				connectionId: ADAPTER,
 				groupId: "G_OPENID",
 				userId: "M_OPENID",
 				text: LINK,
 				cardLinks: [],
+				miniAppCardLinks: [],
 			});
 			expect(h.sent.map((s) => s.payload.kind)).toEqual(["image"]);
 		});
@@ -647,9 +693,9 @@ describe("createLinkParser", () => {
 			expect(none.sent).toHaveLength(0);
 		});
 
-		it("一张也发不出来时不吃冷却:适配器一恢复,同一条链接立刻出卡", async () => {
-			// 形式=小程序卡、适配器签不了、又没有渲染器 —— 回落无门。这一趟要是把冷却记上,
-			// 主人把 Chrome 装好 / 适配器连上之后,还得干等一整个冷却才看得到卡。
+		it("一张也发不出来时不吃冷却:连接一恢复,同一条链接立刻出卡", async () => {
+			// 形式=小程序卡、连接签不了、又没有渲染器 —— 回落无门。这一趟要是把冷却记上,
+			// 主人把 Chrome 装好 / 连接连上之后,还得干等一整个冷却才看得到卡。
 			let state: "unsupported" | "supported" = "unsupported";
 			const h = makeParser({}, undefined, {
 				policyFor: miniapp,

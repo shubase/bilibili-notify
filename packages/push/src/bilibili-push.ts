@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import type {
 	DeliveryResult,
 	Disposable,
+	ExtraKey,
 	FeatureKey,
 	GlobalDefaults,
 	Logger,
@@ -46,7 +47,14 @@ export interface PushMessage {
 }
 
 export interface PushMessageOutcome extends PushMessage {
-	result: DeliveryResult;
+	/**
+	 * 缺省 = **这条从来没出过网**:同一目标的前一条失败、整段序列就此中止,后面这些
+	 * 连 sink 都没进(ADR-0017 决策 17)。它们照样回调,好让历史记全「本来要发几条」——
+	 * 从前静默丢掉,一次本该发 3 条的推送在面板上只剩 1 条,少掉的无从查起。
+	 *
+	 * 与无目标行的每一条同形状(那一整行也都没有结果)。
+	 */
+	result?: DeliveryResult;
 }
 
 interface PushSendBase {
@@ -90,8 +98,18 @@ export interface BroadcastOptions {
 	pushId?: string;
 	/** 显式 false 抑制 @全体(周期「正在直播」等非开播的 live 推送);不传 = 按 feature 决定。 */
 	allowAtAll?: boolean;
-	/** 这一段消息是本体还是附加项;缺省本体。@全体 不由它管,恒为附加项。 */
+	/**
+	 * 这一段消息是本体还是附加项;缺省跟着 {@link extra} 走(带了附加项键自然是附加项)。
+	 * @全体 不由它管,恒为附加项。
+	 */
 	role?: PushMessageRole;
+	/**
+	 * 这一段消息是**哪个**附加项(ADR-0016 决策 5)。带上它,目标列表就在主特性的基础上
+	 * 再按那把键的三态表筛一道 —— 谁没订这个附加项谁就收不到,本体照旧。
+	 *
+	 * @全体 不走这里:它有自己那条分支(单独一条消息 + 平台能力判定),见下面的 `atAllKey`。
+	 */
+	extra?: ExtraKey;
 	/**
 	 * 历史里记成哪一类推送。缺省按 feature 翻译;只有 `live` 那把键分不出开播与周期
 	 * 「正在直播」,调用方知道是哪种时显式传。
@@ -246,13 +264,13 @@ export class BilibiliPush {
 	 * @全体 是 fire-and-forget,不计入返回值)。
 	 *
 	 * 闸门按代价排:全局静音 → 无订阅 → 特性总开关 → 免扰时段,任一挡下都静默返回 —— 这些
-	 * 不是「无目标」。过了闸再看目标:路由里**启用的**(目标启用、所属适配器启用)才是候选,
+	 * 不是「无目标」。过了闸再看目标:路由里**启用的**(目标启用、所属连接启用)才是候选,
 	 * 停用的既不发也不进可达性重试;一个候选都没有就是「无目标」,回调 `onSend` 落一行。
 	 *
 	 * @全体成员 修饰(仅 `feature === "dynamic" | "live"` 且 `opts.allowAtAll !== false` 进入):
-	 * - 订阅级默认 `sub.atAllDefaults.X` 决定 inherit-state 的 target 是否 @
-	 * - per-target tristate Map `sub.atAll.X[targetId]` 显式覆写:`true` 强 ON、`false` 强 OFF
-	 * - Map 里没有该 key → 走默认
+	 * - 全局 + per-UP 合并后的 `eff.features.extras.atAll<Scope>` 决定 inherit-state 的 target 是否 @
+	 * - per-target tristate Map `sub.extras.atAll<Scope>[targetId]` 显式覆写:`true` 强 ON、`false` 强 OFF
+	 * - Map 里没有该 key → 走上面那个默认
 	 * - 目标平台不支持 @全体(`platformSupportsAtAll`,今天只有 QQ 官方机器人)→ 一律不 @,
 	 *   默认与覆写都不看 —— 单发的那条只含 at-all 段,到适配器就成了空消息
 	 *
@@ -304,11 +322,11 @@ export class BilibiliPush {
 			feature,
 			kind: opts?.kind ?? featureToPushKind(feature),
 			pushId: opts?.pushId ?? randomUUID(),
-			role: opts?.role ?? "main",
+			role: opts?.role ?? (opts?.extra ? "extra" : "main"),
 		};
-		// 只有启用的目标才是候选:停用的目标 / 停用的适配器不进重试、不落历史。
-		const targetIds = (sub.routing[feature] ?? []).filter((id) => this.sink.isEnabled(id));
-		if (targetIds.length === 0) {
+		// 只有启用的目标才是候选:停用的目标 / 停用的连接不进重试、不落历史。
+		const routed = (sub.routing[feature] ?? []).filter((id) => this.sink.isEnabled(id));
+		if (routed.length === 0) {
 			this.logger.debug(`[push] uid=${uid} feature=${feature} 无可用目标`);
 			this.onSend?.({
 				...ctx,
@@ -318,24 +336,39 @@ export class BilibiliPush {
 			return [];
 		}
 
+		// 附加项再按自己那张三态表筛一道(ADR-0016 决策 5):目标显式写了就听它的,没写就
+		// 跟随折叠后(全局 + per-UP)的默认 —— 与下面 @全体 那条分支同一句判定,四把键一视同仁。
+		// routing 查找全仓仍然只有上面那一处,这里只是在它的结果上再筛。
+		const extraKey = opts?.extra;
+		const targetIds = extraKey
+			? routed.filter((id) => sub.extras[extraKey][id] ?? eff.features.extras[extraKey])
+			: routed;
+		if (targetIds.length === 0) {
+			// 收窄成空**不是「无目标」**(决策 7):本体那一行已经在了、而且是「已送达」,
+			// 这个附加项只是谁都没订 —— 是配置意图不是故障,不落行、不弹卡、不记失败。
+			this.logger.debug(`[push] uid=${uid} feature=${feature} 附加项 ${extraKey} 无人订阅，跳过`);
+			return [];
+		}
+
 		// 默认(opts 不传 / allowAtAll 非显式 false)= 按 feature 决定,保持旧行为。
 		// 调用方显式传 false 时强制不 @全体(周期「正在直播」等非开播的 live 推送)。
-		const atAllScope =
+		const atAllKey: ExtraKey | null =
 			opts?.allowAtAll === false
 				? null
 				: feature === "dynamic"
-					? "dynamic"
+					? "atAllDynamic"
 					: feature === "live"
-						? "live"
+						? "atAllLive"
 						: null;
 
 		this.logger.info(`[push] uid=${uid} feature=${feature} → ${targetIds.length} 个目标`);
-		if (!atAllScope) {
+		if (!atAllKey) {
 			return this.sendBatch(targetIds, payloads, ctx);
 		}
 
-		const defaultOn = sub.atAllDefaults[atAllScope];
-		const overrides = sub.atAll[atAllScope];
+		// 默认取**折叠后**那一份(全局 + per-UP 覆盖已合并);per-target 三态表挂在订阅上。
+		const defaultOn = eff.features.extras[atAllKey];
+		const overrides = sub.extras[atAllKey];
 		const atAllTargets: string[] = [];
 		const plainTargets: string[] = [];
 		for (const id of targetIds) {
@@ -393,7 +426,8 @@ export class BilibiliPush {
 			const atAllJob = this.sendToTarget(id, atAllPayload, { routing });
 			const outcomes = await this.sendSequence(id, payloads, ctx, myGen);
 			if (outcomes === null) break;
-			results.push(...outcomes.map((o) => o.result));
+			// 被中止的那几条没有结果可报(从没出过网),不进这个数组。
+			results.push(...outcomes.flatMap((o) => (o.result ? [o.result] : [])));
 			this.emit(ctx, id, outcomes);
 			// 本体那次回调已经发出,@全体 的结果再追加 —— 就算它早就落地了也排在后面。
 			void atAllJob
@@ -424,7 +458,8 @@ export class BilibiliPush {
 			if (this.disposed || this.generation !== myGen) break;
 			const outcomes = await this.sendSequence(id, payloads, ctx, myGen);
 			if (outcomes === null) break;
-			results.push(...outcomes.map((o) => o.result));
+			// 被中止的那几条没有结果可报(从没出过网),不进这个数组。
+			results.push(...outcomes.flatMap((o) => (o.result ? [o.result] : [])));
 			this.emit(ctx, id, outcomes);
 		}
 		return results;
@@ -432,8 +467,9 @@ export class BilibiliPush {
 
 	/**
 	 * 一个目标的一段序列:顺序发,某条失败即中止其后续条(失败后大概率继续失败,且乱序
-	 * 补发比缺失更糟);失败那条留在结果里,被中止的不在。返回 null = 生命周期翻转,
-	 * 这一段作废。
+	 * 补发比缺失更糟)。失败那条留在结果里;**被中止的也留在结果里,但不带 `result`**
+	 * —— 它们一次都没进 sink,只是让历史记得住「本来还有几条」(ADR-0017 决策 17)。
+	 * 返回 null = 生命周期翻转,这一段作废。
 	 */
 	private async sendSequence(
 		targetId: string,
@@ -443,11 +479,17 @@ export class BilibiliPush {
 	): Promise<PushMessageOutcome[] | null> {
 		const routing = { uid: ctx.uid, feature: ctx.feature };
 		const outcomes: PushMessageOutcome[] = [];
-		for (const payload of payloads) {
+		for (const [i, payload] of payloads.entries()) {
 			const result = await this.sendToTarget(targetId, payload, { routing });
 			if (this.disposed || this.generation !== myGen) return null;
 			outcomes.push({ payload, role: ctx.role, result });
-			if (!result.ok) break;
+			if (!result.ok) {
+				// 中止。剩下的原样记上,没有结果 —— 人工重推要按这个数把它们补齐。
+				for (const rest of payloads.slice(i + 1)) {
+					outcomes.push({ payload: rest, role: ctx.role });
+				}
+				break;
+			}
 		}
 		return outcomes;
 	}

@@ -25,28 +25,39 @@
  */
 
 import type { BilibiliAPI } from "@bilibili-notify/api";
-import type { PreviewResponse, TestPushResponse } from "@bilibili-notify/contract";
+import type {
+	CardSkinShotResponse,
+	PreviewResponse,
+	TestPushResponse,
+} from "@bilibili-notify/contract";
 import {
-	type Component,
-	DynamicCard,
 	type DynamicCardProps,
 	h,
 	ImageRenderer,
-	LiveCard,
 	type LiveCardProps,
-	renderCard,
+	renderCardWithSkin,
+	resolveKnobAssets,
+	shrinkImageForCssVar,
 	USER_FONT_FAMILY,
 } from "@bilibili-notify/image";
 import {
-	type CardBlock,
-	type CardLayout,
-	CardLayoutSchema,
+	CARD_SKIN_LIMITS,
+	CARD_SKIN_UPLOAD_PREFIX,
+	CardSkinIdSchema,
+	type CardSkinKind,
+	CardSkinKindSchema,
+	type CardSkinKnobOverrides,
+	type CardSkinManifest,
+	DEFAULT_CARD_SKIN,
 	type GlobalConfig,
 	type NotificationPayload,
 	type Subscription,
 } from "@bilibili-notify/internal";
 import { Hono } from "hono";
 import { z } from "zod";
+import { prefetchCardSkinAssets, readCardSkinAssetDataUrl } from "../card-skins/asset-url.js";
+import { renderSkinPreviewHtml } from "../card-skins/preview-html.js";
+import type { CardSkinStore } from "../card-skins/store.js";
 import { commandHelpHintFromGlobals } from "../commands/bili-onebot.js";
 import type { ChromeSource } from "../config/persist.js";
 import {
@@ -112,21 +123,22 @@ export interface CardsRouteOptions {
 	 * 热启用成功后回调,通知 index.ts 更新全局 puppeteer 引用(供进程退出时 dispose)。
 	 */
 	onPuppeteerEnabled?: (puppeteer: StandalonePuppeteer) => void;
+	/**
+	 * 卡片皮肤库(ADR-0014)。预览两条路都要它:走 ImageRenderer 的那条把它接成渲染器的
+	 * 皮肤解析口,虚构 mock 那条直接拿清单调 `renderCardWithSkin`。不给 = 只有内置默认皮肤。
+	 */
+	cardSkins?: CardSkinStore;
+	/**
+	 * 把「截一张盘上皮肤」的口子交出去 —— 卡片工坊的 `look_card` 要用(ADR-0015 决策 19 的 🔗)。
+	 * 握着 Chrome 的是这条路由,截图口只能从这里借;交出去的是闭包,热启用换了 Chrome 照样用新的。
+	 */
+	onSkinShot?: (shoot: (skinId: string, kind: CardSkinKind) => Promise<string | null>) => void;
 }
 
 const StyleSchema = z.object({
-	cardColorStart: z.string(),
-	cardColorEnd: z.string(),
 	font: z.string().optional(),
 	/** 主人自带字体的资产 id;设了优先于 `font`(预览与出图必须用同一款,否则「预览好看、推出去变样」)。 */
 	fontAsset: z.string().optional(),
-	showPopularity: z.boolean().optional(),
-	showArea: z.boolean().optional(),
-	showFans: z.boolean().optional(),
-	glassOpacity: z.number().min(0).max(1).optional(),
-	glassClear: z.boolean().optional(),
-	/** 背景图资产 id 列表(空 = 渐变;>1 = 轮换,预览端取首张)。 */
-	backgroundImages: z.array(z.string()).optional(),
 	/** 直播封面资产 id 列表(空 = B 站封面;>1 = 轮换,预览端取首张)。仅 live 卡。 */
 	liveCoverImages: z.array(z.string()).optional(),
 });
@@ -153,8 +165,8 @@ const PreviewRequestSchema = z.object({
 	kind: z.enum(["live", "dyn", "sc", "guard"]),
 	style: StyleSchema,
 	content: ContentSchema,
-	/** 编辑器持有的整份版式草稿;renderPreviewCard 按 kind 取切片。缺省 = 默认版式。 */
-	layout: CardLayoutSchema.optional(),
+	/** 预览用哪套皮肤(ADR-0014);缺省 = 全局在用的那套。 */
+	cardSkin: CardSkinIdSchema.optional(),
 	/**
 	 * 真实拉取失败时是否自动回退示例数据。per-UP 作用域自动用该 UP 真实数据预览,失败
 	 * (未开播 / 无动态 / 网络)应静默回退;全局显式输入失败则照常报错告知用户。
@@ -183,7 +195,7 @@ const TestPushRequestSchema = z.object({
 	kind: z.enum(["live", "dyn", "sc", "guard"]),
 	style: StyleSchema,
 	content: ContentSchema,
-	layout: CardLayoutSchema.optional(),
+	cardSkin: CardSkinIdSchema.optional(),
 	fallback: z.boolean().optional(),
 });
 
@@ -207,21 +219,35 @@ export function testPushCaption(kind: PreviewKind): string {
 }
 
 /**
- * 收集当前配置里仍引用某背景图 id 的作用域(人话标签),用于删除前拦截。基准
- * `cardStyle.backgroundImages` 与**各卡片类型** `cardStyleByKind[*].backgroundImages`(per-kind)
- * 都算,全局默认 + 各 UP 覆盖两层都扫。返回空数组 = 没人用,可安全删盘。
+ * 收集当前配置里仍引用某图 id 的作用域(人话标签),用于删除前拦截。
+ *
+ * 两处算:**皮肤旋钮**(2026-09-14 起背景图的正主 —— 每套皮肤一份,值是一串 id)与
+ * 直播封面(`liveCoverImages`,与背景图共用同一图廊)。返回空数组 = 没人用,可安全删盘。
+ *
+ * ⚠️ **判据里去掉了退役的 `cardStyle.backgroundImages`(2026-09-20,整条链删干净那次)。**
+ * 这是一处**主人看得见**的行为变化:存量配置里那个键还在(schema 不 strict,加载时静静
+ * 剥掉),从前它算一条引用、会把删除拦下来;今天**只被它引用的图算「没人用」,删得掉**。
+ * 这是对的 —— 那个键从 2026-09-19 起已经画不出任何东西(背景图走 `--bn-knob-wallpaper`
+ * 旋钮),再拦着只会让主人删不掉一张早就不出现在任何卡上的图。**不是漏了。**
+ *
+ * ⚠️ 漏掉旋钮那一处的后果是**静默的**:删得掉、请求成功,而那套皮肤的清单里留着一个
+ * 指向空气的 id,出图时静静回落渐变 —— 主人只会觉得「壁纸自己没了」。
  */
 function cardBgReferences(globals: GlobalConfig, subs: Subscription[], id: string): string[] {
-	// 背景图与直播封面共用同一图廊 —— 两类引用都算(删掉被封面引用的图同样会坏渲染)。
-	const inStyle = (style?: { backgroundImages?: string[]; liveCoverImages?: string[] }): boolean =>
-		(style?.backgroundImages?.includes(id) ?? false) ||
-		(style?.liveCoverImages?.includes(id) ?? false);
+	const inStyle = (style?: { liveCoverImages?: string[] }): boolean =>
+		style?.liveCoverImages?.includes(id) ?? false;
 	// per-kind 是各类型对基准的覆盖层;任一类型引用即算被引用。
-	const inByKind = (
-		byKind?: Record<string, { backgroundImages?: string[]; liveCoverImages?: string[] }>,
-	): boolean => (byKind ? Object.values(byKind).some(inStyle) : false);
+	const inByKind = (byKind?: Record<string, { liveCoverImages?: string[] }>): boolean =>
+		byKind ? Object.values(byKind).some(inStyle) : false;
 
 	const refs: string[] = [];
+	// 旋钮值是「一串 id」(图片旋钮)—— 不认旋钮声明,直接按形状扫:这里没有皮肤清单,
+	// 而「哪个 key 是图片旋钮」只有清单知道。多扫一个同形状的值也只是多拦一次删除。
+	for (const [skinId, overrides] of Object.entries(globals.defaults.cardSkinKnobs ?? {})) {
+		if (Object.values(overrides ?? {}).some((v) => Array.isArray(v) && v.includes(id))) {
+			refs.push(`皮肤「${skinId}」`);
+		}
+	}
 	if (inStyle(globals.defaults.cardStyle) || inByKind(globals.defaults.cardStyleByKind)) {
 		refs.push("全局默认");
 	}
@@ -234,26 +260,42 @@ function cardBgReferences(globals: GlobalConfig, subs: Subscription[], id: strin
 }
 
 /**
- * 哪些地方还选着这款字体 —— 与 {@link cardBgReferences} 同一套四层扫描
- * (全局基准 / 全局 per-kind / UP 基准 / UP per-kind)。**四层都得查**:漏掉哪一层,
- * 那一层的配置删完就成了悬空引用,出图静静落回兜底字体,而设置页还显示着它的名字。
+ * 哪些皮肤的旋钮还选着这款字体。
+ *
+ * 🪦 2026-09-20 从四层收成一层。从前它还扫 `cardStyle.fontAsset` 的四个位置(全局基准 /
+ * 全局 per-kind / UP 基准 / UP per-kind),那在字体还由卡片页管的时候是对的。今天那条路
+ * **一个读者都没有**:全局那份在字体退役成旋钮时就断了,per-UP 与 per-kind 两层
+ * 2026-09-20 一并摘掉(见 `runtime/engines.ts` 的 `cardStyleToColorOptions`)。
+ *
+ * 继续扫它的后果是**凭一个不生效的引用拦住删除**:409 说「UP 12345 还在用」,而主人去
+ * 面板上找,既找不到那个设置(入口早删了)、那款字体也根本没出现在卡上 —— 「换掉再删」
+ * 这句指路指向一个不存在的地方。宁可让残留值随它去,也不留一个查不下去的 409。
+ *
+ * 与 {@link cardBgReferences} 不同:那边扫的 `liveCoverImages` 是**还活着**的字段。
  */
-function fontAssetReferences(globals: GlobalConfig, subs: Subscription[], id: string): string[] {
-	const inStyle = (style?: { fontAsset?: string }): boolean => style?.fontAsset === id;
-	const inByKind = (byKind?: Record<string, { fontAsset?: string }>): boolean =>
-		byKind ? Object.values(byKind).some(inStyle) : false;
-
+function fontAssetReferences(globals: GlobalConfig, id: string): string[] {
 	const refs: string[] = [];
-	if (inStyle(globals.defaults.cardStyle) || inByKind(globals.defaults.cardStyleByKind)) {
-		refs.push("全局默认");
-	}
-	for (const s of subs) {
-		if (inStyle(s.overrides.cardStyle) || inByKind(s.overrides.cardStyleByKind)) {
-			refs.push(`UP ${s.uid}`);
-		}
+	const asKnob = `${CARD_SKIN_UPLOAD_PREFIX}${id}`;
+	for (const [skinId, overrides] of Object.entries(globals.defaults.cardSkinKnobs ?? {})) {
+		if (Object.values(overrides ?? {}).some((v) => v === asKnob)) refs.push(`皮肤「${skinId}」`);
 	}
 	return refs;
 }
+
+/**
+ * 没配 Chrome 时那句话。**两处 503 共用一份** —— 说的是同一件事,分成两份写迟早会漂,
+ * 而这句正是主人照着去修的那条路径(「失败的原因不许吞」)。
+ */
+const NO_CHROME_HINT =
+	"puppeteer 未配置 — 设置 BN_CHROME_PATH（本地 Chromium 路径）或 BN_CHROME_ENDPOINT（远程浏览器端点），或 yaml 的 chromePath / chromeEndpoint 字段";
+
+/** 「最终效果」的请求体。`manifest` 不在这儿校形 —— 它要过的是装包门那一整套。 */
+const SkinShotRequestSchema = z.object({
+	skinId: CardSkinIdSchema,
+	kind: CardSkinKindSchema,
+	scene: z.string().max(40).optional(),
+	manifest: z.unknown(),
+});
 
 export function createCardsRoute(opts: CardsRouteOptions): Hono {
 	const app = new Hono();
@@ -373,7 +415,8 @@ export function createCardsRoute(opts: CardsRouteOptions): Hono {
 		}
 	});
 
-	// 背景图上传 → 落盘 `<dataDir>/assets/card-bg/<id>`,返回资产 id 写进 cardStyle.backgroundImage。
+	// 图片上传 → 落盘 `<dataDir>/assets/card-bg/<id>`,返回资产 id 写进皮肤的图旋钮
+	// (或 `cardStyle.liveCoverImages`)。目录名 `card-bg` 是历史,今天这套图廊两家共用。
 	// 闸在 parseBody 之前:超大的当场回绝,别先整份读进那 512MB 的堆里。见 upload-limit.ts。
 	app.post("/asset", uploadBodyLimit(MAX_CARD_BG_BYTES, "图片"), async (c) => {
 		const body = await c.req.parseBody().catch(() => null);
@@ -471,14 +514,10 @@ export function createCardsRoute(opts: CardsRouteOptions): Hono {
 	app.delete("/font-asset/:id", async (c) => {
 		const id = c.req.param("id");
 		if (!isValidFontAssetId(id)) return c.json({ ok: false, err: "无效的资产 id" }, 400);
-		const referencedBy = fontAssetReferences(
-			opts.deps.store.getGlobals(),
-			opts.deps.store.getSubscriptions(),
-			id,
-		);
+		const referencedBy = fontAssetReferences(opts.deps.store.getGlobals(), id);
 		if (referencedBy.length > 0) {
 			return c.json(
-				{ ok: false, err: "该字体仍被使用,请先在卡片设置里换掉再删除", referencedBy },
+				{ ok: false, err: "该字体仍被皮肤的字体旋钮选着,请先换掉再删除", referencedBy },
 				409,
 			);
 		}
@@ -508,6 +547,38 @@ export function createCardsRoute(opts: CardsRouteOptions): Hono {
 		return opts.deps.runtime.loadFontFace(id);
 	};
 
+	/**
+	 * **预览用哪套皮肤 —— 唯一那处解析。**
+	 *
+	 * 「请求没指皮肤」只有一个意思:用全局在用的那套。这里之前是三处各兜一次缺省,而
+	 * 走渲染器的那条(SC / 上舰 / 真实拉取)压根没兜,落进渲染器自己的内置默认 —— 于是
+	 * 同一屏里直播卡是新皮肤、SC 卡是出厂样子(2026-09-14 主人报的那一组现象)。缺省
+	 * 只准有一个,就在这儿。
+	 */
+	function previewSkinId(id?: string): string {
+		return id || opts.deps.store.getGlobals().defaults.cardSkin;
+	}
+
+	/**
+	 * 预览用哪套皮肤的清单。id 由 {@link previewSkinId} 解析好再进来;店里取不到
+	 * (皮肤被删了)就退回内置默认 —— 预览不该因为指了个不存在的 id 而报错,它本来就是
+	 * 「看看长什么样」。
+	 */
+	async function previewManifest(skinId: string): Promise<CardSkinManifest> {
+		const store = opts.cardSkins;
+		if (!store) return DEFAULT_CARD_SKIN;
+		await store.ensureReady();
+		return store.get(skinId) ?? DEFAULT_CARD_SKIN;
+	}
+
+	/**
+	 * 预览要用的那份**旋钮覆盖**:按皮肤 id 从配置里取(存覆盖不存值,没拧过就没有键)。
+	 * 与出图那条路同源 —— 两边各取一份的话,预览与推出去的卡会在配色上悄悄分家。
+	 */
+	function previewKnobValues(skinId: string): CardSkinKnobOverrides | undefined {
+		return opts.deps.store.getGlobals().defaults.cardSkinKnobs?.[skinId];
+	}
+
 	let imageRenderer: ImageRenderer | null = null;
 	// 缓存绑定的 adapter 快照 —— 热切换(/enable-rendering)会把 currentPuppeteer 换成
 	// 新 adapter 并 dispose 旧的,若不比对直接复用,imageRenderer 会一直攥着已销毁的
@@ -516,22 +587,13 @@ export function createCardsRoute(opts: CardsRouteOptions): Hono {
 	async function getImageRenderer(style: PreviewStyle): Promise<ImageRenderer | null> {
 		if (!currentPuppeteer) return null;
 		const config = {
-			cardColorStart: style.cardColorStart,
-			cardColorEnd: style.cardColorEnd,
 			font: style.font ?? "PingFang SC, sans-serif",
-			showPopularity: style.showPopularity ?? true,
-			showArea: style.showArea ?? true,
-			showFans: style.showFans ?? true,
-			glassOpacity: style.glassOpacity,
-			glassClear: style.glassClear,
-			// 跳过悬空引用(文件已删的 id),取第一张盘上存在的图 —— 否则解析失败静默回退渐变。
-			backgroundImage: await firstExistingCardBg(
-				opts.deps.store.bootstrap.dataDir,
-				style.backgroundImages,
-			),
 			// 预览得跟出图用同一款字体,否则「预览好看、推出去变样」。悬空 id 由
 			// resolveFontFace 兜成空串,渲染器据此回落家族名。
 			fontAsset: style.fontAsset,
+			// 旋钮覆盖:SC / 上舰的预览走渲染器这条路,不给就只有另外两种卡的预览跟着
+			// 旋钮变 —— 「预览好看、推出去变样」的同一个坑,换个卡种再踩一次。
+			cardSkinKnobs: opts.deps.store.getGlobals().defaults.cardSkinKnobs,
 		};
 		if (!imageRenderer || imageRendererPuppeteer !== currentPuppeteer) {
 			imageRenderer = new ImageRenderer({
@@ -542,6 +604,10 @@ export function createCardsRoute(opts: CardsRouteOptions): Hono {
 				resolveAsset: (id) => readCardBgDataUrl(opts.deps.store.bootstrap.dataDir, id),
 				// 字体 id → 拼好的 @font-face(读 <dataDir>/assets/font)。
 				resolveFontFace: loadFontFace,
+				// 皮肤:与推送出图问的是同一家店(app.ts 传进来的那一个实例)。
+				resolveCardSkin: (id) => opts.cardSkins?.get(id) ?? undefined,
+				resolveCardSkinAsset: async (skinId, name) =>
+					opts.cardSkins ? await readCardSkinAssetDataUrl(opts.cardSkins, skinId, name) : undefined,
 				// 预览:每来一次请求就热更一次样式,打 info 会刷屏且像"已保存"。真正生效的
 				// INFO 由推送渲染器(runtime/engines.ts)在 config-changed 后打。
 				quietConfigUpdates: true,
@@ -552,6 +618,38 @@ export function createCardsRoute(opts: CardsRouteOptions): Hono {
 		}
 		return imageRenderer;
 	}
+
+	/**
+	 * 只要**截图管线**(串行闸 + 页池),不碰 config —— 皮肤的「最终效果」喂的是现成 HTML,
+	 * 配置对它没有影响,而 `getImageRenderer(style)` 会热更 config:拿它去截图会把并发的
+	 * `/preview` 刚设好的样式冲掉(「预览好看、推出去变样」的同一族)。
+	 *
+	 * 仍复用同一个实例 —— 闸是实例私有的,另起一个等于两条并发的 Chrome 渲染。
+	 */
+	async function getScreenshotRenderer(): Promise<ImageRenderer | null> {
+		if (!currentPuppeteer) return null;
+		if (imageRenderer && imageRendererPuppeteer === currentPuppeteer) return imageRenderer;
+		// 还没建过:照常建一个(config 随下一次 `/preview` 热更)。
+		return await getImageRenderer({});
+	}
+
+	/**
+	 * 截一张**盘上那份**皮肤(默认场景),回 data URL;没 Chrome 回 null。与「最终效果」同一条路
+	 * (清单 → HTML → 截图),只是清单取自皮肤库而不是草稿。
+	 */
+	async function shootSavedSkin(skinId: string, kind: CardSkinKind): Promise<string | null> {
+		const store = opts.cardSkins;
+		if (!store) return null;
+		const renderer = await getScreenshotRenderer();
+		if (!renderer) return null;
+		const manifest = store.get(skinId);
+		if (!manifest) throw new Error(`皮肤不存在: ${skinId}`);
+		const out = await renderSkinPreviewHtml({ store, skinId, kind, manifest });
+		if (!out.ok) throw new Error(out.errors.join("；"));
+		const { buffer } = await renderer.screenshotHtml(out.html);
+		return `data:image/jpeg;base64,${buffer.toString("base64")}`;
+	}
+	opts.onSkinShot?.(shootSavedSkin);
 
 	// Cached snapshot of the logged-in B站 account. Used as the SENDER on
 	// SC / Guard preview cards (the SC payer / new captain), not the
@@ -619,11 +717,13 @@ export function createCardsRoute(opts: CardsRouteOptions): Hono {
 		kind: PreviewKind,
 		style: PreviewStyle,
 		content: PreviewContent,
-		layout?: CardLayout,
+		cardSkin?: string,
 		fallback = false,
 	): Promise<{ buffer: Buffer; mime: string }> {
 		const puppeteer = currentPuppeteer;
 		if (!puppeteer) throw new Error("puppeteer 未就绪");
+		// 下面四条出图路子(SC / 上舰 / 真实拉取 / 虚构 mock)都吃这一个 id。
+		const skinId = previewSkinId(cardSkin);
 
 		if (kind === "sc") {
 			const renderer = await getImageRenderer(style);
@@ -640,9 +740,8 @@ export function createCardsRoute(opts: CardsRouteOptions): Hono {
 					text: content?.text?.trim() || "主播加油！这首要听到！示例 UP 主唱得太好了！",
 					price: content?.price ?? 30,
 				},
-				// 预览样式已由 getImageRenderer(style) 烤进渲染器 config,故 colorOptions 留空。
-				{},
-				layout?.sc,
+				// 预览样式已由 getImageRenderer(style) 烤进渲染器 config,故只带皮肤 id。
+				{ cardSkin: skinId },
 			);
 			return { buffer, mime: "image/jpeg" };
 		}
@@ -657,9 +756,8 @@ export function createCardsRoute(opts: CardsRouteOptions): Hono {
 			const buffer = await renderer.generateGuardCard(
 				{ guardLevel: (content?.level ?? 3) as 1 | 2 | 3, uname, face, isAdmin: 0 },
 				{ masterAvatarUrl: master.face, masterName: master.name },
-				// 预览样式已由 getImageRenderer(style) 烤进渲染器 config,故 colorOptions 留空。
-				{},
-				layout?.guard,
+				// 预览样式已由 getImageRenderer(style) 烤进渲染器 config,故只带皮肤 id。
+				{ cardSkin: skinId },
 			);
 			return { buffer, mime: "image/jpeg" };
 		}
@@ -680,7 +778,7 @@ export function createCardsRoute(opts: CardsRouteOptions): Hono {
 					roomId,
 					style,
 					opts.deps.store.bootstrap.dataDir,
-					layout?.live,
+					skinId,
 				);
 				return { buffer, mime: "image/jpeg" };
 			} catch (err) {
@@ -698,8 +796,7 @@ export function createCardsRoute(opts: CardsRouteOptions): Hono {
 					renderer,
 					content.uid.trim(),
 					content.offset ?? 1,
-					style,
-					layout?.dynamic,
+					skinId,
 					commandHelpHintFromGlobals(opts.deps.store.getGlobals()),
 				);
 				return { buffer, mime: "image/jpeg" };
@@ -709,14 +806,12 @@ export function createCardsRoute(opts: CardsRouteOptions): Hono {
 			}
 		}
 		// Live + Dyn 无真实数据(或回退):虚构 mock 数据,走 renderCard + screenshot 流水线
-		// (不经 ImageRenderer,未登录也能调色)。背景图/直播封面在此解析成 data URL 注入;
-		// 取「第一张盘上存在的图」,跳过悬空引用。
+		// (不经 ImageRenderer,未登录也能调色)。直播封面在此解析成 data URL 注入;
+		// 取「第一张盘上存在的图」,跳过悬空引用。卡片背景图不在这条路上了 —— 它归皮肤的
+		// `image` 旋钮,由下面的 `resolveKnobAssets` 解析。
 		const dataDir = opts.deps.store.bootstrap.dataDir;
-		// 背景图、直播封面、自带字体互不依赖(各自独立的资产解析),并发发起省几次串行 I/O。
-		const [bgDataUrl, coverDataUrl, fontFace] = await Promise.all([
-			firstExistingCardBg(dataDir, style.backgroundImages).then((id) =>
-				readCardBgDataUrl(dataDir, id),
-			),
+		// 直播封面与自带字体互不依赖(各自独立的资产解析),并发发起省一次串行 I/O。
+		const [coverDataUrl, fontFace] = await Promise.all([
 			kind === "live"
 				? firstExistingCardBg(dataDir, style.liveCoverImages).then((id) =>
 						readCardBgDataUrl(dataDir, id),
@@ -724,22 +819,48 @@ export function createCardsRoute(opts: CardsRouteOptions): Hono {
 				: Promise.resolve(""),
 			loadFontFace(style.fontAsset ?? ""),
 		]);
-		const { component, props, title, htmlWidth } = buildPreviewSpec(
+		const spec = buildPreviewSpec(
 			kind,
-			style,
-			layout,
-			bgDataUrl,
 			coverDataUrl,
 			commandHelpHintFromGlobals(opts.deps.store.getGlobals()),
 		);
+		// 皮肤那条路与推送出图**同一个函数**(`renderCardWithSkin`)—— 各拼一份的话必然出现
+		// 「预览是这套皮肤、推出去是另一副样子」,而两边都说不出哪儿错了。
+		const manifest = await previewManifest(skinId);
+		// 与编辑器预览那条路共用同一份预取(`card-skins/asset-url.ts`)。
+		const assets = opts.cardSkins
+			? await prefetchCardSkinAssets(opts.cardSkins, skinId, manifest, spec.kind)
+			: new Map<string, string>();
+		// 🔴 **`knobValues` 一个人不够。** 字体与图这两档旋钮的值是资产库里的一个 id,
+		// 要读盘才变得成 CSS,所以 `cardSkinKnobCss` 那条同步路径对它们恒回 null ——
+		// 少了这一句,主人在旋钮面板里选了「卡片背景图」,别的旋钮照常跟着变,唯独背景图
+		// 与字体**静静地什么也不做**,而推送出去的卡是对的(ImageRenderer 那条路调了它)。
+		// 「预览好看、推出去变样」的镜像版,2026-09-19 审查抓到。
+		const knobValues = previewKnobValues(skinId);
+		const knobAssets = await resolveKnobAssets(manifest.knobs, knobValues, {
+			image: (id) => readCardBgDataUrl(dataDir, id),
+			fontFace: loadFontFace,
+			// 超出 CSS 自定义属性 2 MiB 上限的图要压一下,否则 Chrome 整条丢弃、
+			// 预览画兜底渐变 —— 而推送那头压了,两边就分家了。
+			shrinkImage: (url, budget) => shrinkImageForCssVar(puppeteer, url, budget),
+		});
+		for (const w of knobAssets.warnings) log.warn(`[card-skin] ${w}`);
 		// 自带字体优先于家族名(与 ImageRenderer#resolveFont 同一套判断);资产悬空时
 		// fontFace 是空串,静静回落家族名。
-		const html = await renderCard(component, props, {
-			title,
+		// 两支只差那个字面量(重载靠它收窄 props 的类型),选项一份就够 —— 分成两份写,
+		// 改一支漏一支的症状是「直播卡对、动态卡不对」,而两处代码看着都对。
+		const common = {
+			title: spec.title,
 			font: fontFace ? USER_FONT_FAMILY : (style.font ?? "PingFang SC, sans-serif"),
 			fontFace: fontFace || undefined,
-			htmlWidth,
-		});
+			resolveAsset: (name: string) => assets.get(name),
+			knobValues,
+			knobAssets,
+		};
+		const html =
+			spec.kind === "live"
+				? await renderCardWithSkin("live", spec.props, manifest, common)
+				: await renderCardWithSkin("dynamic", spec.props, manifest, common);
 		const buffer = await screenshotHtml(puppeteer, html);
 		return { buffer, mime: "image/png" };
 	}
@@ -751,17 +872,11 @@ export function createCardsRoute(opts: CardsRouteOptions): Hono {
 			return c.json<PreviewResponse>({ ok: false, err: "invalid_request" }, 400);
 		}
 		if (!currentPuppeteer) {
-			return c.json<PreviewResponse>(
-				{
-					ok: false,
-					err: "puppeteer 未配置 — 设置 BN_CHROME_PATH（本地 Chromium 路径）或 BN_CHROME_ENDPOINT（远程浏览器端点），或 yaml 的 chromePath / chromeEndpoint 字段",
-				},
-				503,
-			);
+			return c.json<PreviewResponse>({ ok: false, err: NO_CHROME_HINT }, 503);
 		}
-		const { kind, style, content, layout, fallback } = parsed.data;
+		const { kind, style, content, cardSkin, fallback } = parsed.data;
 		try {
-			const { buffer, mime } = await renderPreviewCard(kind, style, content, layout, fallback);
+			const { buffer, mime } = await renderPreviewCard(kind, style, content, cardSkin, fallback);
 			return c.json<PreviewResponse>({
 				ok: true,
 				dataUrl: `data:${mime};base64,${buffer.toString("base64")}`,
@@ -773,6 +888,58 @@ export function createCardsRoute(opts: CardsRouteOptions): Hono {
 		}
 	});
 
+	/**
+	 * POST /api/cards/skin-shot —— 编辑器那颗「最终效果」(ADR-0014 决策 22)。
+	 *
+	 * 实时预览回 HTML 由**看的人的浏览器**画,推出去那张是 **server 上的 Chrome** 画的,
+	 * 字体渲染像素级对不上;这颗按钮补的正是那一刀。落在这条路由(而不是 `card-skins`)是
+	 * 因为握着 Chrome 的是这儿 —— 而「清单 → HTML」那一步两边**共用同一个件**,预览与
+	 * 截图因此结构性地同源。
+	 */
+	app.post("/skin-shot", async (c) => {
+		const parsed = SkinShotRequestSchema.safeParse(await c.req.json().catch(() => null));
+		if (!parsed.success) {
+			return c.json<CardSkinShotResponse>(
+				{ ok: false, err: "请求体要 { skinId, kind, scene?, manifest }" },
+				400,
+			);
+		}
+		if (!opts.cardSkins)
+			return c.json<CardSkinShotResponse>({ ok: false, err: "皮肤库未就绪" }, 503);
+		const renderer = await getScreenshotRenderer();
+		if (!renderer) return c.json<CardSkinShotResponse>({ ok: false, err: NO_CHROME_HINT }, 503);
+
+		const { skinId, kind, scene, manifest } = parsed.data;
+		const out = await renderSkinPreviewHtml({
+			store: opts.cardSkins,
+			skinId,
+			kind,
+			scene,
+			manifest,
+		});
+		if (!out.ok) return c.json<CardSkinShotResponse>({ ok: false, errors: out.errors }, 400);
+
+		try {
+			const { buffer, height } = await renderer.screenshotHtml(out.html);
+			return c.json<CardSkinShotResponse>({
+				ok: true,
+				dataUrl: `data:image/jpeg;base64,${buffer.toString("base64")}`,
+				width: out.width,
+				height,
+				// 超了出图那头会**静默**回落默认皮肤(决策 19);作者只有在这儿能提前知道。
+				// 减掉上下两道出血 —— 出图那头的闸也这么算,两把尺子不一样的话,编辑器
+				// 会为一张其实发得出去的卡报警(反过来更糟:说没事,推的时候静默回落)。
+				overHeight: height - out.bleed * 2 > CARD_SKIN_LIMITS.maxHeight,
+				warnings: out.warnings,
+				scene: out.scene,
+			});
+		} catch (err) {
+			const msg = err instanceof Error ? err.message : String(err);
+			log.warn(`[cards] skin-shot render failed (${kind}): ${msg}`);
+			return c.json<CardSkinShotResponse>({ ok: false, err: msg }, 500);
+		}
+	});
+
 	// POST /api/cards/test-push — 渲染当前预览卡片(同 /preview 的草稿样式)并真实
 	// 推送给一个 PushTarget。图片 Tab「测试推送」用,所见即所推。
 	app.post("/test-push", async (c) => {
@@ -781,7 +948,7 @@ export function createCardsRoute(opts: CardsRouteOptions): Hono {
 		if (!parsed.success) {
 			return c.json<TestPushResponse>({ ok: false, latencyMs: 0, err: "invalid_request" }, 400);
 		}
-		const { targetId, kind, style, content, layout, fallback } = parsed.data;
+		const { targetId, kind, style, content, cardSkin, fallback } = parsed.data;
 
 		if (!currentPuppeteer) {
 			return c.json<TestPushResponse>(
@@ -803,7 +970,7 @@ export function createCardsRoute(opts: CardsRouteOptions): Hono {
 
 		let card: { buffer: Buffer; mime: string };
 		try {
-			card = await renderPreviewCard(kind, style, content, layout, fallback);
+			card = await renderPreviewCard(kind, style, content, cardSkin, fallback);
 		} catch (err) {
 			const msg = err instanceof Error ? err.message : String(err);
 			log.warn(`[cards] test-push render failed (${kind}): ${msg}`);
@@ -873,7 +1040,7 @@ async function renderRealLive(
 	roomId: string,
 	style: PreviewStyle,
 	dataDir: string,
-	layout?: CardBlock[],
+	cardSkin?: string,
 ): Promise<Buffer> {
 	if (!/^\d+$/.test(roomId)) throw new Error("直播间号必须是纯数字");
 
@@ -909,14 +1076,12 @@ async function renderRealLive(
 		{}, // liveData — no danmaku context in preview, watched/liked left blank
 		2,
 		{
-			cardColorStart: style.cardColorStart,
-			cardColorEnd: style.cardColorEnd,
 			// 自定义直播封面:跳过悬空引用(文件已删的 id),取第一张盘上存在的图 ——
 			// 与 mock 预览 / 生产推送同一条守卫,否则第一张是幽灵 id 时会静默回退
 			// B 站原始封面,即便后面还有张有效图。
 			liveCoverImage: await firstExistingCardBg(dataDir, style.liveCoverImages),
+			cardSkin,
 		},
-		layout,
 	);
 }
 
@@ -925,8 +1090,7 @@ async function renderRealDynamic(
 	renderer: ImageRenderer,
 	uid: string,
 	offset: number,
-	style: PreviewStyle,
-	layout?: CardBlock[],
+	cardSkin?: string,
 	helpHint?: string,
 ): Promise<Buffer> {
 	if (!/^\d+$/.test(uid)) throw new Error("UID 必须是纯数字");
@@ -947,66 +1111,36 @@ async function renderRealDynamic(
 	const item = items[idx];
 	if (!item) throw new Error(`第 ${offset} 条动态为空`);
 
-	const generateDynamicCard = renderer.generateDynamicCard.bind(renderer) as (
-		data: Parameters<ImageRenderer["generateDynamicCard"]>[0],
-		colorOptions?: Parameters<ImageRenderer["generateDynamicCard"]>[1],
-		layout?: Parameters<ImageRenderer["generateDynamicCard"]>[2],
-		options?: { helpHint?: string },
-	) => Promise<Buffer>;
-	return generateDynamicCard(
-		item,
-		{
-			cardColorStart: style.cardColorStart,
-			cardColorEnd: style.cardColorEnd,
-		},
-		layout,
-		{ helpHint },
-	);
+	return renderer.generateDynamicCard(item, { cardSkin }, { helpHint });
 }
 
 // ── Mock pipeline (fall-through path) ────────────────────────────────────────
 
-interface PreviewSpec {
-	component: Component;
-	props: Record<string, unknown>;
-	title: string;
-	htmlWidth: number;
-}
+/**
+ * 虚构 mock 那条路要画的东西。**卡宽不在这儿** —— 它由皮肤(`card.width`)定,
+ * `renderCardWithSkin` 自己取,这里再写一个 600 就是第二个事实源。
+ */
+type PreviewSpec =
+	| { kind: "live"; props: LiveCardProps; title: string }
+	| { kind: "dynamic"; props: DynamicCardProps; title: string };
 
 function buildPreviewSpec(
 	kind: "live" | "dyn",
-	style: PreviewStyle,
-	layout?: CardLayout,
-	/** 已解析的背景图 data URL(mock SSR 路径不经 generate*,需在此注入)。 */
-	bgDataUrl?: string,
-	/** 已解析的直播封面 data URL(仅 live 卡消费,语义同上)。 */
+	/** 已解析的直播封面 data URL(mock SSR 路径不经 generate*,需在此注入;仅 live 卡消费)。 */
 	coverDataUrl?: string,
 	helpHint?: string,
 ): PreviewSpec {
-	const backgroundImage = bgDataUrl || undefined;
 	if (kind === "live") {
 		return {
-			component: LiveCard,
-			props: {
-				...buildLivePreviewProps(style),
-				layout: layout?.live,
-				backgroundImage,
-				coverOverride: coverDataUrl || undefined,
-			},
+			kind: "live",
+			props: { ...buildLivePreviewProps(), coverOverride: coverDataUrl || undefined },
 			title: "卡片预览 · 直播",
-			htmlWidth: 600,
 		};
 	}
 	return {
-		component: DynamicCard,
-		props: {
-			...buildDynamicPreviewProps(style),
-			layout: layout?.dynamic,
-			backgroundImage,
-			helpHint,
-		},
+		kind: "dynamic",
+		props: { ...buildDynamicPreviewProps(), helpHint },
 		title: "卡片预览 · 动态",
-		htmlWidth: 600,
 	};
 }
 
@@ -1022,15 +1156,8 @@ const SVG_AVATAR_BLUE =
 const SVG_AVATAR_FAN =
 	"data:image/svg+xml;utf8,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Ccircle cx='32' cy='32' r='32' fill='%23fdcb6e'/%3E%3Ctext x='50%25' y='52%25' fill='white' font-size='28' text-anchor='middle' dominant-baseline='middle'%3E粉%3C/text%3E%3C/svg%3E";
 
-function buildLivePreviewProps(style: PreviewStyle): LiveCardProps {
+function buildLivePreviewProps(): LiveCardProps {
 	return {
-		showPopularity: style.showPopularity ?? true,
-		showArea: style.showArea ?? true,
-		showFans: style.showFans ?? true,
-		cardColorStart: style.cardColorStart,
-		cardColorEnd: style.cardColorEnd,
-		glassOpacity: style.glassOpacity,
-		glassClear: style.glassClear,
 		data: {
 			user_cover: SVG_COVER,
 			keyframe: "",
@@ -1053,8 +1180,8 @@ function buildLivePreviewProps(style: PreviewStyle): LiveCardProps {
 	};
 }
 
-function buildDynamicPreviewProps(style: PreviewStyle): DynamicCardProps {
-	const body = h(
+function buildDynamicPreviewProps(): DynamicCardProps {
+	const text = h(
 		"div",
 		{
 			style: "font-size:14px;line-height:1.7;color:#444;white-space:pre-line;",
@@ -1086,7 +1213,7 @@ function buildDynamicPreviewProps(style: PreviewStyle): DynamicCardProps {
 		pubTime: "2026-05-08 10:30:00",
 		headerLabel: "投稿了视频",
 		topic: undefined,
-		body: h(
+		text: h(
 			"div",
 			{ style: "font-size:14px;line-height:1.7;color:#444;" },
 			"这是被转发的原动态正文 —— 内部也跟随同一套版式（块顺序 / 显隐 / 边距）。",
@@ -1095,17 +1222,13 @@ function buildDynamicPreviewProps(style: PreviewStyle): DynamicCardProps {
 		stats: undefined,
 	};
 	return {
-		cardColorStart: style.cardColorStart,
-		cardColorEnd: style.cardColorEnd,
-		glassOpacity: style.glassOpacity,
-		glassClear: style.glassClear,
 		node: {
 			avatarUrl: SVG_AVATAR_BLUE,
 			upName: "示例 UP 主",
 			upIsVip: true,
 			pubTime: "2026-05-09 18:24:00",
 			topic: "示例话题",
-			body,
+			text,
 			additional,
 			forward,
 			stats: { forward: "1.2万", comment: "5,891", like: "8.7万" },

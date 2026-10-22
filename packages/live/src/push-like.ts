@@ -11,7 +11,7 @@
  */
 
 import type { CommentaryCallOverride } from "@bilibili-notify/ai";
-import type { CardKind, CardLayout, MessageKindLayout } from "@bilibili-notify/internal";
+import type { CardKind, ExtraKey, MessageKindLayout } from "@bilibili-notify/internal";
 
 /** Push category enum — numeric values are the historical bilibili-notify push-type codes. */
 export enum LivePushType {
@@ -61,35 +61,22 @@ export const LIVE_ROOM_MASTER_KEYS: readonly LiveMasterFeature[] = [
 ];
 
 /**
- * 下播的两个附加项(词云 / AI 总结):像开播的 @全体,挂在下播下面,跟着下播的开关与目标走。
- * 卡片先发,它们算好后作为同一次推送的后续消息追加。
+ * 附加项的开关(ADR-0016):挂在某把主特性下面、与本体分开发的一条消息。引擎只关心下播
+ * 那两把(词云 / AI 总结)—— 卡片先发,它们算好后作为同一次推送的后续消息追加;@全体
+ * 那两把归推送层。发不发给谁也归推送层,引擎照渲照算。
  */
-export interface LiveEndExtrasLike {
-	wordcloud: boolean;
-	liveSummary: boolean;
-}
+export type PushExtrasLike = Record<ExtraKey, boolean>;
 
-/** 这位 UP 要不要采集弹幕:下播开着,且至少一个附加项开着。 */
+/** 这位 UP 要不要采集弹幕:下播开着,且下播那两个附加项至少一个开着。 */
 export function wantsLiveEndExtras(sub: SubItemView): boolean {
-	return sub.liveEnd && (sub.liveEndExtras.wordcloud || sub.liveEndExtras.liveSummary);
+	return sub.liveEnd && (sub.extras.wordcloud || sub.extras.liveSummary);
 }
 
 /** Sub-level customisation blocks copied from `@bilibili-notify/push`. */
 export interface CustomCardStyleLike {
 	enable: boolean;
-	cardColorStart?: string;
-	cardColorEnd?: string;
-	/** 玻璃片(内容层)透明度 0..1;透传给 generate* 的 colorOptions。 */
-	glassOpacity?: number;
-	/** 完全透明:内容层透明 + 无模糊;透传给 generate* 的 colorOptions。 */
-	glassClear?: boolean;
-	/** 背景图资产 id;透传给 generate* 的 colorOptions(renderer 经 resolveAsset 解析)。 */
-	backgroundImage?: string;
-	/**
-	 * 该卡片类型解析后的**完整**背景图列表(>1 张时「每次推送轮换」)。adapter 折算 per-kind
-	 * 时填入;推送点据它选下一张覆盖 `backgroundImage`。缺省 / ≤1 张 = 不轮换,用 `backgroundImage`。
-	 */
-	backgroundImages?: string[];
+	// 🪦 `backgroundImage` / `backgroundImages` 2026-09-20 随整条链删掉 —— 背景图归皮肤
+	// 自己的 `image` 旋钮(`--bn-knob-wallpaper`),不再从样式覆盖里透传。
 	/** 直播卡自定义封面资产 id(独立端专属);透传给 generateLiveCard 的 colorOptions。 */
 	liveCoverImage?: string;
 	/**
@@ -106,17 +93,14 @@ export interface CustomCardStyleLike {
 	font?: string;
 	/** 主人自带字体的资产 id(独立端专属);设了优先于 `font`,缺省回退全局。 */
 	fontAsset?: string;
-	/** 直播卡数据区:显示人气 / 点赞;透传给 generateLiveCard 的 colorOptions(缺省回退全局)。 */
-	showPopularity?: boolean;
-	/** 直播卡数据区:显示分区;透传给 generateLiveCard 的 colorOptions(缺省回退全局)。 */
-	showArea?: boolean;
-	/** 直播卡数据区:显示粉丝数据;透传给 generateLiveCard 的 colorOptions(缺省回退全局)。 */
-	showFans?: boolean;
 }
 
 /**
- * 背景图轮换选择器:给定 scopeKey 与该 kind 的完整图列表,返回本次该用的背景(并在实现内
- * 推进游标)。宿主注入(独立端有 fs 持久化游标);返回 undefined = 不轮换。
+ * 直播封面轮换选择器:给定 scopeKey(`uid:live-cover`)与完整图列表,返回本次该用的那张
+ * (并在实现内推进游标)。宿主注入(独立端有 fs 持久化游标);返回 undefined = 不轮换。
+ *
+ * 名字里的 "Background" 是历史:它从前也管卡片背景图轮换,那条链 2026-09-20 删掉了
+ * (背景图归皮肤的 `image` 旋钮),今天只剩直播封面在用。
  */
 export type PickCardBackground = (scopeKey: string, images: string[]) => string | undefined;
 
@@ -127,12 +111,21 @@ export interface CustomLiveMsgLike {
 	customLiveEnd?: string;
 }
 
-export interface CustomGuardBuyLike {
+/** 大航海三档的键,与配置 `templates.guardBuy` 同名(总督 / 提督 / 舰长)。 */
+export type GuardTierKey = "governor" | "commander" | "captain";
+
+/** 一档上舰的自定义文案 + 图片。 */
+export interface GuardTierLike {
+	template?: string;
+	imageUrl?: string;
+}
+
+/**
+ * 自定义上舰提示:三档**各自**一份文案 + 图片,room-session 按事件的 guard_level
+ * 取同一档的文案和图。`enable` 为 false 时三档都不读(走官方上舰图 / 上舰卡)。
+ */
+export interface CustomGuardBuyLike extends Partial<Record<GuardTierKey, GuardTierLike>> {
 	enable: boolean;
-	guardBuyMsg?: string;
-	captainImgUrl?: string;
-	supervisorImgUrl?: string;
-	governorImgUrl?: string;
 }
 
 export interface CustomLiveSummaryLike {
@@ -169,8 +162,8 @@ export interface SubItemView {
 	liveEnd: boolean;
 	liveGuardBuy: boolean;
 	superchat: boolean;
-	/** 见 {@link LiveEndExtrasLike}。宿主折叠 `eff.features.liveEndExtras` 后填入。 */
-	liveEndExtras: LiveEndExtrasLike;
+	/** 见 {@link PushExtrasLike}。宿主折叠 `eff.features.extras` 后整份填入。 */
+	extras: PushExtrasLike;
 	target: SubItemTargetLike;
 	customCardStyle: CustomCardStyleLike;
 	/**
@@ -212,10 +205,11 @@ export interface SubItemView {
 	 */
 	wordcloudStopWords?: string;
 	/**
-	 * 该 UP 解析后的卡片版式描述符(块顺序 / 显隐;guard 含 badgeSide)。adapter 已折算好
-	 * (per-UP 整份覆盖 ?? 全局)。各 generate* 渲染时取对应卡片的切片;undefined = 走默认版式。
+	 * 该 UP 生效的**卡片皮肤 id**(ADR-0014)。宿主折叠 `eff.cardSkin`(per-UP 指了就是它,
+	 * 否则全局)后填入;undefined = 内置默认皮肤。各 generate* 原样透传 —— 版式住皮肤包里,
+	 * 不再逐块下发。
 	 */
-	cardLayout?: CardLayout;
+	cardSkin?: string;
 	/**
 	 * 该 UP 解析后的**消息版式**直播切片(块顺序 / 显隐 / 分条符 + 分隔符)。宿主折叠
 	 * `eff.messageLayout.live` 后填入。覆盖开播 / 直播中 / 下播三类推送;SC / 上舰不受影响
@@ -236,7 +230,7 @@ export type LiveScopedChange = { scope: "live" } & Partial<
 		| "liveEnd"
 		| "liveGuardBuy"
 		| "superchat"
-		| "liveEndExtras"
+		| "extras"
 		| "uname"
 		| "roomId"
 		| "customCardStyle"
@@ -254,7 +248,7 @@ export type LiveScopedChange = { scope: "live" } & Partial<
 		| "liveEndGraceMinutes"
 		| "aiOverride"
 		| "wordcloudStopWords"
-		| "cardLayout"
+		| "cardSkin"
 		| "messageLayout"
 	>
 >;

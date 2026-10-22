@@ -12,7 +12,7 @@
 | `auth-lost` / `auth-restored` | 登录状态切换(限流通知 master) |
 | `cookies-refreshed` | 触发 cookie 持久化 |
 | `subscription-changed` | `SubscriptionStore` CRUD 后发出的 `SubscriptionOp[]` diff |
-| `config-changed` | 独立端 `ConfigStore` 写入后发出;scope ∈ `globals\|subscriptions\|targets\|adapters\|secrets`。引擎据此 reconcile cron / 刷新状态 / 重建连接 |
+| `config-changed` | 独立端 `ConfigStore` 写入后发出;scope ∈ `globals\|subscriptions\|targets\|connections\|secrets`。引擎据此 reconcile cron / 刷新状态 / 重建连接 |
 | `engine-error` | 引擎或子系统的运行时错误 `(source, message)`。`master-notifier`(→ master 私聊)+ `log` WS channel(→ AlertShell)消费 |
 | `history-recorded` | `HistoryStore.record` 建起一行(一次推送 × 一个目标,本体落地那一刻;无目标行也建)时发出的完整 `HistoryEntry`;独立端转到 `push-events` WS channel。`BilibiliPush.onSend` 每个目标一段回调 → `runtime/push-history.ts` 搬字段 → `record` |
 | `history-updated` | 同一次推送的后续消息(@全体 / 图集 / 词云 / 总结)追加到已有那一行之后发出的**合并后整行**;前端按 `id` 换缓存、小卡同 id 换字不重弹。盘上是补丁行,读时并回 |
@@ -21,6 +21,7 @@
 | `live-viewers-changed` | `room-session` 每 uid 2s 节流的 `WATCHED_CHANGE` 帧 `(uid, viewers)` |
 | `fans-refreshed` | 独立端 `FansPoller` 每个 tick 的完整 `FansRefreshEntry[]` 快照 |
 | `ready` | 业务核心完全启动 |
+| `extension-status-changed` | 某个拓展喊了 `ctx.statusChanged()`(桥:一条接入连上 / 断开)。载荷只有拓展 id;独立端转成 `state` WS channel 的 `extension-changed` 帧,面板按 id 失效 `/api/ext/<id>/status` 与 bot 名单的缓存后自己重取 —— 数据本身不上 bus |
 
 ## MessageBus 语义
 
@@ -32,12 +33,15 @@
 
 信封:`{ type: <channel>, event: <name>, data: <args> }`。单参事件 unwrap 成参数本身;多参事件序列化成 tuple。
 
+`resources` 是唯一一条**按订阅开关采样**的:订阅那一刻发一帧 `hydrate`(静态量 + 近 5 分钟缓冲),之后每 tick 一帧 `sample`;名册空了服务端就摘掉采样监听(浏览器子树那一项要起子进程)。前端相应地有 `unsubscribeChannels`,别的频道整个会话都开着、不用它。
+
 | Channel | 来源 | 前端消费者 |
 |---|---|---|
 | `auth` | `login-status-report` | `useAuthChannel` → 扫码 / 登录状态 |
 | `push-events` | `history-recorded` / `history-updated` / `live-state-changed` / `live-viewers-changed` / `fans-refreshed` | `usePushEventsChannel` → tanstack-query `setQueryData` 补丁(recorded 头插 + 日桶 +1,无目标行不计;updated 按 id 换行、不插) |
 | `log` | `engine-error` + 每条 `logger.<level>`(在单一 fan-out 点脱敏,同时归档进 LogStore jsonl) | `useAlertChannel`(engine-error → AlertShell)+ `useLogChannel`(全量流 → Logs tab) |
-| `state` | 运行时健康快照 | `useStateChannel` |
+| `state` | `hydrate`(订阅 / 重连时)+ `config-changed`(只带 scope)+ `extension-changed`(只带拓展 id) | `useStateChannel` → 按 scope / 按拓展 id invalidate tanstack-query 缓存 |
+| `resources` | `ResourceMonitor` 每 2 秒一份系统资源样本(宿主机 / 本体 / 浏览器子树) | `useResourcesChannel` → 概览页「系统资源」卡 |
 
 ## 推送历史的行模型
 

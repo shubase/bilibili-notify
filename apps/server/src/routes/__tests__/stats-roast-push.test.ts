@@ -41,7 +41,9 @@ interface StubOpts {
 	renderThrows?: boolean;
 	/** 让投递失败。 */
 	sendFails?: boolean;
-	targets?: Array<{ id: string; enabled?: boolean; adapterId?: string }>;
+	targets?: Array<{ id: string; enabled?: boolean; connectionId?: string }>;
+	/** 全局在用的卡片皮肤。 */
+	cardSkin?: string;
 }
 
 const ADAPTER = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
@@ -52,11 +54,13 @@ function makeDeps(opts: StubOpts = {}) {
 		latencyMs: 1,
 		err: opts.sendFails ? "目标不可达" : undefined,
 	}));
-	const generateRoastBoardCard = vi.fn(async () => {
+	// 变参签名照抄真身:写成零参的话 `mock.calls[0][1]` 在类型上是「长度 0 的元组」,
+	// 断言第二个参数(皮肤 id)根本编译不过。
+	const generateRoastBoardCard = vi.fn(async (..._args: unknown[]) => {
 		if (opts.renderThrows) throw new Error("Chrome 崩了");
 		return Buffer.from("BOARD-PNG");
 	});
-	const generateRoastSoloCard = vi.fn(async () => {
+	const generateRoastSoloCard = vi.fn(async (..._args: unknown[]) => {
 		if (opts.renderThrows) throw new Error("Chrome 崩了");
 		return Buffer.from("SOLO-PNG");
 	});
@@ -76,17 +80,18 @@ function makeDeps(opts: StubOpts = {}) {
 				defaults: {
 					ai: { enabled: true },
 					cardStyle: { enabled: opts.cardStyleEnabled ?? true },
+					cardSkin: opts.cardSkin ?? "default",
 				},
 			}),
-			// 投递前会看目标与适配器是不是停用了(停用 = 跳过),所以夹具里的目标得像真的一样
-			// 带着 enabled 与 adapterId,不然全被当成停用、一条都发不出去。
+			// 投递前会看目标与连接是不是停用了(停用 = 跳过),所以夹具里的目标得像真的一样
+			// 带着 enabled 与 connectionId,不然全被当成停用、一条都发不出去。
 			getTargets: () =>
 				(opts.targets ?? [{ id: "11111111-1111-4111-8111-111111111111" }]).map((t) => ({
 					enabled: true,
-					adapterId: ADAPTER,
+					connectionId: ADAPTER,
 					...t,
 				})),
-			getAdapters: () => [{ id: ADAPTER, enabled: true }],
+			getConnections: () => [{ id: ADAPTER, enabled: true }],
 		},
 		runtime: {
 			engines: {
@@ -121,6 +126,16 @@ const boardBody = (over: Record<string, unknown> = {}) => ({
 });
 
 describe("POST /roast/push — 图片优先", () => {
+	it("targetId 不是 uuid → 400,与 /api/push、/api/cards、/api/ai 同一把尺子", async () => {
+		// PushTarget.id 本来就是 z.uuid();这里曾是 z.string().min(1),于是同一个
+		// 「目标 id」在四个端点上有两套校验,松的那个把错 id 一路带到投递层才失败。
+		const { deps, sendToTarget } = makeDeps();
+		const res = await push(createStatsRoute(deps), boardBody({ targetId: "not-a-uuid" }));
+
+		expect(res.status).toBe(400);
+		expect(sendToTarget).not.toHaveBeenCalled();
+	});
+
 	it("图片渲染开着时推图片,并把周报文本一起带上作图说明", async () => {
 		// caption 不是可有可无的装饰:图挂了 / 客户端不展图时,那段文字是唯一还能读的东西。
 		const { deps, sendToTarget } = makeDeps();
@@ -133,6 +148,20 @@ describe("POST /roast/push — 图片优先", () => {
 		expect(payload.kind).toBe("image");
 		expect(payload.image.buffer.toString()).toBe("BOARD-PNG");
 		expect(payload.caption).toBe("本周鸽王诞生 🕊️");
+	});
+
+	// 锐评卡与词云卡同源:不属于任何单个 UP,吃全局那套皮肤(ADR-0014 决策 3)。
+	// 不传的话渲染器退回内置默认皮肤,主人换了皮肤只有周报卡还是老样子。
+	it("榜单与单人锐评都带上全局在用的那套皮肤", async () => {
+		const { deps, generateRoastBoardCard, generateRoastSoloCard } = makeDeps({
+			cardSkin: "k3ccc-beefbeef",
+		});
+		const app = createStatsRoute(deps);
+		await push(app, { targetId: TARGET, kind: "board", days: 7, result: BOARD });
+		await push(app, { targetId: TARGET, kind: "solo", days: 7, result: SOLO });
+		// 验红:把 roast-deliver.ts 里那两个 `{ cardSkin }` 删掉,这两条红。
+		expect(generateRoastBoardCard.mock.calls[0]?.[1]).toEqual({ cardSkin: "k3ccc-beefbeef" });
+		expect(generateRoastSoloCard.mock.calls[0]?.[1]).toEqual({ cardSkin: "k3ccc-beefbeef" });
 	});
 
 	it("单人锐评走单人卡,不是榜单卡", async () => {

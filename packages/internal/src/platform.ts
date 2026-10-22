@@ -58,6 +58,11 @@ export interface BiliEvents {
 	ready: () => void;
 	"config-changed": (scope: ConfigScope) => void;
 	/**
+	 * 某个拓展喊了「面板数据变了」(`ctx.statusChanged`)。载荷只有拓展 id:面板按 id 失效
+	 * `/api/ext/<id>/status` 与 bot 名单的缓存、自己去取,数据本身不上 bus。
+	 */
+	"extension-status-changed": (id: string) => void;
+	/**
 	 * 历史仓建起一行(一次推送 × 一个目标,本体落地那一刻)后立刻 emit。
 	 * 载荷是完整 entry,WS push-events 直接转发给前端做 toast/通知,
 	 * 无需前端再二次 fetch detail。
@@ -141,7 +146,7 @@ export interface FansRefreshEntry {
 }
 
 /** ConfigStore 在 set 后 emit 'config-changed' 时携带的范围标识。 */
-export type ConfigScope = "globals" | "subscriptions" | "adapters" | "targets" | "secrets";
+export type ConfigScope = "globals" | "subscriptions" | "connections" | "targets" | "secrets";
 
 /** 用于 'login-status-report' 事件 / Dashboard auth channel；具体 schema 在 packages/api。 */
 export interface LoginSnapshot {
@@ -162,13 +167,16 @@ export type PayloadSegment =
 	| { type: "image"; buffer: Buffer; mime: string }
 	| { type: "link"; href: string; title?: string }
 	/**
-	 * @全体成员 段。仅出现在 composite payload 中,由 BilibiliPush.broadcastToFeature
-	 * 在 per-target 时按 sub.atAll[feature] 判断是否前置。各 platform adapter 自行翻译:
+	 * @全体成员 段。各 platform adapter 自行翻译:
 	 * - OneBot v11: `{ type: "at", data: { qq: "all" } }`(真实 @ 全体)
 	 * - Webhook: JSON 序列化时保留 `{ type: "at-all" }`,由接收方自行处理
 	 * - Web Dashboard: 渲染成可视化 "@全体" 文本(非真实 @)
 	 *
-	 * 不会作为单独 payload kind 出现 —— @ 永远是 dynamic/live 推送的"修饰",不能单独发。
+	 * **它是一条自己的消息,不是本体的修饰**(ADR-0016):`BilibiliPush` 把这一段单独包成
+	 * 一条 composite payload,排在本体之前发出,落历史时 `role: "extra"` —— 与下播的词云 /
+	 * AI 总结同类,都是挂在某把主特性下面的附加项。发不发由「全局 + per-UP 合并后的
+	 * `features.extras.atAll<Scope>`」定,某个目标要不要另说则看订阅上的三态表
+	 * `extras.atAll<Scope>[targetId]`。
 	 */
 	| { type: "at-all" };
 
@@ -232,7 +240,7 @@ export interface NotificationSink {
 	/** 允许 adapter 通过 id 查目标的元数据（platform / scope / 启停状态）。 */
 	resolve(targetId: string): PushTarget | undefined;
 	/**
-	 * 配置层面能不能推:目标存在、目标启用、所属适配器启用。停用的目标不是候选 ——
+	 * 配置层面能不能推:目标存在、目标启用、所属连接启用。停用的目标不是候选 ——
 	 * 推送层既不发也不等它「恢复可达」。与 {@link isAvailable} 分开:那是运行时的健康。
 	 */
 	isEnabled(targetId: string): boolean;
@@ -262,7 +270,7 @@ export function isReachabilityEvidence(result: DeliveryResult): boolean {
 }
 
 /**
- * 一个适配器能不能发 QQ 小程序卡。认接口不认实现名:拿空参数探 OneBot 扩展接口
+ * 一条连接上的一个平台能不能发 QQ 小程序卡。认接口不认实现名:拿空参数探 OneBot 扩展接口
  * `get_mini_app_ark`,按 OneBot 11 的 retcode 判 —— 1404「不支持的动作」= 不支持,
  * 1400「参数错」= 接口在、支持;别的(连不上、别的错)= 还没探出来,带原因。
  * 面板上就是这三态;发送失败不翻它,只有再收到 1404 才翻成不支持。
@@ -272,7 +280,7 @@ export type MiniAppCardSupport =
 	| { state: "unsupported"; reason: string; checkedAt: number }
 	| { state: "unknown"; reason?: string };
 
-/** 适配器的平台能力快照。今天只有一项;将来薄插件接进来时按需加。 */
-export interface AdapterCapabilities {
+/** 一个平台的能力快照。今天只有一项;将来薄插件接进来时按需加。 */
+export interface ConnectionCapabilities {
 	miniAppCard: MiniAppCardSupport;
 }

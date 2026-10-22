@@ -1,5 +1,6 @@
 import type { UpdateStatusDTO } from "@bilibili-notify/contract";
 import { describe, expect, it, vi } from "vite-plus/test";
+import { createAdapterRegistry } from "../../platforms/registry.js";
 import { createNodeMessageBus } from "../../runtime/message-bus.js";
 import type { UpdateService } from "../../update/service.js";
 import { createDevtools } from "../index.js";
@@ -26,14 +27,17 @@ const updateService: UpdateService = {
 
 const BARE = {
 	updateService,
-	adapters: [],
+	adapters: createAdapterRegistry(),
 	historyStore: { deleteRange: async () => 0 },
 	api: {} as never,
 	subs: () => [],
 	dynamic: () => undefined,
 	inbound: () => undefined,
 	commands: () => ({ prefix: "/" }),
-	adapterConfigs: () => [],
+	connectionConfigs: () => [],
+	globals: () => ({ extensions: {} }),
+	// 还没起监听 —— 假桥那条场景据此说「等一下再按」,而不是去连一个 undefined。
+	address: () => undefined,
 	targets: () => [],
 	bus: createNodeMessageBus(),
 	authSystem: { status: () => ({ status: 5, msg: "" }) } as never,
@@ -42,6 +46,9 @@ const BARE = {
 	mute: () => undefined,
 	fansPoller: () => undefined,
 	loginFlow: () => undefined,
+	// 仓里那个目录在测试里指向一个不存在的路径 → 拓展那三条场景没有可选项,不注册。
+	// 它们自己的规矩在 `devtools-extensions.test.ts` 里钉。
+	extensions: { repoDir: "/nope/extensions", installRoot: "/nope/data", loaded: () => undefined },
 	sourceRun: true,
 };
 
@@ -78,7 +85,7 @@ describe("createDevtools", () => {
 
 describe("createDevtools · 截流接线", () => {
 	const ADAPTER = { id: "ad", name: "A", platform: "onebot", enabled: true } as never;
-	const TARGET = { id: "t", name: "群", adapterId: "ad", platform: "onebot" } as never;
+	const TARGET = { id: "t", name: "群", connectionId: "ad", platform: "onebot" } as never;
 
 	function setup() {
 		const send = vi.fn(async () => ({ ok: true, latencyMs: 1 }));
@@ -92,16 +99,51 @@ describe("createDevtools · 截流接线", () => {
 		const dev = createDevtools({
 			...BARE,
 			payloadVersion: "0.0.0-dev",
-			adapters: [inner],
+			adapters: createAdapterRegistry([inner]),
 			historyStore: { deleteRange } as never,
 		});
 		if (dev === null) throw new Error("unreachable");
 		return { dev, send, deleteRange };
 	}
 
+	/**
+	 * 🔴 交回去的是**视图**不是拷贝。
+	 *
+	 * 拷一份的话,拓展后注册进来的出口在开发版里根本不存在 —— 而生产是好的。那是
+	 * 「本地一跑就不生效、两边都不报错」那类假绿(ADR-0012 决策 29 拿它否掉了
+	 * 「传同一个可变数组」那个方案)。
+	 */
+	it("createDevtools 之后**才注册**的出口,照样看得见、照样是包过闸的", async () => {
+		const send = vi.fn(async () => ({ ok: true, latencyMs: 1 }));
+		const registry = createAdapterRegistry();
+		const dev = createDevtools({
+			...BARE,
+			payloadVersion: "0.0.0-dev",
+			adapters: registry,
+			historyStore: { deleteRange: vi.fn(async () => 0) } as never,
+		});
+		if (dev === null) throw new Error("unreachable");
+		expect(dev.adapters.list()).toEqual([]);
+
+		// 拓展在 activate 里注册的那一刻 —— 比 devtools 晚得多。
+		registry.register({
+			platforms: ["bridge"] as const,
+			isAvailable: () => true,
+			send,
+			probe: async () => ({ ok: true, latencyMs: 1 }),
+		} as never);
+
+		const [wrapped] = dev.adapters.list();
+		if (!wrapped) throw new Error("后注册的出口在 devtools 那份里不见了");
+		// 包过闸:截流开着就不真发。
+		await dev.registry.run("push.capture", {});
+		await wrapped.send(ADAPTER, TARGET, { kind: "text", text: "1" });
+		expect(send).not.toHaveBeenCalled();
+	});
+
 	it("交回去的 adapters 是包过闸的:跑 push.capture 之后不再真发,收摊后又真发", async () => {
 		const { dev, send } = setup();
-		const [wrapped] = dev.adapters;
+		const [wrapped] = dev.adapters.list();
 		if (!wrapped) throw new Error("unreachable");
 
 		await wrapped.send(ADAPTER, TARGET, { kind: "text", text: "1" });

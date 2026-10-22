@@ -40,9 +40,8 @@ export type FieldSection =
 	| "specialUsers"
 	| "imageGroup"
 	| "target"
-	| "adapter"
+	| "connection"
 	| "transport"
-	| "session"
 	| "logging"
 	| "linkParsing";
 
@@ -90,18 +89,8 @@ export const FIELD_LABELS = {
 		hint: "留「跟随全局」即用 app.logLevel；保存后会立即推到对应模块的 pino 实例,无需重启",
 		section: "logging",
 	},
-	"app.logLevels.ai": {
-		label: "日志等级",
-		hint: "只影响 ai 模块;选「跟随全局」时与 app.logLevel 同步。保存后立即生效,无需重启。",
-		section: "logging",
-	},
-	"app.logLevels.image": {
-		label: "日志等级",
-		hint: "只影响 image 模块;选「跟随全局」时与 app.logLevel 同步。保存后立即生效,无需重启。",
-		section: "logging",
-	},
-	// 以下 3 条仅作 diff-path entry 用(System 页 SYSTEM_MODULES 改 core/dynamic/live
-	// 时 walkTreeDiff 会输出对应 dot-path,跳转锚点回到包裹整组的 <Field code="app.logLevels">)。
+	// 以下 5 条仅作 diff-path entry 用(System 页 SYSTEM_MODULES 改某一格时 walkTreeDiff
+	// 会输出对应 dot-path,跳转锚点回到包裹整组的 <Field code="app.logLevels">)。
 	"app.logLevels.core": {
 		label: "日志等级",
 		hint: "只影响 core 模块",
@@ -117,6 +106,16 @@ export const FIELD_LABELS = {
 		hint: "只影响 live 模块",
 		section: "logging",
 	},
+	"app.logLevels.image": {
+		label: "日志等级",
+		hint: "只影响 image 模块",
+		section: "logging",
+	},
+	"app.logLevels.ai": {
+		label: "日志等级",
+		hint: "只影响 ai 模块",
+		section: "logging",
+	},
 	"app.userAgent": {
 		label: "User-Agent",
 		hint: "留空使用默认;遇 -352 风控可换",
@@ -130,6 +129,11 @@ export const FIELD_LABELS = {
 	"app.historyRetentionDays": {
 		label: "历史保留天数",
 		hint: "到期的 jsonl 日志会被清理",
+		section: "logging",
+	},
+	"app.memoryLog": {
+		label: "内存自检打印",
+		hint: "每 10 分钟往日志写一行 [mem](堆用量 / 上限 / RSS / 弹幕规模),给排泄漏留曲线;概览页的系统资源卡不靠它。堆逼近上限的警告始终会响",
 		section: "logging",
 	},
 
@@ -444,8 +448,6 @@ export const FIELD_LABELS = {
 	},
 
 	// ── 卡片样式 ──────────────────────────────────────────────────────────
-	cardColorStart: { label: "渐变起始", section: "cardStyle" },
-	cardColorEnd: { label: "渐变结束", section: "cardStyle" },
 	font: {
 		label: "字体",
 		hint: "字体家族名。渲染那台机器没装这个字体时自动回退到内置兜底链(Microsoft YaHei / Noto Sans CJK / sans-serif)。想用别的字体就把文件传上来。",
@@ -456,19 +458,15 @@ export const FIELD_LABELS = {
 		hint: "主人上传的字体文件。设了就优先于字体家族名;文件被删掉时静静回退,不会让出图崩。",
 		section: "cardStyle",
 	},
-	showPopularity: { label: "人气 / 点赞", section: "cardStyle" },
-	showArea: { label: "直播分区", section: "cardStyle" },
-	showFans: { label: "粉丝数据", section: "cardStyle" },
-	glassOpacity: { label: "玻璃片透明度", section: "cardStyle" },
-	glassClear: { label: "完全透明", section: "cardStyle" },
-	backgroundImages: { label: "自定义背景图", section: "cardStyle" },
 	liveCoverImages: { label: "直播封面替换", section: "cardStyle" },
-	// 卡片版式(灵动岛 diff 码 —— walkTreeDiff 把每张卡的块数组当叶子整体比较)。
-	"cardLayout.live": { label: "直播卡版式", section: "cardStyle" },
-	"cardLayout.dynamic": { label: "动态卡版式", section: "cardStyle" },
-	"cardLayout.sc": { label: "SC 卡版式", section: "cardStyle" },
-	"cardLayout.guard.badgeSide": { label: "上舰卡徽章位置", section: "cardStyle" },
-	"cardLayout.guard.blocks": { label: "上舰卡版式", section: "cardStyle" },
+	// 卡片皮肤(ADR-0014):整套外观住皮肤包里,旧的一维版式编辑器已退役。全局那一档
+	// 由皮肤库当场启用(PUT /api/card-skins/active),不走草稿;这个 code 只给 per-UP
+	// 的「这个 UP 用哪套」——「跟随全局」= 把 overrides.cardSkin 整个键清掉。
+	cardSkin: {
+		label: "卡片皮肤",
+		hint: "这个 UP 的推送卡用哪套皮肤;不选就跟随全局。想单独改排版,先在皮肤库「复制一份」再改。",
+		section: "cardStyle",
+	},
 
 	// ── 卡片预览(Cards 页样本数据,不真正写回 globals) ───────────────────
 	roomId: {
@@ -630,15 +628,10 @@ export const FIELD_LABELS = {
 		section: "target",
 	},
 
-	// ── Targets(推送目标 / 适配器 / 传输 / 会话) ────────────────────────
-	"adapter.platform": { label: "平台", section: "adapter" },
-	"adapter.name": { label: "显示名称", section: "adapter" },
-	"adapter.enabled": { label: "启用", section: "adapter" },
-	"config.provider": {
-		label: "Webhook 协议",
-		hint: "Generic 保持旧 JSON envelope；钉钉/飞书按平台机器人协议发送文本消息",
-		section: "transport",
-	},
+	// ── Targets(推送目标 / 连接 / 传输 / 会话) ────────────────────────
+	"connection.platform": { label: "平台", section: "connection" },
+	"connection.name": { label: "显示名称", section: "connection" },
+	"connection.enabled": { label: "启用", section: "connection" },
 	"config.transport": { label: "连接方式", section: "transport" },
 	"config.baseUrl": { label: "HTTP baseUrl", section: "transport" },
 	"config.url": { label: "URL", section: "transport" },
@@ -680,7 +673,7 @@ export const FIELD_LABELS = {
 		section: "transport",
 		secret: true,
 	},
-	// QQ 官方机器人(q.qq.com)适配器凭据
+	// QQ 官方机器人(q.qq.com)连接凭据
 	"config.appId": {
 		label: "AppID",
 		hint: "QQ 开放平台机器人的 AppID(明文存储)",
@@ -710,18 +703,16 @@ export const FIELD_LABELS = {
 	"target.name": { label: "显示名称", section: "target" },
 	"target.scope": { label: "作用域", section: "target" },
 	"target.enabled": { label: "启用", section: "target" },
-	"session.userId": { label: "QQ 号 (userId)", section: "session" },
-	"session.groupId": { label: "群号 (groupId)", section: "session" },
-	"session.allowMemberManage": {
+	// 地址这一格原先是每平台一套 session 字段(session.groupId / session.groupOpenid / …),
+	// 六个词条对着六个字段名。收成一格之后只剩这两条 —— 界面上叫什么由 scope 决定,
+	// 但差异摘要里不该逐 scope 换名字(同一格改了就是改了)。
+	"target.address": { label: "会话地址", section: "target" },
+	"target.parentAddress": { label: "上级容器 ID", section: "target" },
+	"target.allowMemberManage": {
 		label: "普通成员可管理本群订阅",
-		hint: "关闭时只有群主、管理员和主人能执行 bili订阅 / bili取消；bili清空 仅主人可用。",
-		section: "session",
+		hint: "开启后，普通群成员也可以使用 bili订阅、bili取消 等群聊命令。",
+		section: "target",
 	},
-	// QQ 官方机器人会话寻址(按 scope)
-	"session.guildId": { label: "频道服务器 ID (guildId)", section: "session" },
-	"session.channelId": { label: "子频道 ID (channelId)", section: "session" },
-	"session.groupOpenid": { label: "群 openid (groupOpenid)", section: "session" },
-	"session.userOpenid": { label: "用户 openid (C2C)", section: "session" },
 
 	// ── 定时周报(roastSchedule.*) ─────────────────────────────────────────
 	// 周期与统计范围是**解耦**的两个字段:cron 定何时发,days 定统计多少天。

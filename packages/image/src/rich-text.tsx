@@ -1,4 +1,14 @@
 /** @jsxImportSource vue */
+
+/**
+ * 动态正文的富文本渲染。
+ *
+ * 这两个根 div 是卡片皮肤 `dynamic.content` 的 `body` 挂点(ADR-0014 决策 9)所在:
+ * content 块里的 `{node.body}` 是 VNode 插槽,**不给它包一层壳**(包了就往输出里塞一个
+ * 今天没有的元素),挂点因此下沉到正文自己的根元素上。普通正文与专栏各有一个根,两个都挂。
+ */
+
+import { escapeHtml } from "./html-escape";
 import { SVG_LOTTERY_INLINE, SVG_VIDEO_INLINE } from "./icons";
 import type { RichTextNode } from "./types";
 
@@ -14,18 +24,6 @@ const TYPE_LOTTERY = "RICH_TEXT_NODE_TYPE_LOTTERY";
 const TYPE_VOTE = "RICH_TEXT_NODE_TYPE_VOTE";
 const TYPE_OGV_SEASON = "RICH_TEXT_NODE_TYPE_OGV_SEASON";
 const TYPE_OGV_EP = "RICH_TEXT_NODE_TYPE_OGV_EP";
-
-/**
- * HTML 转义 —— 同时安全用于文本内容与双引号属性值上下文。
- * 对齐 SCCard 的转义策略;`"` 一并转义以覆盖 `src="…"` 属性场景。
- */
-function escapeHtml(s: string): string {
-	return s
-		.replace(/&/g, "&amp;")
-		.replace(/</g, "&lt;")
-		.replace(/>/g, "&gt;")
-		.replace(/"/g, "&quot;");
-}
 
 export function parseRichText(rt: RichTextNode, title?: string, isArticle = false) {
 	if (isArticle) {
@@ -89,7 +87,7 @@ export function parseRichText(rt: RichTextNode, title?: string, isArticle = fals
 	}
 
 	return (
-		<div class="text-[16px] text-[#18191C] leading-[1.6] break-words">
+		<div data-bn="body" class="text-[16px] text-[#18191C] leading-[1.6] break-words">
 			{title && <h1 class="text-[18px] font-bold mb-2">{title}</h1>}
 			{segs.map((seg, i) => {
 				if (seg.kind === "emoji")
@@ -160,7 +158,16 @@ function parseRichTextArticle(rt: RichTextNode, title?: string) {
 		displayHtml = rawHtml.replace(/\n/g, "<br><br>");
 	}
 
-	const fullHtml = `${title ? `<h1 style="font-size:18px;font-weight:bold;margin-bottom:8px">${escapeHtml(title)}</h1>` : ""}${displayHtml}${truncated ? '<span style="color:#999">...（全文过长，已省略）</span>' : ""}`;
+	// 标题与「已省略」那行走 **class 不走 inline**:这段是拼进 `innerHTML` 的,而 inline
+	// 皮肤永远压不过(清洗器一律摘 `!important`)。同一句灰字在上面非专栏那条路本来就是
+	// `text-[#999]`,两条路的可染性不该差一截。
+	const fullHtml = `${title ? `<h1 class="text-[18px] font-bold mb-[8px]">${escapeHtml(title)}</h1>` : ""}${displayHtml}${truncated ? '<span class="text-[#999]">...（全文过长，已省略）</span>' : ""}`;
 
-	return <div class="text-[15px] text-[#18191C] leading-[1.6] break-words" innerHTML={fullHtml} />;
+	return (
+		<div
+			data-bn="body"
+			class="text-[15px] text-[#18191C] leading-[1.6] break-words"
+			innerHTML={fullHtml}
+		/>
+	);
 }

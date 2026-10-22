@@ -2,7 +2,7 @@
 
 主人在 IM 私聊里敲的那套指令:入站链路、指令表、参数模型、可配置项;末尾另有**链接解析**(群里贴视频链接自动出卡片 —— 挂在同一条入站帧上,但**不是指令**)。CLAUDE.md 的渐进式披露目标之一。
 
-**只覆盖独立端。** 将来薄适配插件把宿主(Koishi / AstrBot)桥接进来时,宿主自带的指令系统不在此列、也不强行统一。
+**只覆盖独立端自己这套。** 桥驮上来的 bot(`extensions/bridge/`)**走的是同一条链路** —— 归一化在拓展那一侧做完,交进来时已经是下面那两个形状,所以指令对它们照样生效。宿主框架(Koishi / AstrBot)自带的指令系统不在此列、也不强行统一。
 
 ## 三条约束
 
@@ -10,7 +10,7 @@
 
 1. **这条私聊同时是主人正常说话的地方。** 它不是一个专用的命令行终端 —— 任何「对认不出的输入给回音」的设计都会让主人没法在这儿好好聊天。
 2. **通道对面是 B 站账号与推送控制权。** 任何回音都是接口指纹,试探者靠报错差异就能摸出指令表。
-3. **只有 onebot / qq-official 收得到回复**(`INBOUND_CAPABLE_PLATFORMS`)。webhook 天生没有回程。所以指令是**增量入口,不是 Dashboard 的替代** —— 每个能力在网页上都得有一份。
+3. **不是每条连接都有回程。** 直连里只有 onebot / qq-official 收得到回复(`INBOUND_CAPABLE_PLATFORMS`),webhook 天生没有;桥那条**不经过这张表** —— 收不收得到由桥**逐 bot** 报的 `inbound` 能力位回答(⚠️ 别把那张表开成 string 来「顺便支持桥」,它问的是「**直连**的这个平台」,`inbound-capability.test.ts` 拿 `"someday-telegram"` 钉着这道守卫:没实现入站的平台一律判 false)。所以指令是**增量入口,不是 Dashboard 的替代** —— 每个能力在网页上都得有一份。
 
 ## 模块清单
 
@@ -18,7 +18,7 @@
 
 | 文件 | 角色 |
 |---|---|
-| `platforms/types.ts` / `platforms/onebot-inbound.ts` | 入站消息的平台中立形状 `InboundPrivateMessage{userId,text}` / `InboundGroupMessage{groupId,userId,selfId?,text,cardLinks}` 住在 `types.ts`;**归一化在 adapter 里做**:OneBot 帧由 `onebot-inbound.ts` 的 `extractPrivateMessage` / `extractGroupMessage` 解析(`routeInboundFrame` 一帧至多进一路),官机由 `qq-official.ts` 的 `extractQQPrivateMessage` / `extractQQGroupMessage` 解析;两个 adapter 交出同一个形状,消费者不碰原始帧 |
+| `packages/internal/src/push-source.ts` / `platforms/onebot-inbound.ts` | 入站消息的平台中立形状 `InboundPrivateMessage{userId,text}` / `InboundGroupMessage{groupId,userId,selfId?,text,cardLinks}` 住在 **internal 的推送源契约**里(核心与拓展都要认得它,所以在公共包);**归一化在各自那一侧做**:OneBot 帧由 `onebot-inbound.ts` 的 `extractPrivateMessage` / `extractGroupMessage` 解析(`routeInboundFrame` 一帧至多进一路),官机由 `qq-official.ts` 的 `extractQQPrivateMessage` / `extractQQGroupMessage` 解析,桥由 `extensions/bridge/src/inbound.ts` 解析后经 `ctx.inbound` 喂回来;三条路交出同一个形状,消费者不碰原始帧 |
 | `command-dispatcher.ts` | 鉴权、四道门、路由、触发词查重(`effectiveAliases` / `command()` 注册助手) |
 | `command-params.ts` | 签名解析 `parseSignature` + 入参解析 `parseArgs` + 从签名推 handler 入参类型的 `Values<S>` |
 | `command-help.ts` | `renderUsage` / `renderHelp` —— 纯函数,私聊帮助与面板卡片共用 |
@@ -35,8 +35,9 @@
 ## 入站链路
 
 ```
-平台事件帧
-    ↓  adapter 归一化(OneBot: onebot-inbound.ts;官机: qq-official.ts)—— 平台差异到此为止
+平台事件帧 / 桥的 inbound 帧
+    ↓  归一化(直连: onebot-inbound.ts / qq-official.ts;桥: extensions/bridge/src/inbound.ts
+    ↓            → ctx.inbound,宿主校验「这条连接是不是它的」)—— 平台差异到此为止
 InboundPrivateMessage {userId, text}
     ↓
 ┌─────────────────────────────────────────────────┐
@@ -71,7 +72,7 @@ InboundPrivateMessage {userId, text}
 - **总开关排在确认流之后** —— 「关掉 = 整条链路只剩确认流」。一起关掉的话,主人关一下指令,手里那份等审批的周报就再也批不掉了。
 - **前缀闸排在路由之前** —— 不带前缀的一律当聊天,连「没有这条指令」都不说。
 
-只有一个入口 `handleMessage(msg)`:两个 adapter 都在自己那层把帧归一化成同一个形状再交过来。曾经 OneBot 走 `handle(frame)` 在指令层解析、官机走 `handleMessage`,两条路各写一份鉴权迟早有一边把「不是主人也放行」写漏 —— 现在鉴权与路由只有一处。
+只有一个入口 `handleMessage(msg)`:每条来路都在自己那层把帧归一化成同一个形状再交过来。曾经 OneBot 走 `handle(frame)` 在指令层解析、官机走 `handleMessage`,两条路各写一份鉴权迟早有一边把「不是主人也放行」写漏 —— 现在鉴权与路由只有一处。这也是桥能白接进来的原因:它多的那一层只是**归属校验**(`ctx.inbound` 上,宿主判这条 `connectionId` 是不是那个拓展自己的),鉴权那道门一个字没动。
 
 ## 指令表
 
@@ -256,14 +257,14 @@ interface ConfirmationWindow {
 
 - **默认关**(`globals.linkParsing.enabled`),系统页「链接解析」卡是唯一开关。开着就意味着同群任何人都能让机器人出图,这得是主人自己按的。
 - **只做群**,OneBot(ws / ws-reverse)与 qq-official 都收。私聊里贴链接不理;http 形态的 OneBot 没有入站。官机那头:群主在群设置里给机器人的消息范围有三档(全部消息 / @ 及其前 10 条 / 仅 @),「全部消息」以 `GROUP_MESSAGE_CREATE` 下发、@ 的走 `GROUP_AT_MESSAGE_CREATE`,两种事件网关都交出来(`onInboundGroup`,与 C2C 私聊分开);我们这边收到什么解析什么,不做「要不要 @」的设置 —— 那是 QQ 那边的开关。官机现已无主动消息限制(2026-09-02 主人告知),回复直接走现成的「上传图片 → 发群消息」路径,不用被动回复的 `msg_id`。
-- **在哪些群、回什么 = 一张表**(`globals.linkParsing.defaults` + `groups`,2026-09-05 定,取代 09-04 的 `scope` + `targets` 白名单;老形状读时按形迁移:`all` → 默认解析开,`selected` → 默认关 + 列出的群显式开):**默认行**是所有群解不解析(`parse`)、回什么(`form`:`image` 图片卡 / `miniapp` 小程序卡,**只有这两档**,主人砍掉了「两个都发」);**逐群例外**按推送目标 id 索引,只存显式写了的字段,没写的跟默认行(`linkParsingFor(config, targetId)` 折叠)。「所有群」不是一种模式,它就是默认行;想只在某几群解析 = 默认关 + 那几群显式开。主人嫌「解析 / 形式」两条轴各配一套「所有群 / 指定群」四种形态混乱,收成一张表,说「像 per-UP」。`runtime/link-scope.ts` 的 `resolveLinkParsingPolicies` 把配置 + 目标表 + 适配器表算成 `平台:adapterId:群地址 → {parse, form}` 的表:只认群类目标,**停用的目标或停用 / 不存在的适配器一律不解析**(internal 的 `isTargetPaused`,默认行开着、例外显式开着都压不过 —— 与周报发送时的「跳过」同一条判定,主人定的「停用」两处同义),悬空 id 静默忽略,不是推送目标的群跟默认行,同一群配成两个目标先出现的说了算。表是 engines 里随 `globals` / `targets` / `adapters` 三种 config-changed 重算的快照(`engines.linkPolicyFor(key)`),解析器每条消息只查一次;判定排在总开关之后、渲染器与记账之前,不解析的群不记冷却。面板是系统页链接解析卡(`components/link-parsing-settings.tsx`):默认行两个段选 + 逐群表(列全部收得到入站的群目标,每群两格三态「跟默认 / 显式值」,跟默认时把继承值写在旁边;「跟默认」发的是删除哨兵 `null`,不是把默认值抄进例外;停用的照列标「已停用」—— 判定与运行时同一份,适配器停用的目标也标)。回到来源群不查目标表:adapter 交消息时附上自己的 `adapterId`(两端都是 `onInboundGroup(msg, {adapterId})`),接线层补上平台名、拿 id 找到配置里的 adapter,按平台造一个临时的 group target(session 由 internal 的 `groupSessionFor` 出,与读地址的 `groupAddressOf` 互为反函数)直接 `send`。唯一入口是 `createLinkParser.handleMessage`。
-- **小程序卡**(2026-09-05):形式选 `miniapp` 时回 B 站 App「分享到 QQ」那种 QQ 小程序卡。卡不能自己拼(`config.token` 是腾讯签的,没签名发出去只显示一行「[QQ小程序]哔哩哔哩」或被吞),只有实现了 OneBot 扩展接口 `get_mini_app_ark` 的实现能签(今天已知只有 NapCat;**逻辑里不认实现名,只认接口**)。`platforms/onebot.ts`:能力探测拿**空参数**调 `get_mini_app_ark`,按 OneBot 11 的 retcode 判 —— 1404(或 HTTP 404)= 不支持、1400 = 接口在、支持,其它 = 未探测(带原因),零副作用;通道就绪(正向连上 / 反向 bot 连入)与 http 的 reconcile 时探,结果按 adapter 缓存。**缓存只在两种情况下丢**:该 adapter 的配置指纹变了、或它被删了 —— 健康探测每五分钟写回 `testStatus`就会触发一次 `config-changed: adapters` → `reconcile`,「reconcile 全清」会把刚探出的答案周期性冲掉,而反向 WS 的 bot 早就连着、不会再触发「连入」重探(真机上表现为面板永远停在「未探测」)。同理**探不出来(超时 / 连不上)不推翻已经探实的答案**,降级只认一种证据:真发时收到 1404;engines 的健康探测(开机 / 五分钟 / 主人点「测试」)顺路补探「未探测」的(`probeAdapterAndCapabilities`;**连都连不上就不补探** —— 那一趟只会白等满一个超时,而这条路是逐个 await 的)。真发是 `NotificationPayload` 的 `miniapp-card`(title / desc / picUrl / path / jumpUrl):先用 `type: "bili"` 模板签 ark,再当 `json` 段走普通发送;签卡收到 1404 才翻缓存成不支持,别的失败只报这一条。**签卡请求的两个链接字段别看名字**:`jumpUrl` 是小程序**页面路径**(`path`,B 站小程序视频页 `pages/video/video?bvid=…`),`webUrl` 才是网页链接(`jumpUrl`,签回来落到卡的 `qqdocurl`)—— QQ 客户端源码(MiniProgramOpenSdkUtil)里前者接 OpenSDK 的 `mini_program_path`、后者接 `url`;NapCat 文档把前者写成「跳转 URL」,照着填网址签出来的卡点开是「页面不存在」,`webUrl` 不填则卡上没有 `qqdocurl`(2026-09-07 群友反馈、真机验通的修法)。要核对某张真卡的路径,拿卡里 `meta.detail_1.url` 的 `m.q.qq.com/a/s/<hash>` 经 NapCat `send_packet` 调 `LightAppSvc.mini_app_info.GetAppInfoByLink`(请求 `{2: link, 3: linkType=0}`,外层信封 `{1: 31, 2: sdkId, 4: body, 5: "<uin>_0621001900828_44861"}`),回包 `4.2.11.1` 就是 `first.pagePath`;拉群里卡片原文用 `get_group_msg_history`,json 段的 `data` 就是整张 ark。`link-parser.ts` 里形式 × 能力**在记账之前**算(`handleMessage`,冷却与群额度之前):形式是小程序卡且适配器支持才发小程序卡(未探测先探一次;**「一分钟内不重探」的节流在适配器那一层** —— 缓存与失效规则都在 `onebot.ts`,每个调用方各维护一张时间戳表的话,「什么时候该重探」会摊成三份;探完仍未知按不支持),小程序卡发不出去又没渲染器 = 一张也发不出来,直接走人**不吃冷却**(不然适配器一恢复、同一条链接还得干等一整个冷却)。`reply` 只管发:小程序卡发失败回落图片卡,群里不会空着;图片卡要渲染器,小程序卡不用。官机 / webhook 没有能力概念(`capabilities` 回 undefined),一律图片卡。能力从 `GET /api/adapters/capabilities` 出去(contract 的 `AdapterCapabilitiesMap`),系统页链接解析卡的「适配器支持情况」面板三态显示、半分钟刷一次;例外行所在适配器不支持时形式格旁提示会回落。分享卡进来的也是普通链接,不特殊处理。测试:`platforms/__tests__/onebot-miniapp-card.test.ts`、`runtime/__tests__/link-parser.test.ts` 的「回复形式」、`link-scope.test.ts`。
+- **在哪些群、回什么 = 一张表**(`globals.linkParsing.defaults` + `groups`,2026-09-05 定,取代 09-04 的 `scope` + `targets` 白名单;老形状读时按形迁移:`all` → 默认解析开,`selected` → 默认关 + 列出的群显式开):**默认行**是所有群解不解析(`parse`)、回什么(`form`:`image` 图片卡 / `miniapp` 小程序卡,**只有这两档**,主人砍掉了「两个都发」);**逐群例外**按推送目标 id 索引,只存显式写了的字段,没写的跟默认行(`linkParsingFor(config, targetId)` 折叠)。「所有群」不是一种模式,它就是默认行;想只在某几群解析 = 默认关 + 那几群显式开。主人嫌「解析 / 形式」两条轴各配一套「所有群 / 指定群」四种形态混乱,收成一张表,说「像 per-UP」。`runtime/link-scope.ts` 的 `resolveLinkParsingPolicies` 把配置 + 目标表 + 连接表算成 `平台:connectionId:群地址 → {parse, form}` 的表:只认群类目标,**停用的目标或停用 / 不存在的连接一律不解析**(internal 的 `isTargetPaused`,默认行开着、例外显式开着都压不过 —— 与周报发送时的「跳过」同一条判定,主人定的「停用」两处同义),悬空 id 静默忽略,不是推送目标的群跟默认行,同一群配成两个目标先出现的说了算。表是 engines 里随 `globals` / `targets` / `connections` 三种 config-changed 重算的快照(`engines.linkPolicyFor(key)`),解析器每条消息只查一次;判定排在总开关之后、渲染器与记账之前,不解析的群不记冷却。面板是系统页链接解析卡(`components/link-parsing-settings.tsx`):默认行两个段选 + 逐群表(列全部收得到入站的群目标,每群两格三态「跟默认 / 显式值」,跟默认时把继承值写在旁边;「跟默认」发的是删除哨兵 `null`,不是把默认值抄进例外;停用的照列标「已停用」—— 判定与运行时同一份,连接停用的目标也标)。回到来源群不查目标表:adapter 交消息时附上自己的 `InboundMeta`(两端都是 `onInboundGroup(msg, { connectionId, platform })`),接线层拿 id 找到配置里那条连接,造一个临时的 group target 直接 `send` —— 地址收成一格之后这里不再按平台分岔,群目标的地址就是群号 / 群 openid。唯一入口是 `createLinkParser.handleMessage`。
+- **小程序卡**(2026-09-05):形式选 `miniapp` 时回 B 站 App「分享到 QQ」那种 QQ 小程序卡。卡不能自己拼(`config.token` 是腾讯签的,没签名发出去只显示一行「[QQ小程序]哔哩哔哩」或被吞),只有实现了 OneBot 扩展接口 `get_mini_app_ark` 的实现能签(今天已知只有 NapCat;**逻辑里不认实现名,只认接口**)。`platforms/onebot.ts`:能力探测拿**空参数**调 `get_mini_app_ark`,按 OneBot 11 的 retcode 判 —— 1404(或 HTTP 404)= 不支持、1400 = 接口在、支持,其它 = 未探测(带原因),零副作用;通道就绪(正向连上 / 反向 bot 连入)与 http 的 reconcile 时探,结果按连接缓存。**缓存只在两种情况下丢**:该连接的配置指纹变了、或它被删了 —— 健康探测每五分钟写回 `testStatus`就会触发一次 `config-changed: connections` → `reconcile`,「reconcile 全清」会把刚探出的答案周期性冲掉,而反向 WS 的 bot 早就连着、不会再触发「连入」重探(真机上表现为面板永远停在「未探测」)。同理**探不出来(超时 / 连不上)不推翻已经探实的答案**,降级只认一种证据:真发时收到 1404;engines 的健康探测(开机 / 五分钟 / 主人点「测试」)顺路补探「未探测」的(`probeConnectionAndCapabilities`;**连都连不上就不补探** —— 那一趟只会白等满一个超时,而这条路是逐个 await 的)。真发是 `NotificationPayload` 的 `miniapp-card`(title / desc / picUrl / path / jumpUrl):先用 `type: "bili"` 模板签 ark,再当 `json` 段走普通发送;签卡收到 1404 才翻缓存成不支持,别的失败只报这一条。**签卡请求的两个链接字段别看名字**:`jumpUrl` 是小程序**页面路径**(`path`,B 站小程序视频页 `pages/video/video?bvid=…`),`webUrl` 才是网页链接(`jumpUrl`,签回来落到卡的 `qqdocurl`)—— QQ 客户端源码(MiniProgramOpenSdkUtil)里前者接 OpenSDK 的 `mini_program_path`、后者接 `url`;NapCat 文档把前者写成「跳转 URL」,照着填网址签出来的卡点开是「页面不存在」,`webUrl` 不填则卡上没有 `qqdocurl`(2026-09-07 群友反馈、真机验通的修法)。要核对某张真卡的路径,拿卡里 `meta.detail_1.url` 的 `m.q.qq.com/a/s/<hash>` 经 NapCat `send_packet` 调 `LightAppSvc.mini_app_info.GetAppInfoByLink`(请求 `{2: link, 3: linkType=0}`,外层信封 `{1: 31, 2: sdkId, 4: body, 5: "<uin>_0621001900828_44861"}`),回包 `4.2.11.1` 就是 `first.pagePath`;拉群里卡片原文用 `get_group_msg_history`,json 段的 `data` 就是整张 ark。`link-parser.ts` 里形式 × 能力**在记账之前**算(`handleMessage`,冷却与群额度之前):形式是小程序卡且这条连接支持才发小程序卡(未探测先探一次;**「一分钟内不重探」的节流在 adapter 那一层** —— 缓存与失效规则都在 `onebot.ts`,每个调用方各维护一张时间戳表的话,「什么时候该重探」会摊成三份;探完仍未知按不支持),小程序卡发不出去又没渲染器 = 一张也发不出来,直接走人**不吃冷却**(不然连接一恢复、同一条链接还得干等一整个冷却)。`reply` 只管发:小程序卡发失败回落图片卡,群里不会空着;图片卡要渲染器,小程序卡不用。官机 / webhook 没有能力概念(`capabilities` 回 undefined),一律图片卡。能力从 `GET /api/connections/capabilities` 出去(contract 的 `ConnectionCapabilitiesMap`,**两级索引**:连接 id → 平台名 → 能力),系统页链接解析卡的「连接支持情况」面板三态显示、半分钟刷一次;例外行所在连接不支持时形式格旁提示会回落。分享卡分两种:灰色链接卡之类照普通链接处理;**进来的本身就是 B 站小程序卡(`app` = `com.tencent.miniapp_01`)时一律不回**,图片卡也不回、也不记冷却(主人 2026-09-07 拍板,推翻 09-05 的「不特殊处理」)—— 入站把这类卡的链接单放 `miniAppCardLinks`,link-parser 不读那一格。测试:`platforms/__tests__/onebot-miniapp-card.test.ts`、`runtime/__tests__/link-parser.test.ts` 的「回复形式」、`link-scope.test.ts`。
 - **冷却**:同一个群同一个视频 `cooldownSeconds`(默认 60,0 = 不节流)内只出一次。从**开始处理**起算,不是发出去才算 —— 一条坏链接被反复贴,不该每次都去打接口。短链的那一跳也是接口,所以短链先按它自己吃一道冷却(解不出视频也吃),解出视频号后再按视频号吃一道(短链与直链指着同一个视频只出一张)。
-- **闸门按代价排**:先正则挑链接(没链接的连配置都不读 —— 官机开着「全部消息」时群里每句话都进这儿,而读配置是整份深拷贝),再读配置、再看有没有渲染器(图片卡才要它,小程序卡不用)、再问一次适配器签不签得了小程序卡(有节流,见上),网络与冷却留到每个链接自己那一轮;`handleMessage` 整个裹在 try 里、永不抛 —— 它是被 `void` 掉的回调,rejection 会被独立端的 unhandledRejection 处理器变成进程退出;拆帧那步的异常由 adapter 的通道兜(它还担着推送,不能因一帧怪东西断连)。开关与呈现从 `engines.linkParsing()` / `engines.linkCardPresentation()` 拿,是随 config-changed 刷新的快照,不再按条深拷贝 globals。
+- **闸门按代价排**:先正则挑链接(没链接的连配置都不读 —— 官机开着「全部消息」时群里每句话都进这儿,而读配置是整份深拷贝),再读配置、再看有没有渲染器(图片卡才要它,小程序卡不用)、再问一次这条连接签不签得了小程序卡(有节流,见上),网络与冷却留到每个链接自己那一轮;`handleMessage` 整个裹在 try 里、永不抛 —— 它是被 `void` 掉的回调,rejection 会被独立端的 unhandledRejection 处理器变成进程退出;拆帧那步的异常由 adapter 的通道兜(它还担着推送,不能因一帧怪东西断连)。开关与呈现从 `engines.linkParsing()` / `engines.linkCardPresentation()` 拿,是随 config-changed 刷新的快照,不再按条深拷贝 globals。
 - **硬上限不进面板**(`LINK_LIMITS`,`link-parser.ts`):冷却只防「同一个视频反复贴」,防不住换着视频刷 —— 单个群每分钟最多 6 张;全局同时在处理(取信息 / 渲染 / 发送)的链接卡最多 3 张,超了直接放弃不排队(这管的是积压量;给开播 / 动态卡让路由渲染队列的**低优先级车道**做 —— 链接卡以 `priority: "low"` 渲染,渲染器那级与浏览器闸那级都是「正常车道排空之前不动」);冷却表与群额度表各有容量上限(2000),满了丢最久没碰的,不会越涨越慢。三道闸先看不动手,都过了才一起记账:在冷却里的链接不吃群额度,因忙放弃的链接也不记成「处理过」。
 - **失败一律沉默**:接口失败 / 视频不存在 / 渲染失败 / 没有 Chrome,都只记日志、不回话。群里没人要求解析,失败了还回一句只是噪音,而且等于把「机器人在这个群」广播出去。
 - **一条消息最多三个链接**;机器人自己发的消息不解析;`b23.tv` 只跟一跳 `Location`、只认落在 `bilibili.com` 的目标(短链是别人贴的,跟到哪儿就是让谁指挥我们)。
-- **分享卡也认**(OneBot):用 B 站 App「分享到 QQ」发进群的是一张 json / xml 卡,正文一个字都没有、链接藏在卡的字段里(`meta.detail_1.qqdocurl` / `meta.news.jumpUrl`)。`extractGroupMessage` 把卡里的链接单放一格 `cardLinks`(正文还是用户敲的那句话;json 先 parse 再逐字符串找,不然 `https:\/\/` 这种转义写法对着原文找不到;原文里连 `bilibili.com` / `b23.tv` 都没有的卡不解析),链接解析把正文与 `cardLinks` 拼起来找;私聊那条不做这个,指令入口只认文字。测试在 `platforms/__tests__/onebot-inbound.test.ts`。
+- **分享卡也认**(OneBot):用 B 站 App「分享到 QQ」发进群的是一张 json / xml 卡,正文一个字都没有、链接藏在卡的字段里(`meta.detail_1.qqdocurl` / `meta.news.jumpUrl`)。`extractGroupMessage` 把卡里的链接单放一格 `cardLinks`,其中 QQ 小程序卡(`app` = `com.tencent.miniapp_01`)的再单放 `miniAppCardLinks`、链接解析不读(群里已经有一张能点开播放的卡了,2026-09-07 起一律不回)(正文还是用户敲的那句话;json 先 parse 再逐字符串找,不然 `https:\/\/` 这种转义写法对着原文找不到;原文里连 `bilibili.com` / `b23.tv` 都没有的卡不解析),链接解析把正文与 `cardLinks` 拼起来找;私聊那条不做这个,指令入口只认文字。测试在 `platforms/__tests__/onebot-inbound.test.ts`。
 
 **卡片不新做**:`video-card.ts` 把 `getVideoInfo` 的结果拼成一条 `DYNAMIC_TYPE_AV` 形态的动态,喂给现有的
 `generateDynamicCard` —— 动态卡的版式编辑器、每类型样式、皮肤全部现成。播放 / 弹幕数按接口的样子给

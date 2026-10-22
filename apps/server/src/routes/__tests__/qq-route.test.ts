@@ -1,7 +1,7 @@
 /**
  * 单元测试 — /api/qq 路由。
- * - GET /sessions/:adapterId → 读共享发现表(网关捞到的群/C2C openid),供面板选择器。
- * - GET /guilds/:adapterId   → REST 枚举频道子频道(频道 scope 选择器)。
+ * - GET /sessions/:connectionId → 读共享发现表(网关捞到的群/C2C openid),供面板选择器。
+ * - GET /guilds/:connectionId   → REST 枚举频道子频道(频道 scope 选择器)。
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import { createQQSessionRegistry } from "../../platforms/qq-official.js";
@@ -22,11 +22,12 @@ afterEach(() => {
 
 function makeDeps(opts?: {
 	registry?: ReturnType<typeof createQQSessionRegistry>;
-	adapters?: unknown[];
+	connections?: unknown[];
 }): RouteDeps {
-	const adapters = opts?.adapters ?? [
+	const connections = opts?.connections ?? [
 		{
 			id: "a1",
+			kind: "direct",
 			platform: "qq-official",
 			enabled: true,
 			config: { appId: "APPID", appSecret: "SECRET", sandbox: false, botType: "public" },
@@ -34,14 +35,14 @@ function makeDeps(opts?: {
 	];
 	return {
 		qqSessionRegistry: opts?.registry ?? null,
-		store: { getAdapters: () => adapters },
+		store: { getConnections: () => connections },
 		runtime: {
 			serviceCtx: { logger: { warn: vi.fn(), error: vi.fn(), info: vi.fn(), debug: vi.fn() } },
 		},
 	} as unknown as RouteDeps;
 }
 
-describe("GET /api/qq/sessions/:adapterId", () => {
+describe("GET /api/qq/sessions/:connectionId", () => {
 	it("返回该 adapter 发现表(最近优先)", async () => {
 		const registry = createQQSessionRegistry();
 		registry.record("a1", { scope: "group", openid: "G1", displayHint: "群甲" }, 1000);
@@ -61,7 +62,7 @@ describe("GET /api/qq/sessions/:adapterId", () => {
 	});
 });
 
-describe("GET /api/qq/guilds/:adapterId", () => {
+describe("GET /api/qq/guilds/:connectionId", () => {
 	it("枚举频道子频道(文字)", async () => {
 		fetchMock.mockImplementation(async (url: string) => {
 			if (url.includes("getAppAccessToken"))
@@ -87,7 +88,9 @@ describe("GET /api/qq/guilds/:adapterId", () => {
 
 	it("非 qq-official adapter → 404", async () => {
 		const app = createQQRoute(
-			makeDeps({ adapters: [{ id: "a1", platform: "onebot", enabled: true, config: {} }] }),
+			makeDeps({
+				connections: [{ id: "a1", kind: "direct", platform: "onebot", enabled: true, config: {} }],
+			}),
 		);
 		const r = await app.request("/guilds/a1");
 		expect(r.status).toBe(404);

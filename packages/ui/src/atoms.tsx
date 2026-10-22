@@ -13,6 +13,7 @@ import type {
 	ReactNode,
 	SVGProps,
 } from "react";
+import { createContext, useContext } from "react";
 import { Icon, type IconName } from "./icons";
 
 // ── Avatar ──────────────────────────────────────────────────────────────────
@@ -459,6 +460,10 @@ export interface AddFileButtonProps {
  * 「点这里挑个文件上传」—— {@link AddButton} 的 file-input 变体:同一份虚线空位
  * 语汇,壳是 `<label>` 裹一个隐藏的 `<input type="file">`。收编前图库格与字体钮
  * 各手写一份,hover 组合逐字符相同。上传中把内容换成一句话,input 同时禁用。
+ *
+ * **交出去之后把 `value` 清空**:浏览器只在「挑的文件变了」时才发 change,不清的话同一
+ * 份文件挑第二次**点了没反应**(传上去被重名 / 体积拒掉、删了再传回来,都是真实路径)。
+ * 清空会连 `files` 一起清掉,所以**先把文件取出来再清**。
  */
 export function AddFileButton({
 	accept,
@@ -478,7 +483,11 @@ export function AddFileButton({
 				accept={accept}
 				className="sr-only"
 				disabled={uploading}
-				onChange={(e) => onFile(e.target.files?.[0] ?? undefined)}
+				onChange={(e) => {
+					const file = e.target.files?.[0] ?? undefined;
+					e.target.value = "";
+					onFile(file);
+				}}
 			/>
 		</label>
 	);
@@ -691,7 +700,7 @@ export function ToneChip({
 	uppercase,
 }: ToneChipProps) {
 	// 底与边**刻意留在 inline**,不像候选行那样拆成 `--bn-tint` + @utility(那条路
-	// 是 7e8a00e 给服务商卡与适配器行走的)。原因是这排胶囊**能同时亮好几颗**:
+	// 是 7e8a00e 给服务商卡与连接行走的)。原因是这排胶囊**能同时亮好几颗**:
 	// 日志页的等级筛选是多选(`levels.has(l)` + toggleLevel),DEBUG/INFO/WARN/ERROR
 	// 四档可以一起选中。底一旦挪出 inline,皮肤一句 `chip-active{background:…}` 就
 	// 把四档抹成同一个颜色 —— 而「严重度是产品语言、皮肤重上色会让 warn 和 error
@@ -1148,20 +1157,61 @@ export function HintNote({ children, tone = "neutral", className }: HintNoteProp
 
 // ── PlatformIcon ────────────────────────────────────────────────────────────
 
-const PLATFORM_META: Record<string, { color: string; label: string; icon?: IconName }> = {
-	onebot: { color: "#3b82f6", label: "OneBot", icon: "qq" },
-	"qq-official": { color: "#14b8a6", label: "QQ官方", icon: "qq" },
-	webhook: { color: "#22c55e", label: "Webhook" },
-};
+/**
+ * 一个平台在界面上的样子 —— 由**消费方注入**。
+ *
+ * 这张表原先写死在库里:六个平台名、色、短名,连「飞书 / 钉钉 / 企微的品牌色都在蓝绿
+ * 一带,单靠色摆不开所以不给图标、走首字方章」这条理由都在。可这是个纯展示件库 ——
+ * 认识业务平台意味着桥每驮进来一个平台都得改一次库,而库根本不该知道有桥这回事。
+ *
+ * 所以留在库里的是**怎么画**(有图标画图标、没有画首字方章、色可被 tone 盖),
+ * **画谁**从外面注入。事实那一份住 `@bilibili-notify/internal` 的平台注册表。
+ */
+export interface PlatformMeta {
+	/** 标识色。 */
+	tint: string;
+	/** 短名。没有图标时的方章取它的**首字**。 */
+	label: string;
+	/** 图标名(见 `Icon`)。留空、或给了一个库里没有的名字,都退首字方章。 */
+	icon?: string;
+	/**
+	 * 整段 SVG —— 拓展随清单交上来的那种,不是图标表的键。**调用方保证它过过白名单**
+	 * (BN 的服务端读清单那一刻就过了),这里只管画、吃 `currentColor`。有 `icon` 时优先 `icon`。
+	 */
+	svg?: string;
+}
+
+const PlatformMetaContext = createContext<((platform: string) => PlatformMeta | undefined) | null>(
+	null,
+);
+
+export const PlatformMetaProvider = PlatformMetaContext.Provider;
+
+const NO_PLATFORM_META = () => undefined;
+
+/**
+ * 查一个平台的样子。**没有 Provider 时恒 undefined** —— 调用方按「认不出」处理,
+ * 库在别处(只想画个方章)照常能用。
+ */
+export function usePlatformMeta(): (platform: string) => PlatformMeta | undefined {
+	return useContext(PlatformMetaContext) ?? NO_PLATFORM_META;
+}
 
 /**
  * 平台的标识色。**认不出的平台退静默档** —— 「不认识」正是那个 token 的意思。
  *
- * 导出它是为了让 Targets 的平台胶囊别再照着 `PLATFORM_META` 抄第二份:那份副本连
- * 兜底的 `#888` 都一字不差,而站里同义的灰正在往 `--color-bn-inactive` 上收。
+ * 它是个 hook 而不是裸函数,是因为表从 context 来。导出它是为了让 Targets 的平台
+ * 胶囊别再照着抄第二份:那份副本连兜底的 `#888` 都一字不差,而站里同义的灰正在往
+ * `--color-bn-inactive` 上收。
  */
-export function platformTint(platform: string): string {
-	return PLATFORM_META[platform]?.color ?? "var(--color-bn-inactive)";
+export function usePlatformTint(): (platform: string) => string {
+	const lookup = usePlatformMeta();
+	return (platform) => lookup(platform)?.tint ?? "var(--color-bn-inactive)";
+}
+
+export function usePlatformLabel(): (platform: string) => string {
+	const lookup = usePlatformMeta();
+	return (platform) => lookup(platform)?.label ?? platform;
 }
 
 export function PlatformIcon({
@@ -1172,7 +1222,7 @@ export function PlatformIcon({
 	platform: string;
 	size?: number;
 	/**
-	 * 盖掉标识色。留空走 {@link platformTint} —— 平常就该是标识色。
+	 * 盖掉标识色。留空走 {@link usePlatformTint} —— 平常就该是标识色。
 	 *
 	 * 有这个口子是因为标识色是**中等亮度**的品牌色,摆在皮肤画的实心强调块上会撞
 	 * (实测 QQ官方 #14b8a6 对主人那块粉只有 1.24:1)。喂 `currentColor` 让它跟着
@@ -1180,10 +1230,21 @@ export function PlatformIcon({
 	 */
 	tone?: string;
 }) {
-	const meta = PLATFORM_META[platform];
-	const color = tone ?? platformTint(platform);
-	const I = meta?.icon ? Icon[meta.icon] : null;
+	const meta = usePlatformMeta()(platform);
+	// 兜底与 {@link usePlatformTint} 一字不差 —— 那边也是「表里没有就是认不出」这一档灰。
+	const color = tone ?? meta?.tint ?? "var(--color-bn-inactive)";
+	const I = meta?.icon ? Icon[meta.icon as IconName] : null;
 	if (I) return <I size={size} style={{ color }} />;
+	if (meta?.svg) {
+		return (
+			<span
+				className="inline-flex shrink-0 [&>svg]:h-full [&>svg]:w-full"
+				style={{ width: size, height: size, color }}
+				// biome-ignore lint/security/noDangerouslySetInnerHtml: 表由消费方注入,SVG 是它保证过过白名单的(见 PlatformMeta.svg)
+				dangerouslySetInnerHTML={{ __html: meta.svg }}
+			/>
+		);
+	}
 	const label = meta?.label ?? platform;
 	const badgeStyle: CSSProperties & SVGProps<SVGSVGElement> = {
 		width: size,
@@ -1202,8 +1263,94 @@ export function PlatformIcon({
 	);
 }
 
-export function platformLabel(platform: string): string {
-	return PLATFORM_META[platform]?.label ?? platform;
+// ── Donut (环形占比图) ─────────────────────────────────────────────────────
+
+/** 环上的一段弧。多段按给的顺序顺时针首尾相接。 */
+export interface DonutSegment {
+	/** 占整圈的比例(0..1)。负数当 0;各段之和越过一圈时整体按比例压回一圈。 */
+	value: number;
+	color: string;
+}
+
+export interface DonutProps {
+	/** 单段的简写。与 `segments` 二选一,同时给以 `segments` 为准。 */
+	value?: number;
+	color?: string;
+	/** 多段:表达「这部分 + 那部分 = 总占用」。 */
+	segments?: readonly DonutSegment[];
+	size?: number;
+	stroke?: number;
+	label?: ReactNode;
+	title?: string;
+}
+
+/**
+ * 环形占比图:一圈灰轨道 + 一段或多段按比例排布的彩弧。
+ *
+ * 多段时首尾相接 —— 「BN + 其他 = 总占用」这句话靠的就是接得上;重叠或中间露轨道
+ * 都会把它读成别的意思。各段之和越过一圈时整体按比例压回,绝不绕第二圈。
+ *
+ * `title` 是念给读屏器的那句话:同一页上两个环讲的不是同一件事,都念「占比」听不出区别。
+ */
+export function Donut({
+	value = 0,
+	size = 104,
+	color = "var(--color-bn-pink)",
+	stroke = 13,
+	label,
+	title = "占比",
+	segments,
+}: DonutProps) {
+	const r = (size - stroke) / 2;
+	const c = 2 * Math.PI * r;
+	const raw = segments ?? [{ value, color }];
+	// 负值当 0:读数抖动不该让弧往回画。
+	const clamped = raw.map((s) => ({ ...s, value: Math.max(0, s.value) }));
+	const total = clamped.reduce((sum, s) => sum + s.value, 0);
+	// 超过一圈按比例压回。单段时这等价于旧的 Math.min(1, value)。
+	const scale = total > 1 ? 1 / total : 1;
+	// 0 长的弧配上圆头线帽会变成一个点,看着像多了一段不存在的东西。
+	const drawn: Array<{ len: number; start: number; color: string }> = [];
+	let cursor = 0;
+	for (const s of clamped) {
+		const len = s.value * scale;
+		if (len > 0) drawn.push({ len, start: cursor, color: s.color });
+		cursor += len;
+	}
+	// 多段时用平头:圆头会让每段两端各鼓出半个线宽,相邻两段互相盖住,读出来的比例不对。
+	const cap = drawn.length > 1 ? "butt" : "round";
+	return (
+		<div className="relative" style={{ width: size, height: size }}>
+			<svg width={size} height={size} style={{ transform: "rotate(-90deg)" }}>
+				<title>{title}</title>
+				<circle
+					cx={size / 2}
+					cy={size / 2}
+					r={r}
+					fill="none"
+					stroke="var(--color-bn-code-bg)"
+					strokeWidth={stroke}
+				/>
+				{drawn.map((seg) => (
+					<circle
+						key={`${seg.start}-${seg.color}`}
+						cx={size / 2}
+						cy={size / 2}
+						r={r}
+						fill="none"
+						stroke={seg.color}
+						strokeWidth={stroke}
+						strokeLinecap={cap}
+						strokeDasharray={`${c * seg.len} ${c}`}
+						strokeDashoffset={-c * seg.start}
+					/>
+				))}
+			</svg>
+			{label ? (
+				<div className="absolute inset-0 flex items-center justify-center">{label}</div>
+			) : null}
+		</div>
+	);
 }
 
 // ── StatsBar (mini bar chart) ──────────────────────────────────────────────

@@ -13,7 +13,6 @@ import {
 export type LoginStatusMsgKey =
 	| "loading"
 	| "notLogin"
-	| "keyReset"
 	| "authLost"
 	| "loggedIn"
 	| "loginJustSucceeded"
@@ -30,7 +29,6 @@ export type LoginStatusMsgKey =
 const MESSAGES: Record<LoginStatusMsgKey, string> = {
 	loading: "正在加载登录信息...",
 	notLogin: "账号未登录，请点击「扫码登录」",
-	keyReset: "密钥已重置，cookie 已清除，请重新扫码登录",
 	authLost: "账号登录已失效，请在控制台重新扫码登录",
 	loggedIn: "已登录",
 	loginJustSucceeded: "登录成功，正在加载订阅...",
@@ -48,7 +46,7 @@ const MESSAGES: Record<LoginStatusMsgKey, string> = {
 /** Snapshot of the current login state — alias of BiliDataServer for API consumers. */
 export type LoginSnapshot = BiliDataServer;
 
-/** Outcome of a single QR poll tick. The bridge does not need to act on this directly. */
+/** Outcome of a single QR poll tick. Callers do not need to act on this directly. */
 export type LoginPollResult =
 	| { kind: "pending"; reason: "waitScan" | "waitConfirm" }
 	| { kind: "success" }

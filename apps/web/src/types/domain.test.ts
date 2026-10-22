@@ -5,18 +5,17 @@
  * 回归背景:旧实现优先 `crypto.randomUUID()`,但该 API 仅在 secure context
  * (HTTPS / localhost)可用 —— 独立端 docker 经 `http://<内网IP>:8787` 访问时
  * 它是 undefined,旧 fallback 产出非法格式(4 段任意长 hex),后端 z.uuid()
- * 拒 → 添加订阅 / 适配器 / 目标全部 400。
+ * 拒 → 添加订阅 / 连接 / 目标全部 400。
  */
 
 import { describe, expect, it } from "vite-plus/test";
 import {
 	KNOWN_PLATFORMS,
-	makeEmptyAdapter,
+	makeEmptyConnection,
 	makeEmptyTarget,
 	maskWebhookUrl,
 	newId,
 	switchOnebotTransport,
-	WEBHOOK_PROVIDERS,
 	webhookSecretHint,
 	webhookUrlPlaceholder,
 } from "./domain";
@@ -42,7 +41,7 @@ describe("newId", () => {
 	 * 核心回归守护:即使 `crypto.randomUUID` 完全不存在(= 非 secure context,
 	 * docker 经 `http://<内网IP>:8787` 访问的真实形态),`newId()` 仍必须产出合法
 	 * UUID。旧实现在此场景会落进 4 段任意长 hex 的非法 fallback → 后端 z.uuid()
-	 * 拒 → 添加订阅 / 适配器 / 目标全 400。新实现根本不引用 `crypto.randomUUID`,
+	 * 拒 → 添加订阅 / 连接 / 目标全 400。新实现根本不引用 `crypto.randomUUID`,
 	 * 这条用例把"不依赖 secure-context-only API"这个契约钉死。
 	 *
 	 * `crypto.randomUUID` 是 `Crypto.prototype` 上 `configurable: true` 的方法,
@@ -77,40 +76,37 @@ describe("newId", () => {
 });
 
 describe("webhook adapter factories", () => {
-	it("makeEmptyAdapter(webhook) 默认使用 generic provider 并保留 headers", () => {
-		const adapter = makeEmptyAdapter("webhook", "团队 webhook");
-		expect(adapter.platform).toBe("webhook");
-		if (adapter.platform !== "webhook") return;
-		expect(adapter.config).toMatchObject({
-			provider: "generic",
+	it("makeEmptyConnection(feishu) 走 webhook 连接器并保留 headers", () => {
+		const connection = makeEmptyConnection("feishu", "团队 webhook");
+		expect(connection.platform).toBe("feishu");
+		expect(connection.connector).toBe("webhook");
+		expect(connection.config).toMatchObject({
 			url: "https://example.com/hook",
 			headers: {},
 		});
+		// provider 已经升格成 platform —— 别在 config 里留一份影子。
+		expect(connection.config).not.toHaveProperty("provider");
 	});
 
-	it("WEBHOOK_PROVIDERS 覆盖 generic / dingtalk / feishu / wecom", () => {
-		expect(WEBHOOK_PROVIDERS.map((p) => p.value)).toEqual([
-			"generic",
-			"dingtalk",
-			"feishu",
-			"wecom",
-		]);
+	it("KNOWN_PLATFORMS 把 webhook 那四家平铺出来,不再有一个叫 webhook 的平台", () => {
+		const values = KNOWN_PLATFORMS.map((p) => p.value);
+		expect(values).toEqual(["onebot", "qq-official", "feishu", "dingtalk", "wecom", "generic"]);
 	});
 
-	it("makeEmptyTarget(webhook) 仍生成空 session 的合法手动目标", () => {
-		const adapter = makeEmptyAdapter("webhook", "团队 webhook");
-		const target = makeEmptyTarget(adapter, "团队 webhook");
+	it("makeEmptyTarget(webhook 那族) 生成 endpoint 形态、平台跟着连接走", () => {
+		const connection = makeEmptyConnection("wecom", "团队 webhook");
+		const target = makeEmptyTarget(connection, "团队 webhook");
 		expect(target).toMatchObject({
-			adapterId: adapter.id,
-			platform: "webhook",
+			connectionId: connection.id,
+			kind: "endpoint",
+			platform: "wecom",
 			scope: "channel",
 			enabled: true,
-			session: {},
 		});
 		expect(target.managedBy).toBeUndefined();
 	});
 
-	it("webhook placeholder / secret hint 随 provider 切换", () => {
+	it("webhook placeholder / secret hint 随平台切换", () => {
 		expect(webhookUrlPlaceholder("generic")).toContain("hooks.example.com");
 		expect(webhookSecretHint("generic")).toContain("x-bilibili-notify-secret");
 		expect(webhookUrlPlaceholder("dingtalk")).toContain("oapi.dingtalk.com");
@@ -141,11 +137,11 @@ describe("qq-official adapter factories", () => {
 		expect(KNOWN_PLATFORMS.map((p) => p.value)).toContain("qq-official");
 	});
 
-	it("makeEmptyAdapter(qq-official) 默认 public 域 + 非沙箱 + 空凭据", () => {
-		const adapter = makeEmptyAdapter("qq-official", "QQ 官方机器人");
-		expect(adapter.platform).toBe("qq-official");
-		if (adapter.platform !== "qq-official") return;
-		expect(adapter.config).toEqual({
+	it("makeEmptyConnection(qq-official) 默认 public 域 + 非沙箱 + 空凭据", () => {
+		const connection = makeEmptyConnection("qq-official", "QQ 官方机器人");
+		expect(connection.platform).toBe("qq-official");
+		if (connection.platform !== "qq-official") return;
+		expect(connection.config).toEqual({
 			appId: "",
 			appSecret: "",
 			sandbox: false,
@@ -154,15 +150,16 @@ describe("qq-official adapter factories", () => {
 		});
 	});
 
-	it("makeEmptyTarget(qq-official) 默认 group scope + 空 session", () => {
-		const adapter = makeEmptyAdapter("qq-official", "QQ");
-		const target = makeEmptyTarget(adapter, "测试群");
+	it("makeEmptyTarget(qq-official) 默认 group scope + 空地址", () => {
+		const connection = makeEmptyConnection("qq-official", "QQ");
+		const target = makeEmptyTarget(connection, "测试群");
 		expect(target).toMatchObject({
-			adapterId: adapter.id,
+			connectionId: connection.id,
+			kind: "session",
 			platform: "qq-official",
 			scope: "group",
 			enabled: true,
-			session: {},
+			address: "",
 		});
 	});
 });
@@ -171,7 +168,7 @@ describe("switchOnebotTransport", () => {
 	it("换连接方式时保留共用字段 —— 超时下限不该被悄悄打回默认", () => {
 		// strict schema 逼着换 transport 要整体换 config,共用字段得一个个搬过去。
 		// 漏搬哪个,主人就会遇到「明明调过、换个连接方式又变回去了」。
-		const http = makeEmptyAdapter("onebot", "NapCat").config as Parameters<
+		const http = makeEmptyConnection("onebot", "NapCat").config as Parameters<
 			typeof switchOnebotTransport
 		>[0];
 		const tuned = {

@@ -1,7 +1,5 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { renderCard } from "../render";
-import { WordCloudCard } from "./wordcloud-card";
 
 /**
  * JSON 嵌入内联 `<script>` 的安全序列化。`JSON.stringify` **不**转义
@@ -28,27 +26,19 @@ const WORD_COLORS = [
 	"#a29bfe",
 ];
 
-export async function buildWordCloudHtml(
-	masterName: string,
-	words: Array<[string, number]>,
-	dirname: string,
-	masterAvatarUrl?: string,
-	colorStart = "#e0c3fc",
-	colorEnd = "#8ec5fc",
-	font = "sans-serif",
-	/** 主人自带字体的 `@font-face` 规则(有就跟着一起进 CSS)。 */
-	fontFace?: string,
-): Promise<string> {
+/**
+ * 词云画布的**脚本注入**——「`#wordCloudCanvas` 这个空画布 → 真的画上词」的那一半。
+ *
+ * 单独抽出来是因为**画布那半已经归皮肤了**(ADR-0014:词云卡整张正文是一个内置块,
+ * 皮肤只管外框),而这一半得现读两个磁盘文件 —— 拼 HTML 的人(`ImageRenderer` /
+ * 测试)只要把它注进去就行,取色与自适应参数只有这一份。
+ *
+ * 产物必须塞在 `</body>` 之前 —— 脚本里 `getElementById` 立刻就找画布。
+ */
+export function wordCloudInitScript(words: Array<[string, number]>, dirname: string): string {
 	const wordcloudJS = readFileSync(resolve(dirname, "static/wordcloud2.min.js"), "utf-8");
 	const renderFunc = readFileSync(resolve(dirname, "static/render.js"), "utf-8");
-
-	const html = await renderCard(
-		WordCloudCard,
-		{ masterName, masterAvatarUrl, colorStart, colorEnd },
-		{ title: "弹幕词云", font, fontFace, htmlWidth: 720 },
-	);
-
-	const initScript = `
+	return `
 		<script>${wordcloudJS}</script>
 		<script>${renderFunc}</script>
 		<script>
@@ -79,6 +69,9 @@ export async function buildWordCloudHtml(
 			});
 		</script>
 	`;
+}
 
-	return html.replace("</body>", `${initScript}</body>`);
+/** 词云的脚本必须塞在这之前。出图与测试共用同一个落点。 */
+export function injectWordCloudScript(html: string, script: string): string {
+	return html.replace("</body>", `${script}</body>`);
 }

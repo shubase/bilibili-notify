@@ -5,7 +5,7 @@ import type { OnboardingStepKey, OnboardingView } from "./derive";
  *
  * 主步切换由机器判据驱动(reconcileTourPos 跟随 activeKey),主步内的子步
  * 才是手动翻页 —— 所以「扫码成功自动进下一步」不需要任何额外探测代码。
- * 主步顺序:登录 → 适配器 → 目标 → 测试 → 订阅(理由见 derive.ts)。
+ * 主步顺序:登录 → 连接 → 目标 → 测试 → 订阅(理由见 derive.ts)。
  *
  * `anchor` 指向页面控件上的 `data-tour` 挂点(高亮描边 + 滚入视口);
  * 控件级原则:聚光灯只指到按钮/区块,字段明细写在 `body` 文字里 ——
@@ -20,10 +20,10 @@ export const TOUR_ANCHORS = [
 	"bili-login-qr",
 	"subs-search",
 	"subs-add",
-	"adapter-add",
-	"adapter-form",
-	"adapter-test",
-	"adapter-config",
+	"connection-add",
+	"connection-form",
+	"connection-test",
+	"connection-config",
 	"target-add",
 	"target-form",
 	"target-test",
@@ -42,7 +42,7 @@ export type TourAnchor = (typeof TOUR_ANCHORS)[number];
  */
 export const MODAL_ONLY_ANCHORS: ReadonlySet<TourAnchor> = new Set<TourAnchor>([
 	"bili-login-qr",
-	"adapter-form",
+	"connection-form",
 	"target-form",
 	"subs-search",
 ]);
@@ -78,7 +78,7 @@ export interface TourSubStep {
 	/**
 	 * 此子步的目标已达成的判据 —— 成立即自动流转到下一子步(与 advanceOnRoute
 	 * 同为单向自动流转,只是信号来自探测数据而非路由)。给「主步内的中间动作」用:
-	 * 主步判据只认最终结果(如适配器**测通**),而「建好适配器」这一步做完时导览
+	 * 主步判据只认最终结果(如连接**测通**),而「建好连接」这一步做完时导览
 	 * 必须立刻把灯移到「测试」上,不能等用户自己想起来。
 	 */
 	doneWhen?: (view: OnboardingView) => boolean;
@@ -98,49 +98,49 @@ export const TOUR_SCRIPT: Record<OnboardingStepKey, readonly TourSubStep[]> = {
 			body: "点高亮的「发起扫码登录」,用手机 B 站 App 扫码并确认。登录成功后这里会自动进入下一步。",
 		},
 	],
-	adapter: [
+	connection: [
 		{
 			route: "/targets",
 			// 出发前的选型思考步:不配 anchor(在目标页的动手指引归下一子步),
 			// 抵达 /targets 即流转 —— 灯与文案永远同步
 			advanceOnRoute: true,
 			title: "先选一条接入路线",
-			body: "BN 有三类适配器:「QQ 官方机器人」「OneBot(NapCat 等协议端)」「Webhook(钉钉 / 飞书等)」,能力与部署成本各不同 —— 具体区别看「选型指引」,想清楚了再动身。",
+			body: "BN 的连接分几路:「QQ 官方机器人」「OneBot(NapCat 等协议端)」,以及飞书 / 钉钉 / 企业微信的群机器人和「未指明的 HTTP 端点」。能力与部署成本各不同 —— 具体区别看「选型指引」,想清楚了再动身。",
 			link: { to: "/about/guide", label: "选型指引" },
 		},
 		{
 			route: "/targets",
-			// 表单弹窗打开时链解析到 form(在 modal 内)→ 聚光灯让位;adapter-add 挂在
+			// 表单弹窗打开时链解析到 form(在 modal 内)→ 聚光灯让位;connection-add 挂在
 			// 左栏「+ 新建」与空态主 CTA 两处 —— 同名实例是等价入口,灯一起亮
-			anchor: ["adapter-form", "adapter-add"],
+			anchor: ["connection-form", "connection-add"],
 			// 保存落库的那一刻翻页 —— 灯立刻移到「测试」按钮,不等用户自己想起来
-			doneWhen: (v) => v.hasAdapter,
-			title: "新建推送适配器",
+			doneWhen: (v) => v.hasConnection,
+			title: "新建推送连接",
 			body: "点高亮的「+ 新建」,选好平台:QQ 官方填 appId / appSecret(或点表单里的「扫码连接 / 创建」自动回填);OneBot 选连接方式(推荐反向 WS,填一个监听端口)。填完点「保存」。",
 			// 上一子步在抵达时自动翻过 —— 一直待在本页的用户全程见不到它,选型入口在这也挂一份
 			link: { to: "/about/guide", label: "选型指引" },
 		},
 		{
 			route: "/targets",
-			// 控件级:灯指适配器详情区的「测试」按钮本体;挂点没渲染时回落适配器区
-			anchor: ["adapter-test", "adapter-add"],
-			anchorOnFail: ["adapter-form", ["adapter-config", "adapter-test"], "adapter-add"],
-			title: "测试适配器连通",
-			body: "在刚建好的适配器行上点「测试」—— 通过后状态点变绿,并自动进入下一步。失败的话按错误提示排查(OneBot 先确认 NapCat 已连上)。",
+			// 控件级:灯指连接详情区的「测试」按钮本体;挂点没渲染时回落连接区
+			anchor: ["connection-test", "connection-add"],
+			anchorOnFail: ["connection-form", ["connection-config", "connection-test"], "connection-add"],
+			title: "测试连通性",
+			body: "在刚建好的连接行上点「测试」—— 通过后状态点变绿,并自动进入下一步。失败的话按错误提示排查(OneBot 先确认 NapCat 已连上)。",
 		},
 	],
 	target: [
 		{
 			route: "/targets",
-			// 同 adapter:弹窗内让位;target-add 挂右上按钮与空态 AddCard 两处,一起亮。
-			// 末尾必须留 target-list 兜底:**选中的适配器是 webhook 时 target-add 一处
+			// 同 connection:弹窗内让位;target-add 挂右上按钮与空态 AddCard 两处,一起亮。
+			// 末尾必须留 target-list 兜底:**选中的连接是 webhook 时 target-add 一处
 			// 都不渲染**(右上按钮被 platform 判断掐掉,空态 AddCard 走的是另一条分支),
 			// 链解析不到任何元素 → 灯不亮、锁不铺,而小卡还在说「点高亮的『+ 新建』」,
 			// 指着一个不存在的东西;又因为人已经在目标路由上,「点亮起的页签前往」那条
 			// 降级提示也被抑制,导览就此死在这儿(2026-08-31 审查)。test 步早有这条兜底。
 			anchor: ["target-form", "target-add", "target-list"],
 			title: "添加推送目标",
-			body: "点高亮的「+ 新建」,选刚才的适配器,指定发到哪:OneBot 直接填群号或 QQ 号;QQ 官方要先在 QQ 里给机器人发一句话,然后在表单里选出现的会话。保存后自动进入下一步。",
+			body: "点高亮的「+ 新建」,选刚才的连接,指定发到哪:OneBot 直接填群号或 QQ 号;QQ 官方要先在 QQ 里给机器人发一句话,然后在表单里选出现的会话。保存后自动进入下一步。",
 		},
 	],
 	test: [
@@ -169,7 +169,7 @@ export const TOUR_SCRIPT: Record<OnboardingStepKey, readonly TourSubStep[]> = {
  *  不然小卡文案无声切到下一步,用户不知道刚才那步已经成了(真机反馈:突兀)。 */
 export const STEP_DONE_MESSAGES: Record<OnboardingStepKey, string> = {
 	login: "B 站登录完成!",
-	adapter: "适配器连通了!",
+	connection: "连接打通了!",
 	target: "推送目标建好了!",
 	test: "测试消息已送达,通道全线打通!",
 	subs: "订阅成功,大功告成!",
@@ -182,9 +182,9 @@ export interface TourPos {
 
 /**
  * 判据跟随:activeKey(第一个未完成主步)变了就跳到该主步的第一个子步 ——
- * **前进与回退都跟**。回退=前置被破坏(退出登录、删掉已测通的适配器),导览
+ * **前进与回退都跟**。回退=前置被破坏(退出登录、删掉已测通的连接),导览
  * 必须带用户回去补,否则卡在一个做不了的后续步上(真机踩过:退出登录后停在
- * 适配器步,登录被略过)。「顺序流转、不回头」只约束**交互层** —— 没有
+ * 连接步,登录被略过)。「顺序流转、不回头」只约束**交互层** —— 没有
  * 「上一步」按钮,用户不能手动倒退;判据说话永远算数。
  * 没变则保持手动子步位置(越界收回,防脚本改短);全绿(activeKey=null)进入
  * done 祝贺态。

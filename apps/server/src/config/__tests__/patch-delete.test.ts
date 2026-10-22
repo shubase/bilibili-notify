@@ -65,8 +65,8 @@ describe("patchGlobals 的删除语义", () => {
 		await store.patchGlobals({
 			defaults: {
 				cardStyleByKind: {
-					live: { cardColorStart: "#live" },
-					sc: { cardColorStart: "#sc" },
+					live: { glassOpacity: 0.1 },
+					sc: { glassOpacity: 0.2 },
 				},
 			},
 		});
@@ -78,7 +78,7 @@ describe("patchGlobals 的删除语义", () => {
 				cardStyleByKind: {
 					live: null,
 					dynamic: null,
-					sc: { cardColorStart: "#sc" },
+					sc: { glassOpacity: 0.2 },
 					guard: null,
 				},
 			},
@@ -86,17 +86,59 @@ describe("patchGlobals 的删除语义", () => {
 
 		const byKind = store.getGlobals().defaults.cardStyleByKind;
 		expect(byKind?.live).toBeUndefined();
-		expect(byKind?.sc).toEqual({ cardColorStart: "#sc" });
+		expect(byKind?.sc).toEqual({ glassOpacity: 0.2 });
+	});
+
+	/**
+	 * **旋钮的「还原」压在同一条语义上**(ADR-0014 决策 16 的 🔗):旋钮是「存覆盖不存值」,
+	 * 还原 = 把那个键真的删掉,让皮肤 CSS 的兜底重新生效。写回 default 值不叫还原 ——
+	 * 那仍是一条覆盖,皮肤日后改了默认它也跟不动。
+	 */
+	it("显式 null 删掉一枚旋钮的覆盖,同一套皮肤的其它旋钮与别的皮肤都不受牵连", async () => {
+		await store.patchGlobals({
+			defaults: {
+				cardSkinKnobs: {
+					default: { "gradient-start": "#ff0000", "gradient-end": "#00ff00" },
+					cyberpunk: { neon: "#00f0ff" },
+				},
+			},
+		});
+		expect(store.getGlobals().defaults.cardSkinKnobs.default).toEqual({
+			"gradient-start": "#ff0000",
+			"gradient-end": "#00ff00",
+		});
+
+		// 面板「还原起色」下发的形状:还原的那枚给 null,别的一个字不提。
+		await store.patchGlobals({
+			defaults: { cardSkinKnobs: { default: { "gradient-start": null } } },
+		} as never);
+
+		const knobs = store.getGlobals().defaults.cardSkinKnobs;
+		expect(knobs.default).toEqual({ "gradient-end": "#00ff00" });
+		expect(knobs.cyberpunk).toEqual({ neon: "#00f0ff" });
+	});
+
+	it("整套皮肤的旋钮一次还原:那套给 null,别的皮肤留着", async () => {
+		await store.patchGlobals({
+			defaults: {
+				cardSkinKnobs: { default: { "gradient-start": "#ff0000" }, cyberpunk: { neon: "#0ff" } },
+			},
+		});
+		await store.patchGlobals({ defaults: { cardSkinKnobs: { default: null } } } as never);
+
+		const knobs = store.getGlobals().defaults.cardSkinKnobs;
+		expect(knobs.default).toBeUndefined();
+		expect(knobs.cyberpunk).toEqual({ neon: "#0ff" });
 	});
 
 	it("键不出现 = 不改 —— 这正是「关不掉」的成因,钉住它免得被当成删除", async () => {
 		await store.patchGlobals({
-			defaults: { cardStyleByKind: { live: { cardColorStart: "#live" } } },
+			defaults: { cardStyleByKind: { live: { glassOpacity: 0.1 } } },
 		});
 		// 老前端的下发形状:live 被 delete 掉,于是整个 map 是空的。
 		await store.patchGlobals({ defaults: { cardStyleByKind: {} } });
 		expect(store.getGlobals().defaults.cardStyleByKind?.live).toEqual({
-			cardColorStart: "#live",
+			glassOpacity: 0.1,
 		});
 	});
 
